@@ -99,8 +99,7 @@ impl<R: Read, W: Write> Framing<R, W> {
     /// Reads the next zero delimited frame, returning its range within
     /// `reader_buffer` so callers can parse it without copying. Frames exceeding
     /// MAX_FRAME_SIZE are discarded with a warning, resynchronizing on the next
-    /// delimiter. The unchecked indexing is sound as the buffer has a fixed size
-    /// of MAX_FRAME_SIZE + 1 and all offsets are kept within the filled region.
+    /// delimiter.
     #[inline]
     fn next_frame(&mut self) -> Result<Range<usize>, Error> {
         // Track if we're in discard mode and how much we discarded until now
@@ -136,13 +135,8 @@ impl<R: Read, W: Write> Framing<R, W> {
                 if self.reader_offset > 0 {
                     // We're in waiting mode, compact the buffer to maximise free space
                     let used = self.reader_filled - self.reader_offset;
-                    unsafe {
-                        std::ptr::copy(
-                            self.reader_buffer.as_ptr().add(self.reader_offset),
-                            self.reader_buffer.as_mut_ptr(),
-                            used,
-                        );
-                    }
+                    self.reader_buffer
+                        .copy_within(self.reader_offset..self.reader_filled, 0);
                     self.reader_filled = used;
                     self.reader_offset = 0;
                     self.reader_search = used;
@@ -165,7 +159,7 @@ impl<R: Read, W: Write> Framing<R, W> {
             // Read more data to try and find the next frame marker
             match self
                 .reader
-                .read(unsafe { self.reader_buffer.get_unchecked_mut(self.reader_filled..) })
+                .read(&mut self.reader_buffer[self.reader_filled..])
             {
                 Err(err) => return Err(Error::RecvFailed(err)), // Transport failed internally, cannot recover
                 Ok(0) => return Err(Error::Terminated), // Transport was terminated, tear down
@@ -194,7 +188,7 @@ impl<R: Read, W: Write> Framing<R, W> {
         match self.next_packet() {
             Err(err) => Err(err),
             Ok(None) => Ok(None),
-            Ok(Some(size)) => Ok(Some(unsafe { self.decobs_buffer.get_unchecked(..size) })),
+            Ok(Some(size)) => Ok(Some(&self.decobs_buffer[..size])),
         }
     }
 
@@ -204,7 +198,7 @@ impl<R: Read, W: Write> Framing<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     pub fn next_frame_blob(&mut self) -> Result<&[u8], Error> {
         let frame = self.next_frame()?;
-        Ok(unsafe { self.reader_buffer.get_unchecked(frame.start..frame.end) })
+        Ok(&self.reader_buffer[frame])
     }
 
     /// Test and benchmark helper exposing `send_frame` with the raw frame taken
