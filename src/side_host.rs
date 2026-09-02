@@ -11,7 +11,12 @@ use crate::{
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use std::io::{Read, Write};
-use tracing::trace;
+use tracing::{trace, warn};
+
+/// Maximum number of queued frames skipped while waiting for the ArkHello of a
+/// handshake, before giving up on the Ark. A well-behaved Ark only ever leaves
+/// a handful behind, as its writer blocks once the transport buffers fill up.
+const MAX_STALE_FRAMES: usize = 32;
 
 /// Trust policy for the device attestation an Ark presents in the handshake.
 /// It owns everything the wire deliberately does not (root keys, self-signing
@@ -53,7 +58,9 @@ pub struct HostSide<R: Read, W: Write> {
 }
 
 impl<R: Read, W: Write> HostSide<R, W> {
-    /// Creates a new host side around a low level reader and writer.
+    /// Creates a new host side around a low level reader and writer. Reads block
+    /// per the transport's semantics, so a timeout for an unresponsive Ark must
+    /// be configured on the reader passed in.
     pub fn new(reader: R, writer: W) -> Self {
         Self {
             framing: Framing::new(reader, writer),
@@ -91,11 +98,26 @@ impl<R: Read, W: Write> HostSide<R, W> {
 
         self.framing.send_packet(&hello)?;
 
-        // Message 2: Read ArkHello (COSE seal'd, COBS-framed)
-        let Some(size) = self.framing.next_packet()? else {
-            return Err(Error::HandshakeFailed(
-                "empty frame instead of ark hello".into(),
-            ));
+        // Message 2: Read ArkHello (COSE seal'd, COBS-framed). Frames the Ark
+        // emitted before processing the reset may still be queued, so skip
+        // everything not sealed to the fresh host key.
+        let host_xhpke_fp = host_xhpke_pk.fingerprint();
+
+        let mut stale = 0;
+        let size = loop {
+            // Empty frames are never sent by the Ark, they are stale junk too
+            let size = self.framing.next_packet()?.unwrap_or_default();
+            let recipient = cose::recipient(&self.framing.decobs_buffer[..size]);
+            if recipient.is_ok_and(|fp| fp == host_xhpke_fp) {
+                break size;
+            }
+            stale += 1;
+            if stale > MAX_STALE_FRAMES {
+                return Err(Error::HandshakeFailed(
+                    "too many stale frames before ark hello".into(),
+                ));
+            }
+            warn!("skipping stale frame during handshake");
         };
         let auth = handshake::ArkHelloAuth {
             host_signer: host_xdsa_pk.clone(),

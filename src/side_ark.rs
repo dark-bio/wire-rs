@@ -50,7 +50,8 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
     /// Creates a new Ark side around a low level reader and writer. The signer is
     /// the Ark's identity key, which signs the handshake; the host verifies that
     /// signature against the key it extracts from the attestation, so the two
-    /// must match.
+    /// must match. Reads block per the transport's semantics, so any timeout
+    /// must be configured on the reader passed in.
     pub fn new(reader: R, writer: W, signer: xdsa::SecretKey, attester: A) -> Self {
         Self {
             framing: Framing::new(reader, writer),
@@ -259,7 +260,7 @@ mod tests {
     use crate::testing;
     use crate::{HostSide, Verifier};
     use darkbio_cobs as cobs;
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -271,26 +272,6 @@ mod tests {
         buf.truncate(n);
         buf.push(0x00);
         buf
-    }
-
-    /// Reads one COBS frame from a stream (bytes until 0x00), then COBS-decodes.
-    fn read_cobs_frame(reader: &mut impl Read) -> Vec<u8> {
-        let mut raw = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            reader.read_exact(&mut byte).unwrap();
-            if byte[0] == 0x00 {
-                break;
-            }
-            raw.push(byte[0]);
-        }
-        if raw.is_empty() {
-            return Vec::new();
-        }
-        let mut decoded = vec![0u8; raw.len()];
-        let n = cobs::decode(&raw, &mut decoded).unwrap();
-        decoded.truncate(n);
-        decoded
     }
 
     // Tests a full round trip, the handshake, a host-to-ark request and the
@@ -413,9 +394,71 @@ mod tests {
         );
     }
 
+    // Tests that a response the host never read (e.g. after timing out on it)
+    // does not wedge subsequent handshakes. The Ark answers the request before
+    // it processes the reset, so the stale response precedes the fresh ArkHello
+    // and the host must skip past it.
+    #[test]
+    fn test_reset_unread_response() {
+        testing::init_tracing();
+
+        let signer_key = xdsa::SecretKey::generate();
+        let signer_pub = signer_key.public_key();
+
+        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
+        let ark_reader = ark_sock.try_clone().unwrap();
+        let ark_writer = ark_sock;
+
+        // Ark side: receive two messages (across two sessions), echo each back.
+        let ark_thread = std::thread::spawn(move || {
+            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, Vec::new());
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let req = ark.next_message().unwrap();
+                ids.push(req.id);
+                ark.send_message(ArkToHost {
+                    id: req.id,
+                    err: None,
+                    content: None,
+                })
+                .unwrap();
+            }
+            ids
+        });
+
+        // Session 1: complete handshake, send a message but never read the
+        // response.
+        let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
+        host.handshake(&signer_pub).unwrap();
+        host.send_message(HostToArk {
+            id: Some(1),
+            content: None,
+        })
+        .unwrap();
+
+        // Session 2: new handshake on the same wire with the unread response
+        // still queued in front of the ArkHello, exchange one message.
+        host.handshake(&signer_pub).unwrap();
+        host.send_message(HostToArk {
+            id: Some(2),
+            content: None,
+        })
+        .unwrap();
+        let res = host.next_message().unwrap();
+        assert_eq!(res.id, Some(2), "session 2 response mismatch");
+
+        let ids = ark_thread.join().unwrap();
+        assert_eq!(
+            ids,
+            vec![Some(1), Some(2)],
+            "ark received wrong message ids"
+        );
+    }
+
     // Tests that a session reset mid-handshake (after HostHello/ArkHello but
     // before HostAck) correctly aborts the in-progress handshake and allows a
-    // fresh one to complete.
+    // fresh one to complete, with the abandoned ArkHello left unread for the
+    // fresh handshake to skip past.
     #[test]
     fn test_reset_mid_handshake() {
         testing::init_tracing();
@@ -440,11 +483,11 @@ mod tests {
             req
         });
 
-        let mut host_read = host_sock.try_clone().unwrap();
+        let host_read = host_sock.try_clone().unwrap();
         let mut host_write = host_sock;
 
-        // Start a handshake but abandon it after receiving ArkHello (message 2),
-        // never sending HostAck (message 3).
+        // Start a handshake but abandon it after sending HostHello (message 1),
+        // never reading ArkHello (message 2) nor sending HostAck (message 3).
         host_write.write_all(&[0x00, 0x00]).unwrap(); // session reset
 
         let host_signer_key = xdsa::SecretKey::generate();
@@ -455,11 +498,11 @@ mod tests {
         })
         .unwrap();
         host_write.write_all(&cobs_frame(&hello)).unwrap(); // message 1: HostHello
-        read_cobs_frame(&mut host_read); // consume and discard message 2: ArkHello
 
         // Now do a complete handshake (sends its own reset + full 3 messages).
         // The Ark sees the reset where it expected HostAck, restarts its
-        // handshake loop, and completes the new one.
+        // handshake loop, and completes the new one. The host skips the stale
+        // ArkHello of the abandoned attempt to find its own.
         let mut host = HostSide::new(host_read, host_write);
         host.handshake(&signer_pub).unwrap();
         host.send_message(HostToArk {
