@@ -22,6 +22,16 @@ use std::io;
 /// wire protocol.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
+/// Largest protobuf message the wire carries, being what still fits a frame
+/// after the session's sealing and the COBS framing overheads are added.
+pub const MAX_MESSAGE_SIZE: usize = {
+    let mut size = MAX_FRAME_SIZE;
+    while darkbio_cobs::encode_buffer(size + session::Session::SEAL_OVERHEAD) > MAX_FRAME_SIZE {
+        size -= 1;
+    }
+    size
+};
+
 /// Domain separator for the COSE envelopes of the handshake, sealing the Ark's
 /// hello and the host's ack (the host's hello is plain CBOR). It binds their
 /// signatures and encryption to the wire, so a handshake signed by the Ark's
@@ -39,7 +49,7 @@ pub(crate) const CRYPTO_DOMAIN_WIRE_HOST_TO_ARK: &[u8] = b"wire-v1:host-to-ark";
 /// Things that can go wrong in the wire transport.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("wire packet too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
+    #[error("wire packet too large: {0} bytes, max {MAX_MESSAGE_SIZE} bytes")]
     PacketTooLarge(usize),
 
     #[error("wire packet encode failed: {0}")]

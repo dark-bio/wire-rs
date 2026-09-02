@@ -3,8 +3,7 @@
 
 //! Established session state and the sealing of protobuf messages through it.
 
-use crate::{Error, MAX_FRAME_SIZE};
-use darkbio_cobs as cobs;
+use crate::{Error, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
 use prost::Message;
 
@@ -21,12 +20,12 @@ impl Session {
     pub const SEAL_OVERHEAD: usize = 16;
 
     /// Protobuf encodes a message into the scratch buffer and seals it for the
-    /// peer. Messages whose sealed and framed size would exceed MAX_FRAME_SIZE
-    /// are rejected before sealing, leaving the HPKE sequence untouched; a
-    /// failure of the sealing itself leaves the context unusable.
+    /// peer. Messages above MAX_MESSAGE_SIZE are rejected before sealing,
+    /// leaving the HPKE sequence untouched; a failure of the sealing itself
+    /// leaves the context unusable.
     pub fn seal<M: Message>(&mut self, msg: &M, scratch: &mut Vec<u8>) -> Result<Vec<u8>, Error> {
         let len = msg.encoded_len();
-        if cobs::encode_buffer(len + Self::SEAL_OVERHEAD) > MAX_FRAME_SIZE {
+        if len > MAX_MESSAGE_SIZE {
             return Err(Error::PacketTooLarge(len));
         }
         scratch.clear();
@@ -53,6 +52,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_FRAME_SIZE;
+    use darkbio_cobs as cobs;
 
     // Tests that the sealing overhead constant matches what the session AEAD
     // actually adds, so a crypto upgrade cannot silently break size bounds.
@@ -71,15 +72,40 @@ mod tests {
         }
     }
 
-    // Tests that an oversized message is rejected before sealing, leaving the
-    // HPKE sequence untouched so the session stays in sync with its peer.
+    // Tests that the message limit is exact against the frame limit, the sealed
+    // and framed size of a maximal message fitting a frame with the next byte
+    // pushing it over.
     #[test]
-    fn test_seal_oversized() {
+    fn test_message_limit() {
+        let framed = |size: usize| cobs::encode_buffer(size + Session::SEAL_OVERHEAD);
+
+        assert!(framed(MAX_MESSAGE_SIZE) <= MAX_FRAME_SIZE, "limit too high");
+        assert!(
+            framed(MAX_MESSAGE_SIZE + 1) > MAX_FRAME_SIZE,
+            "limit too low"
+        );
+    }
+
+    // Tests that a message at the limit seals into a frame sized packet, that
+    // one over the limit is rejected before sealing, and that the rejection
+    // leaves the HPKE sequence untouched so the session stays in sync.
+    #[test]
+    fn test_seal_bounds() {
         /// Throwaway message carrying an arbitrary payload.
         #[derive(Clone, PartialEq, Message)]
         struct Blob {
             #[prost(bytes = "vec", tag = "1")]
             data: Vec<u8>,
+        }
+
+        /// Blob whose protobuf encoding is exactly the given size.
+        fn blob_of(size: usize) -> Blob {
+            let mut blob = Blob {
+                data: vec![0x42; size],
+            };
+            blob.data.truncate(size - (blob.encoded_len() - size));
+            assert_eq!(blob.encoded_len(), size, "blob sizing failed");
+            blob
         }
 
         let secret = xhpke::SecretKey::generate();
@@ -88,11 +114,8 @@ mod tests {
         let mut session = Session { sender, receiver };
         let mut scratch = Vec::new();
 
-        // A message that fits the frame limit as plaintext, but not once the
-        // sealing and framing overheads are added, must be rejected up front.
-        let blob = Blob {
-            data: vec![0x42; MAX_FRAME_SIZE - 32],
-        };
+        // One byte over the limit must be rejected up front
+        let blob = blob_of(MAX_MESSAGE_SIZE + 1);
         assert!(
             matches!(
                 session.seal(&blob, &mut scratch),
@@ -101,12 +124,15 @@ mod tests {
             "expected oversized packet rejection"
         );
 
-        // The sequence must not have advanced, so the next sealed message must
-        // still open as the first one on the receiving side.
-        let blob = Blob {
-            data: b"in sync".to_vec(),
-        };
+        // A maximal message must seal, frame within the limit and, the
+        // sequence not having advanced, open as the first message on the
+        // receiving side
+        let blob = blob_of(MAX_MESSAGE_SIZE);
         let sealed = session.seal(&blob, &mut scratch).unwrap();
+        assert!(
+            cobs::encode_buffer(sealed.len()) <= MAX_FRAME_SIZE,
+            "sealed message does not fit a frame"
+        );
         let opened: Blob = session.open(&sealed).unwrap();
         assert_eq!(opened, blob, "message mismatch");
     }
