@@ -13,4 +13,4 @@ The wire wraps an arbitrary byte stream (USB bulk endpoints, sockets, websockets
 - **Handshake**: Three message exchange of ephemeral xDSA and xHPKE keys, authenticated by the device attestation. It establishes independent HPKE contexts per direction.
 - **Messages**: Protobuf encoded requests and responses (see `proto/wire.proto`), individually sealed by the session contexts.
 
-The wire currently does *not* contain policy. The Ark side takes an `Attester` producing the attestation to present, the host side takes a `Verifier` checking the attestation it received. Root keys, trust tiers, self-signing rules and recovery overrides all stay with the consumer.
+The wire keeps trust policy at its edges. The Ark side takes an `Attester` producing the attestation to present, the host side takes a `Verifier` checking the attestation it received. A `Roots` verifier built on [darkbio-trust](https://github.com/dark-bio/trust-rs) accepts the Arks attested under a given set of hardware and emulator roots; which roots to trust, self-signing rules and recovery overrides stay with the consumer.

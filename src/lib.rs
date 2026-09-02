@@ -13,8 +13,8 @@ mod side_ark;
 mod side_host;
 
 pub use protocol::{ArkToHost, HostToArk};
-pub use side_ark::{ArkSide, Attester};
-pub use side_host::{HostSide, Verifier};
+pub use side_ark::{ArkSide, Attestation, Attester};
+pub use side_host::{HostSide, Roots, Verifier};
 
 use std::io;
 
@@ -75,6 +75,9 @@ pub enum Error {
 
     #[error("wire terminated")]
     Terminated,
+
+    #[error("attestation is not for a hardware or emulator")]
+    InvalidAttestation,
 
     #[error("wire handshake failed: {0}")]
     HandshakeFailed(String),

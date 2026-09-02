@@ -385,12 +385,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "darkbio-trust"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814cfa334349f24a29fbb1ac619af1a0c1c9d56dda03e42503d488e6f150bc3a"
+dependencies = [
+ "darkbio-crypto",
+ "hex",
+ "thiserror",
+]
+
+[[package]]
 name = "darkbio-wire"
 version = "0.1.0"
 dependencies = [
  "criterion",
  "darkbio-cobs",
  "darkbio-crypto",
+ "darkbio-trust",
  "memchr",
  "prost",
  "prost-build",
@@ -608,6 +620,12 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"

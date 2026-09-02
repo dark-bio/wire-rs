@@ -5,12 +5,15 @@ use crate::framing::Framing;
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
 use crate::session::Session;
+use crate::side_ark::Attestation;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
 };
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
+use darkbio_trust as trust;
 use std::io::{Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
 
 /// Maximum number of queued frames skipped while waiting for the ArkHello of a
@@ -19,29 +22,57 @@ use tracing::{trace, warn};
 const MAX_STALE_FRAMES: usize = 32;
 
 /// Trust policy for the device attestation an Ark presents in the handshake.
-/// It owns everything the wire deliberately does not (root keys, self-signing
-/// rules, recovery overrides) and decides which Arks a session is opened with.
-///
-/// The attestation is a CWT, handed over as raw bytes for now; a typed form
-/// will be exposed later.
+/// It owns everything the wire deliberately does not (which roots to trust,
+/// self-signing rules, recovery overrides) and decides which Arks a session is
+/// opened with.
 pub trait Verifier {
     /// Session info extracted from an accepted attestation.
     type Info;
 
-    /// Verifies the raw device attestation, returning the Ark's identity key
-    /// along with any info extracted from the attestation. The handshake
-    /// signature is checked against the returned key, so this decision is what
-    /// authenticates the session. Rejecting the attestation aborts the handshake.
-    fn verify(&self, attestation: &[u8]) -> Result<(xdsa::PublicKey, Self::Info), String>;
+    /// Verifies the device attestation, returning the Ark's identity key along
+    /// with any info extracted from the attestation. The handshake signature is
+    /// checked against the returned key, so this decision is what authenticates
+    /// the session. Rejecting the attestation aborts the handshake.
+    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String>;
 }
 
 /// A pinned identity, accepting any attestation and handing it back as
 /// presented. The handshake is authenticated against the pinned key instead.
 impl Verifier for xdsa::PublicKey {
-    type Info = Vec<u8>;
+    type Info = Attestation;
 
-    fn verify(&self, attestation: &[u8]) -> Result<(xdsa::PublicKey, Self::Info), String> {
-        Ok((self.clone(), attestation.to_vec()))
+    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
+        Ok((self.clone(), attestation.clone()))
+    }
+}
+
+/// Roots of trust, accepting the Arks attested under them: hardware Arks by
+/// the hardware roots and emulated Arks by the emulator roots, the attestation
+/// having to be valid at the current time. An Ark that was never onboarded is
+/// rejected, its self-signed attestation being an onboarding decision rather
+/// than one of trust.
+pub struct Roots<'a> {
+    pub hardware: &'a [xdsa::PublicKey], // Roots attesting hardware Arks
+    pub emulator: &'a [xdsa::PublicKey], // Roots attesting emulated Arks
+}
+
+impl Verifier for Roots<'_> {
+    type Info = trust::device::Device;
+
+    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| err.to_string())?
+            .as_secs();
+
+        let device = trust::device::verify(
+            attestation.as_bytes(),
+            self.hardware,
+            self.emulator,
+            Some(now),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok((device.signer.clone(), device))
     }
 }
 
@@ -139,8 +170,9 @@ impl<R: Read, W: Write> HostSide<R, W> {
 
         // Step 2c: Hand the attestation to the verifier to obtain the Ark's
         // identity key and the caller's session info
+        let attestation = Attestation::new(unverified.ark_attest)?;
         let (ark_identity, info) = verifier
-            .verify(&unverified.ark_attest)
+            .verify(&attestation)
             .map_err(Error::HandshakeFailed)?;
 
         // Step 2d: Verify the COSE_Sign1 signature with the discovered identity
