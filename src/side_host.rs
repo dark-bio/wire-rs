@@ -4,13 +4,12 @@
 use crate::framing::Framing;
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
+use crate::session::Session;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
-    MAX_FRAME_SIZE,
 };
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
-use prost::Message;
 use std::io::{Read, Write};
 use tracing::trace;
 
@@ -49,9 +48,8 @@ impl Verifier for xdsa::PublicKey {
 /// The device attestation presented in the handshake is not interpreted by the
 /// wire, it is handed to a `Verifier` deciding whether to trust the Ark.
 pub struct HostSide<R: Read, W: Write> {
-    framing: Framing<R, W>, // COBS framed transport for ingress and egress data
-
-    session: Option<handshake::Session>, // Active encrypted session (if handshake completed)
+    framing: Framing<R, W>,   // COBS framed transport for ingress and egress data
+    session: Option<Session>, // Active encrypted session (if handshake completed)
 }
 
 impl<R: Read, W: Write> HostSide<R, W> {
@@ -165,63 +163,73 @@ impl<R: Read, W: Write> HostSide<R, W> {
         self.framing.send_packet(&ack)?;
 
         // Session established
-        self.session = Some(handshake::Session { sender, receiver });
+        self.session = Some(Session { sender, receiver });
         Ok(info)
     }
 
-    /// Reads the next packet and decodes an ark-to-host response with protobuf.
+    /// Reads the next ark-to-host message, decrypting and protobuf decoding it.
+    /// A frame that cannot be decoded or a packet that cannot be decrypted
+    /// drops the session, as the Ark's HPKE sequence can no longer be followed;
+    /// only a fresh handshake recovers from that.
     pub fn next_message(&mut self) -> Result<ArkToHost, Error> {
-        // Retrieve the next COBS encoded packet. Empty frames are never sent by
-        // the Ark, so surface them as the decode failures they would have been.
-        let Some(size) = self.framing.next_packet()? else {
-            return Err(Error::FrameDecodingFailed(cobs::DecodeError::EmptyInput));
+        // Retrieve the next COBS encoded packet. A skipped frame may have
+        // carried a sealed message, so the session cannot continue past it.
+        // Empty frames are never sent by the Ark, so surface them as the
+        // decode failures they would have been.
+        let size = match self.framing.next_packet() {
+            Err(err) => {
+                self.session = None;
+                return Err(err);
+            }
+            Ok(None) => return Err(Error::FrameDecodingFailed(cobs::DecodeError::EmptyInput)),
+            Ok(Some(size)) => size,
         };
-
-        // Decrypt the message
+        // Decrypt the message and parse it with protobuf, dropping the session
+        // if the HPKE sequence cannot be followed anymore
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
 
-        let blob = session
-            .receiver
-            .open(&self.framing.decobs_buffer[..size], &[])
-            .map_err(|err| Error::EncryptionFailed(format!("decryption failed: {}", err)))?;
-
-        let res = ArkToHost::decode(&blob[..]).map_err(Error::PacketDecodingFailed)?;
-
+        let res = match session.open(&self.framing.decobs_buffer[..size]) {
+            Err(err @ Error::EncryptionFailed(_)) => {
+                self.session = None;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+            Ok(res) => res,
+        };
         trace!("read ark-to-host message ({} bytes encrypted)", size);
         Ok(res)
     }
 
-    /// Encodes a host-to-ark request with protobuf and injects it into the transport.
+    /// Protobuf encodes a host-to-ark message, seals it with the session and
+    /// sends it. Fails without an active session, and a failure after sealing
+    /// drops the session, as the Ark's HPKE sequence can no longer be caught up
+    /// with.
     pub fn send_message(&mut self, req: HostToArk) -> Result<(), Error> {
-        // Encode it with protobuf
-        let len = req.encoded_len();
-        if len > MAX_FRAME_SIZE {
-            return Err(Error::PacketTooLarge(len));
-        }
-        self.framing.encode_buffer.clear();
-        if let Err(err) = req.encode(&mut self.framing.encode_buffer) {
-            return Err(Error::PacketEncodingFailed(err));
-        }
-        // Encrypt the encoded message
+        // Encode and seal the message, oversized messages are rejected before
+        // the HPKE sequence advances, only a failed seal breaks the session
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
 
-        let blob = session
-            .sender
-            .seal(&self.framing.encode_buffer, &[])
-            .map_err(|err| Error::EncryptionFailed(err.to_string()))?;
-
-        let len = blob.len();
-        if len > MAX_FRAME_SIZE {
-            return Err(Error::PacketTooLarge(len));
+        let blob = match session.seal(&req, &mut self.framing.encode_buffer) {
+            Err(err @ Error::EncryptionFailed(_)) => {
+                self.session = None;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+            Ok(blob) => blob,
+        };
+        // Send the sealed message, tearing down the session if the transport
+        // fails to deliver it
+        if let Err(err) = self.framing.send_packet(&blob) {
+            self.session = None;
+            return Err(err);
         }
-        self.framing.send_packet(&blob)?;
-        trace!("sent host-to-ark message ({} bytes)", len);
+        trace!("sent host-to-ark message ({} bytes)", blob.len());
         Ok(())
     }
 

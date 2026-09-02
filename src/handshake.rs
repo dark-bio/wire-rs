@@ -52,9 +52,3 @@ pub(crate) struct HostAckAuth {
     pub ark_signer: xdsa::PublicKey,  // Ark's permanent xDSA signer key
     pub ark_crypto: xhpke::PublicKey, // Ark's ephemeral xHPKE encryption key
 }
-
-/// Established session, holding the xHPKE contexts of the two directions.
-pub(crate) struct Session {
-    pub sender: xhpke::Sender, // Outbound context, sealing messages to the peer
-    pub receiver: xhpke::Receiver, // Inbound context, opening messages from the peer
-}

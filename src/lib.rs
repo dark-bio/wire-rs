@@ -8,6 +8,7 @@ pub mod protocol;
 
 mod framing;
 mod handshake;
+mod session;
 mod side_ark;
 mod side_host;
 

@@ -4,12 +4,11 @@
 use crate::framing::Framing;
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
+use crate::session::Session;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
-    MAX_FRAME_SIZE,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
-use prost::Message;
 use std::io::{Read, Write};
 use tracing::{info, trace, warn};
 
@@ -42,9 +41,9 @@ impl Attester for Vec<u8> {
 pub struct ArkSide<R: Read, W: Write, A: Attester> {
     framing: Framing<R, W>, // COBS framed transport for ingress and egress data
 
-    signer: xdsa::SecretKey, // Ark's identity key, signing the ArkHello
-    attester: A,             // Source of the device attestation for handshakes
-    session: Option<handshake::Session>, // Active encrypted session (if handshake completed)
+    signer: xdsa::SecretKey,  // Ark's identity key, signing the ArkHello
+    attester: A,              // Source of the device attestation for handshakes
+    session: Option<Session>, // Active encrypted session (if handshake completed)
 }
 
 impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
@@ -76,9 +75,16 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                 Err(Error::Terminated) => return Err(Error::Terminated),
                 Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
 
-                // Decode errors may be due to session resets, log and ignore
+                // Decode errors may be due to session resets, log and ignore.
+                // Within a session the skipped frame may have carried a sealed
+                // message though, leaving the HPKE sequence behind the host's,
+                // so the session cannot continue either way.
                 Err(err) => {
-                    warn!("failed to decode cobs packet: {}", err);
+                    if self.session.take().is_some() {
+                        warn!("failed to decode cobs packet, resetting session: {}", err);
+                    } else {
+                        warn!("failed to decode cobs packet: {}", err);
+                    }
                     continue;
                 }
                 // Empty frame signals a session reset from the host
@@ -115,55 +121,49 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                 Some(s) => s,
             };
             // Decrypt the message and parse it with protobuf
-            let blob = match session
-                .receiver
-                .open(&self.framing.decobs_buffer[..size], &[])
-            {
-                Err(err) => {
-                    // If decryption fails, the HPKE context is most probably
-                    // broken, no point continuing with it.
+            let req = match session.open(&self.framing.decobs_buffer[..size]) {
+                // If decryption fails, the HPKE context is most probably
+                // broken, no point continuing with it.
+                Err(Error::EncryptionFailed(err)) => {
                     warn!("decryption failed, resetting session: {}", err);
                     self.session = None;
                     continue;
                 }
-                Ok(blob) => blob,
+                Err(err) => return Err(err),
+                Ok(req) => req,
             };
-            let req = HostToArk::decode(&blob[..]).map_err(Error::PacketDecodingFailed)?;
-
             trace!("read host-to-ark message ({} bytes encrypted)", size);
             return Ok(req);
         }
     }
 
     /// Protobuf encodes an ark-to-host message, seals it with the session and
-    /// sends it. Fails without an active session.
+    /// sends it. Fails without an active session, and a failure after sealing
+    /// drops the session, as the host's HPKE sequence can no longer be caught
+    /// up with.
     pub fn send_message(&mut self, res: ArkToHost) -> Result<(), Error> {
-        // Encode it with protobuf
-        let len = res.encoded_len();
-        if len > MAX_FRAME_SIZE {
-            return Err(Error::PacketTooLarge(len));
-        }
-        self.framing.encode_buffer.clear();
-        if let Err(err) = res.encode(&mut self.framing.encode_buffer) {
-            return Err(Error::PacketEncodingFailed(err));
-        }
-        // Encrypt the encoded message
+        // Encode and seal the message, oversized messages are rejected before
+        // the HPKE sequence advances, only a failed seal breaks the session
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
 
-        let blob = session
-            .sender
-            .seal(&self.framing.encode_buffer, &[])
-            .map_err(|err| Error::EncryptionFailed(err.to_string()))?;
-
-        let len = blob.len();
-        if len > MAX_FRAME_SIZE {
-            return Err(Error::PacketTooLarge(len));
+        let blob = match session.seal(&res, &mut self.framing.encode_buffer) {
+            Err(err @ Error::EncryptionFailed(_)) => {
+                self.session = None;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+            Ok(blob) => blob,
+        };
+        // Send the sealed message, tearing down the session if the transport
+        // fails to deliver it
+        if let Err(err) = self.framing.send_packet(&blob) {
+            self.session = None;
+            return Err(err);
         }
-        self.framing.send_packet(&blob)?;
-        trace!("sent ark-to-host message ({} bytes)", len);
+        trace!("sent ark-to-host message ({} bytes)", blob.len());
         Ok(())
     }
 
@@ -173,7 +173,7 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
     ///   1. Host -> Ark:  HostHello { host_signer, host_crypto }           (plain CBOR)
     ///   2. Ark -> Host:  ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
     ///   3. Host -> Ark:  HostAck   { h2a_encap }                          (cose::seal)
-    fn handshake(&mut self) -> Result<handshake::Session, Error> {
+    fn handshake(&mut self) -> Result<Session, Error> {
         loop {
             // Message 1: Read the HostHello (skip any trailing empty reset frames)
             let size = loop {
@@ -248,7 +248,7 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                 })?;
 
             // Session established
-            return Ok(handshake::Session { sender, receiver });
+            return Ok(Session { sender, receiver });
         }
     }
 }
@@ -259,8 +259,10 @@ mod tests {
     use crate::testing;
     use crate::{HostSide, Verifier};
     use darkbio_cobs as cobs;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// COBS-encodes data and appends the frame delimiter.
     fn cobs_frame(data: &[u8]) -> Vec<u8> {
@@ -565,5 +567,95 @@ mod tests {
             ark_thread.join().unwrap().is_err(),
             "expected torn down wire"
         );
+    }
+
+    // Tests that a transport failure after sealing drops the session, since
+    // the peer's HPKE sequence can no longer be caught up with, and that a
+    // fresh handshake recovers the wire.
+    #[test]
+    fn test_send_failure_drops_session() {
+        testing::init_tracing();
+
+        /// Writer failing on demand to simulate a transport fault.
+        struct Faulty {
+            inner: UnixStream,
+            fail: Arc<AtomicBool>,
+        }
+
+        impl Write for Faulty {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.fail.load(Ordering::Relaxed) {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                self.inner.write(buf)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.inner.flush()
+            }
+        }
+
+        let signer_key = xdsa::SecretKey::generate();
+        let signer_pub = signer_key.public_key();
+
+        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
+        let ark_reader = ark_sock.try_clone().unwrap();
+        let ark_writer = ark_sock;
+
+        // Ark side: receive one message, echo it back.
+        let ark_thread = std::thread::spawn(move || {
+            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, Vec::new());
+            let req = ark.next_message().unwrap();
+            ark.send_message(ArkToHost {
+                id: req.id,
+                err: None,
+                content: None,
+            })
+            .unwrap();
+            req
+        });
+
+        let fail = Arc::new(AtomicBool::new(false));
+        let writer = Faulty {
+            inner: host_sock.try_clone().unwrap(),
+            fail: fail.clone(),
+        };
+        let mut host = HostSide::new(host_sock, writer);
+        host.handshake(&signer_pub).unwrap();
+
+        // Break the transport and send a message. It gets sealed, fails to go
+        // out, and must take the session down with it.
+        fail.store(true, Ordering::Relaxed);
+        let result = host.send_message(HostToArk {
+            id: Some(1),
+            content: None,
+        });
+        assert!(
+            matches!(result, Err(Error::SendFailed(_))),
+            "expected send failure"
+        );
+        let result = host.send_message(HostToArk {
+            id: Some(2),
+            content: None,
+        });
+        assert!(
+            matches!(result, Err(Error::EncryptionFailed(_))),
+            "expected dropped session"
+        );
+
+        // Heal the transport, a fresh handshake resynchronizes both sides.
+        fail.store(false, Ordering::Relaxed);
+        host.handshake(&signer_pub).unwrap();
+        host.send_message(HostToArk {
+            id: Some(3),
+            content: None,
+        })
+        .unwrap();
+
+        let req = ark_thread.join().unwrap();
+        assert_eq!(req.id, Some(3), "request mismatch");
+
+        let res = host.next_message().unwrap();
+        assert_eq!(res.id, Some(3), "response mismatch");
     }
 }
