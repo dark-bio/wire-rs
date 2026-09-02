@@ -461,12 +461,12 @@ message ExecutionUploadChunkResponse{
 // The request expects a RelayAppToArkResponse with the response content:
 //
 //   If approved:
-//     - result = approval = 1u64 // Glorified boolean over an int
+//     - result = approval = true  // CBOR boolean
 //     - err_code: 0
 //     - err_str:  ""
 //
 //   If denied:
-//     - result = approval = 0x64 // Glorified boolean over an int
+//     - result = approval = false // CBOR boolean
 //     - err_code: 0              // No error, deny is valid user choice
 //     - err_str:  ""             // No error, deny is valid user choice
 //
