@@ -1,0 +1,31 @@
+[package]
+name = "darkbio-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+darkbio-cobs = "0.2.0"
+
+[dependencies.darkbio-wire]
+path = ".."
+features = ["fuzz"]
+
+[[bin]]
+name = "next_frame"
+path = "fuzz_targets/next_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "next_packet"
+path = "fuzz_targets/next_packet.rs"
+test = false
+doc = false
+bench = false

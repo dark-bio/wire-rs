@@ -1,0 +1,47 @@
+[package]
+name = "darkbio-wire"
+version = "0.1.0"
+authors = ["Péter Szilágyi <peter@dark.bio>"]
+description = "Encrypted protocol between Ark and host"
+repository = "https://github.com/dark-bio/wire-rs"
+documentation = "https://docs.rs/darkbio-wire"
+categories = ["network-programming", "encoding"]
+keywords = ["ark", "wire", "cobs", "protobuf", "hpke"]
+license = "BSD-3-Clause"
+edition = "2024"
+autobenches = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+bench = ["criterion", "sysinfo"]
+fuzz = []
+
+[dependencies]
+criterion = { version = "0.8", optional = true }
+darkbio-cobs = "0.2.0"
+darkbio-crypto = { version = "0.17.1", features = ["cbor", "cose", "xdsa", "xhpke"] }
+memchr = "2"
+prost = "0.14"
+sysinfo = { version = "0.39", optional = true }
+thiserror = "2.0"
+tracing = "0.1.40" # Keep >= 0.1.40, fixes Instrumented use-after-free (RUSTSEC-2023-0078)
+
+[dev-dependencies]
+rand = "0.10.2" # Keep >= 0.10.1, fixes rng logger unsoundness (RUSTSEC-2026-0097)
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] } # Keep >= 0.3.20, fixes ANSI escape injection (RUSTSEC-2025-0055)
+
+[build-dependencies]
+prost-build = "0.14.1"
+protoc-bin-vendored = "3.2.0"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "main"
+harness = false
+required-features = ["bench"]

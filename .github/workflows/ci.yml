@@ -1,0 +1,72 @@
+name: tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macOS-latest ]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Install cargo-hack
+        run: cargo install cargo-hack
+
+      - name: Build individual features
+        run: cargo hack build --each-feature
+
+      - name: Test individual features
+        run: cargo hack test --each-feature
+
+      - name: Test with all features
+        run: cargo test --all-features
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo clippy --all-features -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo doc --all-features --no-deps
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nightly toolchain
+        run: rustup install nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run all fuzzers for 60 seconds each
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "Fuzzing $target..."
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done

@@ -1,0 +1,693 @@
+// wire-rs: encrypted protocol between Ark and host
+// Copyright 2025 Dark Bio AG. All rights reserved.
+
+syntax = "proto3";
+
+package darkbio.wire;
+
+// HostToArk represents a message sent from the host to the Ark via the USB
+// connection. It embeds all possible message types to keep the protocol simple.
+message HostToArk {
+  // Enveloping fields, reserved range 0x001-0x0ff
+  optional uint64 id = 1;
+
+  // Internal messages, reserved range 0x1000-0x1fff. These are never assigned
+  // in the public schema, permitting internal envelopes to land later without
+  // colliding with public growth.
+  reserved 0x1000 to 0x1fff;
+
+  oneof content {
+    // Special factory message
+    OnboardingRequest onboard = 0x100;
+
+    // System messages, reserved range 0x101-0x200
+    HandshakeRequest       handshake = 0x101;
+    CloudSyncStartRequest  cloud_sync_start = 0x102;
+    CloudSyncFinishRequest cloud_sync_finish = 0x103;
+    GenuinityProofRequest  genuinity_proof = 0x104;
+
+    // Firmware update messages, reserved range 0x201-0x300
+    FirmwareUpdatePrepRequest    firmware_update_prep = 0x201;
+    FirmwareUpdateInitRequest    firmware_update_init = 0x202;
+    FirmwareUpdateUploadRequest  firmware_update_upload = 0x203;
+    FirmwareUpdateVerifyRequest  firmware_update_verify = 0x204;
+    FirmwareUpdateInstallRequest firmware_update_install = 0x205;
+
+    // Pairing messages, reserved range 0x301-0x400
+    PairingStatusRequest         pairing_status = 0x301;
+    PairingAuthRequest           pairing_auth = 0x302;
+    PairingSetAppIdentityRequest pairing_set_app_id = 0x303;
+    PairingSetAppStorageRequest  pairing_set_app_storage = 0x304;
+    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x305;
+    PairingAcceptanceRequest     pairing_accept = 0x306;
+    PairingCompletionRequest     pairing_complete = 0x307;
+
+    // Relay messages, reserved range 0x401-0x500
+    RelayJoinRequest      relay_join = 0x401;
+    RelayAppToArkRequest  relay_req = 0x402;
+    RelayAppToArkResponse relay_res = 0x403;
+
+    // Operational messages, reserved range 0x501-0x600
+    UnlockRequest                unlock = 0x501;
+    ExecutionUploadStartRequest  exec_upload_start = 0x502;
+    ExecutionUploadChunkRequest  exec_upload_chunk = 0x503;
+    ExecutionScheduleRequest     exec_sched = 0x504;
+    ExecutionStatusRequest       exec_status = 0x505;
+    ExecutionCancelRequest       exec_cancel = 0x506;
+
+    // Slot messages, reserved range 0x601-0x700
+    SlotListRequest          slot_list = 0x601;
+    SlotRepairRequest        slot_repair = 0x602;
+    SlotDeleteRequest        slot_delete = 0x603;
+    SlotUploadPeekRequest    slot_upload_peek = 0x604;
+    SlotUploadStartRequest   slot_upload_start = 0x605;
+    SlotUploadChunkRequest   slot_upload_chunk = 0x606;
+    SlotUploadCancelRequest  slot_upload_cancel = 0x607;
+    SlotUploadProcessRequest slot_upload_process = 0x608;
+  }
+}
+
+// ArkToHost represents a message sent from the Ark to the host via the USB
+// connection. It embeds all possible message types to keep the protocol simple.
+message ArkToHost {
+  // Response enveloping fields, reserved range 0x001-0xff
+  optional uint64 id = 1; // Request identifier responding to (if any)
+  optional Error err = 2; // Error encountered while serving (if any)
+
+  // Internal messages, reserved range 0x1000-0x1fff. These are never assigned
+  // in the public schema, permitting internal envelopes to land later without
+  // colliding with public growth.
+  reserved 0x1000 to 0x1fff;
+
+  oneof content {
+    // Special factory message
+    OnboardingResponse onboard = 0x100;
+
+    // System messages, reserved range 0x101-0x200
+    HandshakeResponse       handshake = 0x101;
+    CloudSyncStartResponse  cloud_sync_start = 0x102;
+    CloudSyncFinishResponse cloud_sync_finish = 0x103;
+    GenuinityProofResponse  genuinity_proof = 0x104;
+
+    // Firmware update messages, reserved range 0x201-0x300
+    FirmwareUpdatePrepResponse    firmware_update_prep = 0x201;
+    FirmwareUpdateInitResponse    firmware_update_init = 0x202;
+    FirmwareUpdateUploadResponse  firmware_update_upload = 0x203;
+    FirmwareUpdateVerifyResponse  firmware_update_verify = 0x204;
+    FirmwareUpdateInstallResponse firmware_update_install = 0x205;
+
+    // Pairing messages, reserved range 0x301-0x400
+    PairingStatusResponse           pairing_status = 0x301;
+    PairingAuthResponse             pairing_auth = 0x302;
+    PairingSetAppIdentityResponse   pairing_set_app_id = 0x303;
+    PairingSetAppStorageResponse    pairing_set_app_storage = 0x304;
+    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x305;
+    PairingAcceptanceResponse       pairing_accept = 0x306;
+    PairingCompletionResponse       pairing_complete = 0x307;
+
+    // Relay messages, reserved range 0x401-0x500
+    RelayJoinResponse     relay_join = 0x401;
+    RelayArkToAppRequest  relay_req = 0x402;
+    RelayArkToAppResponse relay_res = 0x403;
+    RelayAppToArkFailure  relay_fail = 0x404;
+
+    // Operational messages, reserved range 0x501-0x600
+    UnlockResponse                unlock = 0x501;
+    ExecutionUploadStartResponse  exec_upload_start = 0x502;
+    ExecutionUploadChunkResponse  exec_upload_chunk = 0x503;
+    ExecutionScheduleResponse     exec_sched = 0x504;
+    ExecutionStatusResponse       exec_status = 0x505;
+    ExecutionCancelResponse       exec_cancel = 0x506;
+
+    // Slot messages, reserved range 0x601-0x700
+    SlotListResponse          slot_list = 0x601;
+    SlotRepairResponse        slot_repair = 0x602;
+    SlotDeleteResponse        slot_delete = 0x603;
+    SlotUploadPeekResponse    slot_upload_peek = 0x604;
+    SlotUploadStartResponse   slot_upload_start = 0x605;
+    SlotUploadChunkResponse   slot_upload_chunk = 0x606;
+    SlotUploadCancelResponse  slot_upload_cancel = 0x607;
+    SlotUploadProcessResponse slot_upload_process = 0x608;
+  }
+}
+
+// Error is sent along a response to a failed request.
+//
+// Note, the code is unique per request type or perhaps per request category.
+// There is no attempt to keep them globally unique.
+message Error {
+  uint64 code = 1; // Error code for programmatic interpretation
+  string msg = 2;  // Error message for user interfacing
+}
+
+
+// OnboardingRequest is a vendor utility to onboard an Ark. Currently it contains
+// the signed device genuinity attestation (certificate).
+//
+// Note, as this method is only used during initial device setup, there is no API
+// compatibility guarantee, it will evolve with the
+message OnboardingRequest {
+  bytes device_attestation = 1;
+}
+// OnboardingResponse is the acknowledgement of the onboarding.
+message OnboardingResponse {
+}
+
+
+// HandshakeRequest is sent by the client to initiate a new session.
+message HandshakeRequest {
+}
+// HandshakeResponse acknowledges starting a new session. It returns the device
+// identity (public key) and various version information.
+message HandshakeResponse {
+  uint32 version_id = 1;   // Ark device version (defines the major features)
+  string version_str = 2;  // Ark device version label (as known by the device)
+  uint32 revision_id = 3;  // Ark device revision (defines the minor differences)
+  string revision_str = 4; // Ark device revision label (as known by the device)
+
+  bytes compute_identity = 5; // xDSA fingerprint uniquely identifying the device
+  bytes compute_pubkey = 6; // xDSA public key for validating device signatures
+
+  string firmware_version = 7; // Current firmware version (X.Y.Z-commit)
+  uint64 firmware_publish = 8; // Current firmware publish unix timestamp
+}
+
+
+// CloudSyncStartRequest requests the device to start a synchronization procedure
+// against the cloud servers to establish the current time as well as the currently
+// active cloud identity.
+message CloudSyncStartRequest {
+  bytes signer = 1; // Post-quantum CWT attestation for the server signing (xDSA) key
+  bytes crypto = 2; // Post-quantum CWT attestation for the server encryption (xHPKE) key
+}
+// CloudSyncStartResponse is an initiation of a cloud sync from the device, authed
+// to the requested cloud identity.
+message CloudSyncStartResponse {
+  bytes challenge = 1; // Random nonce to avoid malicious host machines setting bad times
+}
+
+// CloudSyncFinishRequest is the completion of a previously initiated cloud sync
+// procedure, this time being signed by a single identity currently used by the
+// cloud.
+message CloudSyncFinishRequest {
+  uint64 unixmilli = 1; // Unix timestamp from the server in milliseconds
+  bytes  signature = 2; // SignAt[Cloud]["cloudsync-v1"][unixmilli/1000](CBOR(challenge))
+}
+// CloudSyncFinishResponse is the acknowledgement whether the device accepted the
+// cloud sync from the server or rejected for some reason.
+message CloudSyncFinishResponse {
+  uint64 accepted = 1; // Timestamp that was accepted and set
+}
+
+
+// GenuinityProofRequest requests the device to generate a cryptographic proof of
+// its own authenticity.
+message GenuinityProofRequest {
+}
+// GenuinityProofResponse is the device genuinity proof, an encrypted signature
+// of the device.
+message GenuinityProofResponse {
+  bytes proof = 1; // Seal[Ark->Cloud]["genuinity-v1"][null](null)
+}
+
+
+// FirmwareUpdatePrepRequest prepares a firmware update procedure. If any previous
+// update procedure was in progress, it is aborted.
+message FirmwareUpdatePrepRequest {
+  string version = 1; // Version string to update to
+  bytes sha256 = 2;   // SHA256 hash of the (encrypted) firmware archive
+  uint64 bytes = 3;   // Number of bytes (progress purposes, ignored otherwise)
+}
+// FirmwareUpdatePrepResponse confirms whether a new firmware update process was
+// started, or if the request was rejected and why.
+//
+// If it was accepted, a new ephemeral encryption identity is generated by the Ark
+// to receive the firmware access key to; and sent along with the firmware infos.
+message FirmwareUpdatePrepResponse {
+  bytes auth = 1; // Seal[Ark->Cloud]["firmware-v1"][[version, sha256]](temp-key)
+}
+
+// FirmwareUpdateInitRequest initiates a previously prepared firmware update
+// procedure by providing the authenticated and encrypted firmware key.
+//
+// Note, if the initiation is rejected, the entire update process is torn down.
+message FirmwareUpdateInitRequest {
+  bytes access = 1; // Seal[Cloud->temp-key]["firmware-v1"][[version, sha256]](sym-key)
+}
+// FirmwareUpdateInitResponse confirms whether a new firmware update process
+// was started, or if the request was rejected and why.
+//
+// Note, if the init is rejected, the entire update process is torn down.
+message FirmwareUpdateInitResponse {
+}
+
+// FirmwareUpdateUploadRequest requests appending a new chunk of data to the
+// currently pending firmware upload process.
+message FirmwareUpdateUploadRequest {
+  bytes chunk = 1; // Chunk of firmware blob to append (reasonably capped)
+}
+// FirmwareUpdateUploadResponse is the response whether the requested chunk was
+// accepted or rejected.
+//
+// Note, if the upload is rejected, the entire update process is torn down.
+message FirmwareUpdateUploadResponse {
+}
+
+// FirmwareUpdateVerifyRequest requests decrypting the uploaded firmware and
+// verifying its contents, preparing for the last step of actually installing
+// the firmware update.
+message FirmwareUpdateVerifyRequest {
+}
+// FirmwareUpdateVerifyResponse is the response whether the firmware just uploaded
+// passed all verifications and is ready for application.
+//
+// Note, if the verification is rejected, the entire update process is torn down.
+message FirmwareUpdateVerifyResponse {
+}
+
+// FirmwareUpdateInstallRequest requests the currently pending (but already
+// verified) firmware to be applied to disk. This message will cause the device
+// to reboot if applied successfully.
+message FirmwareUpdateInstallRequest {
+}
+// FirmwareUpdateInstallResponse is the response whether the firmware was applied
+// successfully or not.
+message FirmwareUpdateInstallResponse {
+}
+
+
+// PairingStatusRequest requests the initialization status from the device.
+message PairingStatusRequest{
+}
+// PairingStatusResponse is the initialization status response of the device.
+message PairingStatusResponse{
+  bool paired = 1; // Whether the device has user data initialized
+  bool opened = 2; // Whether the device is currently opened (false if not paired)
+}
+
+// PairingAuthRequest requests the initiation of a pairing.
+message PairingAuthRequest {
+}
+// PairingAuthResponse responds whether the device is in a state compatible with
+// pairing (i.e. reset) and if so, it signs an authorization for the server to open
+// a new rendezvous point; containing the xHPKE public key to use for encrypting
+// messages to this Ark after pairing.
+message PairingAuthResponse {
+  bytes auth = 1;   // Seal[Ark->Cloud]["pairing-v1"][null](pair-key)
+  bytes fprint = 2; // Fingerprint of the pair-key to transmit to the app out-of-protocol
+}
+
+// PairingSetAppIdentityRequest injects the companion app's identity, relayed
+// by the cloud.
+message PairingSetAppIdentityRequest {
+  bytes identity = 1; // Seal[Cloud->App]["pairing-v1:identity"][[ark_signer_id, ark_crypto_id]]([app_signer, app_crypto])
+}
+// PairingSetAppIdentityResponse confirms whether the remote identity was
+// accepted by the Ark or not.
+message PairingSetAppIdentityResponse {
+}
+// PairingSetAppStorageRequest injects the app's storage key material into the
+// pairing flow.
+message PairingSetAppStorageRequest {
+  bytes app_key = 1; // Seal[App->Ark]["pairing-v1:storage"][[ark_signer_id, ark_crypto_id, app_signer_id, app_crypto_id]]([app_keymat])
+}
+// PairingSetAppStorageResponse confirms whether the remote storage material
+// was accepted, and if so, bundles the ark device infos and ark key material.
+message PairingSetAppStorageResponse {
+  bytes ark_keys = 1; // Seal[Ark->App]["pairing-v1:storage"][[ark_signer_id, ark_crypto_id, app_signer_id, app_crypto_id, app_keymat]]([hw_ver, hw_rev, fw_ver, fw_pub, ark_keymat])
+}
+// PairingAckArkStorageRequest confirms from the app that the Ark's key material
+// was received correctly.
+message PairingAckArkStorageRequest{
+  bytes app_ack = 1; // Seal[App->Ark]["pairing-v1:storage"][[ark_signer_id, ark_crypto_id, app_signer_id, app_crypto_id, ark_keymat]](null)
+}
+// PairingAckArkStorageResponse confirms that the key ack was accepted.
+message PairingAckArkStorageResponse{
+}
+
+// PairingAcceptanceRequest is a blocking poller to wait until the user accepts
+// a pairing request or it times out.
+message PairingAcceptanceRequest {
+}
+// PairingAcceptanceResponse returns whether the user accepted the pairing or
+// if it timed out. At this point, the device still needs to format itself.
+message PairingAcceptanceResponse {
+  bytes confirm = 1; //Seal[Ark->Cloud]["pairing-v1:accept"][[ark_signer_id, ark_crypto_id, app_signer_id, app_crypto_id]](null)
+}
+
+// PairingCompletionRequest is a blocking poller to wait until the device finishes
+// any pairing maintenance operation (e.g. encrypting itself).
+message PairingCompletionRequest {
+}
+// PairingCompletionResponse returns whether the device finished preparing for
+// live operation.
+message PairingCompletionResponse {
+  bytes confirm = 1; // Seal[Ark->Cloud]["pairing-v1:complete"][[ark_signer_id, ark_crypto_id, app_signer_id, app_crypto_id]](null)
+}
+
+
+// RelayJoinRequest requests authorization to join the communication relay with
+// the companion app.
+message RelayJoinRequest {
+}
+// RelayJoinResponse responds whether the device is in a state compatible with
+// relaying (i.e. paired) and if so, it signs an authorization for the server
+// to join the rendezvous point.
+message RelayJoinResponse {
+  bytes auth = 1; // Seal[Ark->Cloud]["relaying-v1"][null](null)
+}
+
+// RelayAppToArkRequest is an opaque request from the companion app that the Ark may
+// respond to, or may flat out reject.
+message RelayAppToArkRequest {
+  uint64 id = 1;  // Application layer request ID from the app
+  bytes  req = 2; // Seal[App->Ark]["relaying-v1:request"][id]([method, [params...]]))
+}
+// RelayArkToAppResponse is an opaque response from the Ark to the companion app to an
+// opaque request.
+message RelayArkToAppResponse {
+  uint64 id = 1;  // Application layer request ID from the app being responding to
+  bytes  res = 2; // Seal[Ark->App]["relaying-v1:response"][id]([result, [err_code, err_str]])
+}
+// RelayAppToArkFailure is returned if a low level protocol violation is detected
+// when an app-to-ark response was processed.
+//
+// This is not an actionable message, rather it's just a way to expose a protocol
+// failure / violation to the calling app for debugging purposes.
+message RelayAppToArkFailure {
+  string error = 1; // Reason for rejecting the response at the protocol level
+}
+
+// RelayArkToAppRequest is an opaque request from the Ark to the companion app, which
+// will generally be sent as an interim response to some other request, requiring
+// authorization from the app side.
+message RelayArkToAppRequest {
+  uint64 id = 1;  // Application layer request ID from the ark
+  bytes  req = 2; // Seal[Ark->App]["relaying-v1:request"][id]([method, [params...]])
+}
+// RelayAppToArkResponse is an opaque response from the companion app to an opaque
+// Ark request. The ark will respond with the deferred response to the original
+// request.
+message RelayAppToArkResponse {
+  uint64 id = 1;  // Application layer request ID from the ark being responding to
+  bytes  res = 2; // Seal[App->Ark]["relaying-v1:response"][id]([result, [err_code, err_str]])
+}
+
+
+// UnlockRequest requests the device to start the unlock procedure. This request
+// is async, potentially returning a response only after confirming with the app.
+//
+// It will trigger sending a RelayArkToAppRequest with the request content:
+//   - method: "unlock"
+//   - params: []
+//
+// The request expects a RelayAppToArkResponse with the response content:
+//
+//   If approved:
+//     - result = key: [u8; 32] // Shared secret from the pairing protocol
+//     - err_code: 0
+//     - err_str:  ""
+//
+//   If denied:
+//     - result = key = [0u8; 32] // All zeroes (signals a denial)
+//     - err_code: 0              // No error, deny is valid user choice
+//     - err_str:  ""             // No error, deny is valid user choice
+//
+// where:
+//   - key: Symmetric key for accessing the storage partition
+//
+// Note, relayed messages are encrypted and authenticated on the timestamp and
+// request/response id, so there's no need for further complications.
+message UnlockRequest{
+}
+// UnlockResponse contains whether the unlock was successfully executed.
+message UnlockResponse{
+}
+
+// ExecutionUploadStartRequest begins a chunked upload of a WASM binary to
+// execute. The declared size is used to pre-allocate the receive buffer and
+// to reject oversized uploads early; the actual bytes are sent via subsequent
+// ExecutionUploadChunkRequest messages.
+message ExecutionUploadStartRequest{
+  uint64 bytes = 1; // Total binary size in bytes
+}
+// ExecutionUploadStartResponse contains the task id to use for subsequent
+// chunk, schedule and cancel messages.
+message ExecutionUploadStartResponse{
+  uint64 taskid = 1; // Task id to stream chunks into
+}
+
+// ExecutionUploadChunkRequest appends a chunk of data to a pending upload.
+// Chunks must be appended in order and must not overrun the declared size.
+message ExecutionUploadChunkRequest{
+  uint64 taskid = 1; // Task id to append to
+  bytes chunk = 2;   // Data chunk to append (reasonably capped)
+}
+// ExecutionUploadChunkResponse is an empty ack of the chunk upload request.
+message ExecutionUploadChunkResponse{
+}
+
+// ExecutionScheduleRequest finalizes an upload and requests the device to
+// execute the uploaded 3rd party app. The upload must have been completed
+// (i.e. the sum of chunk sizes matches the declared size).
+//
+// This request is async, potentially returning a response only after confirming
+// with the app.
+//
+// It will trigger sending a RelayArkToAppRequest with the request content:
+//   - method: "execute"
+//   - params: [task: string]
+//
+// The request expects a RelayAppToArkResponse with the response content:
+//
+//   If approved:
+//     - result = approval = 1u64 // Glorified boolean over an int
+//     - err_code: 0
+//     - err_str:  ""
+//
+//   If denied:
+//     - result = approval = 0x64 // Glorified boolean over an int
+//     - err_code: 0              // No error, deny is valid user choice
+//     - err_str:  ""             // No error, deny is valid user choice
+//
+// where:
+//   - approval: Whether the user approved or denied the execution request
+//
+// Note, relayed messages are encrypted and authenticated on the timestamp and
+// request/response id, so there's no need for further complications.
+message ExecutionScheduleRequest{
+  uint64 taskid = 1; // Task id returned by ExecutionUploadStartResponse
+}
+// ExecutionScheduleResponse acks that the execution was authorized and the
+// task is now running. The host already holds the task id from the preceding
+// ExecutionUploadStartResponse.
+message ExecutionScheduleResponse{
+}
+
+// ExecutionCancelRequest cancels a previously started 3rd party app run or
+// an in-progress upload.
+message ExecutionCancelRequest{
+  uint64 taskid = 1; // Task id to cancel
+}
+
+// ExecutionCancelResponse contains the data gathered during an app's execution.
+message ExecutionCancelResponse{
+}
+
+// ExecutionStatusRequest checks the execution status of a previously started
+// 3rd party app run.
+message ExecutionStatusRequest{
+  uint64 taskid = 1; // Pending execution ID to check for updates
+}
+
+// ExecutionResultResponse contains the data gathered during an app's execution.
+message ExecutionResultResponse{
+  string app_name = 2; // Name of the executed app
+  string app_version = 3; // Version of the executed app
+  bool success = 4; // Whether the task finished successfully
+  bytes  stdout = 5;  // Raw standard output of the app
+  bytes  stderr = 6;  // Raw standard error the app (only in develop mode)
+}
+
+// ExecutionStatusResponse contains the status of a started 3rd party app
+// execution.
+message ExecutionStatusResponse{
+  bool pending = 1; // Whether the app is still running
+  optional ExecutionResultResponse result = 2; // The result of the execution
+}
+
+// SlotKind identifies a slot slot on the device. Each value corresponds to
+// a unique data type that the device can store and manage.
+enum SlotKind {
+  SLOT_REFERENCE_GENOME = 0; // Human reference genome assembly
+  SLOT_GENE_ANNOTATIONS = 1; // Gene-to-coordinate mapping database
+  SLOT_SNP_INDEL_CALLS = 2;  // User's SNP/indel variant calls
+  SLOT_VARIANT_CATALOG = 3;  // Variant catalog (rsID-to-position), from dbSNP
+}
+
+// SlotOrigin describes the nature of the data in a slot, determining what
+// actions are available to the user for filling it.
+enum SlotOrigin {
+  ORIGIN_PERSONAL = 0;  // Unique to the user, uploaded by them
+  ORIGIN_REFERENCE = 1; // Standard reference data, downloaded from public sources
+}
+
+// SlotConfidence indicates how confident the device is in its classification
+// of a peeked slot, based on content, filename, and size.
+enum SlotConfidence {
+  CONFIDENCE_LOW  = 0; // Filename/extension only, no content confirmation
+  CONFIDENCE_MID  = 1; // Format detected but slot type inferred from size/filename
+  CONFIDENCE_HIGH = 2; // Magic bytes match and format-specific content confirmed
+}
+
+// SlotMetaReferenceGenome contains metadata for the reference genome slot.
+// Includes download information so the dashboard can fetch it from public sources.
+message SlotMetaReferenceGenome {
+  string build = 1;           // Reference genome build (e.g. "GRCh38.p13")
+  string download_url = 2;    // Public download URL for the reference genome
+  uint64 download_bytes = 3;  // Download file size in bytes
+  string download_sha256 = 4; // Download file SHA256 checksum
+}
+
+// SlotMetaGeneAnnotations contains metadata for the gene annotations slot.
+// Includes download information so the dashboard can fetch it from public sources.
+message SlotMetaGeneAnnotations {
+  string build = 1;           // Reference genome build these annotations apply to
+  string download_url = 2;    // Public download URL for the annotation file
+  uint64 download_bytes = 3;  // Download file size in bytes
+  string download_sha256 = 4; // Download file SHA256 checksum
+}
+
+// SlotMetaSnpIndelCalls contains metadata for the user's variant calls slot.
+message SlotMetaSnpIndelCalls {
+  string build = 1; // Reference genome build the variants were called against
+}
+
+// SlotMetaVariantCatalog contains metadata for the variant-catalog slot. Includes
+// download information so the dashboard can fetch it from public sources.
+message SlotMetaVariantCatalog {
+  string build = 1;            // Reference genome build the dbSNP release is keyed to
+  uint32 dbsnp_build = 2;      // dbSNP build number (e.g. 157)
+  string download_url = 3;     // Public download URL for the dbSNP VCF
+  uint64 download_bytes = 4;   // Download file size in bytes
+  string download_sha256 = 5;  // Download file SHA256 checksum
+}
+
+// SlotStatus describes the current state of a single slot slot on the device.
+message SlotStatus {
+  SlotKind   kind    = 1; // Slot type
+  string     name    = 2; // Human-readable slot name
+  string     desc    = 3; // Detailed description of this slot
+  SlotOrigin origin  = 4; // Nature of the data (personal, reference, generated)
+  bool       filled  = 5; // Whether data is present on the device
+  string     damaged = 6; // Non-empty if data files exist but metadata is missing/corrupt
+  repeated SlotKind deps = 7; // Slots that must be filled before this one is actionable
+
+  // Slot-type-specific metadata, set when the device has information about
+  // this slot (either filled or dependencies provide enough context).
+  oneof meta {
+    SlotMetaReferenceGenome reference_genome = 100;
+    SlotMetaGeneAnnotations gene_annotations = 101;
+    SlotMetaSnpIndelCalls   snp_indel_calls = 102;
+    SlotMetaVariantCatalog  variant_catalog = 103;
+  }
+}
+
+// SlotListRequest requests the state of all slot slots on the device.
+message SlotListRequest {
+}
+// SlotListResponse contains the current state of every slot slot.
+message SlotListResponse {
+  repeated SlotStatus slots = 1;
+}
+
+// SlotRepairRequest resets a slot to empty regardless of its current state.
+// Unlike SlotDelete (which requires the slot to be filled), repair is a stateless
+// force cleanup that removes any leftover metadata and/or files on disk. It is
+// intended for recovering from corruption or half-written state after crashes.
+message SlotRepairRequest{
+  SlotKind slot = 1; // Slot to repair (reset to empty)
+}
+message SlotRepairResponse{
+}
+
+// SlotDeleteRequest removes the contents of a filled slot. The slot must be
+// in a healthy, filled state; corrupted or half-written slots must be cleaned
+// up via SlotRepair instead.
+message SlotDeleteRequest{
+  SlotKind slot = 1; // Slot to delete
+}
+message SlotDeleteResponse{
+}
+
+// SlotUploadPeekRequest can be used to send an ephemeral file chunk to the
+// Ark and ask it to attempt to identify it for the caller. Its purpose is to
+// allow quickly filtering out potentially huge slots without uploading them
+// first (e.g. q 30GB compressed whole genome sequencing).
+message SlotUploadPeekRequest{
+  string name = 1; // Slot file name to guess the contents of
+  uint64 size = 2; // Slot file size to guess the contents of
+  bytes chunk = 3; // Slot first chunk to guess the contents of
+
+  repeated SlotKind kinds = 4; // Possible slot items to interpret as (empty == any)
+}
+// SlotUploadPeekResponse contains the data identification based on the small
+// chunk shared in the request.
+message SlotUploadPeekResponse{
+  SlotKind kind = 1; // Identified slot type to use during upload
+  SlotConfidence conf = 2;    // Identification confidence level
+
+  string summary = 3; // Short summary of the identified slot type
+  string details = 4; // Detailed description of the identified slot type
+  string reject = 5;  // Reason why the slot is rejected
+}
+
+// SlotUploadStartRequest requests uploading a specific type of slot (e.g
+// a whole genome variant call file, a bloodwork report).
+message SlotUploadStartRequest{
+  SlotKind kind = 1; // Slot type requesting to upload
+
+  string name = 2; // Slot file name to guess the contents of
+  uint64 size = 3; // Slot file size to guess the contents of
+  bytes chunk = 4; // Slot first chunk to guess the contents of
+}
+// SlotUploadStartResponse contains a unique session id for an approved upload
+// and a maximum file limit after which the upload will be killed.
+message SlotUploadStartResponse{
+  uint64 session = 1; // Session id for concurrent uploads (not recommended)
+}
+// SlotUploadChunkRequest contains a new chunk of data to append to a pending
+// upload session.
+message SlotUploadChunkRequest{
+  uint64 session = 1; // Session id into which to append a new chunk
+  bytes chunk = 2;    // Data chunk to append (reasonably capped)
+}
+// SlotUploadChunkResponse is an empty ack of the chunk upload request.
+message SlotUploadChunkResponse{
+}
+// SlotUploadCancelRequest contains an upload session id to abort.
+message SlotUploadCancelRequest{
+  uint64 session = 1; // Session id to cancel
+}
+// SlotUploadCancelResponse is an empty ack of the cancellation request.
+message SlotUploadCancelResponse{
+}
+// SlotUploadProcessRequest marks an upload session ready for processing and
+// requests a progress report to be sent back. May be called multiple times.
+message SlotUploadProcessRequest{
+  uint64 session = 1; // Session id to mark as completed
+}
+// SlotUploadProcessResponse acks the completion of a slot upload and also
+// contains the current processing progress.
+message SlotUploadProcessResponse{
+  uint64 proc_start = 1; // Timestamp when data processing started
+
+  repeated string phase_names = 2; // Short labels for each phase
+  repeated string phase_descs = 3; // Descriptions for each phase
+
+  uint64 phase_in = 4;       // Current phase (1-indexed)
+  uint64 phase_start = 5;    // Timestamp when the current phase started
+  uint64 phase_progress = 6; // Approximate progress for this phase [0-10000]
+
+  string failure = 7; // Failure reason if processing failed, empty otherwise
+}
