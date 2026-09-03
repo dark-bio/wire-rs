@@ -15,12 +15,16 @@ autobenches = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
 [features]
 default = []
 bench = ["criterion", "sysinfo"]
-fuzz = []
+fuzz = ["arbitrary"]
 
 [dependencies]
+arbitrary = { version = "1", features = ["derive"], optional = true }
 criterion = { version = "0.8", optional = true }
 darkbio-cobs = "0.2.0"
 darkbio-crypto = { version = "0.17.1", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }

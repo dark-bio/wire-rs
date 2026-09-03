@@ -63,6 +63,10 @@ impl Attester for Attestation {
 /// from a connected host. It waits for session resets (empty frames), responds
 /// to handshake and afterward decrypts inbound and encrypts outbound messages.
 ///
+/// Whenever the Ark drops a session, fails a handshake or receives data while
+/// it has no session, it answers with an empty frame of its own. A host still
+/// holding a session thus learns it is gone instead of having to time out.
+///
 /// The device attestation is not interpreted by the wire, it is provided by an
 /// `Attester` and forwarded to the host verbatim.
 pub struct ArkSide<R: Read, W: Write, A: Attester> {
@@ -75,7 +79,7 @@ pub struct ArkSide<R: Read, W: Write, A: Attester> {
 
 impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
     /// Creates a new Ark side around a low level reader and writer. The signer is
-    /// the Ark's identity key, which signs the handshake; the host verifies that
+    /// the Ark's identity key, which signs the handshake. The host verifies that
     /// signature against the key it extracts from the attestation, so the two
     /// must match. Reads block per the transport's semantics, so any timeout
     /// must be configured on the reader passed in.
@@ -89,10 +93,10 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
     }
 
     /// Serves the next host-to-ark message, decrypting and protobuf decoding it.
-    /// Empty frames are session resets and run the handshake inline;
-    /// junk outside a session, undecryptable packets and failed handshakes are
-    /// logged and skipped, so only transport failures and malformed messages
-    /// surface as errors.
+    /// Empty frames are session resets and run the handshake inline. Junk
+    /// outside a session, undecryptable packets and failed handshakes are
+    /// logged, answered with an empty frame and skipped. Only transport
+    /// failures and malformed messages surface as errors.
     pub fn next_message(&mut self) -> Result<HostToArk, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and trigger a new session handshake.
@@ -113,6 +117,7 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                     } else {
                         warn!("failed to decode cobs packet: {}", err);
                     }
+                    self.send_dropped();
                     continue;
                 }
                 // Empty frame signals a session reset from the host
@@ -124,9 +129,11 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                         Err(Error::Terminated) => return Err(Error::Terminated),
                         Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
 
-                        // Decode or protocol errors are logged and ignored
+                        // Decode or protocol errors are logged and ignored, the
+                        // host learning that no session came out of it
                         Err(err) => {
                             warn!("wire handshake failed: {}", err);
+                            self.send_dropped();
                             continue;
                         }
                         // Handshake successful
@@ -140,10 +147,12 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                 // Valid COBS packet
                 Ok(Some(size)) => size,
             };
-            // Non-empty packet without a session is considered junk
+            // Non-empty packet without a session is considered junk, the host
+            // may still think it has a session though, tell it otherwise
             let session = match self.session.as_mut() {
                 None => {
                     warn!("dropping data outside session");
+                    self.send_dropped();
                     continue;
                 }
                 Some(s) => s,
@@ -155,6 +164,7 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
                 Err(Error::EncryptionFailed(err)) => {
                     warn!("decryption failed, resetting session: {}", err);
                     self.session = None;
+                    self.send_dropped();
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -165,10 +175,18 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
         }
     }
 
+    /// Tells the host that the Ark has no session with it by sending an empty
+    /// frame.
+    fn send_dropped(&mut self) {
+        if let Err(err) = self.framing.send_dropped() {
+            warn!("failed to signal dropped session: {}", err);
+        }
+    }
+
     /// Protobuf encodes an ark-to-host message, seals it with the session and
-    /// sends it. Fails without an active session, and a failure after sealing
-    /// drops the session, as the host's HPKE sequence can no longer be caught
-    /// up with.
+    /// sends it. Fails without an active session. A failure after sealing
+    /// drops the session and signals the host, as the host's HPKE sequence can
+    /// no longer be caught up with.
     pub fn send_message(&mut self, res: ArkToHost) -> Result<(), Error> {
         // Encode and seal the message, oversized messages are rejected before
         // the HPKE sequence advances, only a failed seal breaks the session
@@ -180,6 +198,7 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
         let blob = match session.seal(&res, &mut self.framing.encode_buffer) {
             Err(err @ Error::EncryptionFailed(_)) => {
                 self.session = None;
+                self.send_dropped();
                 return Err(err);
             }
             Err(err) => return Err(err),
@@ -189,6 +208,7 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
         // fails to deliver it
         if let Err(err) = self.framing.send_packet(&blob) {
             self.session = None;
+            self.send_dropped();
             return Err(err);
         }
         trace!("sent ark-to-host message ({} bytes)", blob.len());
@@ -282,15 +302,14 @@ impl<R: Read, W: Write, A: Attester> ArkSide<R, W, A> {
 }
 
 #[cfg(all(test, unix))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::testing;
     use crate::{HostSide, Verifier};
     use darkbio_cobs as cobs;
-    use std::io::{self, Write};
+    use std::io::Write;
     use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Self-signed attestation of a never onboarded device, the placeholder an
     /// Ark presents before it is attested by a root.
@@ -324,9 +343,10 @@ mod tests {
         buf
     }
 
-    // Tests a full round trip, the handshake, a host-to-ark request and the
-    // ark-to-host response, and that the device attestation reaches the host's
-    // verifier byte-for-byte.
+    // Tests the two real sides against each other. The handshake hands the
+    // attestation to the host's verifier unchanged and a request gets its
+    // response. The Ark's signal for a dropped session then surfaces on the
+    // host as a reset, which a fresh handshake recovers from.
     #[test]
     fn test_message_round_trip() {
         testing::init_tracing();
@@ -340,58 +360,8 @@ mod tests {
         let ark_reader = ark_sock.try_clone().unwrap();
         let ark_writer = ark_sock;
 
-        // Ark side: handshake, receive one message, echo it back.
-        let ark_thread = std::thread::spawn(move || {
-            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
-            let req = ark.next_message().unwrap();
-            ark.send_message(ArkToHost {
-                id: req.id,
-                err: None,
-                content: None,
-            })
-            .unwrap();
-            req
-        });
-
-        // Host side: handshake, send a message, read the response.
-        let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
-        let attest = host.handshake(&signer_pub).unwrap();
-        assert_eq!(
-            attest.as_bytes(),
-            presented.as_bytes(),
-            "attestation mismatch"
-        );
-
-        host.send_message(HostToArk {
-            id: Some(42),
-            content: None,
-        })
-        .unwrap();
-
-        let req = ark_thread.join().unwrap();
-        assert_eq!(req.id, Some(42), "request mismatch");
-
-        let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(42), "response mismatch");
-    }
-
-    // Tests that a session reset mid-transfer (after a successful handshake and
-    // message exchange) correctly tears down the old session and allows a fresh
-    // handshake to establish a new one.
-    #[test]
-    fn test_reset_mid_transfer() {
-        testing::init_tracing();
-
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
         // Ark side: receive two messages (across two sessions), echo each back.
         let ark_thread = std::thread::spawn(move || {
-            let attestation = self_attestation(&signer_key);
             let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
             let mut ids = Vec::new();
             for _ in 0..2 {
@@ -410,23 +380,34 @@ mod tests {
         // Raw handle to inject bytes past the host side.
         let mut raw_sock = host_sock.try_clone().unwrap();
 
-        // Session 1: complete handshake, exchange one message.
+        // Session 1: handshake, checking the attestation, exchange one message.
         let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
-        host.handshake(&signer_pub).unwrap();
+        let attest = host.handshake(&signer_pub).unwrap();
+        assert_eq!(attest.as_bytes(), presented.as_bytes());
         host.send_message(HostToArk {
             id: Some(1),
             content: None,
         })
         .unwrap();
         let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(1), "session 1 response mismatch");
+        assert_eq!(res.id, Some(1));
 
-        // Simulate an interrupted transfer by sending a valid COBS frame with a
-        // garbage payload, which the Ark fails to decrypt and drops the session
-        // over.
+        // Inject a frame the Ark cannot decrypt. It drops the session and
+        // signals it, the host surfacing the signal as a reset on its next
+        // read and refusing to send into the dead session afterwards.
         raw_sock
             .write_all(&cobs_frame(b"interrupted transfer"))
             .unwrap();
+        let result = host.next_message();
+        assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
+        let result = host.send_message(HostToArk {
+            id: Some(2),
+            content: None,
+        });
+        assert!(
+            matches!(result, Err(Error::EncryptionFailed(_))),
+            "{result:?}"
+        );
 
         // Session 2: new handshake on the same wire, exchange one message.
         host.handshake(&signer_pub).unwrap();
@@ -436,193 +417,10 @@ mod tests {
         })
         .unwrap();
         let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(2), "session 2 response mismatch");
+        assert_eq!(res.id, Some(2));
 
         let ids = ark_thread.join().unwrap();
-        assert_eq!(
-            ids,
-            vec![Some(1), Some(2)],
-            "ark received wrong message ids"
-        );
-    }
-
-    // Tests that a response the host never read (e.g. after timing out on it)
-    // does not wedge subsequent handshakes. The Ark answers the request before
-    // it processes the reset, so the stale response precedes the fresh ArkHello
-    // and the host must skip past it.
-    #[test]
-    fn test_reset_unread_response() {
-        testing::init_tracing();
-
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        // Ark side: receive two messages (across two sessions), echo each back.
-        let ark_thread = std::thread::spawn(move || {
-            let attestation = self_attestation(&signer_key);
-            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
-            let mut ids = Vec::new();
-            for _ in 0..2 {
-                let req = ark.next_message().unwrap();
-                ids.push(req.id);
-                ark.send_message(ArkToHost {
-                    id: req.id,
-                    err: None,
-                    content: None,
-                })
-                .unwrap();
-            }
-            ids
-        });
-
-        // Session 1: complete handshake, send a message but never read the
-        // response.
-        let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
-        host.handshake(&signer_pub).unwrap();
-        host.send_message(HostToArk {
-            id: Some(1),
-            content: None,
-        })
-        .unwrap();
-
-        // Session 2: new handshake on the same wire with the unread response
-        // still queued in front of the ArkHello, exchange one message.
-        host.handshake(&signer_pub).unwrap();
-        host.send_message(HostToArk {
-            id: Some(2),
-            content: None,
-        })
-        .unwrap();
-        let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(2), "session 2 response mismatch");
-
-        let ids = ark_thread.join().unwrap();
-        assert_eq!(
-            ids,
-            vec![Some(1), Some(2)],
-            "ark received wrong message ids"
-        );
-    }
-
-    // Tests that a session reset mid-handshake (after HostHello/ArkHello but
-    // before HostAck) correctly aborts the in-progress handshake and allows a
-    // fresh one to complete, with the abandoned ArkHello left unread for the
-    // fresh handshake to skip past.
-    #[test]
-    fn test_reset_mid_handshake() {
-        testing::init_tracing();
-
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        // Ark side: receive one message, echo it back.
-        let ark_thread = std::thread::spawn(move || {
-            let attestation = self_attestation(&signer_key);
-            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
-            let req = ark.next_message().unwrap();
-            ark.send_message(ArkToHost {
-                id: req.id,
-                err: None,
-                content: None,
-            })
-            .unwrap();
-            req
-        });
-
-        let host_read = host_sock.try_clone().unwrap();
-        let mut host_write = host_sock;
-
-        // Start a handshake but abandon it after sending HostHello (message 1),
-        // never reading ArkHello (message 2) nor sending HostAck (message 3).
-        host_write.write_all(&[0x00, 0x00]).unwrap(); // session reset
-
-        let host_signer_key = xdsa::SecretKey::generate();
-        let host_crypto_key = xhpke::SecretKey::generate();
-        let hello = cbor::encode(&handshake::HostHello {
-            host_signer: host_signer_key.public_key(),
-            host_crypto: host_crypto_key.public_key(),
-        })
-        .unwrap();
-        host_write.write_all(&cobs_frame(&hello)).unwrap(); // message 1: HostHello
-
-        // Now do a complete handshake (sends its own reset + full 3 messages).
-        // The Ark sees the reset where it expected HostAck, restarts its
-        // handshake loop, and completes the new one. The host skips the stale
-        // ArkHello of the abandoned attempt to find its own.
-        let mut host = HostSide::new(host_read, host_write);
-        host.handshake(&signer_pub).unwrap();
-        host.send_message(HostToArk {
-            id: Some(99),
-            content: None,
-        })
-        .unwrap();
-
-        let req = ark_thread.join().unwrap();
-        assert_eq!(req.id, Some(99), "request mismatch");
-
-        let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(99), "response mismatch");
-    }
-
-    // Tests that garbage sent instead of a handshake hello (after a session
-    // reset) aborts the in-progress handshake without wedging the Ark, allowing
-    // a fresh handshake to complete.
-    #[test]
-    fn test_reset_malformed_hello() {
-        testing::init_tracing();
-
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        // Ark side: receive one message, echo it back.
-        let ark_thread = std::thread::spawn(move || {
-            let attestation = self_attestation(&signer_key);
-            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
-            let req = ark.next_message().unwrap();
-            ark.send_message(ArkToHost {
-                id: req.id,
-                err: None,
-                content: None,
-            })
-            .unwrap();
-            req
-        });
-
-        // Raw handle to inject bytes past the host side.
-        let mut raw_sock = host_sock.try_clone().unwrap();
-
-        // Signal a session reset, but follow it up with a garbage hello. The Ark
-        // fails to decode it, abandons the handshake and returns to its message
-        // loop.
-        raw_sock.write_all(&[0x00, 0x00]).unwrap();
-        raw_sock.write_all(&cobs_frame(b"not a hello")).unwrap();
-
-        // Now do a complete handshake and exchange one message.
-        let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
-        host.handshake(&signer_pub).unwrap();
-        host.send_message(HostToArk {
-            id: Some(99),
-            content: None,
-        })
-        .unwrap();
-
-        let req = ark_thread.join().unwrap();
-        assert_eq!(req.id, Some(99), "request mismatch");
-
-        let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(99), "response mismatch");
+        assert_eq!(ids, vec![Some(1), Some(2)]);
     }
 
     // Tests that an untrusting verifier rejects the session on the host side.
@@ -658,19 +456,16 @@ mod tests {
         // Host side: refuse the attestation in the verifier.
         let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
         let result = host.handshake(&Untrusting);
-        assert!(result.is_err(), "expected rejected handshake");
+        assert!(result.is_err());
 
         // Dropping the host tears down the transport, unblocking the Ark.
         drop(host);
-        assert!(
-            ark_thread.join().unwrap().is_err(),
-            "expected torn down wire"
-        );
+        assert!(ark_thread.join().unwrap().is_err());
     }
 
     // Tests that the roots verifier opens sessions with root attested Arks of
-    // either realm, handing back their verified identity, and refuses Arks
-    // attested under unknown roots or self-signed ones.
+    // either realm, handing back their verified identity. Arks attested under
+    // unknown roots or self-signed ones are refused.
     #[test]
     fn test_roots_verifier() {
         testing::init_tracing();
@@ -739,15 +534,12 @@ mod tests {
         .map(|cwt| Attestation::new(cwt).unwrap())
         .unwrap();
         let device = handshake(signer_key, attestation.clone(), &hardware_roots, &[]).unwrap();
-        assert_eq!(device.realm, Realm::Hardware, "realm mismatch");
-        assert_eq!(device.serial, "ark-1234", "serial mismatch");
+        assert_eq!(device.realm, Realm::Hardware);
+        assert_eq!(device.serial, "ark-1234");
 
         // The same Ark is refused by a host trusting only emulator roots
         let signer_key = xdsa::SecretKey::generate();
-        assert!(
-            handshake(signer_key, attestation, &[], &emulator_roots).is_err(),
-            "hardware attestation accepted under emulator roots"
-        );
+        assert!(handshake(signer_key, attestation, &[], &emulator_roots).is_err());
 
         // An emulated Ark attested by an emulator root is accepted with its expiry
         let signer_key = xdsa::SecretKey::generate();
@@ -772,8 +564,8 @@ mod tests {
         .map(|cwt| Attestation::new(cwt).unwrap())
         .unwrap();
         let device = handshake(signer_key, attestation, &hardware_roots, &emulator_roots).unwrap();
-        assert_eq!(device.realm, Realm::Emulator, "realm mismatch");
-        assert_eq!(device.expiry, Some(now + 1000), "expiry mismatch");
+        assert_eq!(device.realm, Realm::Emulator);
+        assert_eq!(device.expiry, Some(now + 1000));
 
         // A never onboarded Ark presenting a self-signed attestation is refused
         let signer_key = xdsa::SecretKey::generate();
@@ -792,10 +584,7 @@ mod tests {
         )
         .map(|cwt| Attestation::new(cwt).unwrap())
         .unwrap();
-        assert!(
-            handshake(signer_key, attestation, &hardware_roots, &emulator_roots).is_err(),
-            "self-signed attestation accepted"
-        );
+        assert!(handshake(signer_key, attestation, &hardware_roots, &emulator_roots).is_err());
     }
 
     // Tests that only CWTs in a device attestation shape are accepted as
@@ -829,150 +618,15 @@ mod tests {
             cnf: claims::Confirm::new(signer.public_key()),
         };
         let cwt = cwt::issue(&cloud, &signer, CRYPTO_DOMAIN_DEVICE_ATTESTATION).unwrap();
+        let result = Attestation::new(cwt).map(|_| ());
         assert!(
-            matches!(Attestation::new(cwt), Err(Error::InvalidAttestation)),
-            "cloud attestation accepted as device attestation"
+            matches!(result, Err(Error::InvalidAttestation)),
+            "{result:?}"
         );
+        let result = Attestation::new(b"junk".to_vec()).map(|_| ());
         assert!(
-            matches!(
-                Attestation::new(b"junk".to_vec()),
-                Err(Error::InvalidAttestation)
-            ),
-            "junk accepted as device attestation"
+            matches!(result, Err(Error::InvalidAttestation)),
+            "{result:?}"
         );
-    }
-
-    // Tests that the host refuses a malformed attestation before consulting its
-    // verifier. The Ark bypasses the shape check through the private constructor,
-    // as a misbehaving Ark would by not using this crate at all.
-    #[test]
-    fn test_malformed_attestation_rejected() {
-        testing::init_tracing();
-
-        /// Verifier that must never be consulted.
-        struct Unreachable;
-
-        impl Verifier for Unreachable {
-            type Info = ();
-
-            fn verify(&self, _: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
-                panic!("verifier consulted with a malformed attestation")
-            }
-        }
-
-        let signer_key = xdsa::SecretKey::generate();
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        let ark_thread = std::thread::spawn(move || {
-            let attestation = Attestation(b"junk".to_vec());
-            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
-            ark.next_message()
-        });
-        let mut host = HostSide::new(host_sock.try_clone().unwrap(), host_sock);
-        assert!(
-            matches!(host.handshake(&Unreachable), Err(Error::InvalidAttestation)),
-            "malformed attestation not rejected"
-        );
-
-        // Dropping the host tears down the transport, unblocking the Ark
-        drop(host);
-        assert!(
-            ark_thread.join().unwrap().is_err(),
-            "expected torn down wire"
-        );
-    }
-
-    // Tests that a transport failure after sealing drops the session, since
-    // the peer's HPKE sequence can no longer be caught up with, and that a
-    // fresh handshake recovers the wire.
-    #[test]
-    fn test_send_failure_drops_session() {
-        testing::init_tracing();
-
-        /// Writer failing on demand to simulate a transport fault.
-        struct Faulty {
-            inner: UnixStream,
-            fail: Arc<AtomicBool>,
-        }
-
-        impl Write for Faulty {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                if self.fail.load(Ordering::Relaxed) {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-                self.inner.write(buf)
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                self.inner.flush()
-            }
-        }
-
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        // Ark side: receive one message, echo it back.
-        let ark_thread = std::thread::spawn(move || {
-            let attestation = self_attestation(&signer_key);
-            let mut ark = ArkSide::new(ark_reader, ark_writer, signer_key, attestation);
-            let req = ark.next_message().unwrap();
-            ark.send_message(ArkToHost {
-                id: req.id,
-                err: None,
-                content: None,
-            })
-            .unwrap();
-            req
-        });
-
-        let fail = Arc::new(AtomicBool::new(false));
-        let writer = Faulty {
-            inner: host_sock.try_clone().unwrap(),
-            fail: fail.clone(),
-        };
-        let mut host = HostSide::new(host_sock, writer);
-        host.handshake(&signer_pub).unwrap();
-
-        // Break the transport and send a message. It gets sealed, fails to go
-        // out, and must take the session down with it.
-        fail.store(true, Ordering::Relaxed);
-        let result = host.send_message(HostToArk {
-            id: Some(1),
-            content: None,
-        });
-        assert!(
-            matches!(result, Err(Error::SendFailed(_))),
-            "expected send failure"
-        );
-        let result = host.send_message(HostToArk {
-            id: Some(2),
-            content: None,
-        });
-        assert!(
-            matches!(result, Err(Error::EncryptionFailed(_))),
-            "expected dropped session"
-        );
-
-        // Heal the transport, a fresh handshake resynchronizes both sides.
-        fail.store(false, Ordering::Relaxed);
-        host.handshake(&signer_pub).unwrap();
-        host.send_message(HostToArk {
-            id: Some(3),
-            content: None,
-        })
-        .unwrap();
-
-        let req = ark_thread.join().unwrap();
-        assert_eq!(req.id, Some(3), "request mismatch");
-
-        let res = host.next_message().unwrap();
-        assert_eq!(res.id, Some(3), "response mismatch");
     }
 }

@@ -299,6 +299,7 @@ dependencies = [
 name = "darkbio-wire"
 version = "0.3.0"
 dependencies = [
+ "arbitrary",
  "darkbio-cobs",
  "darkbio-crypto",
  "darkbio-trust",
@@ -315,7 +316,6 @@ name = "darkbio-wire-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
- "darkbio-cobs",
  "darkbio-wire",
  "libfuzzer-sys",
 ]

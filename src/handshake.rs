@@ -52,3 +52,82 @@ pub(crate) struct HostAckAuth {
     pub ark_signer: xdsa::PublicKey,  // Ark's permanent xDSA signer key
     pub ark_crypto: xhpke::PublicKey, // Ark's ephemeral xHPKE encryption key
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use darkbio_crypto::cbor;
+
+    // Tests the handshake messages against their golden vectors, the exact
+    // encoding of each for fixed keys and contents.
+    #[test]
+    fn test_message_vectors() {
+        /// Signer key derived from a fixed seed.
+        fn signer(seed: u8) -> xdsa::PublicKey {
+            xdsa::SecretKey::from_bytes(&[seed; xdsa::SECRET_KEY_SIZE]).public_key()
+        }
+
+        /// Encryption key derived from a fixed seed.
+        fn crypto(seed: u8) -> xhpke::PublicKey {
+            xhpke::SecretKey::from_bytes(&[seed; xhpke::SECRET_KEY_SIZE]).public_key()
+        }
+
+        /// Deterministic bytes standing in for an attestation or an
+        /// encapsulated key.
+        fn filler(len: usize) -> Vec<u8> {
+            (0..len).map(|i| i as u8).collect()
+        }
+
+        struct TestCase {
+            encoded: Vec<u8>,
+            vector: &'static [u8],
+        }
+        let tests = [
+            TestCase {
+                encoded: cbor::encode(&HostHello {
+                    host_signer: signer(1),
+                    host_crypto: crypto(2),
+                })
+                .unwrap(),
+                vector: include_bytes!("testdata/handshake/host_hello.cbor"),
+            },
+            TestCase {
+                encoded: cbor::encode(&ArkHello {
+                    ark_attest: filler(300),
+                    ark_crypto: crypto(3),
+                    a2h_encap: filler(xhpke::ENCAP_KEY_SIZE),
+                })
+                .unwrap(),
+                vector: include_bytes!("testdata/handshake/ark_hello.cbor"),
+            },
+            TestCase {
+                encoded: cbor::encode(&ArkHelloAuth {
+                    host_signer: signer(4),
+                    host_crypto: crypto(5),
+                })
+                .unwrap(),
+                vector: include_bytes!("testdata/handshake/ark_hello_auth.cbor"),
+            },
+            TestCase {
+                encoded: cbor::encode(&HostAck {
+                    h2a_encap: filler(xhpke::ENCAP_KEY_SIZE),
+                })
+                .unwrap(),
+                vector: include_bytes!("testdata/handshake/host_ack.cbor"),
+            },
+            TestCase {
+                encoded: cbor::encode(&HostAckAuth {
+                    ark_signer: signer(6),
+                    ark_crypto: crypto(3),
+                })
+                .unwrap(),
+                vector: include_bytes!("testdata/handshake/host_ack_auth.cbor"),
+            },
+        ];
+
+        for (i, tt) in tests.into_iter().enumerate() {
+            assert_eq!(tt.encoded, tt.vector, "test {i}");
+        }
+    }
+}

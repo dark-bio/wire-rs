@@ -1,6 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
+// Allow excluding test code from coverage measurements on nightly
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 // Pull in the README as the package doc
 #![doc = include_str!("../README.md")]
 
@@ -11,6 +13,11 @@ mod handshake;
 mod session;
 mod side_ark;
 mod side_host;
+
+#[cfg(any(test, feature = "fuzz"))]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod scripted;
 
 pub use protocol::{ArkToHost, HostToArk};
 pub use side_ark::{ArkSide, Attestation, Attester};
@@ -61,9 +68,6 @@ pub enum Error {
     #[error("wire frame too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
     FrameTooLarge(usize),
 
-    #[error("wire frame encode failed: {0}")]
-    FrameEncodingFailed(darkbio_cobs::EncodeError),
-
     #[error("wire frame decode failed: {0}")]
     FrameDecodingFailed(darkbio_cobs::DecodeError),
 
@@ -76,6 +80,9 @@ pub enum Error {
     #[error("wire terminated")]
     Terminated,
 
+    #[error("wire session reset by the ark")]
+    SessionReset,
+
     #[error("attestation is not for a hardware or emulator")]
     InvalidAttestation,
 
@@ -87,6 +94,7 @@ pub enum Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod testing {
     use std::sync::Once;
 

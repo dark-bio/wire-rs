@@ -9,7 +9,6 @@ use crate::side_ark::Attestation;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
 };
-use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::io::{Read, Write};
@@ -19,7 +18,7 @@ use tracing::{trace, warn};
 /// Maximum number of queued frames skipped while waiting for the ArkHello of a
 /// handshake, before giving up on the Ark. A well-behaved Ark only ever leaves
 /// a handful behind, as its writer blocks once the transport buffers fill up.
-const MAX_STALE_FRAMES: usize = 32;
+pub(crate) const MAX_STALE_FRAMES: usize = 32;
 
 /// Trust policy for the device attestation an Ark presents in the handshake.
 /// It owns everything the wire deliberately does not (which roots to trust,
@@ -46,11 +45,11 @@ impl Verifier for xdsa::PublicKey {
     }
 }
 
-/// Roots of trust, accepting the Arks attested under them: hardware Arks by
-/// the hardware roots and emulated Arks by the emulator roots, the attestation
-/// having to be valid at the current time. An Ark that was never onboarded is
-/// rejected, its self-signed attestation being an onboarding decision rather
-/// than one of trust.
+/// Roots of trust, accepting the Arks attested under them. Hardware Arks are
+/// accepted by the hardware roots and emulated Arks by the emulator roots, the
+/// attestation having to be valid at the current time. An Ark that was never
+/// onboarded is rejected, its self-signed attestation being an onboarding
+/// decision rather than one of trust.
 pub struct Roots<'a> {
     pub hardware: &'a [xdsa::PublicKey], // Roots attesting hardware Arks
     pub emulator: &'a [xdsa::PublicKey], // Roots attesting emulated Arks
@@ -80,6 +79,10 @@ impl Verifier for Roots<'_> {
 /// to a connected Ark. It initiates sessions by signaling a transport reset and
 /// driving the handshake, afterward encrypting outbound and decrypting inbound
 /// messages.
+///
+/// An empty frame from the Ark means it has no session with the host anymore.
+/// It surfaces as `Error::SessionReset` with the host's session dropped too,
+/// so the caller can handshake again instead of waiting on a dead session.
 ///
 /// The device attestation presented in the handshake is not interpreted by the
 /// wire, it is handed to a `Verifier` deciding whether to trust the Ark.
@@ -136,7 +139,8 @@ impl<R: Read, W: Write> HostSide<R, W> {
 
         let mut stale = 0;
         let size = loop {
-            // Empty frames are never sent by the Ark, they are stale junk too
+            // Empty frames are the Ark signaling an earlier session dropped,
+            // stale junk too by now
             let size = self.framing.next_packet()?.unwrap_or_default();
             let recipient = cose::recipient(&self.framing.decobs_buffer[..size]);
             if recipient.is_ok_and(|fp| fp == host_xhpke_fp) {
@@ -223,19 +227,22 @@ impl<R: Read, W: Write> HostSide<R, W> {
 
     /// Reads the next ark-to-host message, decrypting and protobuf decoding it.
     /// A frame that cannot be decoded or a packet that cannot be decrypted
-    /// drops the session, as the Ark's HPKE sequence can no longer be followed;
-    /// only a fresh handshake recovers from that.
+    /// drops the session, as the Ark's HPKE sequence can no longer be followed.
+    /// So does an empty frame, the Ark signaling it dropped the session on its
+    /// end. Only a fresh handshake recovers from either.
     pub fn next_message(&mut self) -> Result<ArkToHost, Error> {
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
-        // Empty frames are never sent by the Ark, so surface them as the
-        // decode failures they would have been.
+        // An empty frame is the Ark telling us it has no session with us.
         let size = match self.framing.next_packet() {
             Err(err) => {
                 self.session = None;
                 return Err(err);
             }
-            Ok(None) => return Err(Error::FrameDecodingFailed(cobs::DecodeError::EmptyInput)),
+            Ok(None) => {
+                self.session = None;
+                return Err(Error::SessionReset);
+            }
             Ok(Some(size)) => size,
         };
         // Decrypt the message and parse it with protobuf, dropping the session
@@ -292,6 +299,7 @@ impl<R: Read, W: Write> HostSide<R, W> {
     #[doc(hidden)]
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_packet_blob(&mut self) -> Result<Option<&[u8]>, Error> {
         self.framing.next_packet_blob()
     }
@@ -301,6 +309,7 @@ impl<R: Read, W: Write> HostSide<R, W> {
     #[doc(hidden)]
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn send_packet_blob(&mut self, packet: &[u8]) -> Result<(), Error> {
         self.framing.send_packet(packet)
     }
@@ -310,6 +319,7 @@ impl<R: Read, W: Write> HostSide<R, W> {
     #[doc(hidden)]
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_frame_blob(&mut self) -> Result<&[u8], Error> {
         self.framing.next_frame_blob()
     }
@@ -319,6 +329,7 @@ impl<R: Read, W: Write> HostSide<R, W> {
     #[doc(hidden)]
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn send_frame_blob(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.framing.send_frame_blob(frame)
     }
