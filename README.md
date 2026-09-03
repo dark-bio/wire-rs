@@ -4,9 +4,9 @@
 [![](https://docs.rs/darkbio-wire/badge.svg)](https://docs.rs/darkbio-wire)
 [![](https://github.com/dark-bio/wire-rs/workflows/tests/badge.svg)](https://github.com/dark-bio/wire-rs/actions/workflows/ci.yml)
 
-This repository implements the wire protocol between a [Dark Bio: Ark](https://dark.bio) enclave and the host machine it is plugged into.
+This repository implements the wire protocol between an [Ark](https://dark.bio) enclave and the host machine it is plugged into.
 
-The wire wraps an arbitrary byte stream (USB bulk endpoints, sockets, websockets, pipes, etc) into a reliable, encrypted, request oriented transport:
+The wire wraps an arbitrary byte stream into an encrypted, request oriented transport:
 
 - **Framing**: [Consistent Overhead Byte Stuffing (COBS)](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing) encoded frames delimited by zero bytes, with oversized frames silently discarded.
 - **Sessions**: The wire assumes its stream carries no client lifecycle as USB bulk transfers deliver none. Empty frames are used to mark session resets and cryptography renegotiations.
