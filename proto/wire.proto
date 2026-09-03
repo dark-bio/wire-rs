@@ -11,11 +11,6 @@ message HostToArk {
   // Enveloping fields, reserved range 0x001-0x0ff
   optional uint64 id = 1;
 
-  // Internal messages, reserved range 0x1000-0x1fff. These are never assigned
-  // in the public schema, permitting internal envelopes to land later without
-  // colliding with public growth.
-  reserved 0x1000 to 0x1fff;
-
   oneof content {
     // Special factory message
     OnboardingRequest onboard = 0x100;
@@ -64,6 +59,9 @@ message HostToArk {
     SlotUploadChunkRequest   slot_upload_chunk = 0x606;
     SlotUploadCancelRequest  slot_upload_cancel = 0x607;
     SlotUploadProcessRequest slot_upload_process = 0x608;
+
+    // Unreleased messages still under development, opaque to the public protocol
+    bytes internal = 0x1000;
   }
 }
 
@@ -73,11 +71,6 @@ message ArkToHost {
   // Response enveloping fields, reserved range 0x001-0xff
   optional uint64 id = 1; // Request identifier responding to (if any)
   optional Error err = 2; // Error encountered while serving (if any)
-
-  // Internal messages, reserved range 0x1000-0x1fff. These are never assigned
-  // in the public schema, permitting internal envelopes to land later without
-  // colliding with public growth.
-  reserved 0x1000 to 0x1fff;
 
   oneof content {
     // Special factory message
@@ -128,6 +121,9 @@ message ArkToHost {
     SlotUploadChunkResponse   slot_upload_chunk = 0x606;
     SlotUploadCancelResponse  slot_upload_cancel = 0x607;
     SlotUploadProcessResponse slot_upload_process = 0x608;
+
+    // Unreleased messages still under development, opaque to the public protocol
+    bytes internal = 0x1000;
   }
 }
 
