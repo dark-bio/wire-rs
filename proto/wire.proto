@@ -60,8 +60,10 @@ message HostToArk {
     SlotUploadCancelRequest  slot_upload_cancel = 0x607;
     SlotUploadProcessRequest slot_upload_process = 0x608;
 
-    // Unreleased messages still under development, opaque to the public protocol
-    bytes internal = 0x1000;
+    // Unreleased messages served by development firmware only, carried opaquely
+    // so the public protocol is untouched while they are still under development.
+    // Their schema is private and production Arks refuse the envelope.
+    bytes develop = 0x1000;
   }
 }
 
@@ -122,8 +124,10 @@ message ArkToHost {
     SlotUploadCancelResponse  slot_upload_cancel = 0x607;
     SlotUploadProcessResponse slot_upload_process = 0x608;
 
-    // Unreleased messages still under development, opaque to the public protocol
-    bytes internal = 0x1000;
+    // Unreleased messages emitted by development firmware only, in response to
+    // a develop request, carried opaquely so the public protocol is untouched
+    // while they are still under development. Their schema is private.
+    bytes develop = 0x1000;
   }
 }
 
