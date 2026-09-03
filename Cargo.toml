@@ -1,12 +1,12 @@
 [package]
 name = "darkbio-wire"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Encrypted protocol between Ark and host"
 repository = "https://github.com/dark-bio/wire-rs"
 documentation = "https://docs.rs/darkbio-wire"
 categories = ["network-programming", "encoding"]
-keywords = ["ark", "wire", "cobs", "protobuf", "hpke"]
+keywords = ["ark", "wire", "transport", "protobuf"]
 license = "BSD-3-Clause"
 edition = "2024"
 autobenches = false
