@@ -17,4 +17,4 @@ This package does not concern itself with the underlying transport. Genuine Ark 
 
 ## Disclaimer
 
-The Ark's wire protocol is still heavily evolving, including the Rust API, the low level transport and the high level protobuf messages too. This crate is published for interoperability reasons, but it will undergo aggressive updates, possibly forced through by the Dark Bio cloud, hub and tools.
+The Ark's wire protocol is still heavily evolving, including the Rust API, low level transport and high level protobuf messages too. This crate is published for interoperability reasons, but it will undergo aggressive updates, possibly forced through by the Dark Bio cloud, hub and tools.
