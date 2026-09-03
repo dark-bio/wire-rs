@@ -16,7 +16,7 @@ message HostToArk {
     OnboardingRequest onboard = 0x100;
 
     // System messages, reserved range 0x101-0x200
-    HandshakeRequest       handshake = 0x101;
+    DeviceInfoRequest      device_info = 0x101;
     CloudSyncStartRequest  cloud_sync_start = 0x102;
     CloudSyncFinishRequest cloud_sync_finish = 0x103;
     GenuinityProofRequest  genuinity_proof = 0x104;
@@ -79,7 +79,7 @@ message ArkToHost {
     OnboardingResponse onboard = 0x100;
 
     // System messages, reserved range 0x101-0x200
-    HandshakeResponse       handshake = 0x101;
+    DeviceInfoResponse      device_info = 0x101;
     CloudSyncStartResponse  cloud_sync_start = 0x102;
     CloudSyncFinishResponse cloud_sync_finish = 0x103;
     GenuinityProofResponse  genuinity_proof = 0x104;
@@ -154,19 +154,18 @@ message OnboardingResponse {
 }
 
 
-// HandshakeRequest is sent by the client to initiate a new session.
-message HandshakeRequest {
+// DeviceInfoRequest is sent by the host to fetch the Ark's device stats.
+message DeviceInfoRequest {
 }
-// HandshakeResponse acknowledges starting a new session. It returns the device
-// identity (public key) and various version information.
-message HandshakeResponse {
+// DeviceInfoResponse returns various hardware and software version information.
+message DeviceInfoResponse {
   uint32 version_id = 1;   // Ark device version (defines the major features)
   string version_str = 2;  // Ark device version label (as known by the device)
   uint32 revision_id = 3;  // Ark device revision (defines the minor differences)
   string revision_str = 4; // Ark device revision label (as known by the device)
 
-  bytes compute_identity = 5; // xDSA fingerprint uniquely identifying the device
-  bytes compute_pubkey = 6; // xDSA public key for validating device signatures
+  reserved 5; // Carried the Ark's hex identity before @darkbio/crypto, derived since
+  reserved 6; // Carried the Ark's pubkey before the encrypted wire, in handshake now
 
   string firmware_version = 7; // Current firmware version (X.Y.Z-commit)
   uint64 firmware_publish = 8; // Current firmware publish unix timestamp
