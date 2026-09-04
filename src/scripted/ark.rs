@@ -12,17 +12,18 @@
 //! asks for more input, the frames it wrote are checked against the emissions
 //! expected. Any divergence panics.
 
-use super::{MAX_STEPS, Outbox, frame, self_attestation, unframe, would_block};
+use super::{CutPoint, MAX_STEPS, Outbox, frame, self_attestation, unframe, would_block};
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk, ark_to_host};
 use crate::session::Session;
 use crate::{
     ArkSide, Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_MESSAGE_SIZE,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::{self, Read};
 use std::rc::Rc;
 
@@ -84,15 +85,46 @@ pub enum Step {
     /// A valid HostHello without its delimiter. The next frame's bytes merge
     /// into it, a lone delimiter completing it into the valid hello it is.
     Partial,
+    /// A frame past the size limit, delimiter included. The framing throws it
+    /// away before the Ark sees it, a partial hello in front going with it.
+    Oversized,
     /// The read fails with `WouldBlock`, handing control back to the driver.
     Yield,
+    /// The read fails with `Interrupted`, which the framing retries with the
+    /// Ark none the wiser.
+    Interrupt,
     /// The Ark's writes fail from here on, as on a transport that died.
     Break,
     /// The Ark's writes work again.
     Heal,
+    /// The Ark's next write the point applies to is cut there, the transport
+    /// staying broken afterwards if told to, until healed.
+    Cut { point: CutPoint, then_broken: bool },
     /// Caps what a single read hands the Ark at the byte count, so frames
     /// arrive in pieces. Zero lifts the cap.
     Chunk(u8),
+    /// Puts the frames of the next steps in front of the Ark in one read, up
+    /// to the count. A step the Ark surfaces something for ends the batch
+    /// early, the driver acting on it before the Ark reads on, as does any
+    /// step not queuing frames.
+    Batch(u8),
+}
+
+impl Step {
+    /// Whether the step only puts frames in front of the Ark, as opposed to
+    /// handing control back or changing the transport.
+    fn queues_frames(&self) -> bool {
+        !matches!(
+            self,
+            Step::Yield
+                | Step::Interrupt
+                | Step::Break
+                | Step::Heal
+                | Step::Cut { .. }
+                | Step::Chunk(_)
+                | Step::Batch(_)
+        )
+    }
 }
 
 /// State the model expects the Ark to be in.
@@ -114,9 +146,11 @@ pub enum State {
 pub struct Summary {
     pub state: State,      // State the Ark ended up in
     pub dropped: usize,    // Empty frames the Ark emitted
+    pub fragments: usize,  // Frames the Ark left cut short, terminated later
     pub handshakes: usize, // ArkHellos the Ark emitted
     pub delivered: usize,  // Requests the Ark delivered
-    pub replies: usize,    // Replies and probes the Ark sealed
+    pub replies: usize,    // Replies and probes that reached the host
+    pub reads: usize,      // Reads that handed the Ark bytes
 }
 
 /// A frame put in front of the Ark, as the model sees it.
@@ -146,15 +180,45 @@ enum Partial {
     Junk,
 }
 
-/// Frame the model expects the Ark to emit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Frame the model expects the Ark to emit, along with what verifies it.
 enum Emit {
-    /// The empty frame signaling that the Ark has no session.
+    /// The empty frame, the signal that the Ark has no session or a resync
+    /// delimiter with nothing to terminate.
     Dropped,
-    /// The handshake reply, sealed to the hello being answered.
-    ArkHello,
-    /// A sealed ArkToHost with the id, sent by the driver on the Ark's behalf.
-    Reply(u64),
+    /// The prefix of a frame cut short, meaning nothing to the host.
+    Fragment,
+    /// The handshake reply, sealed to the hello with the keys.
+    ArkHello(Box<Keys>),
+    /// A sealed ArkToHost with the id, opening in the session.
+    Reply(u64, Rc<RefCell<Session>>),
+}
+
+impl fmt::Debug for Emit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Emit::Dropped => write!(f, "Dropped"),
+            Emit::Fragment => write!(f, "Fragment"),
+            Emit::ArkHello(_) => write!(f, "ArkHello"),
+            Emit::Reply(id, _) => write!(f, "Reply({id})"),
+        }
+    }
+}
+
+/// A frame the Ark left unterminated, a send having failed under it. The
+/// delimiter of the next send completes it.
+enum Tail {
+    /// A prefix of the body, decoding to nothing the host accepts.
+    Fragment,
+    /// The whole body, completing into the frame it was meant to be.
+    Body(Emit),
+}
+
+/// What a send of the Ark carries.
+enum Payload {
+    /// A frame, the emission it is expected as.
+    Frame(Emit),
+    /// The signal that the Ark has no session, a lone delimiter.
+    Signal,
 }
 
 /// What the model expects `next_message` to surface for the last step.
@@ -201,10 +265,15 @@ impl Keys {
 /// finds them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AckFlaw {
+    /// A ciphertext byte flipped, the seal failing to open.
     Tampered,
+    /// Bound to another Ark key than the one that answered.
     Auth,
+    /// Signed by a key other than the hello's.
     Signer,
+    /// A sealed payload that is not an ack at all.
     Payload,
+    /// An encapsulated key of the wrong size.
     Encap,
 }
 
@@ -299,16 +368,20 @@ pub struct Host {
     outbox: Outbox,            // Frames the Ark wrote
     bytes: Vec<u8>,            // Bytes of executed steps not yet read by the Ark
     chunk: usize,              // Most bytes a read hands over, zero for all
+    batch: usize,              // Steps left to put in front of the Ark in one read
     broken: bool,              // Whether the Ark's writes fail
+    cut: Option<CutPoint>,     // Cut armed for the next write of the Ark it applies to
+    flush_fails: bool,         // Whether the flush of the send in progress fails
 
-    state: State,     // State the Ark should be in
-    partial: Partial, // Unterminated frame in front of the Ark
-    emits: Vec<Emit>, // Frames the Ark should have emitted since the last sync
-    outcome: Outcome, // What next_message should surface for the last step
+    state: State,       // State the Ark should be in
+    partial: Partial,   // Unterminated frame in front of the Ark
+    resync: bool,       // Whether the Ark's last send failed, the next starting with a delimiter
+    tail: Option<Tail>, // Unterminated frame the Ark left behind
+    emits: Vec<Emit>,   // Frames the Ark should have emitted since the last sync
+    outcome: Outcome,   // What next_message should surface for the last step
 
-    awaiting: Option<Keys>,   // Keys of the hello an ArkHello is expected for
     pending: Option<Pending>, // ArkHello received, awaiting the host's ack
-    session: Option<Session>, // Live session on the host's side
+    session: Option<Rc<RefCell<Session>>>, // Live session of the host, shared with its replies
 
     last_hello: Option<(Vec<u8>, Keys)>, // Last HostHello sent, framed
     last_ack: Option<Vec<u8>>,           // Last HostAck sent, framed
@@ -326,12 +399,16 @@ impl Host {
             outbox,
             bytes: Vec::new(),
             chunk: 0,
+            batch: 0,
             broken: false,
+            cut: None,
+            flush_fails: false,
             state: State::Idle,
             partial: Partial::None,
+            resync: false,
+            tail: None,
             emits: Vec::new(),
             outcome: Outcome::Absorbed,
-            awaiting: None,
             pending: None,
             session: None,
             last_hello: None,
@@ -380,7 +457,7 @@ impl Host {
                     let framed = frame(&ack);
                     self.record(&framed);
                     self.last_ack = Some(framed.clone());
-                    self.session = Some(session);
+                    self.session = Some(Rc::new(RefCell::new(session)));
                     self.deliver(Frame::Ack);
                     self.bytes.extend(framed);
                 }
@@ -397,14 +474,17 @@ impl Host {
             Step::AckBadSigner => self.bad_ack(AckFlaw::Signer),
             Step::AckBadPayload => self.bad_ack(AckFlaw::Payload),
             Step::AckBadEncap => self.bad_ack(AckFlaw::Encap),
-            Step::Request(tag) => match self.session.as_mut() {
+            Step::Request(tag) => match self.session.as_ref() {
                 Some(session) => {
                     let id = tag as u64;
                     let request = HostToArk {
                         id: Some(id),
                         content: None,
                     };
-                    let packet = session.seal(&request, &mut Vec::new()).unwrap();
+                    let packet = session
+                        .borrow_mut()
+                        .seal(&request, &mut Vec::new())
+                        .unwrap();
                     let framed = frame(&packet);
                     self.record(&framed);
                     self.last_request = Some(framed.clone());
@@ -419,21 +499,24 @@ impl Host {
                     self.bytes.extend(framed);
                 }
             }
-            Step::RequestTampered => match self.session.as_mut() {
+            Step::RequestTampered => match self.session.as_ref() {
                 Some(session) => {
                     let request = HostToArk {
                         id: Some(0),
                         content: None,
                     };
-                    let mut packet = session.seal(&request, &mut Vec::new()).unwrap();
+                    let mut packet = session
+                        .borrow_mut()
+                        .seal(&request, &mut Vec::new())
+                        .unwrap();
                     *packet.last_mut().unwrap() ^= 0xff;
                     self.junk(&packet);
                 }
                 None => self.junk(b"tampered request without a session"),
             },
-            Step::Garbage => match self.session.as_mut() {
+            Step::Garbage => match self.session.as_ref() {
                 Some(session) => {
-                    let packet = session.sender.seal(&[0x07], &[]).unwrap();
+                    let packet = session.borrow_mut().sender.seal(&[0x07], &[]).unwrap();
                     let framed = frame(&packet);
                     self.record(&framed);
                     self.deliver(Frame::Garbage);
@@ -475,10 +558,25 @@ impl Host {
                     _ => Partial::Junk,
                 };
             }
-            Step::Yield => unreachable!("yields are handled by the reader"),
+            Step::Oversized => {
+                self.partial = Partial::None;
+                self.bytes.resize(self.bytes.len() + MAX_FRAME_SIZE + 1, 1);
+                self.bytes.push(0x00);
+            }
+            Step::Yield | Step::Interrupt => {
+                unreachable!("yields and interrupts are handled by the reader")
+            }
             Step::Break => self.set_broken(true),
             Step::Heal => self.set_broken(false),
+            Step::Cut { point, then_broken } => {
+                self.cut = Some(point);
+                self.outbox.set_cut(point);
+                if then_broken {
+                    self.set_broken(true);
+                }
+            }
             Step::Chunk(n) => self.chunk = n as usize,
+            Step::Batch(n) => self.batch = n as usize,
         }
     }
 
@@ -530,16 +628,16 @@ impl Host {
                 self.forget();
                 self.state = State::AwaitHello;
             }
-            // The ArkHello never gets out on a broken transport, the Ark
-            // giving up on the handshake
-            (State::AwaitHello, Frame::Hello(_)) if self.broken => {
-                self.forget();
-                self.state = State::Idle;
-            }
+            // The ArkHello failing to get out has the Ark give up on the
+            // handshake and signal so
             (State::AwaitHello, Frame::Hello(keys)) => {
-                self.awaiting = Some(*keys);
-                self.state = State::AwaitAck;
-                self.emit(Emit::ArkHello);
+                if self.send(Payload::Frame(Emit::ArkHello(keys))) {
+                    self.state = State::AwaitAck;
+                } else {
+                    self.forget();
+                    self.state = State::Idle;
+                    self.send(Payload::Signal);
+                }
             }
             (State::AwaitAck, Frame::Ack) => {
                 self.state = State::Established;
@@ -555,22 +653,83 @@ impl Host {
             _ => {
                 self.forget();
                 self.state = State::Idle;
-                self.emit(Emit::Dropped);
+                self.send(Payload::Signal);
             }
         }
     }
 
-    /// Expects the Ark to emit a frame, unless its transport is broken and
-    /// the frame is lost.
-    fn emit(&mut self, emit: Emit) {
-        if !self.broken {
-            self.emits.push(emit);
+    /// Applies the model's transition for a send of the Ark, returning whether
+    /// it goes through. It mirrors the framing, a send after a failed one
+    /// starting with a delimiter that terminates the tail the failure left
+    /// behind, and its flush failing the send after every byte went out.
+    fn send(&mut self, payload: Payload) -> bool {
+        let mut sent = !self.resync || self.write_zero();
+        if sent {
+            sent = match payload {
+                Payload::Frame(emit) => self.write_frame(emit),
+                Payload::Signal => self.write_zero(),
+            };
+        }
+        if sent {
+            sent = !std::mem::take(&mut self.flush_fails);
+        }
+        self.resync = !sent;
+        sent
+    }
+
+    /// A lone delimiter written, the resync ahead of a send or the signal,
+    /// returning whether it got out. Only a cut at the start applies to it,
+    /// the other points waiting for a write with a body.
+    fn write_zero(&mut self) -> bool {
+        if self.cut == Some(CutPoint::Start) {
+            self.cut = None;
+            return false;
+        }
+        if self.broken {
+            return false;
+        }
+        self.zero_out();
+        true
+    }
+
+    /// A frame written, returning whether it got out whole. An armed cut
+    /// fires on it, ahead of a broken transport.
+    fn write_frame(&mut self, emit: Emit) -> bool {
+        match self.cut.take() {
+            Some(CutPoint::Start) => false,
+            Some(CutPoint::Middle(_)) => {
+                self.tail = Some(Tail::Fragment);
+                false
+            }
+            Some(CutPoint::Delimiter) => {
+                self.tail = Some(Tail::Body(emit));
+                false
+            }
+            Some(CutPoint::Flush) => {
+                self.flush_fails = true;
+                self.emits.push(emit);
+                true
+            }
+            None if self.broken => false,
+            None => {
+                self.emits.push(emit);
+                true
+            }
         }
     }
 
-    /// Forgets any session or handshake in progress. The keys of a hello the
-    /// Ark already answered stay until its ArkHello is checked, the Ark having
-    /// emitted it before the handshake was abandoned.
+    /// A lone delimiter reaching the stream, terminating the tail into the
+    /// frame it was cut from or forming an empty frame without one.
+    fn zero_out(&mut self) {
+        self.emits.push(match self.tail.take() {
+            None => Emit::Dropped,
+            Some(Tail::Fragment) => Emit::Fragment,
+            Some(Tail::Body(emit)) => emit,
+        });
+    }
+
+    /// Forgets any session or handshake in progress. A session stays with the
+    /// replies still to be checked against it.
     fn forget(&mut self) {
         self.session = None;
         self.pending = None;
@@ -604,6 +763,11 @@ impl Host {
         let frames = self.outbox.take_frames();
         let emits = std::mem::take(&mut self.emits);
         assert_eq!(frames.len(), emits.len(), "model expected {emits:?}");
+        assert_eq!(
+            self.outbox.has_tail(),
+            self.tail.is_some(),
+            "unterminated frame"
+        );
         for (frame, emit) in frames.iter().zip(emits) {
             match emit {
                 Emit::Dropped => {
@@ -614,15 +778,20 @@ impl Host {
                     );
                     self.summary.dropped += 1;
                 }
-                Emit::ArkHello => {
-                    self.receive_hello(frame);
+                Emit::Fragment => {
+                    assert!(
+                        !frame.is_empty(),
+                        "expected a cut frame, ark emitted an empty one"
+                    );
+                    self.summary.fragments += 1;
+                }
+                Emit::ArkHello(keys) => {
+                    self.receive_hello(frame, *keys);
                     self.summary.handshakes += 1;
                 }
-                Emit::Reply(id) => {
-                    let msg: ArkToHost = self
-                        .session
-                        .as_mut()
-                        .expect("reply without a session")
+                Emit::Reply(id, session) => {
+                    let msg: ArkToHost = session
+                        .borrow_mut()
                         .open(&unframe(frame))
                         .expect("reply failed to open");
                     assert_eq!(msg.id, Some(id));
@@ -632,13 +801,9 @@ impl Host {
         }
     }
 
-    /// Opens and verifies an ArkHello, keeping what is needed to ack it as long
-    /// as the Ark is still awaiting that ack.
-    fn receive_hello(&mut self, frame: &[u8]) {
-        let keys = self
-            .awaiting
-            .take()
-            .expect("ark hello without a hello awaiting it");
+    /// Opens and verifies an ArkHello sealed to the keys, keeping what is
+    /// needed to ack it as long as the Ark is still awaiting that ack.
+    fn receive_hello(&mut self, frame: &[u8], keys: Keys) {
         let auth = handshake::ArkHelloAuth {
             host_signer: keys.signer.public_key(),
             host_crypto: keys.crypto.public_key(),
@@ -676,6 +841,7 @@ impl Read for Feed {
             // Everything handed over was consumed, check the reactions to it
             // before moving the script forward
             host.sync();
+            host.batch = 0;
             loop {
                 match host.steps.pop_front() {
                     None => {
@@ -686,11 +852,24 @@ impl Read for Feed {
                         host.interrupt(Outcome::Yield);
                         return Err(would_block());
                     }
+                    Some(Step::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
                     Some(step) => host.execute(step),
                 }
                 if !host.bytes.is_empty() {
                     break;
                 }
+            }
+            // A batch queues the frames of the steps after too, so they arrive
+            // in one read. It ends at a step the Ark surfaces something for,
+            // the driver acting on that before the Ark reads on, and at any
+            // step not queuing frames
+            while host.batch > 1
+                && host.outcome == Outcome::Absorbed
+                && host.steps.front().is_some_and(Step::queues_frames)
+            {
+                let step = host.steps.pop_front().unwrap();
+                host.execute(step);
+                host.batch -= 1;
             }
         }
         let mut n = buf.len().min(host.bytes.len());
@@ -699,6 +878,7 @@ impl Read for Feed {
         }
         buf[..n].copy_from_slice(&host.bytes[..n]);
         host.bytes.drain(..n);
+        host.summary.reads += 1;
         Ok(n)
     }
 }
@@ -729,33 +909,32 @@ fn check_session(ark: &mut Ark, host: &Host) {
 }
 
 /// Sends a message on the Ark's behalf, checking that the send path works
-/// exactly in a session on a working transport. A failed send takes the
-/// session down with it.
+/// exactly in a session and fails exactly when the transport does. A failed
+/// send takes the session down with it, the Ark signaling so.
 fn send(ark: &mut Ark, host: &mut Host, id: u64) {
+    // Predict the send, a reply going out in a session unless the transport
+    // fails it, in which case the Ark drops the session and signals
     let established = host.state == State::Established;
+    let expected = established.then(|| {
+        let session = host.session.clone().expect("established without a session");
+        let sent = host.send(Payload::Frame(Emit::Reply(id, session)));
+        if !sent {
+            host.forget();
+            host.state = State::Idle;
+            host.send(Payload::Signal);
+        }
+        sent
+    });
     let sent = ark.send_message(ArkToHost {
         id: Some(id),
         err: None,
         content: None,
     });
-    match sent {
-        Ok(()) => {
-            assert!(established, "ark sent a message without a session");
-            assert!(!host.broken, "ark sent on a broken transport");
-            host.emits.push(Emit::Reply(id));
-        }
-        Err(Error::SendFailed(_)) => {
-            assert!(
-                established && host.broken,
-                "ark failed a send it should not have"
-            );
-            host.forget();
-            host.state = State::Idle;
-        }
-        Err(Error::EncryptionFailed(_)) => {
-            assert!(!established, "ark refused to send in a session");
-        }
-        Err(err) => panic!("unexpected send error: {err}"),
+    match (expected, sent) {
+        (Some(true), Ok(())) => {}
+        (Some(false), Err(Error::SendFailed(_))) => {}
+        (None, Err(Error::EncryptionFailed(_))) => {}
+        (expected, sent) => panic!("model expected {expected:?}, ark returned {sent:?}"),
     }
 }
 
@@ -834,9 +1013,11 @@ mod tests {
             Summary {
                 state: State::Established,
                 dropped: 0,
+                fragments: 0,
                 handshakes: 1,
                 delivered: 2,
                 replies: 2,
+                reads: 5,
             }
         );
     }
@@ -1210,7 +1391,8 @@ mod tests {
 
     // Tests a transport failing under the Ark's writes. A failed reply drops
     // the session, the signals it would send are lost and a handshake whose
-    // ArkHello cannot go out is given up. A healed transport recovers.
+    // ArkHello cannot go out is given up. A healed transport recovers, the
+    // first send on it starting with a resync delimiter, an empty frame.
     #[test]
     fn test_scripted_broken_transport() {
         let summary = run_logged(&[
@@ -1230,7 +1412,7 @@ mod tests {
         assert_eq!(summary.state, State::Established);
         assert_eq!(summary.delivered, 3);
         assert_eq!(summary.replies, 2);
-        assert_eq!(summary.dropped, 0);
+        assert_eq!(summary.dropped, 1);
 
         let summary = run_logged(&[
             Step::Reset,
@@ -1244,7 +1426,7 @@ mod tests {
         ]);
         assert_eq!(summary.state, State::Established);
         assert_eq!(summary.handshakes, 1);
-        assert_eq!(summary.dropped, 1);
+        assert_eq!(summary.dropped, 2);
 
         let summary = run_logged(&[
             Step::Reset,
@@ -1258,6 +1440,260 @@ mod tests {
         assert_eq!(summary.state, State::Idle);
         assert_eq!(summary.delivered, 0);
         assert_eq!(summary.replies, 0);
+        assert_eq!(summary.dropped, 2);
+    }
+
+    // Tests the Ark's reply cut short. The bytes that got out are terminated
+    // by the resync delimiter ahead of the signal, into junk or into the
+    // valid reply that lacked only its delimiter. A reply lost whole, or one
+    // whose flush failed after it went out whole, arms the resync too, its
+    // delimiter forming a needless empty frame ahead of the signal.
+    #[test]
+    fn test_scripted_cut_replies() {
+        struct TestCase {
+            point: CutPoint,
+            fragments: usize,
+            replies: usize,
+            dropped: usize,
+        }
+        let tests = [
+            TestCase {
+                point: CutPoint::Middle(7),
+                fragments: 1,
+                replies: 0,
+                dropped: 1,
+            },
+            TestCase {
+                point: CutPoint::Delimiter,
+                fragments: 0,
+                replies: 1,
+                dropped: 1,
+            },
+            TestCase {
+                point: CutPoint::Start,
+                fragments: 0,
+                replies: 0,
+                dropped: 2,
+            },
+            TestCase {
+                point: CutPoint::Flush,
+                fragments: 0,
+                replies: 1,
+                dropped: 2,
+            },
+        ];
+        for (i, tt) in tests.into_iter().enumerate() {
+            let summary = run_logged(&[
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Cut {
+                    point: tt.point,
+                    then_broken: false,
+                },
+                Step::Request(1),
+            ]);
+            assert_eq!(summary.state, State::Idle, "test {i}");
+            assert_eq!(summary.delivered, 1, "test {i}");
+            assert_eq!(summary.fragments, tt.fragments, "test {i}");
+            assert_eq!(summary.replies, tt.replies, "test {i}");
+            assert_eq!(summary.dropped, tt.dropped, "test {i}");
+        }
+    }
+
+    // Tests a cut whose signal is lost too, the transport staying broken. The
+    // cut frame waits on the stream until the healed transport carries the
+    // Ark's next send, the ArkHello of a fresh handshake, whose resync
+    // delimiter terminates it ahead of the hello.
+    #[test]
+    fn test_scripted_cut_then_broken() {
+        struct TestCase {
+            point: CutPoint,
+            fragments: usize,
+            replies: usize,
+            dropped: usize,
+        }
+        let tests = [
+            TestCase {
+                point: CutPoint::Middle(7),
+                fragments: 1,
+                replies: 1,
+                dropped: 0,
+            },
+            TestCase {
+                point: CutPoint::Delimiter,
+                fragments: 0,
+                replies: 2,
+                dropped: 0,
+            },
+            TestCase {
+                point: CutPoint::Start,
+                fragments: 0,
+                replies: 1,
+                dropped: 1,
+            },
+            TestCase {
+                point: CutPoint::Flush,
+                fragments: 0,
+                replies: 2,
+                dropped: 1,
+            },
+        ];
+        for (i, tt) in tests.into_iter().enumerate() {
+            let summary = run_logged(&[
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Cut {
+                    point: tt.point,
+                    then_broken: true,
+                },
+                Step::Request(1),
+                Step::Heal,
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Request(2),
+            ]);
+            assert_eq!(summary.state, State::Established, "test {i}");
+            assert_eq!(summary.handshakes, 2, "test {i}");
+            assert_eq!(summary.delivered, 2, "test {i}");
+            assert_eq!(summary.fragments, tt.fragments, "test {i}");
+            assert_eq!(summary.replies, tt.replies, "test {i}");
+            assert_eq!(summary.dropped, tt.dropped, "test {i}");
+        }
+    }
+
+    // Tests the ArkHello cut short. The Ark gives up on the handshake and
+    // signals so, the resync delimiter ahead of the signal terminating what
+    // got out. An ArkHello lacking only its delimiter is completed into a
+    // valid one, which the host acks in vain. A fresh handshake recovers.
+    #[test]
+    fn test_scripted_cut_handshakes() {
+        struct TestCase {
+            point: CutPoint,
+            handshakes: usize,
+            fragments: usize,
+            dropped: usize,
+        }
+        let tests = [
+            TestCase {
+                point: CutPoint::Middle(3),
+                handshakes: 0,
+                fragments: 1,
+                dropped: 2,
+            },
+            TestCase {
+                point: CutPoint::Delimiter,
+                handshakes: 1,
+                fragments: 0,
+                dropped: 2,
+            },
+            TestCase {
+                point: CutPoint::Start,
+                handshakes: 0,
+                fragments: 0,
+                dropped: 3,
+            },
+            TestCase {
+                point: CutPoint::Flush,
+                handshakes: 1,
+                fragments: 0,
+                dropped: 3,
+            },
+        ];
+        for (i, tt) in tests.into_iter().enumerate() {
+            let cut = Step::Cut {
+                point: tt.point,
+                then_broken: false,
+            };
+            let summary = run_logged(&[Step::Reset, cut.clone(), Step::Hello, Step::Ack]);
+            assert_eq!(summary.state, State::Idle, "test {i}");
+            assert_eq!(summary.handshakes, tt.handshakes, "test {i}");
+            assert_eq!(summary.fragments, tt.fragments, "test {i}");
+            assert_eq!(summary.dropped, tt.dropped, "test {i}");
+
+            let summary = run_logged(&[
+                Step::Reset,
+                cut,
+                Step::Hello,
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Request(1),
+            ]);
+            assert_eq!(summary.state, State::Established, "test {i}");
+            assert_eq!(summary.handshakes, tt.handshakes + 1, "test {i}");
+            assert_eq!(summary.delivered, 1, "test {i}");
+        }
+    }
+
+    // Tests that a cut needing a body passes over the lone delimiters of the
+    // Ark's signals and fires on its next frame, whereas one at the start
+    // loses the signal it lands on, the resync it arms forming an empty frame
+    // ahead of the next frame.
+    #[test]
+    fn test_scripted_cut_signals() {
+        struct TestCase {
+            point: CutPoint,
+            handshakes: usize,
+            fragments: usize,
+            dropped: usize,
+        }
+        let tests = [
+            TestCase {
+                point: CutPoint::Middle(1),
+                handshakes: 1,
+                fragments: 1,
+                dropped: 2,
+            },
+            TestCase {
+                point: CutPoint::Delimiter,
+                handshakes: 2,
+                fragments: 0,
+                dropped: 2,
+            },
+            TestCase {
+                point: CutPoint::Flush,
+                handshakes: 2,
+                fragments: 0,
+                dropped: 3,
+            },
+        ];
+        for (i, tt) in tests.into_iter().enumerate() {
+            let summary = run_logged(&[
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Cut {
+                    point: tt.point,
+                    then_broken: false,
+                },
+                Step::Junk(vec![1]),
+                Step::Reset,
+                Step::Hello,
+            ]);
+            assert_eq!(summary.state, State::Idle, "test {i}");
+            assert_eq!(summary.handshakes, tt.handshakes, "test {i}");
+            assert_eq!(summary.fragments, tt.fragments, "test {i}");
+            assert_eq!(summary.dropped, tt.dropped, "test {i}");
+        }
+
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Cut {
+                point: CutPoint::Start,
+                then_broken: false,
+            },
+            Step::Junk(vec![1]),
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 2);
         assert_eq!(summary.dropped, 1);
     }
 
@@ -1293,6 +1729,140 @@ mod tests {
             assert_eq!(summary.state, State::Established, "chunk {chunk}");
             assert_eq!(summary.handshakes, 1, "chunk {chunk}");
         }
+    }
+
+    // Tests that the frames of several steps batched into one read are served
+    // like frames arriving one per read, a partial hello completing within a
+    // batch too. A step the Ark surfaces something for ends the batch, so
+    // requests still arrive one per read.
+    #[test]
+    fn test_scripted_batched_reads() {
+        let summary = run_logged(&[
+            Step::Batch(3),
+            Step::Reset,
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Request(1),
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 1);
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(summary.reads, 3);
+
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Batch(3),
+            Step::Junk(vec![1]),
+            Step::Junk(vec![2]),
+            Step::Junk(vec![3]),
+        ]);
+        assert_eq!(summary.state, State::Idle);
+        assert_eq!(summary.dropped, 3);
+        assert_eq!(summary.reads, 4);
+
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Batch(3),
+            Step::Request(1),
+            Step::Request(2),
+            Step::Request(3),
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.delivered, 3);
+        assert_eq!(summary.reads, 6);
+
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Batch(2),
+            Step::Partial,
+            Step::Reset,
+            Step::Ack,
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 1);
+        assert_eq!(summary.reads, 3);
+
+        for chunk in [1u8, 7] {
+            let summary = run_logged(&[
+                Step::Chunk(chunk),
+                Step::Batch(3),
+                Step::Reset,
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Request(1),
+            ]);
+            assert_eq!(summary.state, State::Established, "chunk {chunk}");
+            assert_eq!(summary.delivered, 1, "chunk {chunk}");
+        }
+    }
+
+    // Tests that a read interrupted by a signal is retried by the framing in
+    // every state, the Ark none the wiser.
+    #[test]
+    fn test_scripted_interrupted_reads() {
+        let summary = run_logged(&[
+            Step::Interrupt,
+            Step::Reset,
+            Step::Interrupt,
+            Step::Hello,
+            Step::Interrupt,
+            Step::Ack,
+            Step::Interrupt,
+            Step::Request(1),
+            Step::Interrupt,
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 1);
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(summary.dropped, 0);
+    }
+
+    // Tests that frames past the size limit vanish in the framing in every
+    // state, a partial hello in front of one vanishing with it, whole or in
+    // pieces.
+    #[test]
+    fn test_scripted_oversized_frames() {
+        let summary = run_logged(&[
+            Step::Oversized,
+            Step::Reset,
+            Step::Oversized,
+            Step::Hello,
+            Step::Oversized,
+            Step::Ack,
+            Step::Oversized,
+            Step::Request(1),
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 1);
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(summary.dropped, 0);
+
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Partial,
+            Step::Oversized,
+            Step::Hello,
+            Step::Ack,
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 1);
+
+        let summary = run_logged(&[
+            Step::Chunk(255),
+            Step::Reset,
+            Step::Oversized,
+            Step::Hello,
+            Step::Ack,
+            Step::Request(1),
+        ]);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.delivered, 1);
     }
 
     // Tests that steps with nothing to replay or truncate yet are no-ops.

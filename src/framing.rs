@@ -3,7 +3,7 @@
 
 use crate::{Error, MAX_FRAME_SIZE};
 use darkbio_cobs as cobs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use tracing::warn;
 
@@ -18,6 +18,11 @@ use tracing::warn;
 /// A host opens a session with two zeros, the first terminating whatever frame
 /// may have been interrupted, the second being the reset. An Ark answers with
 /// a single zero whenever it has no session for what it received.
+///
+/// A failed send may have put part of its frame on the stream already. The
+/// next send, a frame or a signal, starts with an extra delimiter terminating
+/// that leftover. A failed flush counts as a failed send, as some transports
+/// only report a lost transfer there.
 pub(crate) struct Framing<R: Read, W: Write> {
     reader: R, // Byte stream frames are read from
     writer: W, // Byte stream frames are written to
@@ -26,6 +31,8 @@ pub(crate) struct Framing<R: Read, W: Write> {
     reader_filled: usize,   // Number of received bytes in reader_buffer
     reader_offset: usize,   // Start of the unconsumed data, i.e. of the next frame
     reader_search: usize,   // End of the unconsumed data already scanned for a delimiter
+    reader_discard: usize, // Bytes of an oversized frame thrown away so far, its delimiter still to come
+    writer_resync: bool,   // Whether the last send failed, possibly leaving a frame unterminated
 
     pub decobs_buffer: Vec<u8>, // Last decoded packet, consumed by the session layer
     encobs_buffer: Vec<u8>,     // Frame being sent, with a spare slot for the delimiter
@@ -42,6 +49,8 @@ impl<R: Read, W: Write> Framing<R, W> {
             reader_offset: 0,
             reader_filled: 0,
             reader_search: 0,
+            reader_discard: 0,
+            writer_resync: false,
             decobs_buffer: vec![0u8; MAX_FRAME_SIZE],
             encobs_buffer: vec![0u8; MAX_FRAME_SIZE + 1], // one extra slot for the frame delimiter
             encode_buffer: vec![0u8; MAX_FRAME_SIZE],
@@ -50,25 +59,18 @@ impl<R: Read, W: Write> Framing<R, W> {
 
     /// Signals a session reset by writing two frame delimiters, the first one
     /// terminating any interrupted frame, the second forming the empty reset
-    /// frame.
+    /// frame. The first covers a frame a previous host may have left behind,
+    /// so a reset resyncs the stream by itself.
     pub fn send_reset(&mut self) -> Result<(), Error> {
-        (|| {
-            self.writer.write_all(&[0x00, 0x00])?;
-            self.writer.flush()
-        })()
-        .map_err(Error::SendFailed)
+        self.writer_resync = false;
+        self.send(&[0x00, 0x00])
     }
 
     /// Signals a dropped session by writing a single frame delimiter, forming
-    /// an empty frame. Unlike a host reset, this one does not guard against an
-    /// interrupted frame. The Ark only leaves one behind when a write failed,
-    /// which leaves the transport broken for the signal too.
+    /// an empty frame. After a failed send it goes out behind the delimiter
+    /// terminating what that send left behind, so it is not swallowed as one.
     pub fn send_dropped(&mut self) -> Result<(), Error> {
-        (|| {
-            self.writer.write_all(&[0x00])?;
-            self.writer.flush()
-        })()
-        .map_err(Error::SendFailed)
+        self.send(&[0x00])
     }
 
     /// Reads the next frame and COBS decodes it into `decobs_buffer`, returning
@@ -112,12 +114,10 @@ impl<R: Read, W: Write> Framing<R, W> {
     /// Reads the next zero delimited frame, returning its range within
     /// `reader_buffer` so callers can parse it without copying. Frames exceeding
     /// MAX_FRAME_SIZE are discarded with a warning, resynchronizing on the next
-    /// delimiter.
+    /// delimiter, a read failing midway through one leaving the discard to
+    /// resume on the next call. A read interrupted by a signal is retried.
     #[inline]
     fn next_frame(&mut self) -> Result<Range<usize>, Error> {
-        // Track if we're in discard mode and how much we discarded until now
-        let mut discard = 0usize;
-
         'outer: loop {
             // Search for the frame delimiter, starting from where we left off
             if let Some(found) = memchr::memchr(
@@ -132,9 +132,12 @@ impl<R: Read, W: Write> Framing<R, W> {
                 self.reader_search = end + 1; // skip the zero marker
 
                 // If we were in discard mode, report, throw away and start over
-                if discard > 0 {
-                    warn!("discarded frame of {} bytes", discard + end - start);
-                    discard = 0;
+                if self.reader_discard > 0 {
+                    warn!(
+                        "discarded frame of {} bytes",
+                        self.reader_discard + end - start
+                    );
+                    self.reader_discard = 0;
                     continue 'outer;
                 }
                 // We were in normal operation, return the consumed frame
@@ -144,7 +147,7 @@ impl<R: Read, W: Write> Framing<R, W> {
             self.reader_search = self.reader_filled;
 
             // Frame delimiter not found, we only have fragments
-            if discard == 0 {
+            if self.reader_discard == 0 {
                 if self.reader_offset > 0 {
                     // We're in waiting mode, compact the buffer to maximise free space
                     let used = self.reader_filled - self.reader_offset;
@@ -156,7 +159,7 @@ impl<R: Read, W: Write> Framing<R, W> {
                 }
             } else {
                 // We're in discard mode, throw everything away
-                discard += self.reader_filled;
+                self.reader_discard += self.reader_filled;
                 self.reader_filled = 0;
                 self.reader_offset = 0;
                 self.reader_search = 0
@@ -164,7 +167,7 @@ impl<R: Read, W: Write> Framing<R, W> {
             // We've done everything we could, we need more data. If the buffer
             // is already full, we've exceeded our frame size, drop all.
             if self.reader_filled == MAX_FRAME_SIZE + 1 {
-                discard += MAX_FRAME_SIZE + 1;
+                self.reader_discard += MAX_FRAME_SIZE + 1;
                 self.reader_filled = 0;
                 self.reader_offset = 0;
                 self.reader_search = 0
@@ -174,6 +177,7 @@ impl<R: Read, W: Write> Framing<R, W> {
                 .reader
                 .read(&mut self.reader_buffer[self.reader_filled..])
             {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue, // Signal cut the read short, retry
                 Err(err) => return Err(Error::RecvFailed(err)), // Transport failed internally, cannot recover
                 Ok(0) => return Err(Error::Terminated), // Transport was terminated, tear down
                 Ok(n) => self.reader_filled += n,       // Read some bytes, ingest them
@@ -186,11 +190,24 @@ impl<R: Read, W: Write> Framing<R, W> {
     #[inline]
     fn send_frame(&mut self, size: usize) -> Result<(), Error> {
         self.encobs_buffer[size] = 0;
-        (|| {
-            self.writer.write_all(&self.encobs_buffer[..size + 1])?;
+        let frame = std::mem::take(&mut self.encobs_buffer);
+        let result = self.send(&frame[..size + 1]);
+        self.encobs_buffer = frame;
+        result
+    }
+
+    /// Writes the bytes and flushes them, starting with a frame delimiter if
+    /// the send before failed, and tracks whether this one failed for the next.
+    fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let result = (|| {
+            if self.writer_resync {
+                self.writer.write_all(&[0x00])?;
+            }
+            self.writer.write_all(bytes)?;
             self.writer.flush()
-        })()
-        .map_err(Error::SendFailed)
+        })();
+        self.writer_resync = result.is_err();
+        result.map_err(Error::SendFailed)
     }
 
     /// Test and benchmark helper exposing `next_packet` with the decoded packet
@@ -233,6 +250,7 @@ impl<R: Read, W: Write> Framing<R, W> {
 mod tests {
     use super::*;
     use crate::testing;
+    use std::collections::VecDeque;
     use std::io::{Cursor, empty, sink};
 
     // Tests corner-cases when consuming a packet from the framed transport.
@@ -438,6 +456,71 @@ mod tests {
             let mut framing = Framing::new(&mut host_to_wire, sink());
             let frame = framing.next_frame_blob().unwrap();
             assert_eq!(frame, tt.expected, "test {i}");
+        }
+    }
+
+    // Tests reads failing midway through an oversized frame, which leave the
+    // discard to resume on the next call, the frame's tail never served.
+    #[test]
+    fn test_next_frame_discard_resumes() {
+        testing::init_tracing();
+
+        /// Reader handing out one scripted result per read.
+        struct Scripted(VecDeque<io::Result<Vec<u8>>>);
+
+        impl Read for Scripted {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(Ok(bytes)) => {
+                        buf[..bytes.len()].copy_from_slice(&bytes);
+                        Ok(bytes.len())
+                    }
+                    Some(Err(err)) => Err(err),
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
+        let timeout = || io::Error::from(io::ErrorKind::WouldBlock);
+
+        struct TestCase {
+            reads: Vec<io::Result<Vec<u8>>>,
+            expected: Vec<Option<Vec<u8>>>, // Frame served per call, none for a failure
+        }
+        let tests = [
+            // An interrupted read resumes the discard of an oversized frame
+            TestCase {
+                reads: vec![
+                    Ok(vec![b'a'; MAX_FRAME_SIZE + 1]),
+                    Err(interrupted()),
+                    Ok(b"aaa\0foo\0".to_vec()),
+                ],
+                expected: vec![Some(b"foo".to_vec())],
+            },
+            // A failed read surfaces, the discard resuming on the next call
+            TestCase {
+                reads: vec![
+                    Ok(vec![b'a'; MAX_FRAME_SIZE + 1]),
+                    Err(timeout()),
+                    Ok(b"aaa\0foo\0".to_vec()),
+                ],
+                expected: vec![None, Some(b"foo".to_vec())],
+            },
+        ];
+
+        for (i, tt) in tests.into_iter().enumerate() {
+            let mut framing = Framing::new(Scripted(tt.reads.into()), sink());
+            for (j, expected) in tt.expected.into_iter().enumerate() {
+                let result = framing.next_frame_blob().map(<[u8]>::to_vec);
+                match expected {
+                    Some(frame) => assert_eq!(result.unwrap(), frame, "test {i} call {j}"),
+                    None => assert!(
+                        matches!(result, Err(Error::RecvFailed(_))),
+                        "test {i} call {j}: {result:?}"
+                    ),
+                }
+            }
         }
     }
 

@@ -140,8 +140,13 @@ impl<R: Read, W: Write> HostSide<R, W> {
         let mut stale = 0;
         let size = loop {
             // Empty frames are the Ark signaling an earlier session dropped,
-            // stale junk too by now
-            let size = self.framing.next_packet()?.unwrap_or_default();
+            // stale junk too by now. So are frames failing to decode, the
+            // leftovers of a transfer that was cut short.
+            let size = match self.framing.next_packet() {
+                Ok(Some(size)) => size,
+                Ok(None) | Err(Error::FrameDecodingFailed(_)) => 0,
+                Err(err) => return Err(err),
+            };
             let recipient = cose::recipient(&self.framing.decobs_buffer[..size]);
             if recipient.is_ok_and(|fp| fp == host_xhpke_fp) {
                 break size;

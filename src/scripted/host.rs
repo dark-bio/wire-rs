@@ -11,14 +11,17 @@
 //! The model predicts the result of every call from the frames it consumed,
 //! tracking the session the host should have. Any divergence panics.
 
-use super::{MAX_STEPS, Outbox, cloud_attestation, frame, self_attestation, unframe, would_block};
+use super::{
+    CutPoint, MAX_STEPS, Outbox, cloud_attestation, frame, self_attestation, unframe, would_block,
+};
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk, host_to_ark};
 use crate::side_host::MAX_STALE_FRAMES;
 use crate::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, HostSide, MAX_MESSAGE_SIZE,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, HostSide, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
+use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use prost::Message;
 use std::cell::RefCell;
@@ -83,15 +86,35 @@ pub enum Step {
     Junk(Vec<u8>),
     /// A frame failing COBS decoding.
     Undecodable,
+    /// The last valid frame produced cut short, keeping at least one byte.
+    /// Nothing if none was produced yet.
+    Truncated(u8),
+    /// A valid ArkHello without its delimiter. The next frame's bytes merge
+    /// into it, a lone delimiter completing it into the valid hello it is.
+    Partial,
+    /// A frame past the size limit, delimiter included. The framing throws it
+    /// away before the host sees it, a partial ArkHello in front going with
+    /// it.
+    Oversized,
     /// The read fails with `WouldBlock`.
     Yield,
+    /// The read fails with `Interrupted`, which the framing retries with the
+    /// host none the wiser.
+    Interrupt,
     /// The host's writes fail from here on, as on a transport that died.
     Break,
     /// The host's writes work again.
     Heal,
+    /// The host's next write the point applies to is cut there, the transport
+    /// staying broken afterwards if told to, until healed.
+    Cut { point: CutPoint, then_broken: bool },
     /// Caps what a single read hands the host at the byte count, so frames
     /// arrive in pieces. Zero lifts the cap.
     Chunk(u8),
+    /// Hands the next frames to the host in one read, up to the count. The
+    /// frame settling the call in progress ends the batch early, the host
+    /// acting on it before reading on, as does any step not queuing a frame.
+    Batch(u8),
 }
 
 impl Step {
@@ -99,19 +122,47 @@ impl Step {
     fn is_call(&self) -> bool {
         matches!(self, Step::Handshake | Step::Send(_) | Step::Recv)
     }
+
+    /// Whether the step only puts a frame in front of the host, as opposed to
+    /// a call, a yield or a change to the transport.
+    fn queues_frame(&self) -> bool {
+        !matches!(
+            self,
+            Step::Handshake
+                | Step::Send(_)
+                | Step::Recv
+                | Step::Yield
+                | Step::Interrupt
+                | Step::Break
+                | Step::Heal
+                | Step::Cut { .. }
+                | Step::Chunk(_)
+                | Step::Batch(_)
+        )
+    }
 }
 
 /// Error kinds the model distinguishes in the host's results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// `Error::PacketDecodingFailed`, a packet opening but not decoding.
     PacketDecoding,
+    /// `Error::FrameDecodingFailed`, a frame failing COBS decoding.
     FrameDecoding,
+    /// `Error::SendFailed`, the transport refusing a write.
     Send,
+    /// `Error::RecvFailed`, the transport failing a read.
     Recv,
+    /// `Error::Terminated`, the transport ending.
     Terminated,
+    /// `Error::SessionReset`, the Ark signaling that it has no session.
     SessionReset,
+    /// `Error::InvalidAttestation`, an attestation of the wrong shape.
     InvalidAttestation,
+    /// `Error::HandshakeFailed`, a handshake refused or given up on.
     Handshake,
+    /// `Error::EncryptionFailed`, a packet failing to open or no session to
+    /// send in.
     Encryption,
 }
 
@@ -123,6 +174,7 @@ pub struct Summary {
     pub messages: usize,   // Messages the host read
     pub resets: usize,     // Session resets the host surfaced
     pub failures: usize,   // Other errors the host surfaced
+    pub reads: usize,      // Reads that handed the host bytes
 }
 
 /// What is wrong with an ArkHello crafted to be refused, in the order the
@@ -130,14 +182,23 @@ pub struct Summary {
 /// hello of the host's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flaw {
+    /// Nothing, a valid ArkHello.
     None,
+    /// Sealed to a key the host never had.
     Stale,
+    /// A ciphertext byte flipped, the seal failing to open.
     Tampered,
+    /// Bound to another host's keys, as a substituted hello would be.
     Auth,
+    /// Signed by a key other than the Ark's identity.
     Signer,
+    /// A sealed payload that is not an ArkHello at all.
     Payload,
+    /// An encryption key failing validation.
     Key,
+    /// An encapsulated key of the wrong size.
     Encap,
+    /// A well formed attestation of the wrong shape.
     Attest,
 }
 
@@ -161,18 +222,36 @@ enum Frame {
     Undecodable,
 }
 
+/// Bytes of an unterminated frame in front of the host, waiting for the
+/// delimiter that completes them into a frame.
+enum Partial {
+    /// The stream is at a frame boundary.
+    None,
+    /// An ArkHello answering the hello of the generation, lacking only its
+    /// delimiter, valid if the next byte is one.
+    Hello(u64, Vec<u8>),
+    /// Bytes no delimiter can complete into anything valid.
+    Junk(Vec<u8>),
+}
+
 /// Call in progress on the host, consuming the frames read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
+    /// No call in progress, a frame read now being a bug.
     None,
+    /// A handshake awaiting the ArkHello of the generation, having skipped
+    /// the count of stale frames so far.
     Handshake { generation: u64, stale: usize },
+    /// A read of the next message.
     Recv,
 }
 
 /// Predicted result of a host call, the message id for a read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Expect {
+    /// The call succeeds, with the message id if it was a read.
     Ok(Option<u64>),
+    /// The call fails with the error kind.
     Err(Kind),
 }
 
@@ -197,11 +276,15 @@ pub struct Ark {
     steps: VecDeque<Step>,
     identity: xdsa::SecretKey,
     attestation: Attestation,
-    outbox: Outbox,                    // Frames the host wrote
-    queue: VecDeque<(Vec<u8>, Frame)>, // Frames produced, not yet read by the host
-    bytes: Vec<u8>,                    // Bytes of the frame being handed over
-    chunk: usize,                      // Most bytes a read hands over, zero for all
-    broken: bool,                      // Whether the host's writes fail
+    outbox: Outbox,                            // Frames the host wrote
+    queue: VecDeque<(Vec<u8>, Option<Frame>)>, // Bytes produced, not yet read by the host, unterminated ones without a frame
+    bytes: Vec<u8>,                            // Bytes of the frame being handed over
+    chunk: usize,                              // Most bytes a read hands over, zero for all
+    batch: usize,                              // Frames left to hand to the host in one read
+    broken: bool,                              // Whether the host's writes fail
+    cut: Option<CutPoint>, // Cut armed for the next write of the host it applies to
+    fragment: bool,        // Whether a frame cut in the middle awaits its terminator
+    partial: Partial,      // Unterminated frame in front of the host
 
     call: Call,                // Call the frames read feed into
     expect: Option<Expect>,    // Its predicted result once settled
@@ -213,6 +296,7 @@ pub struct Ark {
     outstanding: Vec<Outstanding>, // ArkHellos awaiting an ack
     session: Option<ArkSession>, // Live session on the Ark's side
     last_reply: Option<(Vec<u8>, Frame)>, // Last sealed reply, framed
+    last_valid: Option<Vec<u8>>, // Last valid frame produced, delimiter stripped
 
     summary: Summary,
 }
@@ -229,7 +313,11 @@ impl Ark {
             queue: VecDeque::new(),
             bytes: Vec::new(),
             chunk: 0,
+            batch: 0,
             broken: false,
+            cut: None,
+            fragment: false,
+            partial: Partial::None,
             call: Call::None,
             expect: None,
             host_session: None,
@@ -239,6 +327,7 @@ impl Ark {
             outstanding: Vec::new(),
             session: None,
             last_reply: None,
+            last_valid: None,
             summary: Summary::default(),
         }
     }
@@ -268,6 +357,43 @@ impl Ark {
             Step::Dropped => (vec![0x00], Frame::Dropped),
             Step::Junk(bytes) => (frame(&bytes), Frame::Junk),
             Step::Undecodable => (vec![0xff, 0x01, 0x00], Frame::Undecodable),
+            Step::Truncated(n) => match self.last_valid.clone() {
+                Some(valid) => {
+                    let keep = match valid.len() {
+                        0..=1 => 1,
+                        len => 1 + n as usize % (len - 1),
+                    };
+                    let mut bytes = valid[..keep].to_vec();
+                    bytes.push(0x00);
+                    (bytes, classify(&valid[..keep]))
+                }
+                None => return,
+            },
+            Step::Partial => {
+                let (mut bytes, frame) = self.ark_hello(Flaw::None);
+                bytes.pop();
+                self.partial = match std::mem::replace(&mut self.partial, Partial::None) {
+                    Partial::None => match frame {
+                        Frame::ArkHello { generation, .. } => {
+                            Partial::Hello(generation, bytes.clone())
+                        }
+                        _ => Partial::Junk(bytes.clone()),
+                    },
+                    Partial::Hello(_, mut prior) | Partial::Junk(mut prior) => {
+                        prior.extend_from_slice(&bytes);
+                        Partial::Junk(prior)
+                    }
+                };
+                self.queue.push_back((bytes, None));
+                return;
+            }
+            Step::Oversized => {
+                self.partial = Partial::None;
+                let mut bytes = vec![1u8; MAX_FRAME_SIZE + 1];
+                bytes.push(0x00);
+                self.queue.push_back((bytes, None));
+                return;
+            }
             Step::Break => {
                 self.set_broken(true);
                 return;
@@ -276,15 +402,45 @@ impl Ark {
                 self.set_broken(false);
                 return;
             }
+            Step::Cut { point, then_broken } => {
+                self.cut = Some(point);
+                self.outbox.set_cut(point);
+                if then_broken {
+                    self.set_broken(true);
+                }
+                return;
+            }
             Step::Chunk(n) => {
                 self.chunk = n as usize;
                 return;
             }
-            Step::Handshake | Step::Send(_) | Step::Recv | Step::Yield => {
-                unreachable!("calls and yields are handled by the driver and the reader")
+            Step::Batch(n) => {
+                self.batch = n as usize;
+                return;
+            }
+            Step::Handshake | Step::Send(_) | Step::Recv | Step::Yield | Step::Interrupt => {
+                unreachable!(
+                    "calls, yields and interrupts are handled by the driver and the reader"
+                )
             }
         };
-        self.queue.push_back(produced);
+        // An unterminated frame in front of the host swallows the one
+        // produced, a lone delimiter completing a partial hello into the valid
+        // one and anything else merging into junk, decodable or not
+        let (bytes, frame) = produced;
+        let frame = match std::mem::replace(&mut self.partial, Partial::None) {
+            Partial::None => frame,
+            Partial::Hello(generation, _) if frame == Frame::Dropped => Frame::ArkHello {
+                generation,
+                flaw: Flaw::None,
+            },
+            Partial::Hello(_, prior) | Partial::Junk(prior) => {
+                let mut merged = prior;
+                merged.extend_from_slice(&bytes[..bytes.len() - 1]);
+                classify(&merged)
+            }
+        };
+        self.queue.push_back((bytes, Some(frame)));
     }
 
     /// An ArkHello answering the latest HostHello, flawed as requested.
@@ -366,7 +522,11 @@ impl Ark {
                 host_signer,
             });
         }
-        (frame(&sealed), Frame::ArkHello { generation, flaw })
+        let framed = frame(&sealed);
+        if flaw == Flaw::None {
+            self.record(&framed);
+        }
+        (framed, Frame::ArkHello { generation, flaw })
     }
 
     /// A packet sealed in the Ark's session, a tagged reply or garbage.
@@ -393,8 +553,14 @@ impl Ark {
         session.seq += 1;
 
         let produced = (frame(&packet), sealed);
+        self.record(&produced.0);
         self.last_reply = Some(produced.clone());
         produced
+    }
+
+    /// Remembers the frame as the last valid one, for truncating later.
+    fn record(&mut self, framed: &[u8]) {
+        self.last_valid = Some(framed[..framed.len() - 1].to_vec());
     }
 
     /// A reply sealed in the Ark's session with a flipped ciphertext byte,
@@ -432,6 +598,11 @@ impl Ark {
         for framed in self.outbox.take_frames() {
             // Host resets carry nothing to track
             if framed.is_empty() {
+                continue;
+            }
+            // The frame a failed send left cut short, terminated by the reset
+            // of the handshake after it, means nothing
+            if std::mem::take(&mut self.fragment) {
                 continue;
             }
             let packet = unframe(&framed);
@@ -501,13 +672,16 @@ impl Ark {
         match self.call {
             Call::Handshake { generation, stale } => {
                 let result = match frame {
-                    Frame::Undecodable => Expect::Err(Kind::FrameDecoding),
                     Frame::ArkHello {
                         generation: answered,
                         flaw,
                     } if answered == generation => match flaw {
-                        // The ack never gets out on a broken transport
-                        Flaw::None if self.broken => Expect::Err(Kind::Send),
+                        // The ack fails to get out on a broken transport, or
+                        // on one cutting it
+                        Flaw::None if self.broken || self.cut.is_some() => {
+                            self.apply_cut();
+                            Expect::Err(Kind::Send)
+                        }
                         Flaw::None => Expect::Ok(None),
                         Flaw::Tampered
                         | Flaw::Auth
@@ -576,6 +750,15 @@ impl Ark {
         }
     }
 
+    /// Consumes the armed cut for the host's next write with a body, one cut
+    /// in the middle leaving junk behind for the next reset to terminate. The
+    /// other points leave nothing, or a frame the Ark takes as it is.
+    fn apply_cut(&mut self) {
+        if let Some(CutPoint::Middle(_)) = self.cut.take() {
+            self.fragment = true;
+        }
+    }
+
     /// Applies a read failing, which ends the call in progress with the
     /// error, a session not surviving it on the host's side.
     fn interrupt(&mut self, kind: Kind) {
@@ -614,13 +797,13 @@ impl Ark {
 
     /// Moves the script forward to the next call into the host, executing the
     /// Ark steps before it. Their frames queue up in front of the host, yields
-    /// outside a read mean nothing.
+    /// and interrupts outside a read mean nothing.
     fn next_call(&mut self) -> Option<Step> {
         loop {
             match self.steps.pop_front() {
                 None => return None,
                 Some(step) if step.is_call() => return Some(step),
-                Some(Step::Yield) => {}
+                Some(Step::Yield) | Some(Step::Interrupt) => {}
                 Some(step) => self.execute(step),
             }
         }
@@ -634,7 +817,7 @@ impl Read for Feed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut ark = self.0.borrow_mut();
         loop {
-            // Hand over the frame in progress, in pieces if capped
+            // Hand over the frames in progress, in pieces if capped
             if !ark.bytes.is_empty() {
                 let mut n = buf.len().min(ark.bytes.len());
                 if ark.chunk > 0 {
@@ -642,12 +825,37 @@ impl Read for Feed {
                 }
                 buf[..n].copy_from_slice(&ark.bytes[..n]);
                 ark.bytes.drain(..n);
+                ark.summary.reads += 1;
                 return Ok(n);
             }
-            // Start on the next frame queued, the model consuming it whole
+            // Start on the next frame queued, the model consuming it whole,
+            // unterminated bytes carrying no frame to consume yet. A batch
+            // appends the frames after it, the script moved forward for them
+            // while it yields frames, until one settles the call
             if let Some((bytes, frame)) = ark.queue.pop_front() {
-                ark.consume(frame);
+                if let Some(frame) = frame {
+                    ark.consume(frame);
+                }
                 ark.bytes = bytes;
+                while ark.batch > 1 && ark.expect.is_none() {
+                    if ark.queue.is_empty() {
+                        match ark.steps.front() {
+                            Some(step) if step.queues_frame() => {
+                                let step = ark.steps.pop_front().unwrap();
+                                ark.execute(step);
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let (bytes, frame) = ark.queue.pop_front().unwrap();
+                    if let Some(frame) = frame {
+                        ark.consume(frame);
+                        ark.batch -= 1;
+                    }
+                    ark.bytes.extend(bytes);
+                }
+                ark.batch = 0;
                 continue;
             }
             // Move the script forward until a frame is queued, a call or a
@@ -666,6 +874,10 @@ impl Read for Feed {
                     ark.interrupt(Kind::Recv);
                     return Err(would_block());
                 }
+                Some(Step::Interrupt) => {
+                    ark.steps.pop_front();
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
                 Some(_) => {
                     let step = ark.steps.pop_front().unwrap();
                     ark.execute(step);
@@ -677,6 +889,17 @@ impl Read for Feed {
 
 /// The host under test, reading the script and writing into the outbox.
 type Host = HostSide<Feed, Outbox>;
+
+/// The frame the bytes of a frame cut short or merged with another make,
+/// junk if they still decode and undecodable if not, neither meaning
+/// anything to the host.
+fn classify(bytes: &[u8]) -> Frame {
+    let mut buf = vec![0u8; cobs::decode_buffer(bytes.len())];
+    match cobs::decode(bytes, &mut buf) {
+        Ok(_) => Frame::Junk,
+        Err(_) => Frame::Undecodable,
+    }
+}
 
 /// Maps a host error onto the kind the model predicts.
 fn kind(err: Error) -> Kind {
@@ -728,17 +951,20 @@ pub fn run(steps: &[Step]) -> Summary {
 
         match call {
             Step::Handshake => {
-                // On a broken transport not even the reset gets out, the host
-                // failing before reading anything
-                if ark.borrow().broken {
-                    let result = host.handshake(&identity);
-                    assert!(
-                        matches!(result, Err(Error::SendFailed(_))),
-                        "host handshake on a broken transport"
-                    );
+                // On a broken transport not even the reset gets out, and a cut
+                // takes the reset or the hello, the host failing before reading
+                // anything either way
+                let failing = {
+                    let ark = ark.borrow();
+                    ark.broken || ark.cut.is_some()
+                };
+                if failing {
+                    let result = host.handshake(&identity).map(|_| ());
+                    assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
                     let mut ark = ark.borrow_mut();
                     ark.host_session = None;
                     ark.summary.failures += 1;
+                    ark.apply_cut();
                     continue;
                 }
                 {
@@ -761,13 +987,15 @@ pub fn run(steps: &[Step]) -> Summary {
                 let established = ark.borrow().host_session.is_some();
                 check_session(&mut host, established);
 
-                // A failed send takes the session down with it
+                // A failed send takes the session down with it, a cut firing
+                // ahead of a broken transport
                 let expected: Result<Option<u64>, Kind> = {
                     let mut ark = ark.borrow_mut();
-                    match (established, ark.broken) {
+                    match (established, ark.broken || ark.cut.is_some()) {
                         (true, false) => Ok(None),
                         (true, true) => {
                             ark.host_session = None;
+                            ark.apply_cut();
                             Err(Kind::Send)
                         }
                         (false, _) => Err(Kind::Encryption),
@@ -840,6 +1068,7 @@ mod tests {
                 messages: 3,
                 resets: 0,
                 failures: 0,
+                reads: 4,
             }
         );
     }
@@ -925,16 +1154,18 @@ mod tests {
         let summary = run_logged(&steps);
         assert!(!summary.established);
         assert_eq!(summary.failures, 1);
+
+        // A frame failing to decode, the leftover of a transfer cut short, is
+        // stale like any other
+        let summary = run_logged(&[Step::Handshake, Step::Undecodable, Step::Hello]);
+        assert!(summary.established);
+        assert_eq!(summary.failures, 0);
     }
 
-    // Tests that a frame failing to decode, a read failing and the transport
-    // ending all abort a handshake with their own errors.
+    // Tests that a read failing and the transport ending both abort a
+    // handshake with their own errors.
     #[test]
     fn test_scripted_handshake_interrupted() {
-        let summary = run_logged(&[Step::Handshake, Step::Undecodable, Step::Send(1)]);
-        assert!(!summary.established);
-        assert_eq!(summary.failures, 1);
-
         let summary = run_logged(&[Step::Handshake, Step::Yield, Step::Send(1)]);
         assert!(!summary.established);
         assert_eq!(summary.failures, 1);
@@ -1130,6 +1361,74 @@ mod tests {
         assert_eq!(summary.failures, 1);
     }
 
+    // Tests the host's sends cut short. A cut request fails the send and
+    // drops the session, the reset of the next handshake terminating what got
+    // out, junk or the request itself, ahead of its hello. A cut reset, hello
+    // or ack fails the handshake before anything is read, a fresh handshake
+    // recovering either way.
+    #[test]
+    fn test_scripted_cut_sends() {
+        for point in [
+            CutPoint::Start,
+            CutPoint::Middle(5),
+            CutPoint::Delimiter,
+            CutPoint::Flush,
+        ] {
+            let cut = Step::Cut {
+                point,
+                then_broken: false,
+            };
+
+            let summary = run_logged(&[
+                Step::Handshake,
+                Step::Hello,
+                cut.clone(),
+                Step::Send(1),
+                Step::Handshake,
+                Step::Hello,
+                Step::Send(2),
+            ]);
+            assert!(summary.established, "{point:?}");
+            assert_eq!(summary.handshakes, 2, "{point:?}");
+            assert_eq!(summary.failures, 0, "{point:?}");
+
+            let summary = run_logged(&[cut.clone(), Step::Handshake, Step::Handshake, Step::Hello]);
+            assert!(summary.established, "{point:?}");
+            assert_eq!(summary.handshakes, 1, "{point:?}");
+            assert_eq!(summary.failures, 1, "{point:?}");
+
+            let summary = run_logged(&[
+                Step::Handshake,
+                cut,
+                Step::Hello,
+                Step::Handshake,
+                Step::Hello,
+            ]);
+            assert!(summary.established, "{point:?}");
+            assert_eq!(summary.handshakes, 1, "{point:?}");
+            assert_eq!(summary.failures, 1, "{point:?}");
+        }
+
+        // A transport staying broken after the cut heals into a working
+        // handshake, the fragment waiting on the stream until then
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Hello,
+            Step::Cut {
+                point: CutPoint::Middle(5),
+                then_broken: true,
+            },
+            Step::Send(1),
+            Step::Handshake,
+            Step::Heal,
+            Step::Handshake,
+            Step::Hello,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.handshakes, 2);
+        assert_eq!(summary.failures, 1);
+    }
+
     // Tests that frames arriving in pieces, down to a byte per read, are
     // reassembled and read like whole ones.
     #[test]
@@ -1153,13 +1452,199 @@ mod tests {
         }
     }
 
-    // Tests that Ark frames and yields outside a read queue up or vanish, and
-    // that replies before a session are junk.
+    // Tests that frames batched into one read are read like frames arriving
+    // one per read, the batch ending at the frame settling the call, so a
+    // read never takes in more than its call consumes.
+    #[test]
+    fn test_scripted_batched_reads() {
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Batch(3),
+            Step::Dropped,
+            Step::Junk(vec![1]),
+            Step::Hello,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.reads, 1);
+
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Batch(2),
+            Step::Undecodable,
+            Step::Hello,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.reads, 1);
+
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Hello,
+            Step::Send(1),
+            Step::Send(2),
+            Step::Batch(2),
+            Step::Reply(1),
+            Step::Reply(2),
+            Step::Recv,
+            Step::Recv,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.messages, 2);
+        assert_eq!(summary.reads, 3);
+
+        for chunk in [1u8, 7] {
+            let summary = run_logged(&[
+                Step::Chunk(chunk),
+                Step::Handshake,
+                Step::Batch(3),
+                Step::Dropped,
+                Step::Junk(vec![1]),
+                Step::Hello,
+                Step::Send(1),
+            ]);
+            assert!(summary.established, "chunk {chunk}");
+        }
+    }
+
+    // Tests frames cut short and unterminated ones in front of the host. A
+    // truncated ArkHello or reply is stale to a handshake and drops a
+    // session, whether its prefix still decodes or not. A partial ArkHello
+    // swallows the frame after it into junk, a lone delimiter completing it
+    // into the valid ArkHello it is instead.
+    #[test]
+    fn test_scripted_interrupted_frames() {
+        for cut in [0u8, 1, 7, 255] {
+            let summary = run_logged(&[
+                Step::Handshake,
+                Step::Hello,
+                Step::Handshake,
+                Step::Truncated(cut),
+                Step::Hello,
+            ]);
+            assert!(summary.established, "cut {cut}");
+            assert_eq!(summary.handshakes, 2, "cut {cut}");
+            assert_eq!(summary.failures, 0, "cut {cut}");
+
+            let summary = run_logged(&[
+                Step::Handshake,
+                Step::Hello,
+                Step::Send(1),
+                Step::Reply(1),
+                Step::Recv,
+                Step::Truncated(cut),
+                Step::Recv,
+                Step::Send(2),
+            ]);
+            assert!(!summary.established, "cut {cut}");
+            assert_eq!(summary.messages, 1, "cut {cut}");
+            assert_eq!(summary.failures, 1, "cut {cut}");
+        }
+
+        let summary = run_logged(&[Step::Handshake, Step::Partial, Step::Dropped]);
+        assert!(summary.established);
+        assert_eq!(summary.reads, 2);
+
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Partial,
+            Step::Junk(vec![1]),
+            Step::Hello,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.failures, 0);
+
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Partial,
+            Step::Partial,
+            Step::Dropped,
+            Step::Hello,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.failures, 0);
+
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Hello,
+            Step::Send(1),
+            Step::Partial,
+            Step::Reply(1),
+            Step::Recv,
+            Step::Send(2),
+        ]);
+        assert!(!summary.established);
+        assert_eq!(summary.failures, 1);
+
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Hello,
+            Step::Partial,
+            Step::Dropped,
+            Step::Recv,
+        ]);
+        assert!(!summary.established);
+        assert_eq!(summary.failures, 1);
+
+        for chunk in [1u8, 7] {
+            let summary = run_logged(&[
+                Step::Chunk(chunk),
+                Step::Handshake,
+                Step::Partial,
+                Step::Dropped,
+            ]);
+            assert!(summary.established, "chunk {chunk}");
+        }
+    }
+
+    // Tests that a read interrupted by a signal is retried by the framing, in
+    // a handshake and in a session alike, the host none the wiser.
+    #[test]
+    fn test_scripted_interrupted_reads() {
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Interrupt,
+            Step::Hello,
+            Step::Send(1),
+            Step::Recv,
+            Step::Interrupt,
+            Step::Reply(1),
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.messages, 1);
+        assert_eq!(summary.failures, 0);
+    }
+
+    // Tests that frames past the size limit vanish in the framing, in a
+    // handshake and in a session alike, a partial ArkHello in front of one
+    // vanishing with it.
+    #[test]
+    fn test_scripted_oversized_frames() {
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Oversized,
+            Step::Hello,
+            Step::Send(1),
+            Step::Oversized,
+            Step::Reply(1),
+            Step::Recv,
+        ]);
+        assert!(summary.established);
+        assert_eq!(summary.messages, 1);
+        assert_eq!(summary.failures, 0);
+
+        let summary = run_logged(&[Step::Handshake, Step::Partial, Step::Oversized, Step::Hello]);
+        assert!(summary.established);
+    }
+
+    // Tests that Ark frames, yields and interrupts outside a read queue up or
+    // vanish, and that replies before a session are junk, as is truncating
+    // with no valid frame yet.
     #[test]
     fn test_scripted_noops() {
         let summary = run_logged(&[
             Step::Yield,
+            Step::Interrupt,
             Step::ReplyReplay,
+            Step::Truncated(3),
             Step::Reply(1),
             Step::Hello,
             Step::Handshake,
