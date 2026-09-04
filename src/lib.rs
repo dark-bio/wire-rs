@@ -55,6 +55,11 @@ pub(crate) const CRYPTO_DOMAIN_WIRE_HOST_TO_ARK: &[u8] = b"wire-v1:host-to-ark";
 
 /// Things that can go wrong in the wire transport.
 #[derive(Debug, thiserror::Error)]
+// The mocks name the variants in their transcripts
+#[cfg_attr(
+    all(any(test, feature = "fuzz"), not(docsrs)),
+    derive(strum::IntoStaticStr)
+)]
 pub enum Error {
     #[error("wire packet too large: {0} bytes, max {MAX_MESSAGE_SIZE} bytes")]
     PacketTooLarge(usize),

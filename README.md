@@ -15,6 +15,10 @@ The wire keeps trust policy at its edges. The server takes an `Attester` produci
 
 This package does not concern itself with the underlying transport. Genuine Ark devices use USB bulk endpoints, emulators use websockets and tests use Unix sockets. Creating the underlying data-stream is the caller's task.
 
+## Test vectors
+
+The `vectors` directory holds golden test vectors for implementing (or rather validating) 3rd party clients. These are scenario transcripts that can be replayed to confirm expected behaviors and nuances. There are no server test vectors published as the Ark (genuine or emulated) is the single server.
+
 ## Disclaimer
 
 The Ark's wire protocol is still heavily evolving, including the Rust API, low level transport and high level protobuf messages too. This crate is published for interoperability reasons, but it will undergo aggressive updates, possibly forced through by the Dark Bio cloud, hub and tools.
