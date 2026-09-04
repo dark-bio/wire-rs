@@ -75,6 +75,9 @@ pub struct Server<R: Read, W: Write, A: Attester> {
     signer: xdsa::SecretKey,  // Server's identity key, signing the ArkHello
     attester: A,              // Source of the device attestation for handshakes
     session: Option<Session>, // Active encrypted session (if handshake completed)
+
+    #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    timestamp: Option<i64>, // Signing time of the ArkHello pinned by a test, the clock otherwise
 }
 
 impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
@@ -89,7 +92,28 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             signer,
             attester,
             session: None,
+            #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+            timestamp: None,
         }
+    }
+
+    /// Test helper creating a server side signing its ArkHellos at the given
+    /// time instead of the clock, so a run of it is the same every time. Not
+    /// part of the API.
+    #[doc(hidden)]
+    #[inline]
+    #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub fn new_at(
+        reader: R,
+        writer: W,
+        signer: xdsa::SecretKey,
+        attester: A,
+        timestamp: i64,
+    ) -> Self {
+        let mut server = Self::new(reader, writer, signer, attester);
+        server.timestamp = Some(timestamp);
+        server
     }
 
     /// Serves the next host-to-ark message, decrypting and protobuf decoding it.
@@ -246,21 +270,42 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 })?;
 
             // Message 2: Seal and send the ArkHello
-            let ark_hello = cose::seal(
-                &handshake::ArkHello {
-                    ark_attest: self.attester.attest().into_bytes(),
-                    ark_crypto: ark_crypto_pub.clone(),
-                    a2h_encap: a2h_encap.to_vec(),
-                },
-                &handshake::ArkHelloAuth {
-                    host_signer: host_hello.host_signer.clone(),
-                    host_crypto: host_hello.host_crypto.clone(),
-                },
+            let ark_hello = handshake::ArkHello {
+                ark_attest: self.attester.attest().into_bytes(),
+                ark_crypto: ark_crypto_pub.clone(),
+                a2h_encap: a2h_encap.to_vec(),
+            };
+            let auth = handshake::ArkHelloAuth {
+                host_signer: host_hello.host_signer.clone(),
+                host_crypto: host_hello.host_crypto.clone(),
+            };
+            #[cfg(not(any(test, feature = "bench", feature = "fuzz")))]
+            let sealed = cose::seal(
+                &ark_hello,
+                &auth,
                 &self.signer,
                 &host_hello.host_crypto,
                 CRYPTO_DOMAIN_WIRE,
-            )
-            .map_err(|err| {
+            );
+            #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+            let sealed = match self.timestamp {
+                Some(timestamp) => cose::seal_at(
+                    &ark_hello,
+                    &auth,
+                    &self.signer,
+                    &host_hello.host_crypto,
+                    CRYPTO_DOMAIN_WIRE,
+                    timestamp,
+                ),
+                None => cose::seal(
+                    &ark_hello,
+                    &auth,
+                    &self.signer,
+                    &host_hello.host_crypto,
+                    CRYPTO_DOMAIN_WIRE,
+                ),
+            };
+            let ark_hello = sealed.map_err(|err| {
                 Error::HandshakeFailed(format!("failed to seal server hello: {}", err))
             })?;
 

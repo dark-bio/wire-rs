@@ -8,7 +8,12 @@
 //! the packet level fuzzers share this, so a fuzzer finding replays as a test.
 
 pub mod client;
+#[cfg(all(feature = "fuzz", getrandom_backend = "custom"))]
+pub mod random;
+#[cfg(feature = "fuzz")]
+pub mod seed;
 pub mod server;
+pub mod vector;
 
 use crate::Attestation;
 use darkbio_cobs as cobs;
@@ -17,11 +22,16 @@ use darkbio_crypto::{cwt, xdsa};
 use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
 use std::rc::Rc;
+use vector::{Event, Vector};
 
 /// Most steps a script is run for. It bounds the runtime of a fuzz iteration
 /// and keeps the unterminated frames a script can pile up well below the
 /// frame limit.
 pub const MAX_STEPS: usize = 64;
+
+/// Signing time stamped into everything the mocks and the drivers seal. The
+/// wire never checks it, so a fixed one keeps the transcripts off the clock.
+pub const TIMESTAMP: i64 = 0;
 
 /// Self-signed attestation of a never onboarded server, embedding the identity
 /// key that signs the handshake.
@@ -35,10 +45,11 @@ pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
         hwm: eat::HwModel { hw_model: vec![] },
         hwv: eat::HwVersion::new("".into()),
     };
-    let cwt = cwt::issue(
+    let cwt = cwt::issue_at(
         &claims,
         signer,
         darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+        TIMESTAMP,
     )
     .unwrap();
     Attestation::new(cwt).unwrap()
@@ -55,10 +66,11 @@ pub fn cloud_attestation(signer: &xdsa::SecretKey) -> Vec<u8> {
         exp: claims::Expiration { exp: 1 },
         cnf: claims::Confirm::new(signer.public_key()),
     };
-    cwt::issue(
+    cwt::issue_at(
         &claims,
         signer,
         darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+        TIMESTAMP,
     )
     .unwrap()
 }
@@ -85,80 +97,15 @@ pub fn would_block() -> io::Error {
     io::ErrorKind::WouldBlock.into()
 }
 
-/// Encoder for the byte stream the fuzzers' `Arbitrary` decoding reads a
-/// script from, letting the scenario tests seed the corpus with theirs. It
-/// mirrors arbitrary 1.4, integers little endian, a keep-going byte ahead of
-/// every vector element and an enum variant picked as the high half of a
-/// u32 scaled by the variant count.
-#[cfg(feature = "fuzz")]
-pub struct Seed(Vec<u8>);
+/// Transcript of the run in progress, shared by everything logging into it,
+/// absent when the run is not recorded.
+pub type Recorder = Rc<RefCell<Option<Vector>>>;
 
-#[cfg(feature = "fuzz")]
-impl Seed {
-    /// Picks the variant with the index out of the count.
-    pub fn variant(&mut self, index: u32, count: u32) {
-        let pick = (u64::from(index) << 32).div_ceil(u64::from(count)) as u32;
-        self.0.extend_from_slice(&pick.to_le_bytes());
+/// Logs an event into the transcript, if the run is recorded.
+pub fn trace(recorder: &Recorder, event: impl FnOnce() -> Event) {
+    if let Some(vector) = recorder.borrow_mut().as_mut() {
+        vector.log(event());
     }
-
-    pub fn byte(&mut self, byte: u8) {
-        self.0.push(byte);
-    }
-
-    pub fn word(&mut self, word: u16) {
-        self.0.extend_from_slice(&word.to_le_bytes());
-    }
-
-    pub fn flag(&mut self, flag: bool) {
-        self.0.push(flag as u8);
-    }
-
-    pub fn bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.flag(true);
-            self.byte(byte);
-        }
-        self.flag(false);
-    }
-}
-
-/// A step able to write itself as the fuzzers read it.
-#[cfg(feature = "fuzz")]
-pub trait Seedable: for<'a> arbitrary::Arbitrary<'a> + PartialEq + std::fmt::Debug {
-    fn seed(&self, seed: &mut Seed);
-}
-
-/// Writes the script into the seed corpus of the target, under the directory
-/// the WIRE_SEEDS environment variable names, checking that the bytes decode
-/// back into the same script. The file is named by the hash of its content,
-/// so regenerating leaves an unchanged script untouched. Without the variable
-/// set nothing happens.
-#[cfg(feature = "fuzz")]
-pub fn seed<S: Seedable>(target: &str, steps: &[S]) {
-    use arbitrary::{Arbitrary, Unstructured};
-    use sha2::{Digest, Sha256};
-
-    let Ok(root) = std::env::var("WIRE_SEEDS") else {
-        return;
-    };
-    let mut seed = Seed(Vec::new());
-    for step in steps {
-        seed.flag(true);
-        step.seed(&mut seed);
-    }
-    seed.flag(false);
-
-    let decoded =
-        Vec::<S>::arbitrary_take_rest(Unstructured::new(&seed.0)).expect("seed failed to decode");
-    assert_eq!(decoded, steps, "seed decoded into another script");
-
-    let dir = std::path::Path::new(&root).join(target);
-    std::fs::create_dir_all(&dir).expect("failed to create the seed directory");
-    let name: String = Sha256::digest(&seed.0)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    std::fs::write(dir.join(name), &seed.0).expect("failed to write the seed");
 }
 
 /// Where a write of the side under test is cut, standing in for a transport
@@ -177,21 +124,6 @@ pub enum CutPoint {
     Flush,
 }
 
-#[cfg(feature = "fuzz")]
-impl Seedable for CutPoint {
-    fn seed(&self, seed: &mut Seed) {
-        match self {
-            CutPoint::Start => seed.variant(0, 4),
-            CutPoint::Middle(n) => {
-                seed.variant(1, 4);
-                seed.word(*n);
-            }
-            CutPoint::Delimiter => seed.variant(2, 4),
-            CutPoint::Flush => seed.variant(3, 4),
-        }
-    }
-}
-
 /// Frames written by the side under test, drained by the mock peer. Its
 /// writes can be cut short or made to fail, standing in for a transport that
 /// died.
@@ -201,6 +133,7 @@ pub struct Outbox {
     broken: Rc<Cell<bool>>,
     cut: Rc<Cell<Option<CutPoint>>>,
     flush_fails: Rc<Cell<bool>>,
+    recorder: Recorder, // Transcript the writes are logged into
 }
 
 impl Outbox {
@@ -232,12 +165,11 @@ impl Outbox {
     pub fn set_cut(&self, point: CutPoint) {
         self.cut.set(Some(point));
     }
-}
 
-impl Write for Outbox {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // An armed cut fires ahead of a broken transport, on the first write
-        // with enough of a body for it
+    /// How much of a write the transport takes and whether it reports failure.
+    /// An armed cut fires ahead of a broken transport, on the first write with
+    /// enough of a body for it.
+    fn accept(&self, buf: &[u8]) -> (usize, bool) {
         if let Some(point) = self.cut.get() {
             let accepted = match point {
                 CutPoint::Start => Some(0),
@@ -247,24 +179,40 @@ impl Write for Outbox {
             };
             if let Some(accepted) = accepted {
                 self.cut.set(None);
-                self.bytes.borrow_mut().extend_from_slice(&buf[..accepted]);
                 if point == CutPoint::Flush {
                     self.flush_fails.set(true);
-                    return Ok(accepted);
+                    return (accepted, false);
                 }
-                return Err(io::ErrorKind::BrokenPipe.into());
+                return (accepted, true);
             }
         }
         if self.broken.get() {
-            return Err(io::ErrorKind::BrokenPipe.into());
+            return (0, true);
         }
-        self.bytes.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
+        (buf.len(), false)
+    }
+}
+
+impl Write for Outbox {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let (accepted, failed) = self.accept(buf);
+        self.bytes.borrow_mut().extend_from_slice(&buf[..accepted]);
+        trace(&self.recorder, || Event::Write {
+            bytes: buf[..accepted].to_vec(),
+            failed,
+        });
+        match failed {
+            true => Err(io::ErrorKind::BrokenPipe.into()),
+            false => Ok(accepted),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self.flush_fails.replace(false) {
-            true => Err(io::ErrorKind::BrokenPipe.into()),
+            true => {
+                trace(&self.recorder, || Event::FlushFailed);
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
             false => Ok(()),
         }
     }

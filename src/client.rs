@@ -111,16 +111,29 @@ impl<R: Read, W: Write> Client<R, W> {
     /// The verifier receives the raw device attestation from the server's hello and
     /// its accepted info is returned once the session is established.
     pub fn handshake<V: Verifier>(&mut self, verifier: &V) -> Result<V::Info, Error> {
+        // Generate ephemeral client keys for this session
+        let host_xdsa_sk = xdsa::SecretKey::generate();
+        let host_xhpke_sk = xhpke::SecretKey::generate();
+        self.handshake_with(verifier, host_xdsa_sk, host_xhpke_sk, None)
+    }
+
+    /// Drives the handshake with the given ephemeral keys, the ack signed at
+    /// the given time instead of now if one is given. This method is internally
+    /// used to generate deterministic test vectors for 3rd party implementations.
+    fn handshake_with<V: Verifier>(
+        &mut self,
+        verifier: &V,
+        host_xdsa_sk: xdsa::SecretKey,
+        host_xhpke_sk: xhpke::SecretKey,
+        timestamp: Option<i64>,
+    ) -> Result<V::Info, Error> {
         self.session = None;
 
         // Send two zero bytes: first terminates any interrupted message, second
         // signals a fresh session.
         self.framing.send_reset()?;
 
-        // Generate ephemeral client keys for this session
-        let host_xdsa_sk = xdsa::SecretKey::generate();
         let host_xdsa_pk = host_xdsa_sk.public_key();
-        let host_xhpke_sk = xhpke::SecretKey::generate();
         let host_xhpke_pk = host_xhpke_sk.public_key();
 
         // Message 1: Send HostHello (plain CBOR, COBS-framed)
@@ -214,18 +227,30 @@ impl<R: Read, W: Write> Client<R, W> {
             })?;
 
         // Message 3: Send HostAck (COSE seal'd, COBS-framed)
-        let ack = cose::seal(
-            &handshake::HostAck {
-                h2a_encap: enc_h2a.to_vec(),
-            },
-            &handshake::HostAckAuth {
-                ark_signer: ark_identity,
-                ark_crypto: ark_xhpke_pk.clone(),
-            },
-            &host_xdsa_sk,
-            &ark_xhpke_pk,
-            CRYPTO_DOMAIN_WIRE,
-        )
+        let ack = handshake::HostAck {
+            h2a_encap: enc_h2a.to_vec(),
+        };
+        let auth = handshake::HostAckAuth {
+            ark_signer: ark_identity,
+            ark_crypto: ark_xhpke_pk.clone(),
+        };
+        let ack = match timestamp {
+            Some(timestamp) => cose::seal_at(
+                &ack,
+                &auth,
+                &host_xdsa_sk,
+                &ark_xhpke_pk,
+                CRYPTO_DOMAIN_WIRE,
+                timestamp,
+            ),
+            None => cose::seal(
+                &ack,
+                &auth,
+                &host_xdsa_sk,
+                &ark_xhpke_pk,
+                CRYPTO_DOMAIN_WIRE,
+            ),
+        }
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
         self.framing.send_packet(&ack)?;
@@ -302,6 +327,23 @@ impl<R: Read, W: Write> Client<R, W> {
         }
         trace!("sent host-to-ark message ({} bytes)", blob.len());
         Ok(())
+    }
+
+    /// Test helper running the handshake with the given ephemeral keys instead
+    /// of fresh ones and the ack signed at the given time, so a transcript of
+    /// it can be replayed. Not part of the API.
+    #[doc(hidden)]
+    #[inline]
+    #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub fn handshake_with_keys<V: Verifier>(
+        &mut self,
+        verifier: &V,
+        host_xdsa_sk: xdsa::SecretKey,
+        host_xhpke_sk: xhpke::SecretKey,
+        timestamp: i64,
+    ) -> Result<V::Info, Error> {
+        self.handshake_with(verifier, host_xdsa_sk, host_xhpke_sk, Some(timestamp))
     }
 
     /// Test and benchmark helper exposing the framer's `next_packet` with the

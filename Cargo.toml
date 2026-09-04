@@ -16,28 +16,36 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", 'cfg(getrandom_backend, values("custom"))'] }
 
 [features]
 default = []
 bench = ["criterion", "sysinfo"]
-fuzz = ["arbitrary", "sha2"]
+fuzz = ["arbitrary", "base64", "getrandom", "rand_chacha", "serde_json", "sha2", "strum"]
 
 [dependencies]
 arbitrary = { version = "1", features = ["derive"], optional = true }
+base64 = { version = "0.23", optional = true }
 criterion = { version = "0.8", optional = true }
 darkbio-cobs = "0.2.0"
 darkbio-crypto = { version = "0.17.1", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
 darkbio-trust = "0.2.0"
+getrandom = { version = "0.4", optional = true }
 memchr = "2"
 prost = "0.14"
+rand_chacha = { version = "0.10", optional = true }
+serde_json = { version = "1", optional = true }
 sha2 = { version = "0.11", optional = true }
+strum = { version = "0.28", features = ["derive"], optional = true }
 sysinfo = { version = "0.39", optional = true }
 thiserror = "2.0"
 tracing = "0.1.40" # Keep >= 0.1.40, fixes Instrumented use-after-free (RUSTSEC-2023-0078)
 
 [dev-dependencies]
+base64 = "0.23"
 rand = "0.10.2" # Keep >= 0.10.1, fixes rng logger unsoundness (RUSTSEC-2026-0097)
+serde_json = "1"
+strum = { version = "0.28", features = ["derive"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] } # Keep >= 0.3.20, fixes ANSI escape injection (RUSTSEC-2025-0055)
 
 [build-dependencies]
