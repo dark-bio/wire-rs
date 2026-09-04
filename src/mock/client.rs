@@ -131,7 +131,7 @@ impl Step {
 /// seed its corpus. Keep it in step with the binary in fuzz/Cargo.toml, the
 /// seeds make target checks that every target listed there gets seeds.
 #[cfg(feature = "fuzz")]
-pub const FUZZ_TARGET: &str = "server_protocol";
+pub const FUZZ_TARGET: &str = "server-protocol";
 
 #[cfg(feature = "fuzz")]
 impl super::Seedable for Step {
