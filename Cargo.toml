@@ -28,7 +28,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 base64 = { version = "0.23", optional = true }
 criterion = { version = "0.8", optional = true }
 darkbio-cobs = "0.2.0"
-darkbio-crypto = { version = "0.17.1", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
+darkbio-crypto = { version = "0.17.2", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
 darkbio-trust = "0.2.0"
 getrandom = { version = "0.4", optional = true }
 memchr = "2"
