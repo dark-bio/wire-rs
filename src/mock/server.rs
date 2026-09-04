@@ -142,6 +142,72 @@ impl Step {
     }
 }
 
+/// Fuzz target driving the real client through this mock's scripts, which
+/// seed its corpus. Keep it in step with the binary in fuzz/Cargo.toml, the
+/// seeds make target checks that every target listed there gets seeds.
+#[cfg(feature = "fuzz")]
+pub const FUZZ_TARGET: &str = "client_protocol";
+
+#[cfg(feature = "fuzz")]
+impl super::Seedable for Step {
+    fn seed(&self, seed: &mut super::Seed) {
+        const COUNT: u32 = 29;
+        match self {
+            Step::Handshake => seed.variant(0, COUNT),
+            Step::Send(tag) => {
+                seed.variant(1, COUNT);
+                seed.byte(*tag);
+            }
+            Step::Recv => seed.variant(2, COUNT),
+            Step::Hello => seed.variant(3, COUNT),
+            Step::HelloStale => seed.variant(4, COUNT),
+            Step::HelloTampered => seed.variant(5, COUNT),
+            Step::HelloBadAuth => seed.variant(6, COUNT),
+            Step::HelloBadSigner => seed.variant(7, COUNT),
+            Step::HelloBadPayload => seed.variant(8, COUNT),
+            Step::HelloBadKey => seed.variant(9, COUNT),
+            Step::HelloBadEncap => seed.variant(10, COUNT),
+            Step::HelloBadAttest => seed.variant(11, COUNT),
+            Step::Reply(tag) => {
+                seed.variant(12, COUNT);
+                seed.byte(*tag);
+            }
+            Step::ReplyReplay => seed.variant(13, COUNT),
+            Step::ReplyTampered => seed.variant(14, COUNT),
+            Step::Garbage => seed.variant(15, COUNT),
+            Step::Dropped => seed.variant(16, COUNT),
+            Step::Junk(bytes) => {
+                seed.variant(17, COUNT);
+                seed.bytes(bytes);
+            }
+            Step::Undecodable => seed.variant(18, COUNT),
+            Step::Truncated(n) => {
+                seed.variant(19, COUNT);
+                seed.byte(*n);
+            }
+            Step::Partial => seed.variant(20, COUNT),
+            Step::Oversized => seed.variant(21, COUNT),
+            Step::Yield => seed.variant(22, COUNT),
+            Step::Interrupt => seed.variant(23, COUNT),
+            Step::Break => seed.variant(24, COUNT),
+            Step::Heal => seed.variant(25, COUNT),
+            Step::Cut { point, then_broken } => {
+                seed.variant(26, COUNT);
+                point.seed(seed);
+                seed.flag(*then_broken);
+            }
+            Step::Chunk(n) => {
+                seed.variant(27, COUNT);
+                seed.byte(*n);
+            }
+            Step::Batch(n) => {
+                seed.variant(28, COUNT);
+                seed.byte(*n);
+            }
+        }
+    }
+}
+
 /// Error kinds the model distinguishes in the client's results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -940,6 +1006,9 @@ fn check_session(client: &mut Client, established: bool) {
 /// Runs a script against a real client, panicking on any divergence from the
 /// model, and reports what the run observed.
 pub fn run(steps: &[Step]) -> Summary {
+    #[cfg(feature = "fuzz")]
+    super::seed(FUZZ_TARGET, steps);
+
     let outbox = Outbox::default();
     let server = Rc::new(RefCell::new(Server::new(steps, outbox.clone())));
     let identity = server.borrow().identity.public_key();

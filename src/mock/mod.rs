@@ -85,6 +85,82 @@ pub fn would_block() -> io::Error {
     io::ErrorKind::WouldBlock.into()
 }
 
+/// Encoder for the byte stream the fuzzers' `Arbitrary` decoding reads a
+/// script from, letting the scenario tests seed the corpus with theirs. It
+/// mirrors arbitrary 1.4, integers little endian, a keep-going byte ahead of
+/// every vector element and an enum variant picked as the high half of a
+/// u32 scaled by the variant count.
+#[cfg(feature = "fuzz")]
+pub struct Seed(Vec<u8>);
+
+#[cfg(feature = "fuzz")]
+impl Seed {
+    /// Picks the variant with the index out of the count.
+    pub fn variant(&mut self, index: u32, count: u32) {
+        let pick = (u64::from(index) << 32).div_ceil(u64::from(count)) as u32;
+        self.0.extend_from_slice(&pick.to_le_bytes());
+    }
+
+    pub fn byte(&mut self, byte: u8) {
+        self.0.push(byte);
+    }
+
+    pub fn word(&mut self, word: u16) {
+        self.0.extend_from_slice(&word.to_le_bytes());
+    }
+
+    pub fn flag(&mut self, flag: bool) {
+        self.0.push(flag as u8);
+    }
+
+    pub fn bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.flag(true);
+            self.byte(byte);
+        }
+        self.flag(false);
+    }
+}
+
+/// A step able to write itself as the fuzzers read it.
+#[cfg(feature = "fuzz")]
+pub trait Seedable: for<'a> arbitrary::Arbitrary<'a> + PartialEq + std::fmt::Debug {
+    fn seed(&self, seed: &mut Seed);
+}
+
+/// Writes the script into the seed corpus of the target, under the directory
+/// the WIRE_SEEDS environment variable names, checking that the bytes decode
+/// back into the same script. The file is named by the hash of its content,
+/// so regenerating leaves an unchanged script untouched. Without the variable
+/// set nothing happens.
+#[cfg(feature = "fuzz")]
+pub fn seed<S: Seedable>(target: &str, steps: &[S]) {
+    use arbitrary::{Arbitrary, Unstructured};
+    use sha2::{Digest, Sha256};
+
+    let Ok(root) = std::env::var("WIRE_SEEDS") else {
+        return;
+    };
+    let mut seed = Seed(Vec::new());
+    for step in steps {
+        seed.flag(true);
+        step.seed(&mut seed);
+    }
+    seed.flag(false);
+
+    let decoded =
+        Vec::<S>::arbitrary_take_rest(Unstructured::new(&seed.0)).expect("seed failed to decode");
+    assert_eq!(decoded, steps, "seed decoded into another script");
+
+    let dir = std::path::Path::new(&root).join(target);
+    std::fs::create_dir_all(&dir).expect("failed to create the seed directory");
+    let name: String = Sha256::digest(&seed.0)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::write(dir.join(name), &seed.0).expect("failed to write the seed");
+}
+
 /// Where a write of the side under test is cut, standing in for a transport
 /// dying under it. The points needing a body to cut, everything but `Start`,
 /// leave a lone delimiter alone and fire on the next write with one.
@@ -99,6 +175,21 @@ pub enum CutPoint {
     Delimiter,
     /// Everything goes out, the flush after it failing.
     Flush,
+}
+
+#[cfg(feature = "fuzz")]
+impl Seedable for CutPoint {
+    fn seed(&self, seed: &mut Seed) {
+        match self {
+            CutPoint::Start => seed.variant(0, 4),
+            CutPoint::Middle(n) => {
+                seed.variant(1, 4);
+                seed.word(*n);
+            }
+            CutPoint::Delimiter => seed.variant(2, 4),
+            CutPoint::Flush => seed.variant(3, 4),
+        }
+    }
 }
 
 /// Frames written by the side under test, drained by the mock peer. Its

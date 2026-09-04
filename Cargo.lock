@@ -453,6 +453,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "rand 0.10.2",
+ "sha2 0.11.0",
  "sysinfo",
  "thiserror",
  "tracing",
