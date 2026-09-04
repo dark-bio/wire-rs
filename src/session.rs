@@ -50,6 +50,7 @@ impl Session {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::MAX_FRAME_SIZE;
@@ -64,31 +65,24 @@ mod tests {
 
         for size in [0, 1, 255, 4096] {
             let sealed = sender.seal(&vec![0x42; size], &[]).unwrap();
-            assert_eq!(
-                sealed.len(),
-                size + Session::SEAL_OVERHEAD,
-                "overhead mismatch"
-            );
+            assert_eq!(sealed.len(), size + Session::SEAL_OVERHEAD, "size {size}");
         }
     }
 
-    // Tests that the message limit is exact against the frame limit, the sealed
-    // and framed size of a maximal message fitting a frame with the next byte
-    // pushing it over.
+    // Tests that the message limit is exact against the frame limit. The sealed
+    // and framed size of a maximal message fits a frame, the next byte pushing
+    // it over.
     #[test]
     fn test_message_limit() {
         let framed = |size: usize| cobs::encode_buffer(size + Session::SEAL_OVERHEAD);
 
-        assert!(framed(MAX_MESSAGE_SIZE) <= MAX_FRAME_SIZE, "limit too high");
-        assert!(
-            framed(MAX_MESSAGE_SIZE + 1) > MAX_FRAME_SIZE,
-            "limit too low"
-        );
+        assert!(framed(MAX_MESSAGE_SIZE) <= MAX_FRAME_SIZE);
+        assert!(framed(MAX_MESSAGE_SIZE + 1) > MAX_FRAME_SIZE);
     }
 
-    // Tests that a message at the limit seals into a frame sized packet, that
-    // one over the limit is rejected before sealing, and that the rejection
-    // leaves the HPKE sequence untouched so the session stays in sync.
+    // Tests that a message at the limit seals into a frame sized packet and
+    // that one over the limit is rejected before sealing. The rejection leaves
+    // the HPKE sequence untouched, so the session stays in sync.
     #[test]
     fn test_seal_bounds() {
         /// Throwaway message carrying an arbitrary payload.
@@ -104,7 +98,7 @@ mod tests {
                 data: vec![0x42; size],
             };
             blob.data.truncate(size - (blob.encoded_len() - size));
-            assert_eq!(blob.encoded_len(), size, "blob sizing failed");
+            assert_eq!(blob.encoded_len(), size);
             blob
         }
 
@@ -116,12 +110,10 @@ mod tests {
 
         // One byte over the limit must be rejected up front
         let blob = blob_of(MAX_MESSAGE_SIZE + 1);
+        let result = session.seal(&blob, &mut scratch).map(|sealed| sealed.len());
         assert!(
-            matches!(
-                session.seal(&blob, &mut scratch),
-                Err(Error::PacketTooLarge(_))
-            ),
-            "expected oversized packet rejection"
+            matches!(result, Err(Error::PacketTooLarge(_))),
+            "{result:?}"
         );
 
         // A maximal message must seal, frame within the limit and, the
@@ -129,11 +121,8 @@ mod tests {
         // receiving side
         let blob = blob_of(MAX_MESSAGE_SIZE);
         let sealed = session.seal(&blob, &mut scratch).unwrap();
-        assert!(
-            cobs::encode_buffer(sealed.len()) <= MAX_FRAME_SIZE,
-            "sealed message does not fit a frame"
-        );
+        assert!(cobs::encode_buffer(sealed.len()) <= MAX_FRAME_SIZE);
         let opened: Blob = session.open(&sealed).unwrap();
-        assert_eq!(opened, blob, "message mismatch");
+        assert_eq!(opened, blob);
     }
 }

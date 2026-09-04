@@ -10,22 +10,21 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-darkbio-cobs = "0.2.0"
 
 [dependencies.darkbio-wire]
 path = ".."
 features = ["fuzz"]
 
 [[bin]]
-name = "next_frame"
-path = "fuzz_targets/next_frame.rs"
+name = "server-protocol"
+path = "fuzz_targets/server_protocol.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "next_packet"
-path = "fuzz_targets/next_packet.rs"
+name = "client-protocol"
+path = "fuzz_targets/client_protocol.rs"
 test = false
 doc = false
 bench = false

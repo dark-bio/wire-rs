@@ -1,20 +1,27 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
+// Allow excluding test code from coverage measurements on nightly
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 // Pull in the README as the package doc
 #![doc = include_str!("../README.md")]
 
 pub mod protocol;
 
+mod client;
 mod framing;
 mod handshake;
+mod server;
 mod session;
-mod side_ark;
-mod side_host;
 
+#[cfg(any(test, feature = "fuzz"))]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod mock;
+
+pub use client::{Client, Roots, Verifier};
 pub use protocol::{ArkToHost, HostToArk};
-pub use side_ark::{ArkSide, Attestation, Attester};
-pub use side_host::{HostSide, Roots, Verifier};
+pub use server::{Attestation, Attester, Server};
 
 use std::io;
 
@@ -32,9 +39,9 @@ pub const MAX_MESSAGE_SIZE: usize = {
     size
 };
 
-/// Domain separator for the COSE envelopes of the handshake, sealing the Ark's
-/// hello and the host's ack (the host's hello is plain CBOR). It binds their
-/// signatures and encryption to the wire, so a handshake signed by the Ark's
+/// Domain separator for the COSE envelopes of the handshake, sealing the server's
+/// hello and the client's ack (the client's hello is plain CBOR). It binds their
+/// signatures and encryption to the wire, so a handshake signed by the server's
 /// identity key cannot be replayed into other protocols using the same key.
 pub(crate) const CRYPTO_DOMAIN_WIRE: &[u8] = b"wire-v1";
 
@@ -61,9 +68,6 @@ pub enum Error {
     #[error("wire frame too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
     FrameTooLarge(usize),
 
-    #[error("wire frame encode failed: {0}")]
-    FrameEncodingFailed(darkbio_cobs::EncodeError),
-
     #[error("wire frame decode failed: {0}")]
     FrameDecodingFailed(darkbio_cobs::DecodeError),
 
@@ -76,6 +80,9 @@ pub enum Error {
     #[error("wire terminated")]
     Terminated,
 
+    #[error("wire session reset by the server")]
+    SessionReset,
+
     #[error("attestation is not for a hardware or emulator")]
     InvalidAttestation,
 
@@ -87,6 +94,7 @@ pub enum Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod testing {
     use std::sync::Once;
 

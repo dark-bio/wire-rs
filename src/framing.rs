@@ -3,20 +3,26 @@
 
 use crate::{Error, MAX_FRAME_SIZE};
 use darkbio_cobs as cobs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use tracing::warn;
 
 /// COBS framer over a raw byte stream. Frames are zero delimited, with any
 /// zero in the payload encoded away.
 ///
-/// The stream is assumed to carry no client lifecycle, as USB bulk transfers
-/// lack it by design. E.g A host may attach via WebUSB, crash or reconnect
-/// without the Ark noticing. Session boundaries have to be signaled in band.
+/// The stream is assumed to carry no connection lifecycle, as USB bulk transfers
+/// lack it by design. E.g A client may attach via WebUSB, crash or reconnect
+/// without the server noticing. Session boundaries have to be signaled in band.
 ///
 /// Since an empty frame is not valid COBS, it is used to mark a session reset.
-/// A host opens a session with two zeros, the first terminating whatever frame
-/// may have been interrupted, the second being the reset.
+/// A client opens a session with two zeros, the first terminating whatever frame
+/// may have been interrupted, the second being the reset. A server answers with
+/// a single zero whenever it has no session for what it received.
+///
+/// A failed send may have put part of its frame on the stream already. The
+/// next send, a frame or a signal, starts with an extra delimiter terminating
+/// that leftover. A failed flush counts as a failed send, as some transports
+/// only report a lost transfer there.
 pub(crate) struct Framing<R: Read, W: Write> {
     reader: R, // Byte stream frames are read from
     writer: W, // Byte stream frames are written to
@@ -25,6 +31,8 @@ pub(crate) struct Framing<R: Read, W: Write> {
     reader_filled: usize,   // Number of received bytes in reader_buffer
     reader_offset: usize,   // Start of the unconsumed data, i.e. of the next frame
     reader_search: usize,   // End of the unconsumed data already scanned for a delimiter
+    reader_discard: usize, // Bytes of an oversized frame thrown away so far, its delimiter still to come
+    writer_resync: bool,   // Whether the last send failed, possibly leaving a frame unterminated
 
     pub decobs_buffer: Vec<u8>, // Last decoded packet, consumed by the session layer
     encobs_buffer: Vec<u8>,     // Frame being sent, with a spare slot for the delimiter
@@ -41,21 +49,28 @@ impl<R: Read, W: Write> Framing<R, W> {
             reader_offset: 0,
             reader_filled: 0,
             reader_search: 0,
+            reader_discard: 0,
+            writer_resync: false,
             decobs_buffer: vec![0u8; MAX_FRAME_SIZE],
             encobs_buffer: vec![0u8; MAX_FRAME_SIZE + 1], // one extra slot for the frame delimiter
             encode_buffer: vec![0u8; MAX_FRAME_SIZE],
         }
     }
 
-    /// Signals a session reset by writing two frame delimiters, the first
+    /// Signals a session reset by writing two frame delimiters, the first one
     /// terminating any interrupted frame, the second forming the empty reset
-    /// frame.
+    /// frame. The first covers a frame a previous client may have left behind,
+    /// so a reset resyncs the stream by itself.
     pub fn send_reset(&mut self) -> Result<(), Error> {
-        (|| {
-            self.writer.write_all(&[0x00, 0x00])?;
-            self.writer.flush()
-        })()
-        .map_err(Error::SendFailed)
+        self.writer_resync = false;
+        self.send(&[0x00, 0x00])
+    }
+
+    /// Signals a dropped session by writing a single frame delimiter, forming
+    /// an empty frame. After a failed send it goes out behind the delimiter
+    /// terminating what that send left behind, so it is not swallowed as one.
+    pub fn send_dropped(&mut self) -> Result<(), Error> {
+        self.send(&[0x00])
     }
 
     /// Reads the next frame and COBS decodes it into `decobs_buffer`, returning
@@ -89,8 +104,8 @@ impl<R: Read, W: Write> Framing<R, W> {
         if len > MAX_FRAME_SIZE {
             return Err(Error::FrameTooLarge(len));
         }
-        let size =
-            cobs::encode(packet, &mut self.encobs_buffer).map_err(Error::FrameEncodingFailed)?;
+        let size = cobs::encode(packet, &mut self.encobs_buffer)
+            .expect("frame buffer holds any packet passing the size check");
 
         // Send the frame into the 0-bounded stream
         self.send_frame(size)
@@ -99,12 +114,10 @@ impl<R: Read, W: Write> Framing<R, W> {
     /// Reads the next zero delimited frame, returning its range within
     /// `reader_buffer` so callers can parse it without copying. Frames exceeding
     /// MAX_FRAME_SIZE are discarded with a warning, resynchronizing on the next
-    /// delimiter.
+    /// delimiter, a read failing midway through one leaving the discard to
+    /// resume on the next call. A read interrupted by a signal is retried.
     #[inline]
     fn next_frame(&mut self) -> Result<Range<usize>, Error> {
-        // Track if we're in discard mode and how much we discarded until now
-        let mut discard = 0usize;
-
         'outer: loop {
             // Search for the frame delimiter, starting from where we left off
             if let Some(found) = memchr::memchr(
@@ -119,9 +132,12 @@ impl<R: Read, W: Write> Framing<R, W> {
                 self.reader_search = end + 1; // skip the zero marker
 
                 // If we were in discard mode, report, throw away and start over
-                if discard > 0 {
-                    warn!("discarded frame of {} bytes", discard + end - start);
-                    discard = 0;
+                if self.reader_discard > 0 {
+                    warn!(
+                        "discarded frame of {} bytes",
+                        self.reader_discard + end - start
+                    );
+                    self.reader_discard = 0;
                     continue 'outer;
                 }
                 // We were in normal operation, return the consumed frame
@@ -131,7 +147,7 @@ impl<R: Read, W: Write> Framing<R, W> {
             self.reader_search = self.reader_filled;
 
             // Frame delimiter not found, we only have fragments
-            if discard == 0 {
+            if self.reader_discard == 0 {
                 if self.reader_offset > 0 {
                     // We're in waiting mode, compact the buffer to maximise free space
                     let used = self.reader_filled - self.reader_offset;
@@ -143,7 +159,7 @@ impl<R: Read, W: Write> Framing<R, W> {
                 }
             } else {
                 // We're in discard mode, throw everything away
-                discard += self.reader_filled;
+                self.reader_discard += self.reader_filled;
                 self.reader_filled = 0;
                 self.reader_offset = 0;
                 self.reader_search = 0
@@ -151,7 +167,7 @@ impl<R: Read, W: Write> Framing<R, W> {
             // We've done everything we could, we need more data. If the buffer
             // is already full, we've exceeded our frame size, drop all.
             if self.reader_filled == MAX_FRAME_SIZE + 1 {
-                discard += MAX_FRAME_SIZE + 1;
+                self.reader_discard += MAX_FRAME_SIZE + 1;
                 self.reader_filled = 0;
                 self.reader_offset = 0;
                 self.reader_search = 0
@@ -161,6 +177,7 @@ impl<R: Read, W: Write> Framing<R, W> {
                 .reader
                 .read(&mut self.reader_buffer[self.reader_filled..])
             {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue, // Signal cut the read short, retry
                 Err(err) => return Err(Error::RecvFailed(err)), // Transport failed internally, cannot recover
                 Ok(0) => return Err(Error::Terminated), // Transport was terminated, tear down
                 Ok(n) => self.reader_filled += n,       // Read some bytes, ingest them
@@ -173,17 +190,31 @@ impl<R: Read, W: Write> Framing<R, W> {
     #[inline]
     fn send_frame(&mut self, size: usize) -> Result<(), Error> {
         self.encobs_buffer[size] = 0;
-        (|| {
-            self.writer.write_all(&self.encobs_buffer[..size + 1])?;
+        let frame = std::mem::take(&mut self.encobs_buffer);
+        let result = self.send(&frame[..size + 1]);
+        self.encobs_buffer = frame;
+        result
+    }
+
+    /// Writes the bytes and flushes them, starting with a frame delimiter if
+    /// the send before failed, and tracks whether this one failed for the next.
+    fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let result = (|| {
+            if self.writer_resync {
+                self.writer.write_all(&[0x00])?;
+            }
+            self.writer.write_all(bytes)?;
             self.writer.flush()
-        })()
-        .map_err(Error::SendFailed)
+        })();
+        self.writer_resync = result.is_err();
+        result.map_err(Error::SendFailed)
     }
 
     /// Test and benchmark helper exposing `next_packet` with the decoded packet
     /// as a slice.
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_packet_blob(&mut self) -> Result<Option<&[u8]>, Error> {
         match self.next_packet() {
             Err(err) => Err(err),
@@ -196,6 +227,7 @@ impl<R: Read, W: Write> Framing<R, W> {
     /// slice.
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_frame_blob(&mut self) -> Result<&[u8], Error> {
         let frame = self.next_frame()?;
         Ok(&self.reader_buffer[frame])
@@ -205,6 +237,7 @@ impl<R: Read, W: Write> Framing<R, W> {
     /// from a slice. Panics on frames larger than the send buffer.
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn send_frame_blob(&mut self, frame: &[u8]) -> Result<(), Error> {
         let len = self.encobs_buffer.len().min(frame.len());
         self.encobs_buffer[..len].copy_from_slice(&frame[..len]);
@@ -213,9 +246,11 @@ impl<R: Read, W: Write> Framing<R, W> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::testing;
+    use std::collections::VecDeque;
     use std::io::{Cursor, empty, sink};
 
     // Tests corner-cases when consuming a packet from the framed transport.
@@ -225,23 +260,23 @@ mod tests {
 
         struct TestCase {
             input: Vec<u8>,
-            expected: Vec<u8>,
+            expected: Option<Vec<u8>>, // Decoded packet, none if the frame fails to decode
         }
         let tests = [
             // Empty packet, no zeroes encoded
             TestCase {
                 input: [0x01, 0x00].to_vec(),
-                expected: b"".to_vec(),
+                expected: Some(b"".to_vec()),
             },
             // Simple packet, no zeroes encoded
             TestCase {
                 input: [0x04, 0x66, 0x6f, 0x6f, 0x00].to_vec(),
-                expected: b"foo".to_vec(),
+                expected: Some(b"foo".to_vec()),
             },
             // Simple packet, various zeroes
             TestCase {
                 input: [0x02, 0x0a, 0x01, 0x01, 0x01, 0x00].to_vec(),
-                expected: [0x0a, 0x00, 0x00, 0x00].to_vec(),
+                expected: Some([0x0a, 0x00, 0x00, 0x00].to_vec()),
             },
             // A COBS run can contain a maximum of 255 non-zero bytes, check that
             // the max length chunk decodes correctly.
@@ -250,7 +285,7 @@ mod tests {
                     .chain(1..=0xfe)
                     .chain(std::iter::once(0x00))
                     .collect(),
-                expected: (1..=0xfe).collect(),
+                expected: Some((1..=0xfe).collect()),
             },
             // A COBS run can contain a maximum of 255 non-zero bytes, check that
             // exceeding that into multiple chunks succeeds decoding.
@@ -259,19 +294,35 @@ mod tests {
                     .chain(1..=0xfe)
                     .chain([0x02, 0xff, 0x00])
                     .collect(),
-                expected: (1..=0xff).collect(),
+                expected: Some((1..=0xff).collect()),
+            },
+            // A COBS code promising more bytes than the frame carries fails.
+            TestCase {
+                input: [0xff, 0x01, 0x00].to_vec(),
+                expected: None,
             },
         ];
 
-        for tt in tests.into_iter() {
+        for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
             let mut framing = Framing::new(&mut host_to_wire, sink());
-            let packet = framing
-                .next_packet_blob()
-                .unwrap()
-                .expect("expected a COBS packet");
-            assert_eq!(packet, tt.expected, "packet mismatch");
+            match tt.expected {
+                Some(expected) => {
+                    let packet = framing
+                        .next_packet_blob()
+                        .unwrap()
+                        .expect("expected a COBS packet");
+                    assert_eq!(packet, expected, "test {i}");
+                }
+                None => {
+                    let result = framing.next_packet_blob();
+                    assert!(
+                        matches!(result, Err(Error::FrameDecodingFailed(_))),
+                        "test {i}: {result:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -282,52 +333,73 @@ mod tests {
 
         struct TestCase {
             input: Vec<u8>,
-            expected: Vec<u8>,
+            expected: Option<Vec<u8>>, // Bytes on the wire, none if the packet is refused
         }
         let tests = [
             // Empty packet, no zeroes encoded
             TestCase {
                 input: b"".to_vec(),
-                expected: [0x01, 0x00].to_vec(),
+                expected: Some([0x01, 0x00].to_vec()),
             },
             // Simple packet, no zeroes encoded
             TestCase {
                 input: b"foo".to_vec(),
-                expected: [0x04, 0x66, 0x6f, 0x6f, 0x00].to_vec(),
+                expected: Some([0x04, 0x66, 0x6f, 0x6f, 0x00].to_vec()),
             },
             // Simple packet, various zeroes
             TestCase {
                 input: [0x0a, 0x00, 0x00, 0x00].to_vec(),
-                expected: [0x02, 0x0a, 0x01, 0x01, 0x01, 0x00].to_vec(),
+                expected: Some([0x02, 0x0a, 0x01, 0x01, 0x01, 0x00].to_vec()),
             },
             // A COBS run can contain a maximum of 255 non-zero bytes, check that
             // the max length chunk encodes correctly.
             TestCase {
                 input: (1..=0xfe).collect(),
-                expected: std::iter::once(0xff)
-                    .chain(1..=0xfe)
-                    .chain(std::iter::once(0x00))
-                    .collect(),
+                expected: Some(
+                    std::iter::once(0xff)
+                        .chain(1..=0xfe)
+                        .chain(std::iter::once(0x00))
+                        .collect(),
+                ),
             },
             // A COBS run can contain a maximum of 255 non-zero bytes, check that
             // exceeding that into multiple chunks succeeds encoding.
             TestCase {
                 input: (1..=0xff).collect(),
-                expected: std::iter::once(0xff)
-                    .chain(1..=0xfe)
-                    .chain([0x02, 0xff, 0x00])
-                    .collect(),
+                expected: Some(
+                    std::iter::once(0xff)
+                        .chain(1..=0xfe)
+                        .chain([0x02, 0xff, 0x00])
+                        .collect(),
+                ),
+            },
+            // A packet whose encoding would not fit a frame is refused up front.
+            TestCase {
+                input: vec![0x01; MAX_FRAME_SIZE],
+                expected: None,
             },
         ];
 
-        for tt in tests.into_iter() {
-            let mut wire_to_host = Cursor::new(Vec::<u8>::with_capacity(tt.expected.len()));
+        for (i, tt) in tests.into_iter().enumerate() {
+            let mut wire_to_host = Cursor::new(Vec::<u8>::new());
 
             let mut framing = Framing::new(empty(), &mut wire_to_host);
-            framing.send_packet(&tt.input).unwrap();
+            match tt.expected {
+                Some(expected) => {
+                    framing.send_packet(&tt.input).unwrap();
 
-            let written = &wire_to_host.get_ref()[..];
-            assert_eq!(written, tt.expected, "packet mismatch");
+                    let written = &wire_to_host.get_ref()[..];
+                    assert_eq!(written, expected, "test {i}");
+                }
+                None => {
+                    let result = framing.send_packet(&tt.input);
+                    assert!(
+                        matches!(result, Err(Error::FrameTooLarge(_))),
+                        "test {i}: {result:?}"
+                    );
+                    assert!(wire_to_host.get_ref().is_empty(), "test {i}");
+                }
+            }
         }
     }
 
@@ -378,12 +450,77 @@ mod tests {
             },
         ];
 
-        for tt in tests.into_iter() {
+        for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
             let mut framing = Framing::new(&mut host_to_wire, sink());
             let frame = framing.next_frame_blob().unwrap();
-            assert_eq!(frame, tt.expected, "frame mismatch");
+            assert_eq!(frame, tt.expected, "test {i}");
+        }
+    }
+
+    // Tests reads failing midway through an oversized frame, which leave the
+    // discard to resume on the next call, the frame's tail never served.
+    #[test]
+    fn test_next_frame_discard_resumes() {
+        testing::init_tracing();
+
+        /// Reader handing out one mock result per read.
+        struct Mock(VecDeque<io::Result<Vec<u8>>>);
+
+        impl Read for Mock {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(Ok(bytes)) => {
+                        buf[..bytes.len()].copy_from_slice(&bytes);
+                        Ok(bytes.len())
+                    }
+                    Some(Err(err)) => Err(err),
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
+        let timeout = || io::Error::from(io::ErrorKind::WouldBlock);
+
+        struct TestCase {
+            reads: Vec<io::Result<Vec<u8>>>,
+            expected: Vec<Option<Vec<u8>>>, // Frame served per call, none for a failure
+        }
+        let tests = [
+            // An interrupted read resumes the discard of an oversized frame
+            TestCase {
+                reads: vec![
+                    Ok(vec![b'a'; MAX_FRAME_SIZE + 1]),
+                    Err(interrupted()),
+                    Ok(b"aaa\0foo\0".to_vec()),
+                ],
+                expected: vec![Some(b"foo".to_vec())],
+            },
+            // A failed read surfaces, the discard resuming on the next call
+            TestCase {
+                reads: vec![
+                    Ok(vec![b'a'; MAX_FRAME_SIZE + 1]),
+                    Err(timeout()),
+                    Ok(b"aaa\0foo\0".to_vec()),
+                ],
+                expected: vec![None, Some(b"foo".to_vec())],
+            },
+        ];
+
+        for (i, tt) in tests.into_iter().enumerate() {
+            let mut framing = Framing::new(Mock(tt.reads.into()), sink());
+            for (j, expected) in tt.expected.into_iter().enumerate() {
+                let result = framing.next_frame_blob().map(<[u8]>::to_vec);
+                match expected {
+                    Some(frame) => assert_eq!(result.unwrap(), frame, "test {i} call {j}"),
+                    None => assert!(
+                        matches!(result, Err(Error::RecvFailed(_))),
+                        "test {i} call {j}: {result:?}"
+                    ),
+                }
+            }
         }
     }
 
@@ -417,14 +554,14 @@ mod tests {
             },
         ];
 
-        for tt in tests.into_iter() {
+        for (i, tt) in tests.into_iter().enumerate() {
             let mut wire_to_host = Cursor::new(Vec::<u8>::with_capacity(tt.input.len() + 1));
 
             let mut framing = Framing::new(empty(), &mut wire_to_host);
             framing.send_frame_blob(tt.input).unwrap();
 
             let written = &wire_to_host.get_ref()[..];
-            assert_eq!(written, tt.expected, "frame mismatch");
+            assert_eq!(written, tt.expected, "test {i}");
         }
     }
 }
