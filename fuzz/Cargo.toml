@@ -16,15 +16,15 @@ path = ".."
 features = ["fuzz"]
 
 [[bin]]
-name = "ark_protocol"
-path = "fuzz_targets/ark_protocol.rs"
+name = "server_protocol"
+path = "fuzz_targets/server_protocol.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "host_protocol"
-path = "fuzz_targets/host_protocol.rs"
+name = "client_protocol"
+path = "fuzz_targets/client_protocol.rs"
 test = false
 doc = false
 bench = false

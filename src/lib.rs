@@ -8,20 +8,20 @@
 
 pub mod protocol;
 
+mod client;
 mod framing;
 mod handshake;
+mod server;
 mod session;
-mod side_ark;
-mod side_host;
 
 #[cfg(any(test, feature = "fuzz"))]
 #[doc(hidden)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub mod scripted;
+pub mod mock;
 
+pub use client::{Client, Roots, Verifier};
 pub use protocol::{ArkToHost, HostToArk};
-pub use side_ark::{ArkSide, Attestation, Attester};
-pub use side_host::{HostSide, Roots, Verifier};
+pub use server::{Attestation, Attester, Server};
 
 use std::io;
 
@@ -39,9 +39,9 @@ pub const MAX_MESSAGE_SIZE: usize = {
     size
 };
 
-/// Domain separator for the COSE envelopes of the handshake, sealing the Ark's
-/// hello and the host's ack (the host's hello is plain CBOR). It binds their
-/// signatures and encryption to the wire, so a handshake signed by the Ark's
+/// Domain separator for the COSE envelopes of the handshake, sealing the server's
+/// hello and the client's ack (the client's hello is plain CBOR). It binds their
+/// signatures and encryption to the wire, so a handshake signed by the server's
 /// identity key cannot be replayed into other protocols using the same key.
 pub(crate) const CRYPTO_DOMAIN_WIRE: &[u8] = b"wire-v1";
 
@@ -80,7 +80,7 @@ pub enum Error {
     #[error("wire terminated")]
     Terminated,
 
-    #[error("wire session reset by the ark")]
+    #[error("wire session reset by the server")]
     SessionReset,
 
     #[error("attestation is not for a hardware or emulator")]

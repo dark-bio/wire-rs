@@ -3,11 +3,11 @@
 
 #![no_main]
 
-use darkbio_wire::scripted::host::{Step, run};
+use darkbio_wire::mock::client::{Step, run};
 use libfuzzer_sys::fuzz_target;
 
-// Drives a real host side through an arbitrary interleaving of its own calls
-// and Ark frames, the scripted Ark checking every result against the
+// Drives a real client side through an arbitrary interleaving of its own calls
+// and server frames, the mock server checking every result against the
 // protocol's state machine.
 fuzz_target!(|steps: Vec<Step>| {
     run(&steps);

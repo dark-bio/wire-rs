@@ -10,13 +10,13 @@ use tracing::warn;
 /// COBS framer over a raw byte stream. Frames are zero delimited, with any
 /// zero in the payload encoded away.
 ///
-/// The stream is assumed to carry no client lifecycle, as USB bulk transfers
-/// lack it by design. E.g A host may attach via WebUSB, crash or reconnect
-/// without the Ark noticing. Session boundaries have to be signaled in band.
+/// The stream is assumed to carry no connection lifecycle, as USB bulk transfers
+/// lack it by design. E.g A client may attach via WebUSB, crash or reconnect
+/// without the server noticing. Session boundaries have to be signaled in band.
 ///
 /// Since an empty frame is not valid COBS, it is used to mark a session reset.
-/// A host opens a session with two zeros, the first terminating whatever frame
-/// may have been interrupted, the second being the reset. An Ark answers with
+/// A client opens a session with two zeros, the first terminating whatever frame
+/// may have been interrupted, the second being the reset. A server answers with
 /// a single zero whenever it has no session for what it received.
 ///
 /// A failed send may have put part of its frame on the stream already. The
@@ -59,7 +59,7 @@ impl<R: Read, W: Write> Framing<R, W> {
 
     /// Signals a session reset by writing two frame delimiters, the first one
     /// terminating any interrupted frame, the second forming the empty reset
-    /// frame. The first covers a frame a previous host may have left behind,
+    /// frame. The first covers a frame a previous client may have left behind,
     /// so a reset resyncs the stream by itself.
     pub fn send_reset(&mut self) -> Result<(), Error> {
         self.writer_resync = false;
@@ -465,10 +465,10 @@ mod tests {
     fn test_next_frame_discard_resumes() {
         testing::init_tracing();
 
-        /// Reader handing out one scripted result per read.
-        struct Scripted(VecDeque<io::Result<Vec<u8>>>);
+        /// Reader handing out one mock result per read.
+        struct Mock(VecDeque<io::Result<Vec<u8>>>);
 
-        impl Read for Scripted {
+        impl Read for Mock {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 match self.0.pop_front() {
                     Some(Ok(bytes)) => {
@@ -510,7 +510,7 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
-            let mut framing = Framing::new(Scripted(tt.reads.into()), sink());
+            let mut framing = Framing::new(Mock(tt.reads.into()), sink());
             for (j, expected) in tt.expected.into_iter().enumerate() {
                 let result = framing.next_frame_blob().map(<[u8]>::to_vec);
                 match expected {

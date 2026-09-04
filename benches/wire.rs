@@ -3,7 +3,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use darkbio_cobs as cobs;
-use darkbio_wire::HostSide;
+use darkbio_wire::Client;
 use rand::RngExt;
 use std::io::{Cursor, empty, sink};
 
@@ -35,7 +35,7 @@ fn bench_frame_read(c: &mut Criterion) {
                 let actual_iters = (iters as usize).min(MAX_MEMORY_USAGE / data.len()).max(1);
 
                 reader.set_position(0);
-                let mut wire = HostSide::new(&mut reader, sink());
+                let mut wire = Client::new(&mut reader, sink());
 
                 let start = std::time::Instant::now();
                 for _ in 0..actual_iters {
@@ -67,7 +67,7 @@ fn bench_frame_write(c: &mut Criterion) {
                 let actual_iters = (iters as usize).min(MAX_MEMORY_USAGE / frame_size).max(1);
 
                 drain.set_position(0);
-                let mut wire = HostSide::new(empty(), &mut drain);
+                let mut wire = Client::new(empty(), &mut drain);
 
                 let start = std::time::Instant::now();
                 for _ in 0..actual_iters {
@@ -108,7 +108,7 @@ fn bench_packet_read(c: &mut Criterion) {
                     .max(1);
 
                 reader.set_position(0);
-                let mut wire = HostSide::new(&mut reader, sink());
+                let mut wire = Client::new(&mut reader, sink());
 
                 let start = std::time::Instant::now();
                 for _ in 0..actual_iters {
@@ -136,7 +136,7 @@ fn bench_packet_write(c: &mut Criterion) {
                 let actual_iters = (iters as usize).min(MAX_MEMORY_USAGE / packet_size).max(1);
 
                 drain.set_position(0);
-                let mut wire = HostSide::new(empty(), &mut drain);
+                let mut wire = Client::new(empty(), &mut drain);
 
                 let start = std::time::Instant::now();
                 for _ in 0..actual_iters {

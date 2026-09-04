@@ -1,14 +1,14 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Scripted host driving a real `ArkSide`. A script is a sequence of steps,
-//! each putting the bytes of some frames in front of the Ark or handing
+//! Mock client driving a real `Server`. A script is a sequence of steps,
+//! each putting the bytes of some frames in front of the server or handing
 //! control back to the driver. The driver calls `next_message` in a loop and
 //! replies to whatever it delivers. The read half hands over the bytes of one
 //! step at a time, moving the script forward once they are consumed.
 //!
-//! The model tracks the state the Ark should be in, the frames it should emit
-//! and what `next_message` should surface for the last step. Whenever the Ark
+//! The model tracks the state the server should be in, the frames it should emit
+//! and what `next_message` should surface for the last step. Whenever the server
 //! asks for more input, the frames it wrote are checked against the emissions
 //! expected. Any divergence panics.
 
@@ -17,7 +17,7 @@ use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk, ark_to_host};
 use crate::session::Session;
 use crate::{
-    ArkSide, Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
+    Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
@@ -27,19 +27,19 @@ use std::fmt;
 use std::io::{self, Read};
 use std::rc::Rc;
 
-/// Message id of the probes the driver sends on the Ark's behalf.
+/// Message id of the probes the driver sends on the server's behalf.
 const PROBE_ID: u64 = u64::MAX;
 
-/// One step of the scripted host, each putting zero or more frames in front
-/// of the Ark or handing control back to the driver. Frames needing a session
-/// or an ArkHello the host does not have degrade into junk the Ark refuses,
+/// One step of the mock client, each putting zero or more frames in front
+/// of the server or handing control back to the driver. Frames needing a session
+/// or an ArkHello the client does not have degrade into junk the server refuses,
 /// so any sequence of steps is a valid script.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Step {
     /// A lone zero, one empty frame.
     Reset,
-    /// Two zeros, the reset as `HostSide::handshake` sends it.
+    /// Two zeros, the reset as `Client::handshake` sends it.
     ResetPair,
     /// A valid HostHello with fresh ephemeral keys.
     Hello,
@@ -54,7 +54,7 @@ pub enum Step {
     /// A HostAck for the ArkHello last received with a flipped ciphertext
     /// byte. Junk if there is none.
     AckTampered,
-    /// A HostAck for the ArkHello last received bound to another Ark key than
+    /// A HostAck for the ArkHello last received bound to another server key than
     /// the one that answered. Junk if there is none.
     AckBadAuth,
     /// A HostAck for the ArkHello last received signed by a key other than
@@ -86,32 +86,32 @@ pub enum Step {
     /// into it, a lone delimiter completing it into the valid hello it is.
     Partial,
     /// A frame past the size limit, delimiter included. The framing throws it
-    /// away before the Ark sees it, a partial hello in front going with it.
+    /// away before the server sees it, a partial hello in front going with it.
     Oversized,
     /// The read fails with `WouldBlock`, handing control back to the driver.
     Yield,
     /// The read fails with `Interrupted`, which the framing retries with the
-    /// Ark none the wiser.
+    /// Server none the wiser.
     Interrupt,
-    /// The Ark's writes fail from here on, as on a transport that died.
+    /// The server's writes fail from here on, as on a transport that died.
     Break,
-    /// The Ark's writes work again.
+    /// The server's writes work again.
     Heal,
-    /// The Ark's next write the point applies to is cut there, the transport
+    /// The server's next write the point applies to is cut there, the transport
     /// staying broken afterwards if told to, until healed.
     Cut { point: CutPoint, then_broken: bool },
-    /// Caps what a single read hands the Ark at the byte count, so frames
+    /// Caps what a single read hands the server at the byte count, so frames
     /// arrive in pieces. Zero lifts the cap.
     Chunk(u8),
-    /// Puts the frames of the next steps in front of the Ark in one read, up
-    /// to the count. A step the Ark surfaces something for ends the batch
-    /// early, the driver acting on it before the Ark reads on, as does any
+    /// Puts the frames of the next steps in front of the server in one read, up
+    /// to the count. A step the server surfaces something for ends the batch
+    /// early, the driver acting on it before the server reads on, as does any
     /// step not queuing frames.
     Batch(u8),
 }
 
 impl Step {
-    /// Whether the step only puts frames in front of the Ark, as opposed to
+    /// Whether the step only puts frames in front of the server, as opposed to
     /// handing control back or changing the transport.
     fn queues_frames(&self) -> bool {
         !matches!(
@@ -127,7 +127,7 @@ impl Step {
     }
 }
 
-/// State the model expects the Ark to be in.
+/// State the model expects the server to be in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum State {
     /// No session and no handshake in progress.
@@ -144,16 +144,16 @@ pub enum State {
 /// Counts of what a run observed, for scenario tests to assert on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
-    pub state: State,      // State the Ark ended up in
-    pub dropped: usize,    // Empty frames the Ark emitted
-    pub fragments: usize,  // Frames the Ark left cut short, terminated later
-    pub handshakes: usize, // ArkHellos the Ark emitted
-    pub delivered: usize,  // Requests the Ark delivered
-    pub replies: usize,    // Replies and probes that reached the host
-    pub reads: usize,      // Reads that handed the Ark bytes
+    pub state: State,      // State the server ended up in
+    pub dropped: usize,    // Empty frames the server emitted
+    pub fragments: usize,  // Frames the server left cut short, terminated later
+    pub handshakes: usize, // ArkHellos the server emitted
+    pub delivered: usize,  // Requests the server delivered
+    pub replies: usize,    // Replies and probes that reached the client
+    pub reads: usize,      // Reads that handed the server bytes
 }
 
-/// A frame put in front of the Ark, as the model sees it.
+/// A frame put in front of the server, as the model sees it.
 enum Frame {
     /// The empty frame, a reset.
     Empty,
@@ -169,7 +169,7 @@ enum Frame {
     Junk,
 }
 
-/// Bytes of an unterminated frame in front of the Ark, waiting for the
+/// Bytes of an unterminated frame in front of the server, waiting for the
 /// delimiter that completes them into a frame.
 enum Partial {
     /// The stream is at a frame boundary.
@@ -180,12 +180,12 @@ enum Partial {
     Junk,
 }
 
-/// Frame the model expects the Ark to emit, along with what verifies it.
+/// Frame the model expects the server to emit, along with what verifies it.
 enum Emit {
-    /// The empty frame, the signal that the Ark has no session or a resync
+    /// The empty frame, the signal that the server has no session or a resync
     /// delimiter with nothing to terminate.
     Dropped,
-    /// The prefix of a frame cut short, meaning nothing to the host.
+    /// The prefix of a frame cut short, meaning nothing to the client.
     Fragment,
     /// The handshake reply, sealed to the hello with the keys.
     ArkHello(Box<Keys>),
@@ -204,27 +204,27 @@ impl fmt::Debug for Emit {
     }
 }
 
-/// A frame the Ark left unterminated, a send having failed under it. The
+/// A frame the server left unterminated, a send having failed under it. The
 /// delimiter of the next send completes it.
 enum Tail {
-    /// A prefix of the body, decoding to nothing the host accepts.
+    /// A prefix of the body, decoding to nothing the client accepts.
     Fragment,
     /// The whole body, completing into the frame it was meant to be.
     Body(Emit),
 }
 
-/// What a send of the Ark carries.
+/// What a send of the server carries.
 enum Payload {
     /// A frame, the emission it is expected as.
     Frame(Emit),
-    /// The signal that the Ark has no session, a lone delimiter.
+    /// The signal that the server has no session, a lone delimiter.
     Signal,
 }
 
 /// What the model expects `next_message` to surface for the last step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
-    /// The Ark keeps reading.
+    /// The server keeps reading.
     Absorbed,
     /// A HostToArk with the id is delivered.
     Message(u64),
@@ -261,13 +261,13 @@ impl Keys {
     }
 }
 
-/// What is wrong with a HostAck crafted to be refused, in the order the Ark
+/// What is wrong with a HostAck crafted to be refused, in the order the server
 /// finds them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AckFlaw {
     /// A ciphertext byte flipped, the seal failing to open.
     Tampered,
-    /// Bound to another Ark key than the one that answered.
+    /// Bound to another server key than the one that answered.
     Auth,
     /// Signed by a key other than the hello's.
     Signer,
@@ -277,7 +277,7 @@ enum AckFlaw {
     Encap,
 }
 
-/// An ArkHello received, everything needed to ack it. Only kept while the Ark
+/// An ArkHello received, everything needed to ack it. Only kept while the server
 /// awaits that ack.
 struct Pending {
     keys: Keys,
@@ -287,7 +287,7 @@ struct Pending {
 
 impl Pending {
     /// The HostAck completing the handshake, along with the session it opens
-    /// on the host's side.
+    /// on the client's side.
     fn ack(self, identity: &xdsa::PublicKey) -> (Vec<u8>, Session) {
         let (sender, encap) = self
             .ark_crypto
@@ -313,7 +313,7 @@ impl Pending {
         (ack, session)
     }
 
-    /// A HostAck flawed as requested, so the Ark refuses it for that one
+    /// A HostAck flawed as requested, so the server refuses it for that one
     /// reason.
     fn bad_ack(&self, identity: &xdsa::PublicKey, flaw: AckFlaw) -> Vec<u8> {
         let (_, encap) = self
@@ -361,27 +361,27 @@ impl Pending {
     }
 }
 
-/// Scripted host along with the model of the Ark it drives.
-pub struct Host {
+/// Mock client along with the model of the server it drives.
+pub struct Client {
     steps: VecDeque<Step>,
-    identity: xdsa::PublicKey, // The Ark's identity, verifying its hellos
-    outbox: Outbox,            // Frames the Ark wrote
-    bytes: Vec<u8>,            // Bytes of executed steps not yet read by the Ark
+    identity: xdsa::PublicKey, // The server's identity, verifying its hellos
+    outbox: Outbox,            // Frames the server wrote
+    bytes: Vec<u8>,            // Bytes of executed steps not yet read by the server
     chunk: usize,              // Most bytes a read hands over, zero for all
-    batch: usize,              // Steps left to put in front of the Ark in one read
-    broken: bool,              // Whether the Ark's writes fail
-    cut: Option<CutPoint>,     // Cut armed for the next write of the Ark it applies to
+    batch: usize,              // Steps left to put in front of the server in one read
+    broken: bool,              // Whether the server's writes fail
+    cut: Option<CutPoint>,     // Cut armed for the next write of the server it applies to
     flush_fails: bool,         // Whether the flush of the send in progress fails
 
-    state: State,       // State the Ark should be in
-    partial: Partial,   // Unterminated frame in front of the Ark
-    resync: bool,       // Whether the Ark's last send failed, the next starting with a delimiter
-    tail: Option<Tail>, // Unterminated frame the Ark left behind
-    emits: Vec<Emit>,   // Frames the Ark should have emitted since the last sync
+    state: State,       // State the server should be in
+    partial: Partial,   // Unterminated frame in front of the server
+    resync: bool,       // Whether the server's last send failed, the next starting with a delimiter
+    tail: Option<Tail>, // Unterminated frame the server left behind
+    emits: Vec<Emit>,   // Frames the server should have emitted since the last sync
     outcome: Outcome,   // What next_message should surface for the last step
 
-    pending: Option<Pending>, // ArkHello received, awaiting the host's ack
-    session: Option<Rc<RefCell<Session>>>, // Live session of the host, shared with its replies
+    pending: Option<Pending>, // ArkHello received, awaiting the client's ack
+    session: Option<Rc<RefCell<Session>>>, // Live session of the client, shared with its replies
 
     last_hello: Option<(Vec<u8>, Keys)>, // Last HostHello sent, framed
     last_ack: Option<Vec<u8>>,           // Last HostAck sent, framed
@@ -391,7 +391,7 @@ pub struct Host {
     summary: Summary,
 }
 
-impl Host {
+impl Client {
     fn new(steps: &[Step], identity: xdsa::PublicKey, outbox: Outbox) -> Self {
         Self {
             steps: steps.iter().take(MAX_STEPS).cloned().collect(),
@@ -419,7 +419,7 @@ impl Host {
         }
     }
 
-    /// Executes one step, queuing its bytes for the Ark and applying the
+    /// Executes one step, queuing its bytes for the server and applying the
     /// model's transitions for the frames they make up.
     fn execute(&mut self, step: Step) {
         match step {
@@ -461,7 +461,7 @@ impl Host {
                     self.deliver(Frame::Ack);
                     self.bytes.extend(framed);
                 }
-                None => self.junk(b"ack without a pending ark hello"),
+                None => self.junk(b"ack without a pending server hello"),
             },
             Step::AckReplay => {
                 if let Some(framed) = self.last_ack.clone() {
@@ -580,7 +580,7 @@ impl Host {
         }
     }
 
-    /// Queues a flawed HostAck for the ArkHello last received. The Ark refuses
+    /// Queues a flawed HostAck for the ArkHello last received. The server refuses
     /// it either way, so it is junk to the model.
     fn bad_ack(&mut self, flaw: AckFlaw) {
         match self.pending.as_ref() {
@@ -588,11 +588,11 @@ impl Host {
                 let ack = pending.bad_ack(&self.identity, flaw);
                 self.junk(&ack);
             }
-            None => self.junk(b"bad ack without a pending ark hello"),
+            None => self.junk(b"bad ack without a pending server hello"),
         }
     }
 
-    /// Queues a valid COBS frame of content the Ark refuses.
+    /// Queues a valid COBS frame of content the server refuses.
     fn junk(&mut self, text: &[u8]) {
         self.deliver(Frame::Junk);
         self.bytes.extend(frame(text));
@@ -603,13 +603,13 @@ impl Host {
         self.last_valid = Some(framed[..framed.len() - 1].to_vec());
     }
 
-    /// Makes the Ark's writes fail, or work again.
+    /// Makes the server's writes fail, or work again.
     fn set_broken(&mut self, broken: bool) {
         self.outbox.set_broken(broken);
         self.broken = broken;
     }
 
-    /// Applies the model's transition for a frame arriving at the Ark. An
+    /// Applies the model's transition for a frame arriving at the server. An
     /// unterminated frame in front swallows it, a lone delimiter completing a
     /// partial hello into a valid one and anything else into junk.
     fn deliver(&mut self, frame: Frame) {
@@ -622,13 +622,13 @@ impl Host {
             Partial::Junk => Frame::Junk,
         };
         match (self.state, frame) {
-            // A reset restarts the handshake in every state, the host having
+            // A reset restarts the handshake in every state, the client having
             // asked for it, so nothing is signaled
             (_, Frame::Empty) => {
                 self.forget();
                 self.state = State::AwaitHello;
             }
-            // The ArkHello failing to get out has the Ark give up on the
+            // The ArkHello failing to get out has the server give up on the
             // handshake and signal so
             (State::AwaitHello, Frame::Hello(keys)) => {
                 if self.send(Payload::Frame(Emit::ArkHello(keys))) {
@@ -649,7 +649,7 @@ impl Host {
             (State::Established, Frame::Garbage) => {
                 self.outcome = Outcome::Undecodable;
             }
-            // Anything else drops whatever the Ark had, the host told so
+            // Anything else drops whatever the server had, the client told so
             _ => {
                 self.forget();
                 self.state = State::Idle;
@@ -658,7 +658,7 @@ impl Host {
         }
     }
 
-    /// Applies the model's transition for a send of the Ark, returning whether
+    /// Applies the model's transition for a send of the server, returning whether
     /// it goes through. It mirrors the framing, a send after a failed one
     /// starting with a delimiter that terminates the tail the failure left
     /// behind, and its flush failing the send after every byte went out.
@@ -748,17 +748,17 @@ impl Host {
     /// Checks that `next_message` surfaced what the model expected and arms
     /// the model for the next step.
     fn surfaced(&mut self, outcome: Outcome) {
-        assert_eq!(self.outcome, outcome, "model vs ark");
+        assert_eq!(self.outcome, outcome, "model vs server");
         self.outcome = Outcome::Absorbed;
     }
 
-    /// Checks the Ark's reactions to everything delivered so far, run whenever
-    /// the Ark asks for more input and once the run ends.
+    /// Checks the server's reactions to everything delivered so far, run whenever
+    /// the server asks for more input and once the run ends.
     fn sync(&mut self) {
         assert_eq!(
             self.outcome,
             Outcome::Absorbed,
-            "ark read on past a step it should have surfaced"
+            "server read on past a step it should have surfaced"
         );
         let frames = self.outbox.take_frames();
         let emits = std::mem::take(&mut self.emits);
@@ -773,7 +773,7 @@ impl Host {
                 Emit::Dropped => {
                     assert!(
                         frame.is_empty(),
-                        "expected an empty frame, ark emitted {} bytes",
+                        "expected an empty frame, server emitted {} bytes",
                         frame.len()
                     );
                     self.summary.dropped += 1;
@@ -781,7 +781,7 @@ impl Host {
                 Emit::Fragment => {
                     assert!(
                         !frame.is_empty(),
-                        "expected a cut frame, ark emitted an empty one"
+                        "expected a cut frame, server emitted an empty one"
                     );
                     self.summary.fragments += 1;
                 }
@@ -802,21 +802,21 @@ impl Host {
     }
 
     /// Opens and verifies an ArkHello sealed to the keys, keeping what is
-    /// needed to ack it as long as the Ark is still awaiting that ack.
+    /// needed to ack it as long as the server is still awaiting that ack.
     fn receive_hello(&mut self, frame: &[u8], keys: Keys) {
         let auth = handshake::ArkHelloAuth {
             host_signer: keys.signer.public_key(),
             host_crypto: keys.crypto.public_key(),
         };
         let sign1 = cose::decrypt(&unframe(frame), &auth, &keys.crypto, CRYPTO_DOMAIN_WIRE)
-            .expect("ark hello failed to decrypt");
+            .expect("server hello failed to decrypt");
         let hello: handshake::ArkHello =
             cose::verify(&sign1, &auth, &self.identity, CRYPTO_DOMAIN_WIRE, None)
-                .expect("ark hello signature invalid");
+                .expect("server hello signature invalid");
         let encap: [u8; xhpke::ENCAP_KEY_SIZE] = hello
             .a2h_encap
             .try_into()
-            .expect("ark hello encap size invalid");
+            .expect("server hello encap size invalid");
         let receiver = keys
             .crypto
             .new_receiver(&encap, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST)
@@ -831,101 +831,104 @@ impl Host {
     }
 }
 
-/// Read half handed to the Ark, pulling the script forward as the Ark reads.
-struct Feed(Rc<RefCell<Host>>);
+/// Read half handed to the server, pulling the script forward as the server reads.
+struct Feed(Rc<RefCell<Client>>);
 
 impl Read for Feed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut host = self.0.borrow_mut();
-        if host.bytes.is_empty() {
+        let mut client = self.0.borrow_mut();
+        if client.bytes.is_empty() {
             // Everything handed over was consumed, check the reactions to it
             // before moving the script forward
-            host.sync();
-            host.batch = 0;
+            client.sync();
+            client.batch = 0;
             loop {
-                match host.steps.pop_front() {
+                match client.steps.pop_front() {
                     None => {
-                        host.interrupt(Outcome::Terminated);
+                        client.interrupt(Outcome::Terminated);
                         return Ok(0);
                     }
                     Some(Step::Yield) => {
-                        host.interrupt(Outcome::Yield);
+                        client.interrupt(Outcome::Yield);
                         return Err(would_block());
                     }
                     Some(Step::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
-                    Some(step) => host.execute(step),
+                    Some(step) => client.execute(step),
                 }
-                if !host.bytes.is_empty() {
+                if !client.bytes.is_empty() {
                     break;
                 }
             }
             // A batch queues the frames of the steps after too, so they arrive
-            // in one read. It ends at a step the Ark surfaces something for,
-            // the driver acting on that before the Ark reads on, and at any
+            // in one read. It ends at a step the server surfaces something for,
+            // the driver acting on that before the server reads on, and at any
             // step not queuing frames
-            while host.batch > 1
-                && host.outcome == Outcome::Absorbed
-                && host.steps.front().is_some_and(Step::queues_frames)
+            while client.batch > 1
+                && client.outcome == Outcome::Absorbed
+                && client.steps.front().is_some_and(Step::queues_frames)
             {
-                let step = host.steps.pop_front().unwrap();
-                host.execute(step);
-                host.batch -= 1;
+                let step = client.steps.pop_front().unwrap();
+                client.execute(step);
+                client.batch -= 1;
             }
         }
-        let mut n = buf.len().min(host.bytes.len());
-        if host.chunk > 0 {
-            n = n.min(host.chunk);
+        let mut n = buf.len().min(client.bytes.len());
+        if client.chunk > 0 {
+            n = n.min(client.chunk);
         }
-        buf[..n].copy_from_slice(&host.bytes[..n]);
-        host.bytes.drain(..n);
-        host.summary.reads += 1;
+        buf[..n].copy_from_slice(&client.bytes[..n]);
+        client.bytes.drain(..n);
+        client.summary.reads += 1;
         Ok(n)
     }
 }
 
-/// The Ark under test, reading the script and writing into the outbox.
-type Ark = ArkSide<Feed, Outbox, Attestation>;
+/// The server under test, reading the script and writing into the outbox.
+type Server = crate::Server<Feed, Outbox, Attestation>;
 
-/// Checks that the Ark has a session exactly when the model says so. An
+/// Checks that the server has a session exactly when the model says so. An
 /// oversized message is refused before sealing, so it probes the session
 /// without any frame going out.
-fn check_session(ark: &mut Ark, host: &Host) {
-    let established = host.state == State::Established;
+fn check_session(server: &mut Server, client: &Client) {
+    let established = client.state == State::Established;
     let oversized = vec![0x42; MAX_MESSAGE_SIZE + 1];
-    let refused = ark.send_message(ArkToHost {
+    let refused = server.send_message(ArkToHost {
         id: Some(PROBE_ID),
         err: None,
         content: Some(ark_to_host::Content::Develop(oversized)),
     });
     match refused {
         Err(Error::PacketTooLarge(_)) => {
-            assert!(established, "ark has a session the model does not")
+            assert!(established, "server has a session the model does not")
         }
         Err(Error::EncryptionFailed(_)) => {
-            assert!(!established, "ark lacks the session the model has")
+            assert!(!established, "server lacks the session the model has")
         }
         other => panic!("unexpected oversized send result: {other:?}"),
     }
 }
 
-/// Sends a message on the Ark's behalf, checking that the send path works
+/// Sends a message on the server's behalf, checking that the send path works
 /// exactly in a session and fails exactly when the transport does. A failed
-/// send takes the session down with it, the Ark signaling so.
-fn send(ark: &mut Ark, host: &mut Host, id: u64) {
+/// send takes the session down with it, the server signaling so.
+fn send(server: &mut Server, client: &mut Client, id: u64) {
     // Predict the send, a reply going out in a session unless the transport
-    // fails it, in which case the Ark drops the session and signals
-    let established = host.state == State::Established;
+    // fails it, in which case the server drops the session and signals
+    let established = client.state == State::Established;
     let expected = established.then(|| {
-        let session = host.session.clone().expect("established without a session");
-        let sent = host.send(Payload::Frame(Emit::Reply(id, session)));
+        let session = client
+            .session
+            .clone()
+            .expect("established without a session");
+        let sent = client.send(Payload::Frame(Emit::Reply(id, session)));
         if !sent {
-            host.forget();
-            host.state = State::Idle;
-            host.send(Payload::Signal);
+            client.forget();
+            client.state = State::Idle;
+            client.send(Payload::Signal);
         }
         sent
     });
-    let sent = ark.send_message(ArkToHost {
+    let sent = server.send_message(ArkToHost {
         id: Some(id),
         err: None,
         content: None,
@@ -934,61 +937,61 @@ fn send(ark: &mut Ark, host: &mut Host, id: u64) {
         (Some(true), Ok(())) => {}
         (Some(false), Err(Error::SendFailed(_))) => {}
         (None, Err(Error::EncryptionFailed(_))) => {}
-        (expected, sent) => panic!("model expected {expected:?}, ark returned {sent:?}"),
+        (expected, sent) => panic!("model expected {expected:?}, server returned {sent:?}"),
     }
 }
 
-/// Runs a script against a real Ark, panicking on any divergence from the
+/// Runs a script against a real server, panicking on any divergence from the
 /// model, and reports what the run observed.
 pub fn run(steps: &[Step]) -> Summary {
     let signer = xdsa::SecretKey::generate();
     let attestation = self_attestation(&signer);
     let outbox = Outbox::default();
-    let host = Rc::new(RefCell::new(Host::new(
+    let client = Rc::new(RefCell::new(Client::new(
         steps,
         signer.public_key(),
         outbox.clone(),
     )));
-    let mut ark = Ark::new(Feed(host.clone()), outbox, signer, attestation);
+    let mut server = Server::new(Feed(client.clone()), outbox, signer, attestation);
 
     loop {
-        match ark.next_message() {
-            // Reply to every request delivered, as an Ark would
+        match server.next_message() {
+            // Reply to every request delivered, as a server would
             Ok(msg) => {
                 let id = msg.id.expect("delivered message without an id");
-                let mut host = host.borrow_mut();
-                host.surfaced(Outcome::Message(id));
-                host.summary.delivered += 1;
-                send(&mut ark, &mut host, id);
+                let mut client = client.borrow_mut();
+                client.surfaced(Outcome::Message(id));
+                client.summary.delivered += 1;
+                send(&mut server, &mut client, id);
             }
             Err(Error::PacketDecodingFailed(_)) => {
-                host.borrow_mut().surfaced(Outcome::Undecodable);
+                client.borrow_mut().surfaced(Outcome::Undecodable);
             }
             // Probe the send path whenever the script hands control back
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                let mut host = host.borrow_mut();
-                host.surfaced(Outcome::Yield);
-                check_session(&mut ark, &host);
-                send(&mut ark, &mut host, PROBE_ID);
+                let mut client = client.borrow_mut();
+                client.surfaced(Outcome::Yield);
+                check_session(&mut server, &client);
+                send(&mut server, &mut client, PROBE_ID);
             }
             Err(Error::Terminated) => {
-                host.borrow_mut().surfaced(Outcome::Terminated);
+                client.borrow_mut().surfaced(Outcome::Terminated);
                 break;
             }
-            Err(err) => panic!("unexpected error from the ark: {err}"),
+            Err(err) => panic!("unexpected error from the server: {err}"),
         }
     }
-    let mut host = host.borrow_mut();
-    host.sync();
-    check_session(&mut ark, &host);
-    host.summary.state = host.state;
-    host.summary
+    let mut client = client.borrow_mut();
+    client.sync();
+    check_session(&mut server, &client);
+    client.summary.state = client.state;
+    client.summary
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::side_host::MAX_STALE_FRAMES;
+    use crate::client::MAX_STALE_FRAMES;
     use crate::testing;
 
     /// Runs a script with logging enabled.
@@ -1023,7 +1026,7 @@ mod tests {
     }
 
     // Tests that a reset in every state restarts the handshake without the
-    // Ark signaling anything, the host having asked for it. A session does
+    // Server signaling anything, the client having asked for it. A session does
     // not survive one, a request into it earning a signal.
     #[test]
     fn test_scripted_reset_restarts() {
@@ -1206,7 +1209,7 @@ mod tests {
         assert_eq!(summary.dropped, 0);
     }
 
-    // Tests that junk in every state drops the Ark back to idle with the host
+    // Tests that junk in every state drops the server back to idle with the client
     // told about it through an empty frame, and that a fresh handshake
     // recovers from it.
     #[test]
@@ -1274,8 +1277,8 @@ mod tests {
         assert_eq!(summary.dropped, 1);
     }
 
-    // Tests that every request into a session the Ark no longer has earns a
-    // signal of its own. A host pipelining a stale bound's worth of them
+    // Tests that every request into a session the server no longer has earns a
+    // signal of its own. A client pipelining a stale bound's worth of them
     // queues up as many in front of its next handshake.
     #[test]
     fn test_scripted_requests_into_dead_session() {
@@ -1360,7 +1363,7 @@ mod tests {
     }
 
     // Tests that a read failing aborts a handshake in progress without a
-    // signal to the host, but leaves an established session intact.
+    // signal to the client, but leaves an established session intact.
     #[test]
     fn test_scripted_yield() {
         let summary = run_logged(&[Step::Yield]);
@@ -1389,7 +1392,7 @@ mod tests {
         assert_eq!(summary.replies, 2);
     }
 
-    // Tests a transport failing under the Ark's writes. A failed reply drops
+    // Tests a transport failing under the server's writes. A failed reply drops
     // the session, the signals it would send are lost and a handshake whose
     // ArkHello cannot go out is given up. A healed transport recovers, the
     // first send on it starting with a resync delimiter, an empty frame.
@@ -1443,7 +1446,7 @@ mod tests {
         assert_eq!(summary.dropped, 2);
     }
 
-    // Tests the Ark's reply cut short. The bytes that got out are terminated
+    // Tests the server's reply cut short. The bytes that got out are terminated
     // by the resync delimiter ahead of the signal, into junk or into the
     // valid reply that lacked only its delimiter. A reply lost whole, or one
     // whose flush failed after it went out whole, arms the resync too, its
@@ -1503,7 +1506,7 @@ mod tests {
 
     // Tests a cut whose signal is lost too, the transport staying broken. The
     // cut frame waits on the stream until the healed transport carries the
-    // Ark's next send, the ArkHello of a fresh handshake, whose resync
+    // Server's next send, the ArkHello of a fresh handshake, whose resync
     // delimiter terminates it ahead of the hello.
     #[test]
     fn test_scripted_cut_then_broken() {
@@ -1564,10 +1567,10 @@ mod tests {
         }
     }
 
-    // Tests the ArkHello cut short. The Ark gives up on the handshake and
+    // Tests the ArkHello cut short. The server gives up on the handshake and
     // signals so, the resync delimiter ahead of the signal terminating what
     // got out. An ArkHello lacking only its delimiter is completed into a
-    // valid one, which the host acks in vain. A fresh handshake recovers.
+    // valid one, which the client acks in vain. A fresh handshake recovers.
     #[test]
     fn test_scripted_cut_handshakes() {
         struct TestCase {
@@ -1629,7 +1632,7 @@ mod tests {
     }
 
     // Tests that a cut needing a body passes over the lone delimiters of the
-    // Ark's signals and fires on its next frame, whereas one at the start
+    // Server's signals and fires on its next frame, whereas one at the start
     // loses the signal it lands on, the resync it arms forming an empty frame
     // ahead of the next frame.
     #[test]
@@ -1733,7 +1736,7 @@ mod tests {
 
     // Tests that the frames of several steps batched into one read are served
     // like frames arriving one per read, a partial hello completing within a
-    // batch too. A step the Ark surfaces something for ends the batch, so
+    // batch too. A step the server surfaces something for ends the batch, so
     // requests still arrive one per read.
     #[test]
     fn test_scripted_batched_reads() {
@@ -1803,7 +1806,7 @@ mod tests {
     }
 
     // Tests that a read interrupted by a signal is retried by the framing in
-    // every state, the Ark none the wiser.
+    // every state, the server none the wiser.
     #[test]
     fn test_scripted_interrupted_reads() {
         let summary = run_logged(&[

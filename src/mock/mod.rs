@@ -1,14 +1,14 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Scripted peers driving one real side of the wire through arbitrary frame
+//! Mock peers driving one real side of the wire through arbitrary frame
 //! sequences. A script decides what the side under test reads next. A model
 //! of the protocol's state machine predicts the reaction to each frame, and a
 //! run panics at the first divergence between the two. The scenario tests and
 //! the packet level fuzzers share this, so a fuzzer finding replays as a test.
 
-pub mod ark;
-pub mod host;
+pub mod client;
+pub mod server;
 
 use crate::Attestation;
 use darkbio_cobs as cobs;
@@ -23,7 +23,7 @@ use std::rc::Rc;
 /// frame limit.
 pub const MAX_STEPS: usize = 64;
 
-/// Self-signed attestation of a never onboarded Ark, embedding the identity
+/// Self-signed attestation of a never onboarded server, embedding the identity
 /// key that signs the handshake.
 pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
     let claims = darkbio_trust::device::HardwareClaims {
@@ -101,7 +101,7 @@ pub enum CutPoint {
     Flush,
 }
 
-/// Frames written by the side under test, drained by the scripted peer. Its
+/// Frames written by the side under test, drained by the mock peer. Its
 /// writes can be cut short or made to fail, standing in for a transport that
 /// died.
 #[derive(Clone, Default)]
