@@ -1,12 +1,13 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
-use crate::framing::Framing;
+use crate::framing::{FrameReader, FrameWriter};
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
-use crate::session::Session;
+use crate::sealing;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
+    MAX_MESSAGE_SIZE,
 };
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
@@ -70,11 +71,15 @@ impl Attester for Attestation {
 /// The device attestation is not interpreted by the wire, it is provided by an
 /// `Attester` and forwarded to the client verbatim.
 pub struct Server<R: Read, W: Write, A: Attester> {
-    framing: Framing<R, W>, // COBS framed transport for ingress and egress data
+    reader: FrameReader<R>, // COBS framed transport for ingress data
+    writer: FrameWriter<W>, // COBS framed transport for egress data
 
-    signer: xdsa::SecretKey,  // Server's identity key, signing the ArkHello
-    attester: A,              // Source of the device attestation for handshakes
-    session: Option<Session>, // Active encrypted session (if handshake completed)
+    signer: xdsa::SecretKey, // Server's identity key, signing the ArkHello
+    attester: A,             // Source of the device attestation for handshakes
+
+    sender: Option<xhpke::Sender>, // Outbound context of the session (if handshake completed)
+    receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
+    scratch: Vec<u8>,              // Scratch for protobuf encoding a message before sealing
 
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     timestamp: Option<i64>, // Signing time of the ArkHello pinned by a test, the clock otherwise
@@ -88,10 +93,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// must be configured on the reader passed in.
     pub fn new(reader: R, writer: W, signer: xdsa::SecretKey, attester: A) -> Self {
         Self {
-            framing: Framing::new(reader, writer),
+            reader: FrameReader::new(reader),
+            writer: FrameWriter::new(writer),
             signer,
             attester,
-            session: None,
+            sender: None,
+            receiver: None,
+            scratch: Vec::with_capacity(MAX_MESSAGE_SIZE),
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
         }
@@ -126,7 +134,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         // are consumed and trigger a new session handshake.
         loop {
             // Retrieve the next COBS encoded packet
-            let size = match self.framing.next_packet() {
+            let packet = match self.reader.next_packet() {
                 // Transport errors propagate immediately
                 Err(Error::Terminated) => return Err(Error::Terminated),
                 Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
@@ -136,7 +144,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // message though, leaving the HPKE sequence behind the client's,
                 // so the session cannot continue either way.
                 Err(err) => {
-                    if self.session.take().is_some() {
+                    if self.drop_session() {
                         warn!("failed to decode cobs packet, resetting session: {}", err);
                     } else {
                         warn!("failed to decode cobs packet: {}", err);
@@ -146,7 +154,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 }
                 // Empty frame signals a session reset from the client
                 Ok(None) => {
-                    self.session = None;
+                    self.drop_session();
 
                     match self.handshake() {
                         // Transport errors propagate immediately
@@ -161,48 +169,59 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                             continue;
                         }
                         // Handshake successful
-                        Ok(session) => {
+                        Ok((sender, receiver)) => {
                             info!("new wire session established");
-                            self.session = Some(session);
+                            self.sender = Some(sender);
+                            self.receiver = Some(receiver);
                             continue;
                         }
                     }
                 }
                 // Valid COBS packet
-                Ok(Some(size)) => size,
+                Ok(Some(packet)) => packet,
             };
             // Non-empty packet without a session is considered junk, the client
             // may still think it has a session though, tell it otherwise
-            let session = match self.session.as_mut() {
+            let receiver = match self.receiver.as_mut() {
                 None => {
                     warn!("dropping data outside session");
                     self.send_dropped();
                     continue;
                 }
-                Some(s) => s,
+                Some(receiver) => receiver,
             };
             // Decrypt the message and parse it with protobuf
-            let req = match session.open(&self.framing.decobs_buffer[..size]) {
+            let req = match sealing::open(receiver, packet) {
                 // If decryption fails, the HPKE context is most probably
                 // broken, no point continuing with it.
                 Err(Error::EncryptionFailed(err)) => {
                     warn!("decryption failed, resetting session: {}", err);
-                    self.session = None;
+                    self.drop_session();
                     self.send_dropped();
                     continue;
                 }
                 Err(err) => return Err(err),
                 Ok(req) => req,
             };
-            trace!("read host-to-ark message ({} bytes encrypted)", size);
+            trace!(
+                "read host-to-ark message ({} bytes encrypted)",
+                packet.len()
+            );
             return Ok(req);
         }
+    }
+
+    /// Drops the session, both of its contexts going together, and reports
+    /// whether there was one to drop.
+    fn drop_session(&mut self) -> bool {
+        self.sender = None;
+        self.receiver.take().is_some()
     }
 
     /// Tells the client that the server has no session with it by sending an empty
     /// frame.
     fn send_dropped(&mut self) {
-        if let Err(err) = self.framing.send_dropped() {
+        if let Err(err) = self.writer.send_dropped() {
             warn!("failed to signal dropped session: {}", err);
         }
     }
@@ -214,14 +233,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     pub fn send_message(&mut self, res: ArkToHost) -> Result<(), Error> {
         // Encode and seal the message, oversized messages are rejected before
         // the HPKE sequence advances, only a failed seal breaks the session
-        let session = self
-            .session
+        let sender = self
+            .sender
             .as_mut()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
 
-        let blob = match session.seal(&res, &mut self.framing.encode_buffer) {
+        let blob = match sealing::seal(sender, &res, &mut self.scratch) {
             Err(err @ Error::EncryptionFailed(_)) => {
-                self.session = None;
+                self.drop_session();
                 self.send_dropped();
                 return Err(err);
             }
@@ -230,8 +249,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         };
         // Send the sealed message, tearing down the session if the transport
         // fails to deliver it
-        if let Err(err) = self.framing.send_packet(&blob) {
-            self.session = None;
+        if let Err(err) = self.writer.send_packet(&blob) {
+            self.drop_session();
             self.send_dropped();
             return Err(err);
         }
@@ -245,18 +264,16 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     ///   1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
     ///   2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
     ///   3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
-    fn handshake(&mut self) -> Result<Session, Error> {
+    fn handshake(&mut self) -> Result<(xhpke::Sender, xhpke::Receiver), Error> {
         loop {
             // Message 1: Read the HostHello (skip any trailing empty reset frames)
-            let size = loop {
-                if let Some(n) = self.framing.next_packet()? {
-                    break n;
+            let packet = loop {
+                if let Some(packet) = self.reader.next_packet()? {
+                    break packet;
                 }
             };
-            let host_hello: handshake::HostHello =
-                cbor::decode(&self.framing.decobs_buffer[..size]).map_err(|err| {
-                    Error::HandshakeFailed(format!("invalid client hello: {}", err))
-                })?;
+            let host_hello: handshake::HostHello = cbor::decode(packet)
+                .map_err(|err| Error::HandshakeFailed(format!("invalid client hello: {}", err)))?;
 
             // Generate an ephemeral server xHPKE keypair and set up the server->Client sender
             let ark_crypto_key = xhpke::SecretKey::generate();
@@ -309,16 +326,16 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Error::HandshakeFailed(format!("failed to seal server hello: {}", err))
             })?;
 
-            self.framing.send_packet(&ark_hello)?;
+            self.writer.send_packet(&ark_hello)?;
 
             // Message 3: Read and open the HostAck. An empty frame probably
             // means the client is restarting the session, start over.
-            let Some(size) = self.framing.next_packet()? else {
+            let Some(packet) = self.reader.next_packet()? else {
                 warn!("session reset during handshake");
                 continue;
             };
             let host_ack: handshake::HostAck = cose::open(
-                &self.framing.decobs_buffer[..size],
+                packet,
                 &handshake::HostAckAuth {
                     ark_signer: self.signer.public_key(),
                     ark_crypto: ark_crypto_pub.clone(),
@@ -343,7 +360,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 })?;
 
             // Session established
-            return Ok(Session { sender, receiver });
+            return Ok((sender, receiver));
         }
     }
 }
