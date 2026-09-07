@@ -21,7 +21,7 @@ pub mod seed;
 
 use crate::protocol::mux::Writer;
 use crate::protocol::switchboard::Source;
-use crate::transport::{self, Emitter, Funnel, Side};
+use crate::transport::{self, Emitter, Event, Funnel, Side};
 use darkbio_crypto::xhpke;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,9 +69,11 @@ pub fn tag(payload: &[u8]) -> u64 {
 pub(crate) enum Delivery {
     /// A message of the peer's, opened by the transport that is not there.
     Message(Vec<u8>),
-    /// The session the read side held ended, the peer having reset it,
-    /// reported ahead of the handshake that follows.
-    Reset,
+    /// The session the read side held ended, ahead of the handshake that
+    /// follows.
+    SessionClosed,
+    /// A handshake opened the next session.
+    SessionOpened,
     /// The read fails, ending the transport under the multiplexer.
     Failed(transport::Error),
 }
@@ -243,14 +245,15 @@ impl Feed {
 }
 
 impl Source for Feed {
-    fn next_message(&mut self) -> Result<Vec<u8>, transport::Error> {
+    fn next_event(&mut self) -> Result<Event, transport::Error> {
         // Tell the driver that the reader is back for more, which on the first
         // read means it started and took down the session it starts from, and
         // on every later one that the message before it is routed
         let _ = self.routed.send(());
         match self.deliveries.recv() {
-            Ok(Delivery::Message(message)) => Ok(message),
-            Ok(Delivery::Reset) => Err(transport::Error::SessionReset),
+            Ok(Delivery::Message(message)) => Ok(Event::Message(message)),
+            Ok(Delivery::SessionClosed) => Ok(Event::SessionClosed),
+            Ok(Delivery::SessionOpened) => Ok(Event::SessionOpened),
             Ok(Delivery::Failed(err)) => Err(err),
             Err(_) => Err(transport::Error::Terminated),
         }

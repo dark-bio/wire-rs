@@ -60,6 +60,23 @@ impl Attester for Attestation {
     }
 }
 
+/// What a read of the server surfaces, a message of the client's or the
+/// session under it changing, see `Server::next_event`.
+#[derive(Debug)]
+pub enum Event {
+    /// A handshake established a session, `Server::session` numbering it and
+    /// `Server::emitter` sending into it.
+    SessionOpened,
+
+    /// The session ended, the client resetting it or sending what cannot
+    /// belong to it, so nothing may be sealed into it anymore. A reset has
+    /// the client's handshake behind it, which the next read runs.
+    SessionClosed,
+
+    /// A message of the client's, decrypted.
+    Message(Vec<u8>),
+}
+
 /// Server side of the wire, an encrypted transport for serving the messages
 /// of a connected client. It waits for session resets (empty frames), responds
 /// to handshake and afterward decrypts inbound and encrypts outbound messages.
@@ -147,16 +164,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// undecryptable packets and failed handshakes are logged, answered with
     /// an empty frame and skipped.
     ///
-    /// A read that changes the session under the server reports it with
-    /// `SessionReset` rather than reading on, so a caller bound to the
-    /// session hears of it without waiting for the client to say anything.
-    /// A live session ends that way, the client resetting it, a frame that
-    /// does not decode or a packet that does not open, and so does the
-    /// handshake after a reset establishing the next one, `session` telling
-    /// which of the two happened. A session the server dropped itself is not
-    /// reported, its caller knowing. Only transport failures surface as other
-    /// errors.
-    pub fn next_message(&mut self) -> Result<Vec<u8>, Error> {
+    /// A read that changes the session under the server surfaces that rather
+    /// than reading on, so a caller bound to the session hears of it without
+    /// waiting for the client to say anything. A live session ends on the
+    /// client resetting it, a frame that does not decode or a packet that
+    /// does not open, and a session opens on the handshake after a reset.
+    /// A session the server dropped itself is not reported, its caller
+    /// knowing. Only transport failures surface as errors.
+    pub fn next_event(&mut self) -> Result<Event, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and call for a handshake, run on the pass after them.
         loop {
@@ -181,7 +196,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                         self.receiver = Some(receiver);
                         self.funnel.establish_session(sender);
                         self.emitter = self.funnel.emitter();
-                        return Err(Error::SessionReset);
+                        return Ok(Event::SessionOpened);
                     }
                 }
                 continue;
@@ -205,7 +220,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     }
                     self.send_dropped();
                     if ended {
-                        return Err(Error::SessionReset);
+                        return Ok(Event::SessionClosed);
                     }
                     continue;
                 }
@@ -215,7 +230,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Ok(None) => {
                     self.handshaking = true;
                     if self.drop_session() {
-                        return Err(Error::SessionReset);
+                        return Ok(Event::SessionClosed);
                     }
                     continue;
                 }
@@ -230,7 +245,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 warn!("dropping data of a session an emitter ended");
                 self.drop_session();
                 self.send_dropped();
-                return Err(Error::SessionReset);
+                return Ok(Event::SessionClosed);
             }
             let receiver = match self.receiver.as_mut() {
                 None => {
@@ -247,7 +262,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     warn!("decryption failed, resetting session: {}", err);
                     self.drop_session();
                     self.send_dropped();
-                    return Err(Error::SessionReset);
+                    return Ok(Event::SessionClosed);
                 }
                 Ok(message) => message,
             };
@@ -255,7 +270,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 "read host-to-ark message ({} bytes encrypted)",
                 packet.len()
             );
-            return Ok(message);
+            return Ok(Event::Message(message));
         }
     }
 
@@ -474,20 +489,15 @@ mod tests {
         let ark_reader = ark_sock.try_clone().unwrap();
         let ark_writer = ark_sock;
 
-        // Server side: receive two messages across two sessions, echoing each
-        // back, the frame injected between them ending the first session,
-        // which the read reports.
+        // Server side: receive two messages (across two sessions), echo each back.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
             let mut requests = Vec::new();
-            let req = server.next_message().unwrap();
-            server.send_message(&req).unwrap();
-            requests.push(req);
-            let result = server.next_message();
-            assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-            let req = server.next_message().unwrap();
-            server.send_message(&req).unwrap();
-            requests.push(req);
+            for _ in 0..2 {
+                let req = testing::served(&mut server).unwrap();
+                server.send_message(&req).unwrap();
+                requests.push(req);
+            }
             requests
         });
 
@@ -551,7 +561,7 @@ mod tests {
         let ark_thread = std::thread::spawn(move || {
             let attestation = self_attestation(&signer_key);
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
-            server.next_message()
+            testing::served(&mut server)
         });
 
         // Client side: refuse the attestation in the verifier.
@@ -597,7 +607,7 @@ mod tests {
 
             let ark_thread = std::thread::spawn(move || {
                 let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
-                server.next_message()
+                testing::served(&mut server)
             });
             let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
             let result = client.handshake(&Roots { hardware, emulator });
@@ -745,20 +755,15 @@ mod tests {
         let ark_reader = ark_sock.try_clone().unwrap();
         let ark_writer = ark_sock;
 
-        // Server side: note the number before any session, after the first
-        // request, at the report of the first session ending, nothing live
-        // until the next read runs the handshake, and after the request
-        // arriving in the second session.
+        // Server side: note the number before any session and after each of
+        // the two requests, the second one arriving in a second session.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
             let mut numbers = vec![server.session()];
-            server.next_message().unwrap();
-            numbers.push(server.session());
-            let result = server.next_message();
-            assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-            numbers.push(server.session());
-            server.next_message().unwrap();
-            numbers.push(server.session());
+            for _ in 0..2 {
+                testing::served(&mut server).unwrap();
+                numbers.push(server.session());
+            }
             numbers
         });
 
@@ -772,7 +777,7 @@ mod tests {
         assert_eq!(client.session(), 2);
         client.send_message(&payload(2)).unwrap();
 
-        assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 0, 2]);
+        assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 2]);
     }
 
     // Tests that the server resetting a session tells the client, whose next
@@ -793,9 +798,9 @@ mod tests {
         // request of the next session.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
-            server.next_message().unwrap();
+            testing::served(&mut server).unwrap();
             server.reset_session();
-            server.next_message().unwrap();
+            testing::served(&mut server).unwrap();
             server.session()
         });
 
@@ -831,7 +836,7 @@ mod tests {
         // while waiting for the second request.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
-            server.next_message().unwrap();
+            testing::served(&mut server).unwrap();
 
             let pushers: Vec<_> = (0..4)
                 .map(|thread| {
@@ -843,7 +848,7 @@ mod tests {
                     })
                 })
                 .collect();
-            let stop = server.next_message().unwrap();
+            let stop = testing::served(&mut server).unwrap();
             for pusher in pushers {
                 pusher.join().unwrap();
             }

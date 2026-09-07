@@ -450,7 +450,7 @@ mod tests {
         let ark = thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
             for _ in 0..100 {
-                let req = server.next_message().unwrap();
+                let req = testing::served(&mut server).unwrap();
                 server.send_message(&req).unwrap();
             }
         });
@@ -497,11 +497,7 @@ mod tests {
         let attestation = self_attestation(&signer);
         let ark = thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
-            // The second handshake ends the first session, which the read
-            // reports ahead of the request arriving in the second
-            let result = server.next_message();
-            assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-            let req = server.next_message().unwrap();
+            let req = testing::served(&mut server).unwrap();
             server.send_message(&req).unwrap();
         });
         let mut client = Client::new(host_reader, host_writer);

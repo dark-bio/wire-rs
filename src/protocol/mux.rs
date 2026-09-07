@@ -322,7 +322,7 @@ mod tests {
         let ark_writer: Writer = Box::new(ark_sock);
         let peer = thread::spawn(move || {
             let mut server = PeerServer::new(ark_reader, ark_writer, signer, attestation);
-            while let Ok(message) = server.next_message() {
+            while let Ok(message) = testing::served(&mut server) {
                 let message = HostToArk::decode(&message[..]).unwrap();
                 if !script(&mut server, message) {
                     break;

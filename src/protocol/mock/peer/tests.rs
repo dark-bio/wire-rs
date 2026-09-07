@@ -14,11 +14,11 @@ fn client(steps: &[Step]) -> Summary {
 }
 
 /// Runs a script against a server multiplexer with logging enabled. A server
-/// serves whoever opened the live session and only notices it once a message
-/// of that peer's arrives, so every script starts with both.
+/// serves whoever opened the live session, so every script starts with a peer
+/// opening one.
 fn server(steps: &[Step]) -> Summary {
     testing::init_tracing();
-    let mut script = vec![Step::Reset, Step::Stray];
+    let mut script = vec![Step::Reset];
     script.extend_from_slice(steps);
     run_server(&script)
 }
@@ -333,7 +333,6 @@ fn test_scripted_server_reconnect() {
         Step::Request(1),
         Step::Ask(2),
         Step::Reset,
-        Step::Stray,
         Step::Wait(1),
         Step::Request(3),
         Step::Answer(3),
@@ -354,23 +353,22 @@ fn test_scripted_server_reconnect() {
 }
 
 // Tests a server before its first peer, which has nobody to send to, and
-// after it, which has.
+// right after the handshake, which has, the peer not having said a word in
+// its session yet.
 #[test]
 fn test_scripted_server_without_a_peer() {
     let summary = run_server(&[
         Step::Request(1),
         Step::Reset,
         Step::Request(2),
-        Step::Stray,
-        Step::Request(3),
-        Step::Answer(3),
-        Step::Wait(3),
+        Step::Answer(2),
+        Step::Wait(2),
     ]);
     assert_eq!(
         summary,
         Summary {
             sent: 1,
-            refused: 2,
+            refused: 1,
             answered: 1,
             sessions: 1,
             ..Summary::default()
@@ -482,7 +480,6 @@ fn test_scripted_server_broken_transport() {
         Step::Heal,
         Step::Request(3),
         Step::Reset,
-        Step::Stray,
         Step::Request(4),
         Step::Answer(4),
         Step::Wait(4),
@@ -737,7 +734,6 @@ fn test_scripted_window_reset() {
         Step::Bulk(8),
         Step::Bulk(9),
         Step::Reset,
-        Step::Stray,
         Step::Request(10),
         Step::Answer(10),
         Step::Wait(10),
@@ -777,7 +773,6 @@ fn test_scripted_flooded() {
         Step::Flood,
         Step::Request(1),
         Step::Reset,
-        Step::Stray,
         Step::Request(2),
         Step::Answer(2),
         Step::Wait(2),
@@ -803,7 +798,6 @@ fn test_scripted_answer_into_dead_session() {
     let summary = server(&[
         Step::Ask(1),
         Step::Reset,
-        Step::Stray,
         Step::Reply,
         Step::Ask(2),
         Step::Reply,

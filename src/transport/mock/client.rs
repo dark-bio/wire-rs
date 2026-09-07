@@ -20,7 +20,7 @@ use crate::transport::mock::payload;
 use crate::transport::sealing;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, Event, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use std::cell::RefCell;
@@ -232,9 +232,12 @@ enum Outcome {
     Message(u64),
     /// Garbage delivered like any message, the session staying intact.
     Garbage,
-    /// `Error::SessionReset`, a session the read held ending, on the reset
-    /// ending it or the frame breaking it, reported at once.
-    Reset,
+    /// `Event::SessionClosed`, a session the server held ending at once, on
+    /// the reset ending it or the frame breaking it.
+    Ended,
+    /// `Event::SessionOpened`, a handshake establishing a session, on the ack
+    /// that concludes it.
+    Opened,
     /// `Error::RecvFailed` carrying `WouldBlock`.
     Yield,
     /// `Error::Terminated`, the script having run out.
@@ -622,7 +625,7 @@ impl Client {
             // ends with it, reported at once, ahead of the handshake
             (_, Frame::Empty) => {
                 if std::mem::take(&mut self.held) {
-                    self.outcome = Outcome::Reset;
+                    self.outcome = Outcome::Ended;
                 }
                 self.forget();
                 self.state = State::AwaitHello;
@@ -638,9 +641,12 @@ impl Client {
                     self.send(Payload::Signal);
                 }
             }
+            // The handshake concluded, the session it opened reported so a
+            // caller can send into it before the client says anything
             (State::AwaitAck, Frame::Ack) => {
                 self.state = State::Established;
                 self.held = true;
+                self.outcome = Outcome::Opened;
             }
             (State::Established, Frame::Request(id)) => {
                 self.outcome = Outcome::Message(id);
@@ -656,7 +662,7 @@ impl Client {
                 self.state = State::Idle;
                 self.send(Payload::Signal);
                 if std::mem::take(&mut self.held) {
-                    self.outcome = Outcome::Reset;
+                    self.outcome = Outcome::Ended;
                 }
             }
         }
@@ -954,11 +960,11 @@ pub fn run(steps: &[Step]) -> Summary {
     let mut server = Server::new_at(Feed(client.clone()), outbox, signer, attestation, TIMESTAMP);
 
     loop {
-        match server.next_message() {
+        match server.next_event() {
             // Reply to every request delivered, as a server would. The model
             // predicted the delivery, so the payload says which it was, and
             // garbage is nothing to answer.
-            Ok(message) => {
+            Ok(Event::Message(message)) => {
                 let mut client = client.borrow_mut();
                 match client.outcome {
                     Outcome::Message(id) if message == payload(id) => {
@@ -973,10 +979,17 @@ pub fn run(steps: &[Step]) -> Summary {
                 }
             }
             // A session the server held ended, the client having reset or
-            // broken it, the next one standing if the handshake made one
-            Err(Error::SessionReset) => {
+            // broken it
+            Ok(Event::SessionClosed) => {
                 let mut client = client.borrow_mut();
-                client.surfaced(Outcome::Reset);
+                client.surfaced(Outcome::Ended);
+                check_session(&mut server, &client);
+            }
+            // A handshake opened a session, which the server can send into
+            // before the client says anything more
+            Ok(Event::SessionOpened) => {
+                let mut client = client.borrow_mut();
+                client.surfaced(Outcome::Opened);
                 check_session(&mut server, &client);
             }
             // Probe the send path whenever the script hands control back

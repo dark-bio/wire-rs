@@ -354,9 +354,8 @@ struct Peer<Out: Tagged, In: Tagged> {
     closed: bool, // Whether the closer ended the transport for good
     resync: bool, // Whether the last write failed, the next starting with a delimiter
 
-    live: u64,     // Session the funnel carries, zero without one
-    handle: u64,   // Session the multiplexer's handle sends into
-    observed: u64, // Session the reader last saw
+    live: u64,   // Session the funnel carries, zero without one
+    handle: u64, // Session the multiplexer's handle sends into
 
     ids: u64,  // Next id the multiplexer hands out
     asks: u64, // Next id the peer hands out
@@ -790,16 +789,17 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             return;
         }
         // A server's read reports the session it held ending at once, ahead
-        // of the handshake that follows, the multiplexer moving on the report
-        // and binding the next session on the first message in it
+        // of the handshake that follows, and that handshake opening the next
+        // one, so the multiplexer follows without a message of the peer's
         if self.link.held() {
             self.link.drop_session();
             self.live = 0;
-            self.deliver(Delivery::Reset);
+            self.deliver(Delivery::SessionClosed);
         }
         self.receiver = Some(self.link.open_session());
         self.live = self.link.session();
         self.summary.sessions += 1;
+        self.deliver(Delivery::SessionOpened);
     }
 
     /// Ends the transport under the reader, which ends the multiplexer with
@@ -821,34 +821,28 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.broken = broken || self.closed;
     }
 
-    /// Hands a delivery to the reader, a message or a reset, and waits for it
-    /// to be dealt with, so the step after it never races the reader. Applies
-    /// the session check the reader makes and tells whether a message would
-    /// be routed at all, a client ending on that check routing nothing.
+    /// Hands a delivery to the reader and waits for it to be dealt with, so
+    /// the step after it never races the reader. Applies the transition the
+    /// reader makes for it and tells whether a message would be routed at
+    /// all, a session ending routing nothing.
     fn deliver(&mut self, delivery: Delivery) -> bool {
+        let session = match delivery {
+            Delivery::SessionClosed => Some(false),
+            Delivery::SessionOpened => Some(true),
+            _ => None,
+        };
         self.deliveries
             .send(delivery)
             .expect("reader thread reading");
         self.routes
             .recv_timeout(PATIENCE)
             .expect("reader thread back for more");
-        self.session_moved();
+        match session {
+            Some(false) => self.reset(Kind::Reset),
+            Some(true) => self.handle = self.live,
+            None => {}
+        }
         self.open()
-    }
-
-    /// Applies the session check the reader makes on a server ahead of
-    /// routing, the first session installing its handle and every later one
-    /// resetting the multiplexer onto it. A client's session is its
-    /// connection, so the reader never looks at its number.
-    fn session_moved(&mut self) {
-        if self.side == Side::Client || self.live == self.observed {
-            return;
-        }
-        match self.observed {
-            0 => self.handle = self.live,
-            _ => self.reset(Kind::Reset),
-        }
-        self.observed = self.live;
     }
 
     /// Applies a peer breaking the protocol, which on a client is the
@@ -861,7 +855,6 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
                 self.live = 0;
                 self.write(Emit::Dropped);
                 self.reset(reason);
-                self.observed = 0;
             }
         }
     }
@@ -1201,7 +1194,6 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
         resync: false,
         live: session,
         handle: session,
-        observed: session,
         ids: match side {
             Side::Client => 1,
             Side::Server => 2,

@@ -10,7 +10,7 @@
 use crate::protocol;
 use crate::protocol::envelope::{Envelope, Ids, Kind, Parity};
 use crate::protocol::mux::{Closer, Error, INBOX, Reader, Responder, WINDOW, Writer};
-use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
+use crate::transport::{self, Attester, Emitter, Event, MAX_MESSAGE_SIZE, Side};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::SyncSender;
@@ -111,8 +111,10 @@ pub(super) trait Sender: Send + Sync {
 /// Source of the messages a reader thread routes, a transport client or
 /// server with its emitter.
 pub(super) trait Source: Send + 'static {
-    /// Reads the next message of the session, see the transport's.
-    fn next_message(&mut self) -> Result<Vec<u8>, transport::Error>;
+    /// Reads the next message of the session, or the session ending and the
+    /// next one opening, see the transport server's. A client's session is
+    /// its connection, so it only ever reads messages.
+    fn next_event(&mut self) -> Result<Event, transport::Error>;
 
     /// Number of the live session, see the transport's.
     fn session(&self) -> u64;
@@ -127,8 +129,8 @@ pub(super) trait Source: Send + 'static {
 }
 
 impl Source for transport::Client<Reader, Writer> {
-    fn next_message(&mut self) -> Result<Vec<u8>, transport::Error> {
-        transport::Client::next_message(self)
+    fn next_event(&mut self) -> Result<Event, transport::Error> {
+        transport::Client::next_message(self).map(Event::Message)
     }
     fn session(&self) -> u64 {
         transport::Client::session(self)
@@ -139,8 +141,8 @@ impl Source for transport::Client<Reader, Writer> {
 }
 
 impl<A: Attester + Send + 'static> Source for transport::Server<Reader, Writer, A> {
-    fn next_message(&mut self) -> Result<Vec<u8>, transport::Error> {
-        transport::Server::next_message(self)
+    fn next_event(&mut self) -> Result<Event, transport::Error> {
+        transport::Server::next_event(self)
     }
     fn session(&self) -> u64 {
         transport::Server::session(self)
@@ -287,11 +289,6 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             registry.inflight -= bytes;
             self.room.notify_all();
         }
-    }
-
-    /// Session the switchboard is bound to, zero for none.
-    pub(super) fn session(&self) -> u64 {
-        lock(&self.registry).session
     }
 
     /// Callers parked on the window, for the mock to tell one parked from one
@@ -511,42 +508,34 @@ impl<Out: Envelope, In: Envelope> Sender for Switchboard<Out, In> {
 
 /// Reads messages until the transport ends, routing each, the end failing
 /// the multiplexer with the reason, a close needing no notification. A server
-/// reports a session ending as soon as it does, ahead of the handshake the
-/// next read runs, so the multiplexer moves on the report, binding the next
-/// session on the client's first message in it. The source goes with the
-/// thread, ending the session for the emitters.
+/// reports a session ending as soon as it does and the handshake opening the
+/// next one as soon as that concludes, so the multiplexer follows the client
+/// without waiting for it to say anything. The source goes with the thread,
+/// ending the session for the emitters.
 fn read<Out: Envelope, In: Envelope>(
     switchboard: Arc<Switchboard<Out, In>>,
     mut source: impl Source,
 ) {
     loop {
-        let message = match source.next_message() {
-            Ok(message) => Some(message),
-            // The peer reset the session on a server, nothing to route but
-            // the session number to follow below
-            Err(transport::Error::SessionReset) if switchboard.side == Side::Server => None,
+        let message = match source.next_event() {
             Err(err) => {
                 switchboard.fail(Error::Disconnected(Arc::new(err)));
                 return;
             }
-        };
-        // A new session on a server, or none, the one before it reset by the
-        // peer, if there was one, and the responders made from here on
-        // answering into whatever is live. A client's session is its
-        // connection, every way it can end already reported to the reader
-        // or failed on the send that ended it, so the number is left alone
-        if switchboard.side == Side::Server {
-            let bound = switchboard.session();
-            let live = source.session();
-            if live != bound && bound == 0 {
-                switchboard.bind(source.emitter(), live);
-            } else if live != bound {
-                let reason = Error::Disconnected(Arc::new(transport::Error::SessionReset));
-                switchboard.reset(reason, source.emitter(), live);
+            // A handshake opened the next session, the responders made from
+            // here on answering into it
+            Ok(Event::SessionOpened) => {
+                switchboard.bind(source.emitter(), source.session());
+                continue;
             }
-        }
-        let Some(message) = message else {
-            continue;
+            // The session the multiplexer was bound to ended, what it left
+            // pending failing with it and nothing live until the next opens
+            Ok(Event::SessionClosed) => {
+                let reason = Error::Disconnected(Arc::new(transport::Error::SessionReset));
+                switchboard.reset(reason, source.emitter(), 0);
+                continue;
+            }
+            Ok(Event::Message(message)) => message,
         };
         // A peer breaking the protocol has its session ended, which on a
         // client is the multiplexer's end and on a server the session's

@@ -22,6 +22,8 @@ pub use transport::{
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod testing {
+    use crate::transport::{Attester, Error, Event, Server};
+    use std::io::{Read, Write};
     use std::sync::Once;
 
     static INIT: Once = Once::new();
@@ -38,5 +40,17 @@ pub(crate) mod testing {
                 .with_test_writer()
                 .init();
         });
+    }
+
+    // served reads the next message of a server, the sessions it takes to get
+    // there passing unseen, for tests holding nothing of a session.
+    pub fn served<R: Read, W: Write, A: Attester>(
+        server: &mut Server<R, W, A>,
+    ) -> Result<Vec<u8>, Error> {
+        loop {
+            if let Event::Message(message) = server.next_event()? {
+                return Ok(message);
+            }
+        }
     }
 }
