@@ -44,6 +44,12 @@ pub const WINDOW: usize = 16 * 1024 * 1024;
 /// never reaches, so only one ignoring the rules does.
 pub const INBOX: usize = 64 * 1024 * 1024;
 
+/// Bytes a request is charged of either budget at the least, whatever it
+/// encodes to. Holding one costs this much in queues and maps however
+/// little it carries, so the budgets bound what a peer can pile up rather
+/// than only what it sends.
+pub const CHARGE: usize = 256;
+
 /// Things that can go wrong for a caller of the multiplexer.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {

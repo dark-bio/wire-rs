@@ -317,6 +317,12 @@ pub struct Emitter<W: Write> {
 }
 
 impl<W: Write> Emitter<W> {
+    /// Number of the session the handle sends into, for a caller telling
+    /// the session a send belonged to from whichever is live.
+    pub(crate) fn session(&self) -> u64 {
+        self.session
+    }
+
     /// Creates a handle onto a funnel, bound to the session.
     fn new(funnel: Weak<Funnel<W>>, session: u64) -> Self {
         Self { funnel, session }

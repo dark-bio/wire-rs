@@ -246,11 +246,12 @@ fn test_scripted_requests_queue_up() {
     );
 }
 
-// Tests a request of the peer's the multiplexer cannot read, which it fails
-// from its reader without the session suffering for it.
+// Tests requests of the peer's the multiplexer cannot read, which its worker
+// fails one after the other without the session suffering for it.
 #[test]
 fn test_scripted_request_not_understood() {
     let summary = client(&[
+        Step::AskVoid,
         Step::AskVoid,
         Step::Request(1),
         Step::Answer(1),
@@ -261,6 +262,28 @@ fn test_scripted_request_not_understood() {
         Summary {
             sent: 1,
             answered: 1,
+            declined: 2,
+            ..Summary::default()
+        }
+    );
+}
+
+// Tests that a request the multiplexer cannot read waits its turn behind the
+// handler rather than being failed from the reader, which must never wait on
+// a write, so its refusal goes out only once the worker moves on.
+#[test]
+fn test_scripted_request_not_understood_queues() {
+    let summary = client(&[
+        Step::Ask(1),
+        Step::AskVoid,
+        Step::Reply,
+        Step::Ask(2),
+        Step::Reply,
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            served: 2,
             declined: 1,
             ..Summary::default()
         }
@@ -492,6 +515,31 @@ fn test_scripted_server_broken_transport() {
             answered: 1,
             disconnects: 1,
             sessions: 2,
+            ..Summary::default()
+        }
+    );
+}
+
+// Tests a write of a server's failing, which ends the session it belonged
+// to there and then rather than when the client next sends, so a request
+// left pending fails at once and the disconnect handler is told, the client
+// silent throughout.
+#[test]
+fn test_scripted_server_write_fails() {
+    let summary = server(&[
+        Step::Request(1),
+        Step::Break,
+        Step::Request(2),
+        Step::Wait(1),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 1,
+            refused: 1,
+            failed: 1,
+            disconnects: 1,
+            sessions: 1,
             ..Summary::default()
         }
     );

@@ -9,7 +9,7 @@
 
 use crate::protocol;
 use crate::protocol::envelope::{Envelope, Ids, Kind, Parity};
-use crate::protocol::mux::{Closer, Error, INBOX, Reader, Responder, WINDOW, Writer};
+use crate::protocol::mux::{CHARGE, Closer, Error, INBOX, Reader, Responder, WINDOW, Writer};
 use crate::transport::{self, Attester, Emitter, Event, MAX_MESSAGE_SIZE, Side};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -78,10 +78,10 @@ impl<In: Envelope> Registry<In> {
 /// arrived in, so its answer goes nowhere else whatever session is live by
 /// the time the worker gets to it.
 struct Request<In: Envelope> {
-    id: u64,                  // Id of the request, echoed by the response
-    content: In::Content,     // Content for the handler
-    bytes: usize,             // Bytes the request holds of the inbox
-    emitter: Emitter<Writer>, // Handle of the session it arrived in
+    id: u64,                      // Id of the request, echoed by the response
+    content: Option<In::Content>, // Content for the handler, none for one it cannot read
+    bytes: usize,                 // Bytes the request holds of the inbox
+    emitter: Emitter<Writer>,     // Handle of the session it arrived in
 }
 
 /// The requests ahead of the worker, capped in bytes.
@@ -234,8 +234,10 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     }
 
     /// Registers a request, waiting for enough room in the window to avoid
-    /// overloading the remote peer. Hands back the emitter of the session
-    /// the request is registered in.
+    /// overloading the remote peer. It costs the window its bytes or the
+    /// least a request is charged, whichever is more, so a peer cannot hold
+    /// more of them than the window suggests by keeping them small. Hands
+    /// back the emitter of the session the request is registered in.
     fn admit(&self, id: u64, bytes: usize, tx: Answer<In>) -> Result<Emitter<Writer>, Error> {
         // If no messages are being accepted, don't even look at it
         let mut registry = lock(&self.registry);
@@ -245,6 +247,9 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         if bytes > MAX_MESSAGE_SIZE {
             return Err(Error::TooLarge(bytes));
         }
+        // Charge it at least what holding it costs us
+        let bytes = bytes.max(CHARGE);
+
         // Fetch the session we've accepted the message into
         let session = registry.session;
 
@@ -333,7 +338,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// nor error, is the peer breaking the protocol, the fault handed back for
     /// the reader to end the session on.
     fn route(self: &Arc<Self>, message: Vec<u8>) -> Result<(), Error> {
-        let bytes = message.len();
+        let bytes = message.len().max(CHARGE);
         let envelope = match In::decode(&message[..]) {
             Ok(envelope) => envelope,
             Err(err) => {
@@ -371,14 +376,9 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
                 }
                 Ok(())
             }
+            // One the multiplexer cannot read is queued all the same, the
+            // worker refusing it, so the reader never waits on a write
             Kind::Request(id) => {
-                let Some(content) = content else {
-                    warn!("refusing request not understood: {}", id);
-                    let sender = Arc::downgrade(self);
-                    let responder = Responder::new(sender, self.emitter(), id);
-                    self.refuse(responder, "request not understood");
-                    return Ok(());
-                };
                 let emitter = self.emitter();
                 self.push(Request {
                     id,
@@ -394,6 +394,14 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// peer filling the inbox past its limit overran its window, the fault
     /// handed back for the reader to end the session on rather than served.
     fn push(&self, request: Request<In>) -> Result<(), Error> {
+        // Under the registry lock, the one a reset takes, or a request read
+        // out of a session could land in the inbox after that session ended
+        // and be served to whoever comes next
+        let registry = lock(&self.registry);
+        if registry.session != request.emitter.session() {
+            warn!("dropping request of a session that ended: {}", request.id);
+            return Ok(());
+        }
         let mut inbox = lock(&self.inbox);
         if inbox.bytes + request.bytes > INBOX {
             warn!("ending session, peer overran its window");
@@ -431,24 +439,32 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         }
     }
 
-    /// Moves the switchboard to the next session of the source, or to none,
-    /// the one before it having ended for the reason. Every pending request
-    /// fails with it, the callers waiting for window room wake up to be
-    /// refused with it, the requests queued for the worker are dropped, the
-    /// responders made from here on answer into the new session, and the
+    /// Ends the session the switchboard is bound to, which ended for the
+    /// reason, leaving it bound to none until the next one opens. Every
+    /// pending request fails with it, the callers waiting for window room
+    /// wake up to be refused with it, the requests queued for the worker are
+    /// dropped, the responders made from here on answer nowhere, and the
     /// disconnect handler is told. The multiplexer carries on. The session
     /// and the emitter move under the registry's lock, the one a request
-    /// registers under, so no request straddles the two sessions.
-    pub(super) fn reset(&self, reason: Error, emitter: Emitter<Writer>, session: u64) {
+    /// registers under, so no request straddles the two sessions. A session
+    /// the switchboard already moved off ends nothing, whichever thread saw
+    /// it die having done this first.
+    pub(super) fn reset(&self, session: u64, reason: Error, emitter: Emitter<Writer>) {
         {
+            // Everything the session leaves behind goes under the one lock a
+            // request registers under, or the reader could bind the next
+            // session and queue its requests into what this is clearing
             let mut registry = lock(&self.registry);
+            if session == 0 || registry.session != session {
+                return;
+            }
             registry.drain(&reason);
-            registry.session = session;
+            registry.session = 0;
             registry.ended = Some(reason.clone());
             *lock(&self.emitter) = emitter;
+            lock(&self.inbox).clear();
         }
         self.room.notify_all();
-        lock(&self.inbox).clear();
         if let Some(handler) = lock(&self.disconnect).as_mut() {
             handler(reason);
         }
@@ -460,6 +476,8 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// until now.
     fn end(&self, state: State) -> bool {
         {
+            // Under the one lock a request registers under, as a reset is,
+            // so nothing the reader brings in outlives the end
             let mut registry = lock(&self.registry);
             if !matches!(registry.state, State::Open) {
                 return false;
@@ -467,13 +485,12 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             registry.state = state;
             let refusal = registry.refusal();
             registry.drain(&refusal);
-        }
-        self.room.notify_all();
-        {
+
             let mut inbox = lock(&self.inbox);
             inbox.clear();
             inbox.stopped = true;
         }
+        self.room.notify_all();
         self.arrived.notify_one();
         if let Some(closer) = lock(&self.closer).take() {
             closer();
@@ -485,23 +502,30 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
 impl<Out: Envelope, In: Envelope> Sender for Switchboard<Out, In> {
     /// Sends an encoded message through the emitter of a session. A message
     /// refused before sealing leaves the session alone. Any other failure
-    /// means the session ended, which ends a client's multiplexer with it,
-    /// while a server's carries on, the failure the caller's alone and the
-    /// reader minding the sessions.
+    /// took the session with it, which ends a client's multiplexer, while a
+    /// server's ends that session alone and serves the next client. The
+    /// thread that wrote ends it rather than the reader, which may be waiting
+    /// on a client that never sends again.
     fn send(&self, emitter: &Emitter<Writer>, message: &[u8]) -> Result<(), Error> {
         lock(&self.registry).accepting()?;
         match emitter.send_message(message) {
             Ok(()) => Ok(()),
             Err(transport::Error::PacketTooLarge(size)) => Err(Error::TooLarge(size)),
-            Err(err) => match self.side {
-                // The first failure names the reason, a send refused because
-                // the session ended meanwhile surfaces that one instead
-                Side::Client => {
-                    self.fail(Error::Disconnected(Arc::new(err)));
-                    Err(lock(&self.registry).refusal())
+            Err(err) => {
+                let reason = Error::Disconnected(Arc::new(err));
+                match self.side {
+                    // The first failure names the reason, a send refused
+                    // because the session ended meanwhile surfaces that one
+                    Side::Client => {
+                        self.fail(reason);
+                        Err(lock(&self.registry).refusal())
+                    }
+                    Side::Server => {
+                        self.reset(emitter.session(), reason.clone(), emitter.clone());
+                        Err(reason)
+                    }
                 }
-                Side::Server => Err(Error::Disconnected(Arc::new(err))),
-            },
+            }
         }
     }
 }
@@ -516,6 +540,7 @@ fn read<Out: Envelope, In: Envelope>(
     switchboard: Arc<Switchboard<Out, In>>,
     mut source: impl Source,
 ) {
+    let mut bound = source.session();
     loop {
         let message = match source.next_event() {
             Err(err) => {
@@ -525,14 +550,17 @@ fn read<Out: Envelope, In: Envelope>(
             // A handshake opened the next session, the responders made from
             // here on answering into it
             Ok(Event::SessionOpened) => {
-                switchboard.bind(source.emitter(), source.session());
+                bound = source.session();
+                switchboard.bind(source.emitter(), bound);
                 continue;
             }
             // The session the multiplexer was bound to ended, what it left
-            // pending failing with it and nothing live until the next opens
+            // pending failing with it and nothing live until the next opens.
+            // A failed write may have ended it here already.
             Ok(Event::SessionClosed) => {
                 let reason = Error::Disconnected(Arc::new(transport::Error::SessionReset));
-                switchboard.reset(reason, source.emitter(), 0);
+                switchboard.reset(bound, reason, source.emitter());
+                bound = 0;
                 continue;
             }
             Ok(Event::Message(message)) => message,
@@ -545,7 +573,8 @@ fn read<Out: Envelope, In: Envelope>(
                 Side::Client => switchboard.fail(fault),
                 Side::Server => {
                     source.reset_session();
-                    switchboard.reset(fault, source.emitter(), source.session());
+                    switchboard.reset(bound, fault, source.emitter());
+                    bound = 0;
                 }
             }
         }
@@ -580,11 +609,14 @@ fn work<Out: Envelope, In: Envelope>(switchboard: Arc<Switchboard<Out, In>>) {
         };
         let sender = Arc::downgrade(&switchboard);
         let responder = Responder::new(sender, request.emitter, request.id);
+        let Some(content) = request.content else {
+            warn!("refusing request not understood: {}", request.id);
+            switchboard.refuse(responder, "request not understood");
+            continue;
+        };
         match lock(&switchboard.handler).as_mut() {
             Some(handler) => {
-                if panic::catch_unwind(AssertUnwindSafe(|| handler(request.content, responder)))
-                    .is_err()
-                {
+                if panic::catch_unwind(AssertUnwindSafe(|| handler(content, responder))).is_err() {
                     error!("request handler panicked");
                 }
             }

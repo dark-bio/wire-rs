@@ -19,7 +19,7 @@
 //! refusal of a request nobody serves to the tests of the multiplexer.
 
 use super::{Delivery, Feed, Link, MAX_STEPS, PATIENCE, Sink, payload, payload_len, tag as tagged};
-use crate::protocol::mux::{Error, INBOX, Mux, Pending, Responder, WINDOW};
+use crate::protocol::mux::{CHARGE, Error, INBOX, Mux, Pending, Responder, WINDOW};
 use crate::protocol::{self, ArkToHost, Envelope, HostToArk, ark_to_host, host_to_ark};
 use crate::transport::mock::unframe;
 use crate::transport::{self, MAX_MESSAGE_SIZE, Side};
@@ -261,11 +261,11 @@ struct Track {
 /// A request of the peer's ahead of the worker or in the handler.
 #[derive(Clone, Copy)]
 struct Queued {
-    id: u64,      // Id the peer chose for it
-    tag: u8,      // Tag of its payload
-    size: usize,  // Size its payload was asked for
-    bytes: usize, // Bytes it holds of the inbox
-    handle: u64,  // Session its responder answers into
+    id: u64,         // Id the peer chose for it
+    tag: Option<u8>, // Tag of its payload, none for a request that carries none
+    size: usize,     // Size its payload was asked for
+    bytes: usize,    // Bytes it holds of the inbox
+    handle: u64,     // Session its responder answers into
 }
 
 /// Answer the driver is due for a request of its own.
@@ -430,7 +430,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.ids += 2;
 
         let message = Out::request(id, Out::develop(payload.clone())).encode_to_vec();
-        let bytes = message.len();
+        let bytes = message.len().max(CHARGE);
         let content = Out::develop(payload);
 
         // Refused outright once the multiplexer stopped taking calls
@@ -503,7 +503,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         let refusal = match self.send(self.handle, message) {
             None => return None,
             Some(Kind::TooLarge) => Kind::TooLarge,
-            Some(kind) => self.disconnected(kind),
+            Some(kind) => self.disconnected(self.handle, kind),
         };
         // The withdrawal finds nothing when the failure already drained the
         // registry, which is a client ending with its session
@@ -684,7 +684,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.asks += 2;
 
         let message = In::request(id, In::develop(payload(tag, size))).encode_to_vec();
-        let bytes = message.len();
+        let bytes = message.len().max(CHARGE);
         if !self.deliver(Delivery::Message(message)) {
             return;
         }
@@ -697,7 +697,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.queued += bytes;
         self.inbox.push_back(Queued {
             id,
-            tag,
+            tag: Some(tag),
             size,
             bytes,
             handle: self.handle,
@@ -705,7 +705,8 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     }
 
     /// Sends a request of the peer's the multiplexer cannot read, which it
-    /// fails from its reader without ever queuing it.
+    /// queues like any other and its worker fails, the reader never waiting
+    /// on the write.
     fn ask_void(&mut self) {
         if !self.open() {
             return;
@@ -715,15 +716,25 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
 
         // A request with no content at all, which the envelope allows and the
         // multiplexer cannot make anything of
-        if !self.deliver(Delivery::Message(
-            In::response(id, None, None).encode_to_vec(),
-        )) {
+        let message = In::response(id, None, None).encode_to_vec();
+        let bytes = message.len().max(CHARGE);
+        if !self.deliver(Delivery::Message(message)) {
             return;
         }
-        if let Some(kind) = self.failure(self.handle, id, NOT_UNDERSTOOD) {
-            self.disconnected(kind);
+
+        // A peer filling the inbox past its limit overran its window
+        if self.queued + bytes > INBOX {
+            self.fault(Kind::Flooded);
+            return;
         }
-        self.summary.declined += 1;
+        self.queued += bytes;
+        self.inbox.push_back(Queued {
+            id,
+            tag: None,
+            size: 0,
+            bytes,
+            handle: self.handle,
+        });
     }
 
     /// Sends requests until the inbox is past its limit, the worker holding
@@ -763,7 +774,10 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         }
         let failed = match order {
             Order::Reply => {
-                let content = Some(Out::develop(payload(held.tag, held.size)));
+                let content = Some(Out::develop(payload(
+                    held.tag.expect("the handler holds only what it can read"),
+                    held.size,
+                )));
                 let message = Out::response(held.id, content, None);
                 self.send(held.handle, message.encode_to_vec())
             }
@@ -772,13 +786,16 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             // An answer the wire cannot carry is refused before it is sealed
             // and never reaches the peer, so only the one after it does
             Order::Bloat => {
-                let content = Some(Out::develop(payload(held.tag, held.size)));
+                let content = Some(Out::develop(payload(
+                    held.tag.expect("the handler holds only what it can read"),
+                    held.size,
+                )));
                 let message = Out::response(held.id, content, None);
                 self.send(held.handle, message.encode_to_vec())
             }
         };
         if let Some(kind) = failed {
-            self.disconnected(kind);
+            self.disconnected(held.handle, kind);
         }
     }
 
@@ -824,8 +841,14 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     /// Hands a delivery to the reader and waits for it to be dealt with, so
     /// the step after it never races the reader. Applies the transition the
     /// reader makes for it and tells whether a message would be routed at
-    /// all, a session ending routing nothing.
+    /// all, a session ending or a message arriving without one routing
+    /// nothing.
     fn deliver(&mut self, delivery: Delivery) -> bool {
+        // A transport hands no message up without a session, so one sent
+        // into a session that ended never reaches the multiplexer at all
+        if matches!(delivery, Delivery::Message(_)) && self.live == 0 {
+            return false;
+        }
         let session = match delivery {
             Delivery::SessionClosed => Some(false),
             Delivery::SessionOpened => Some(true),
@@ -859,11 +882,14 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         }
     }
 
-    /// Moves the multiplexer onto the next session of the transport, every
-    /// pending request failed with the reason, a request waiting for room
-    /// refused with it, the queued ones dropped and the disconnect handler
-    /// told.
+    /// Ends the session the multiplexer is bound to, every pending request
+    /// failed with the reason, a request waiting for room refused with it,
+    /// the queued ones dropped and the disconnect handler told. A session it
+    /// already moved off ends nothing, a failed write having ended it first.
     fn reset(&mut self, reason: Kind) {
+        if self.handle == 0 {
+            return;
+        }
         self.drain(reason);
         if let Some(blocked) = self.blocked.as_mut() {
             blocked.ended = Some(reason);
@@ -912,12 +938,15 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         }
     }
 
-    /// Applies the multiplexer's reaction to a caller's send failing, a client
-    /// ending with its session and a server carrying on, the failure the
-    /// caller's alone.
-    fn disconnected(&mut self, reason: Kind) -> Kind {
-        if self.side == Side::Client {
-            self.fail(reason);
+    /// Applies the multiplexer's reaction to a send failing, a client ending
+    /// with its session and a server ending the session the send belonged to,
+    /// the thread that wrote seeing it die before the reader would. A send
+    /// into a session the multiplexer already moved off ends nothing.
+    fn disconnected(&mut self, handle: u64, reason: Kind) -> Kind {
+        match self.side {
+            Side::Client => self.fail(reason),
+            Side::Server if handle != 0 && handle == self.handle => self.reset(reason),
+            Side::Server => {}
         }
         reason
     }
@@ -977,24 +1006,33 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     /// Hands the next request to the worker if the handler is free, waiting
     /// for it to be taken.
     fn dispatch(&mut self) {
-        if self.held.is_some() {
-            return;
-        }
-        let Some(queued) = self.inbox.pop_front() else {
-            return;
-        };
-        self.queued -= queued.bytes;
+        while self.held.is_none() {
+            let Some(queued) = self.inbox.pop_front() else {
+                return;
+            };
+            self.queued -= queued.bytes;
 
-        let taken = self
-            .entered
-            .recv_timeout(PATIENCE)
-            .expect("handler taking the request");
-        assert_eq!(
-            (tagged(&taken), taken.len()),
-            (queued.tag as u64, payload_len(queued.size))
-        );
-        self.summary.served += 1;
-        self.held = Some(queued);
+            // One the multiplexer cannot read never reaches the handler, the
+            // worker failing it for the peer and going straight on to the
+            // next, so a run of them leaves the queue in one go
+            let Some(tag) = queued.tag else {
+                if let Some(kind) = self.failure(queued.handle, queued.id, NOT_UNDERSTOOD) {
+                    self.disconnected(queued.handle, kind);
+                }
+                self.summary.declined += 1;
+                continue;
+            };
+            let taken = self
+                .entered
+                .recv_timeout(PATIENCE)
+                .expect("handler taking the request");
+            assert_eq!(
+                (tagged(&taken), taken.len()),
+                (u64::from(tag), payload_len(queued.size))
+            );
+            self.summary.served += 1;
+            self.held = Some(queued);
+        }
     }
 
     /// Joins the request waiting for room in the window once an answer or a
