@@ -524,25 +524,42 @@ fn test_scripted_answer_fails() {
     );
 }
 
-// Tests a client whose write half died under an answer of its handler, which
-// takes the session with it while the multiplexer stays open. The reader
-// notices on the next message of the peer's and ends the multiplexer, a
-// client's session being its connection, so the request after it is refused.
+// Tests a client whose write half dies under an answer of its handler, which
+// tears the session down at once, a client's session being its connection, so
+// the multiplexer ends there and the request after it is refused.
 #[test]
 fn test_scripted_client_answer_fails() {
-    let summary = client(&[
-        Step::Ask(1),
-        Step::Break,
-        Step::Reply,
-        Step::Heal,
-        Step::Stray,
-        Step::Request(2),
-    ]);
+    let summary = client(&[Step::Ask(1), Step::Break, Step::Reply, Step::Request(2)]);
     assert_eq!(
         summary,
         Summary {
             refused: 1,
             served: 1,
+            disconnects: 1,
+            closed: true,
+            ..Summary::default()
+        }
+    );
+}
+
+// Tests that an answer of the handler's failing its write ends the session on
+// a client at once, a request left pending failing there rather than waiting
+// for a message that never comes to notice the dead session.
+#[test]
+fn test_scripted_client_answer_fails_pending() {
+    let summary = client(&[
+        Step::Request(1),
+        Step::Ask(2),
+        Step::Break,
+        Step::Reply,
+        Step::Wait(1),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 1,
+            served: 1,
+            failed: 1,
             disconnects: 1,
             closed: true,
             ..Summary::default()

@@ -232,8 +232,8 @@ enum Outcome {
     Message(u64),
     /// Garbage delivered like any message, the session staying intact.
     Garbage,
-    /// `Error::SessionReset`, a session the read held ending, the handshake
-    /// after a reset concluded either way by then.
+    /// `Error::SessionReset`, a session the read held ending, on the reset
+    /// ending it or the frame breaking it, reported at once.
     Reset,
     /// `Error::RecvFailed` carrying `WouldBlock`.
     Yield,
@@ -384,7 +384,6 @@ pub struct Client {
     emits: Vec<Emit>,   // Frames the server should have emitted since the last sync
     outcome: Outcome,   // What next_message should surface for the last step
     held: bool,         // Whether the server's read side holds a session, its end reported
-    report: bool, // Whether a reset ended the session held, reported once the handshake concludes
 
     pending: Option<Pending>, // ArkHello received, awaiting the client's ack
     sender: Option<xhpke::Sender>, // Outbound context of the live session, sealing the requests
@@ -417,7 +416,6 @@ impl Client {
             emits: Vec::new(),
             outcome: Outcome::Absorbed,
             held: false,
-            report: false,
             pending: None,
             sender: None,
             receiver: None,
@@ -621,10 +619,10 @@ impl Client {
         match (self.state, frame) {
             // A reset restarts the handshake in every state, the client having
             // asked for it, so nothing is signaled. A session held until now
-            // ends with it, reported once the handshake concludes either way
+            // ends with it, reported at once, ahead of the handshake
             (_, Frame::Empty) => {
                 if std::mem::take(&mut self.held) {
-                    self.report = true;
+                    self.outcome = Outcome::Reset;
                 }
                 self.forget();
                 self.state = State::AwaitHello;
@@ -638,13 +636,11 @@ impl Client {
                     self.forget();
                     self.state = State::Idle;
                     self.send(Payload::Signal);
-                    self.reported();
                 }
             }
             (State::AwaitAck, Frame::Ack) => {
                 self.state = State::Established;
                 self.held = true;
-                self.reported();
             }
             (State::Established, Frame::Request(id)) => {
                 self.outcome = Outcome::Message(id);
@@ -660,18 +656,9 @@ impl Client {
                 self.state = State::Idle;
                 self.send(Payload::Signal);
                 if std::mem::take(&mut self.held) {
-                    self.report = true;
+                    self.outcome = Outcome::Reset;
                 }
-                self.reported();
             }
-        }
-    }
-
-    /// Surfaces the end of a session the read held, if one is due, the server
-    /// returning `SessionReset` before it reads on.
-    fn reported(&mut self) {
-        if std::mem::take(&mut self.report) {
-            self.outcome = Outcome::Reset;
         }
     }
 
@@ -753,14 +740,12 @@ impl Client {
         self.pending = None;
     }
 
-    /// Applies a read failing, which aborts a handshake in progress, the
-    /// report of the session it followed lost with it, but leaves a session
-    /// untouched.
+    /// Applies a read failing, which aborts a handshake in progress but leaves
+    /// a session untouched.
     fn interrupt(&mut self, outcome: Outcome) {
         if matches!(self.state, State::AwaitHello | State::AwaitAck) {
             self.forget();
             self.state = State::Idle;
-            self.report = false;
         }
         self.outcome = outcome;
     }

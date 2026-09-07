@@ -14,13 +14,13 @@
 use crate::protocol::envelope::Envelope;
 #[cfg(any(test, feature = "fuzz"))]
 use crate::protocol::switchboard::Source;
-use crate::protocol::switchboard::Switchboard;
+use crate::protocol::switchboard::{Sender, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
 use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tracing::warn;
 
@@ -88,9 +88,9 @@ pub type Server = Mux<ArkToHost, HostToArk>;
 
 impl Server {
     /// Starts multiplexing over a transport server, serving the clients it
-    /// handshakes one session at a time, a new session failing whatever the
-    /// one before it left pending. The closer ends the transport when the
-    /// multiplexer closes or the transport fails.
+    /// handshakes one session at a time, a session ending failing whatever it
+    /// left pending. The closer ends the transport when the multiplexer
+    /// closes or the transport fails.
     pub fn new<A: Attester + Send + 'static>(
         server: transport::Server<Reader, Writer, A>,
         closer: Closer,
@@ -143,16 +143,19 @@ impl<T> Drop for Pending<T> {
 /// forgets does not leave the peer waiting. It is bound to the session the
 /// request arrived in and refused once that ended.
 pub struct Responder<Out: Envelope> {
-    emitter: Emitter<Writer>, // Handle of the session the request arrived in
-    pub(super) id: u64,       // Id of the request, echoed by the answer
-    answered: bool,           // Whether an answer went out
+    switchboard: Weak<dyn Sender>, // Answers through it, a failed write tearing the session down
+    emitter: Emitter<Writer>,      // Handle of the session the request arrived in
+    pub(super) id: u64,            // Id of the request, echoed by the answer
+    answered: bool,                // Whether an answer went out
     envelope: PhantomData<fn() -> Out>, // Envelope the answer travels in
 }
 
 impl<Out: Envelope> Responder<Out> {
-    /// Creates the responder of a request, answering through the emitter.
-    pub(super) fn new(emitter: Emitter<Writer>, id: u64) -> Self {
+    /// Creates the responder of a request, answering through the switchboard
+    /// into the session the request arrived in.
+    pub(super) fn new(switchboard: Weak<dyn Sender>, emitter: Emitter<Writer>, id: u64) -> Self {
         Self {
+            switchboard,
             emitter,
             id,
             answered: false,
@@ -172,16 +175,16 @@ impl<Out: Envelope> Responder<Out> {
         self.send(Out::response(self.id, None, Some(err)))
     }
 
-    /// Sends an answer through the session the request arrived in, a message
-    /// refused before sealing leaving the session alone and any other failure
-    /// meaning it ended.
+    /// Sends an answer through the switchboard, into the session the request
+    /// arrived in, so a failed write ends that session the side's way rather
+    /// than going unnoticed. A refusal once the multiplexer no longer takes
+    /// calls needs no session touched.
     fn send(&self, answer: Out) -> Result<(), Error> {
-        self.emitter
-            .send_message(&answer.encode_to_vec())
-            .map_err(|err| match err {
-                transport::Error::PacketTooLarge(size) => Error::TooLarge(size),
-                err => Error::Disconnected(Arc::new(err)),
-            })
+        let message = answer.encode_to_vec();
+        match self.switchboard.upgrade() {
+            Some(switchboard) => switchboard.send(&self.emitter, &message),
+            None => Err(Error::Closed),
+        }
     }
 }
 

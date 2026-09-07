@@ -69,8 +69,8 @@ pub fn tag(payload: &[u8]) -> u64 {
 pub(crate) enum Delivery {
     /// A message of the peer's, opened by the transport that is not there.
     Message(Vec<u8>),
-    /// The session the read side held ended, the peer having reset it, the
-    /// next one live by the time it is reported if its handshake made one.
+    /// The session the read side held ended, the peer having reset it,
+    /// reported ahead of the handshake that follows.
     Reset,
     /// The read fails, ending the transport under the multiplexer.
     Failed(transport::Error),
@@ -197,6 +197,13 @@ impl Link {
     pub(crate) fn held(&self) -> bool {
         self.held.load(Ordering::Acquire)
     }
+
+    /// Drops the session, the read side letting go of it too, as a transport
+    /// server does on the peer's reset.
+    pub(crate) fn drop_session(&self) {
+        self.held.store(false, Ordering::Release);
+        self.funnel.drop_session();
+    }
 }
 
 /// Reading half of the mock transport, the source the multiplexer's reader
@@ -258,8 +265,7 @@ impl Source for Feed {
     }
 
     fn reset_session(&mut self) {
-        self.link.held.store(false, Ordering::Release);
-        self.link.funnel.drop_session();
+        self.link.drop_session();
         let _ = self.link.funnel.send_dropped();
     }
 }

@@ -709,7 +709,9 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         )) {
             return;
         }
-        self.failure(self.handle, id, NOT_UNDERSTOOD);
+        if let Some(kind) = self.failure(self.handle, id, NOT_UNDERSTOOD) {
+            self.disconnected(kind);
+        }
         self.summary.declined += 1;
     }
 
@@ -742,14 +744,23 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         let orders = self.orders.as_ref().expect("handler still plugged in");
         orders.send(order).expect("worker running the handler");
 
-        match order {
+        // The handler answers through the switchboard, its send refused with
+        // no write once the multiplexer no longer takes calls, and a failed
+        // write ending the session the side's way
+        if !self.open() {
+            return;
+        }
+        let failed = match order {
             Order::Reply => {
                 let content = Some(Out::develop(payload(held.tag, held.size)));
                 let message = Out::response(held.id, content, None);
-                self.send(held.handle, message.encode_to_vec());
+                self.send(held.handle, message.encode_to_vec())
             }
             Order::Refuse => self.failure(held.handle, held.id, REFUSAL),
             Order::Ignore => self.failure(held.handle, held.id, UNANSWERED),
+        };
+        if let Some(kind) = failed {
+            self.disconnected(kind);
         }
     }
 
@@ -759,17 +770,17 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         if self.side == Side::Client || !self.open() {
             return;
         }
-        let held = self.link.held();
+        // A server's read reports the session it held ending at once, ahead
+        // of the handshake that follows, the multiplexer moving on the report
+        // and binding the next session on the first message in it
+        if self.link.held() {
+            self.link.drop_session();
+            self.live = 0;
+            self.deliver(Delivery::Reset);
+        }
         self.receiver = Some(self.link.open_session());
         self.live = self.link.session();
         self.summary.sessions += 1;
-
-        // A server's read reports the session it held ending once the next
-        // one stands, the multiplexer moving on the report rather than on
-        // the next message
-        if held {
-            self.deliver(Delivery::Reset);
-        }
     }
 
     /// Ends the transport under the reader, which ends the multiplexer with
@@ -806,16 +817,12 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.open()
     }
 
-    /// Applies the session check the reader makes ahead of routing. A client's
-    /// session is its connection, so it moving means it died under a failed
-    /// write, which ends the multiplexer. On a server the first session
-    /// installs its handle and every later one resets the multiplexer onto it.
+    /// Applies the session check the reader makes on a server ahead of
+    /// routing, the first session installing its handle and every later one
+    /// resetting the multiplexer onto it. A client's session is its
+    /// connection, so the reader never looks at its number.
     fn session_moved(&mut self) {
-        if self.live == self.observed {
-            return;
-        }
-        if self.side == Side::Client {
-            self.fail(Kind::Terminated);
+        if self.side == Side::Client || self.live == self.observed {
             return;
         }
         match self.observed {
@@ -901,7 +908,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
 
     /// Applies the multiplexer failing a request of the peer's on its own
     /// account, which is never reported anywhere but the log.
-    fn failure(&mut self, handle: u64, id: u64, failure: (u64, &str)) {
+    fn failure(&mut self, handle: u64, id: u64, failure: (u64, &str)) -> Option<Kind> {
         let message = Out::response(
             id,
             None,
@@ -910,7 +917,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
                 msg: failure.1.into(),
             }),
         );
-        self.send(handle, message.encode_to_vec());
+        self.send(handle, message.encode_to_vec())
     }
 
     /// Applies a send of the multiplexer through the handle of a session,
