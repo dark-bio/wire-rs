@@ -365,8 +365,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 }
 
 impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
-    /// Ends the session for the emitters and lets go of the transport writer,
-    /// so nothing stays open on their account.
+    /// Ends the session for the emitters, the funnel and the transport writer
+    /// going with the owner unless a send still holds them, so nothing stays
+    /// open on an idle emitter's account.
     fn drop(&mut self) {
         self.funnel.close();
     }
