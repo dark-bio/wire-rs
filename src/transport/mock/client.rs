@@ -232,6 +232,9 @@ enum Outcome {
     Message(u64),
     /// Garbage delivered like any message, the session staying intact.
     Garbage,
+    /// `Error::SessionReset`, a session the read held ending, the handshake
+    /// after a reset concluded either way by then.
+    Reset,
     /// `Error::RecvFailed` carrying `WouldBlock`.
     Yield,
     /// `Error::Terminated`, the script having run out.
@@ -380,6 +383,8 @@ pub struct Client {
     tail: Option<Tail>, // Unterminated frame the server left behind
     emits: Vec<Emit>,   // Frames the server should have emitted since the last sync
     outcome: Outcome,   // What next_message should surface for the last step
+    held: bool,         // Whether the server's read side holds a session, its end reported
+    report: bool, // Whether a reset ended the session held, reported once the handshake concludes
 
     pending: Option<Pending>, // ArkHello received, awaiting the client's ack
     sender: Option<xhpke::Sender>, // Outbound context of the live session, sealing the requests
@@ -411,6 +416,8 @@ impl Client {
             tail: None,
             emits: Vec::new(),
             outcome: Outcome::Absorbed,
+            held: false,
+            report: false,
             pending: None,
             sender: None,
             receiver: None,
@@ -613,8 +620,12 @@ impl Client {
         };
         match (self.state, frame) {
             // A reset restarts the handshake in every state, the client having
-            // asked for it, so nothing is signaled
+            // asked for it, so nothing is signaled. A session held until now
+            // ends with it, reported once the handshake concludes either way
             (_, Frame::Empty) => {
+                if std::mem::take(&mut self.held) {
+                    self.report = true;
+                }
                 self.forget();
                 self.state = State::AwaitHello;
             }
@@ -627,10 +638,13 @@ impl Client {
                     self.forget();
                     self.state = State::Idle;
                     self.send(Payload::Signal);
+                    self.reported();
                 }
             }
             (State::AwaitAck, Frame::Ack) => {
                 self.state = State::Established;
+                self.held = true;
+                self.reported();
             }
             (State::Established, Frame::Request(id)) => {
                 self.outcome = Outcome::Message(id);
@@ -639,12 +653,25 @@ impl Client {
             (State::Established, Frame::Garbage) => {
                 self.outcome = Outcome::Garbage;
             }
-            // Anything else drops whatever the server had, the client told so
+            // Anything else drops whatever the server had, the client told so,
+            // a session held until now ending with it and reported at once
             _ => {
                 self.forget();
                 self.state = State::Idle;
                 self.send(Payload::Signal);
+                if std::mem::take(&mut self.held) {
+                    self.report = true;
+                }
+                self.reported();
             }
+        }
+    }
+
+    /// Surfaces the end of a session the read held, if one is due, the server
+    /// returning `SessionReset` before it reads on.
+    fn reported(&mut self) {
+        if std::mem::take(&mut self.report) {
+            self.outcome = Outcome::Reset;
         }
     }
 
@@ -726,12 +753,14 @@ impl Client {
         self.pending = None;
     }
 
-    /// Applies a read failing, which aborts a handshake in progress but leaves
-    /// a session untouched.
+    /// Applies a read failing, which aborts a handshake in progress, the
+    /// report of the session it followed lost with it, but leaves a session
+    /// untouched.
     fn interrupt(&mut self, outcome: Outcome) {
         if matches!(self.state, State::AwaitHello | State::AwaitAck) {
             self.forget();
             self.state = State::Idle;
+            self.report = false;
         }
         self.outcome = outcome;
     }
@@ -894,7 +923,8 @@ fn check_session(server: &mut Server, client: &Client) {
 
 /// Sends a message on the server's behalf, checking that the send path works
 /// exactly in a session and fails exactly when the transport does. A failed
-/// send takes the session down with it, the server signaling so.
+/// send takes the session down with it, the server signaling so, and takes
+/// the read side down with it too, so nothing is left for a read to report.
 fn send(server: &mut Server, client: &mut Client, id: u64) {
     // Predict the send, a reply going out in a session unless the transport
     // fails it, in which case the server drops the session and signals
@@ -908,6 +938,7 @@ fn send(server: &mut Server, client: &mut Client, id: u64) {
         if !sent {
             client.forget();
             client.state = State::Idle;
+            client.held = false;
             client.send(Payload::Signal);
         }
         sent
@@ -955,6 +986,13 @@ pub fn run(steps: &[Step]) -> Summary {
                         panic!("server delivered {message:?} where the model has {outcome:?}")
                     }
                 }
+            }
+            // A session the server held ended, the client having reset or
+            // broken it, the next one standing if the handshake made one
+            Err(Error::SessionReset) => {
+                let mut client = client.borrow_mut();
+                client.surfaced(Outcome::Reset);
+                check_session(&mut server, &client);
             }
             // Probe the send path whenever the script hands control back
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::WouldBlock => {

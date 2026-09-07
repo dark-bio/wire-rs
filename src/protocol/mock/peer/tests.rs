@@ -111,6 +111,30 @@ fn test_scripted_remote_failure() {
     );
 }
 
+// Tests a request of a server's failed by the peer, which fails the caller
+// alone the same way a client's is.
+#[test]
+fn test_scripted_server_remote_failure() {
+    let summary = server(&[
+        Step::Request(1),
+        Step::Fail(1),
+        Step::Wait(1),
+        Step::Request(2),
+        Step::Answer(2),
+        Step::Wait(2),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 2,
+            answered: 1,
+            failed: 1,
+            sessions: 1,
+            ..Summary::default()
+        }
+    );
+}
+
 // Tests an answer to a request nobody made, which is dropped without the
 // session suffering for it.
 #[test]
@@ -527,7 +551,8 @@ fn test_scripted_client_answer_fails() {
 }
 
 // Tests a message too large for the wire, refused before it is sealed with
-// the session none the worse for it.
+// the session none the worse for it, and refused just the same against a
+// full window rather than waiting for room it could never use.
 #[test]
 fn test_scripted_message_too_large() {
     let summary = client(&[
@@ -540,6 +565,29 @@ fn test_scripted_message_too_large() {
         summary,
         Summary {
             sent: 1,
+            refused: 1,
+            answered: 1,
+            ..Summary::default()
+        }
+    );
+
+    let summary = client(&[
+        Step::Bulk(1),
+        Step::Bulk(2),
+        Step::Bulk(3),
+        Step::Bulk(4),
+        Step::Bulk(5),
+        Step::Bulk(6),
+        Step::Bulk(7),
+        Step::Bulk(8),
+        Step::Oversized,
+        Step::Answer(1),
+        Step::Wait(1),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 8,
             refused: 1,
             answered: 1,
             ..Summary::default()
@@ -571,6 +619,36 @@ fn test_scripted_window_fills() {
         Summary {
             sent: 9,
             answered: 2,
+            ..Summary::default()
+        }
+    );
+}
+
+// Tests that a request the driver gave up on keeps its place in the window
+// until the peer answers it, the peer holding the work either way, so a
+// request after it waits for room all the same.
+#[test]
+fn test_scripted_forgotten_holds_window() {
+    let summary = client(&[
+        Step::Bulk(1),
+        Step::Bulk(2),
+        Step::Bulk(3),
+        Step::Bulk(4),
+        Step::Bulk(5),
+        Step::Bulk(6),
+        Step::Bulk(7),
+        Step::Bulk(8),
+        Step::Forget(1),
+        Step::Bulk(9),
+        Step::Answer(1),
+        Step::Answer(9),
+        Step::Wait(9),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 9,
+            answered: 1,
             ..Summary::default()
         }
     );

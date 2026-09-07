@@ -775,9 +775,11 @@ fn test_scripted_batched_reads() {
         Step::Junk(vec![2]),
         Step::Junk(vec![3]),
     ]);
+    // The first junk ends the session, which the read reports and which
+    // ends the batch, so the two after it arrive in reads of their own
     assert_eq!(summary.state, State::Idle);
     assert_eq!(summary.dropped, 3);
-    assert_eq!(summary.reads, 4);
+    assert_eq!(summary.reads, 6);
 
     let summary = run_logged(&[
         Step::Reset,

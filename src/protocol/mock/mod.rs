@@ -69,6 +69,9 @@ pub fn tag(payload: &[u8]) -> u64 {
 pub(crate) enum Delivery {
     /// A message of the peer's, opened by the transport that is not there.
     Message(Vec<u8>),
+    /// The session the read side held ended, the peer having reset it, the
+    /// next one live by the time it is reported if its handshake made one.
+    Reset,
     /// The read fails, ending the transport under the multiplexer.
     Failed(transport::Error),
 }
@@ -150,6 +153,7 @@ impl Write for Sink {
 pub(crate) struct Link {
     funnel: Arc<Funnel<Writer>>,
     emitter: Mutex<Emitter<Writer>>, // Handle of the live session, as a transport caches it
+    held: AtomicBool,                // Whether the read side holds a session, its end reported
 }
 
 impl Link {
@@ -158,7 +162,11 @@ impl Link {
     pub(crate) fn new(side: Side, sink: Sink) -> Arc<Self> {
         let funnel = Arc::new(Funnel::new(Box::new(sink) as Writer, side));
         let emitter = Mutex::new(funnel.emitter());
-        Arc::new(Self { funnel, emitter })
+        Arc::new(Self {
+            funnel,
+            emitter,
+            held: AtomicBool::new(false),
+        })
     }
 
     /// Opens a session, the one before it dropped, and hands back the context
@@ -175,12 +183,19 @@ impl Link {
 
         self.funnel.establish_session(sender);
         *self.emitter.lock().expect("link not poisoned") = self.funnel.emitter();
+        self.held.store(true, Ordering::Release);
         receiver
     }
 
     /// Number of the live session, or zero without one.
     pub(crate) fn session(&self) -> u64 {
         self.funnel.session()
+    }
+
+    /// Whether the read side holds a session, one whose end a transport
+    /// server's read would report.
+    pub(crate) fn held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
     }
 }
 
@@ -228,6 +243,7 @@ impl Source for Feed {
         let _ = self.routed.send(());
         match self.deliveries.recv() {
             Ok(Delivery::Message(message)) => Ok(message),
+            Ok(Delivery::Reset) => Err(transport::Error::SessionReset),
             Ok(Delivery::Failed(err)) => Err(err),
             Err(_) => Err(transport::Error::Terminated),
         }
@@ -242,6 +258,7 @@ impl Source for Feed {
     }
 
     fn reset_session(&mut self) {
+        self.link.held.store(false, Ordering::Release);
         self.link.funnel.drop_session();
         let _ = self.link.funnel.send_dropped();
     }

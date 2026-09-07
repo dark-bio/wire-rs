@@ -29,7 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Payload of the requests that fill the window and the inbox, as large as
 /// the wire carries once the envelope is wrapped around it. Eight fill the
@@ -46,7 +46,11 @@ pub const MAX_FLOODS: usize = 2;
 /// neither of which the driver ever waits for an answer to.
 const HOUSEKEEPING: u8 = 0xff;
 
-/// Code and message the mock's handler fails a request with.
+/// Code and message the peer fails a request of the multiplexer's with, told
+/// apart from the handler's own so neither passes for the other.
+const REJECTION: (u64, &str) = (13, "peer said no");
+
+/// Code and message the mock's handler fails a request of the peer's with.
 const REFUSAL: (u64, &str) = (7, "handler said no");
 
 /// Failure the multiplexer answers a request it cannot read with.
@@ -134,8 +138,6 @@ pub enum Kind {
     Closed,
     /// `Error::TooLarge`, a message the wire cannot carry.
     TooLarge,
-    /// `Error::Remote`, the peer failing a request.
-    Remote,
     /// `Error::Disconnected` over `transport::Error::Terminated`.
     Terminated,
     /// `Error::Disconnected` over `transport::Error::SessionReset`.
@@ -155,7 +157,7 @@ fn kind(err: Error) -> Kind {
         Error::Malformed => Kind::Malformed,
         Error::Closed => Kind::Closed,
         Error::TooLarge(_) => Kind::TooLarge,
-        Error::Remote(_) => Kind::Remote,
+        Error::Remote(err) => panic!("peer failure outside an answer: {err:?}"),
         Error::Disconnected(err) => match *err {
             transport::Error::Terminated => Kind::Terminated,
             transport::Error::SessionReset => Kind::Reset,
@@ -268,9 +270,21 @@ enum Outcome {
     /// The peer answered, echoing the tag.
     Payload(u8),
     /// The peer failed the request.
-    Remote,
+    Rejected,
     /// The session ended under it, with the reason.
     Fault(Kind),
+}
+
+/// What a wait hands back, the model's prediction and the multiplexer's
+/// result compared as one.
+#[derive(Debug, PartialEq, Eq)]
+enum Expect {
+    /// The payload the peer echoed.
+    Payload(Vec<u8>),
+    /// The peer failed the request, with the code and message it sent.
+    Rejected(u64, String),
+    /// The wait failed for the reason.
+    Failed(Kind),
 }
 
 /// Frame the model expects the multiplexer to write.
@@ -419,17 +433,34 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             self.called(tag, result, Some(refusal));
             return;
         }
+        // Refused ahead of the window if the wire cannot carry it, never
+        // waiting for room it could not use
+        if bytes > MAX_MESSAGE_SIZE {
+            let result = self.mux.request(content);
+            self.called(tag, result, Some(Kind::TooLarge));
+            return;
+        }
         // Waiting for room, made on a thread the model joins once an answer
         // or a fault frees it
         if self.inflight + bytes > WINDOW {
             let (results, result) = mpsc::channel();
+            let (entering, entered) = mpsc::sync_channel(0);
             let mux = self.mux.clone();
             let call = thread::Builder::new()
                 .name("mock-caller".into())
                 .spawn(move || {
+                    let _ = entering.send(());
                     let _ = results.send(mux.request(content));
                 })
                 .expect("failed to spawn the calling thread");
+
+            // Wait for the thread to reach the call, so it is parked on the
+            // window by the time a later step frees the room, rather than
+            // still starting up and finding it free
+            entered
+                .recv_timeout(PATIENCE)
+                .expect("request thread reaching the call");
+
             self.blocked = Some(Blocked {
                 tag,
                 id,
@@ -506,18 +537,22 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             return;
         };
         let expected = match self.settled.remove(&tag) {
-            Some(Outcome::Payload(answer)) => Ok(payload(answer, 0)),
-            Some(Outcome::Remote) => Err(Kind::Remote),
-            Some(Outcome::Fault(kind)) => Err(kind),
-            None => Err(Kind::Timeout),
+            Some(Outcome::Payload(answer)) => Expect::Payload(payload(answer, 0)),
+            Some(Outcome::Rejected) => Expect::Rejected(REJECTION.0, REJECTION.1.into()),
+            Some(Outcome::Fault(kind)) => Expect::Failed(kind),
+            None => Expect::Failed(Kind::Timeout),
         };
-        let result = pending.wait(Duration::ZERO).map(In::payload).map_err(kind);
+        let result = match pending.wait(Duration::ZERO) {
+            Ok(content) => Expect::Payload(In::payload(content)),
+            Err(Error::Remote(err)) => Expect::Rejected(err.code, err.msg),
+            Err(err) => Expect::Failed(kind(err)),
+        };
         assert_eq!(result, expected);
         match expected {
-            Ok(_) => self.summary.answered += 1,
-            Err(_) => self.summary.failed += 1,
+            Expect::Payload(_) => self.summary.answered += 1,
+            _ => self.summary.failed += 1,
         }
-        if expected == Err(Kind::Timeout) {
+        if expected == Expect::Failed(Kind::Timeout) {
             self.give_up(tag);
         }
     }
@@ -575,12 +610,12 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
                 id,
                 None,
                 Some(protocol::Error {
-                    code: REFUSAL.0,
-                    msg: REFUSAL.1.into(),
+                    code: REJECTION.0,
+                    msg: REJECTION.1.into(),
                 }),
             ),
         };
-        if !self.deliver(message.encode_to_vec()) {
+        if !self.deliver(Delivery::Message(message.encode_to_vec())) {
             return;
         }
 
@@ -593,7 +628,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         if !track.forgotten {
             let outcome = match failed {
                 false => Outcome::Payload(tag),
-                true => Outcome::Remote,
+                true => Outcome::Rejected,
             };
             self.settled.insert(tag, outcome);
         }
@@ -610,7 +645,10 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             Side::Server => u64::MAX - 1,
         };
         let content = carried.then(|| In::develop(payload(0, 0)));
-        if self.deliver(In::response(id, content, None).encode_to_vec()) && !carried {
+        if self.deliver(Delivery::Message(
+            In::response(id, content, None).encode_to_vec(),
+        )) && !carried
+        {
             self.fault(Kind::Malformed);
         }
     }
@@ -620,7 +658,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         if !self.open() {
             return;
         }
-        if self.deliver(vec![0x07]) {
+        if self.deliver(Delivery::Message(vec![0x07])) {
             self.fault(Kind::Malformed);
         }
     }
@@ -636,7 +674,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
 
         let message = In::request(id, In::develop(payload(tag, size))).encode_to_vec();
         let bytes = message.len();
-        if !self.deliver(message) {
+        if !self.deliver(Delivery::Message(message)) {
             return;
         }
 
@@ -666,7 +704,9 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
 
         // A request with no content at all, which the envelope allows and the
         // multiplexer cannot make anything of
-        if !self.deliver(In::response(id, None, None).encode_to_vec()) {
+        if !self.deliver(Delivery::Message(
+            In::response(id, None, None).encode_to_vec(),
+        )) {
             return;
         }
         self.failure(self.handle, id, NOT_UNDERSTOOD);
@@ -719,9 +759,17 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         if self.side == Side::Client || !self.open() {
             return;
         }
+        let held = self.link.held();
         self.receiver = Some(self.link.open_session());
         self.live = self.link.session();
         self.summary.sessions += 1;
+
+        // A server's read reports the session it held ending once the next
+        // one stands, the multiplexer moving on the report rather than on
+        // the next message
+        if held {
+            self.deliver(Delivery::Reset);
+        }
     }
 
     /// Ends the transport under the reader, which ends the multiplexer with
@@ -743,13 +791,13 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.broken = broken || self.closed;
     }
 
-    /// Hands a message to the reader and waits for it to be dealt with, so
-    /// the step after it never races the reader. Applies the session check the
-    /// reader makes ahead of routing and tells whether the message was routed
-    /// at all, a client ending on that check routing nothing.
-    fn deliver(&mut self, message: Vec<u8>) -> bool {
+    /// Hands a delivery to the reader, a message or a reset, and waits for it
+    /// to be dealt with, so the step after it never races the reader. Applies
+    /// the session check the reader makes and tells whether a message would
+    /// be routed at all, a client ending on that check routing nothing.
+    fn deliver(&mut self, delivery: Delivery) -> bool {
         self.deliveries
-            .send(Delivery::Message(message))
+            .send(delivery)
             .expect("reader thread reading");
         self.routes
             .recv_timeout(PATIENCE)
@@ -969,6 +1017,20 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             self.attempts
                 .recv_timeout(PATIENCE)
                 .expect("write attempt the model expected");
+        }
+        // A failed write reports back from inside the write, and the funnel
+        // ends its session only after that, on the thread that wrote, so wait
+        // for the funnel to catch up with the model before the next step
+        // reads the session off it
+        let deadline = Instant::now() + PATIENCE;
+        while self.link.session() != self.live {
+            assert!(
+                Instant::now() < deadline,
+                "funnel in session {} where the model has {}",
+                self.link.session(),
+                self.live
+            );
+            thread::sleep(Duration::from_millis(1));
         }
         if std::mem::take(&mut self.ending) {
             self.ends

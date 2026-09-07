@@ -142,7 +142,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// Serves the next host-to-ark message, decrypting it. Empty frames are
     /// session resets and run the handshake inline. Junk outside a session,
     /// undecryptable packets and failed handshakes are logged, answered with
-    /// an empty frame and skipped. Only transport failures surface as errors.
+    /// an empty frame and skipped. A read that ends a live session, the client
+    /// resetting it, a frame that does not decode or a packet that does not
+    /// open, reports it with `SessionReset` once its housekeeping is done, the
+    /// next session already live if the client's handshake made one, so
+    /// whatever was bound to the old session can be let go. A session the
+    /// server dropped itself, see `reset_session`, is not reported. Only
+    /// transport failures surface as other errors.
     pub fn next_message(&mut self) -> Result<Vec<u8>, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and trigger a new session handshake.
@@ -158,18 +164,21 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // message though, leaving the HPKE sequence behind the client's,
                 // so the session cannot continue either way.
                 Err(err) => {
-                    if self.drop_session() {
+                    let ended = self.drop_session();
+                    if ended {
                         warn!("failed to decode cobs packet, resetting session: {}", err);
                     } else {
                         warn!("failed to decode cobs packet: {}", err);
                     }
                     self.send_dropped();
+                    if ended {
+                        return Err(Error::SessionReset);
+                    }
                     continue;
                 }
                 // Empty frame signals a session reset from the client
                 Ok(None) => {
-                    self.drop_session();
-
+                    let ended = self.drop_session();
                     match self.handshake() {
                         // Transport errors propagate immediately
                         Err(Error::Terminated) => return Err(Error::Terminated),
@@ -180,7 +189,6 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                         Err(err) => {
                             warn!("wire handshake failed: {}", err);
                             self.send_dropped();
-                            continue;
                         }
                         // Handshake successful, the ack read ahead of anything
                         // sealed into the session
@@ -189,19 +197,27 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                             self.receiver = Some(receiver);
                             self.funnel.establish_session(sender);
                             self.emitter = self.funnel.emitter();
-                            continue;
                         }
                     }
+                    // The session the reset ended is reported once the next
+                    // one stands, or failed to, so the caller moves in one go
+                    if ended {
+                        return Err(Error::SessionReset);
+                    }
+                    continue;
                 }
                 // Valid COBS packet
                 Ok(Some(packet)) => packet,
             };
             // An emitter may have ended the session on its own thread, in which
-            // case the receiver side goes down with it here. A non-empty packet
-            // without a session is junk either way, the client may still think
-            // it has a session though, tell it otherwise.
-            if !self.funnel.has_session() {
-                self.receiver = None;
+            // case the receiver side goes down with it here, the end reported.
+            // A non-empty packet without a session is junk either way, the
+            // client may still think it has a session though, tell it otherwise.
+            if !self.funnel.has_session() && self.receiver.is_some() {
+                warn!("dropping data of a session an emitter ended");
+                self.drop_session();
+                self.send_dropped();
+                return Err(Error::SessionReset);
             }
             let receiver = match self.receiver.as_mut() {
                 None => {
@@ -218,7 +234,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     warn!("decryption failed, resetting session: {}", err);
                     self.drop_session();
                     self.send_dropped();
-                    continue;
+                    return Err(Error::SessionReset);
                 }
                 Ok(message) => message,
             };
@@ -231,11 +247,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     }
 
     /// Drops the session, both of its contexts going together, and reports
-    /// whether there was one to drop.
+    /// whether the read side held one, an emitter possibly having ended the
+    /// funnel's already.
     fn drop_session(&mut self) -> bool {
-        let active = self.receiver.take().is_some() && self.funnel.has_session();
+        let held = self.receiver.take().is_some();
         self.funnel.drop_session();
-        active
+        held
     }
 
     /// Tells the client that the server has no session with it by sending an empty
@@ -444,15 +461,20 @@ mod tests {
         let ark_reader = ark_sock.try_clone().unwrap();
         let ark_writer = ark_sock;
 
-        // Server side: receive two messages (across two sessions), echo each back.
+        // Server side: receive two messages across two sessions, echoing each
+        // back, the frame injected between them ending the first session,
+        // which the read reports.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
             let mut requests = Vec::new();
-            for _ in 0..2 {
-                let req = server.next_message().unwrap();
-                server.send_message(&req).unwrap();
-                requests.push(req);
-            }
+            let req = server.next_message().unwrap();
+            server.send_message(&req).unwrap();
+            requests.push(req);
+            let result = server.next_message();
+            assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
+            let req = server.next_message().unwrap();
+            server.send_message(&req).unwrap();
+            requests.push(req);
             requests
         });
 
@@ -710,15 +732,19 @@ mod tests {
         let ark_reader = ark_sock.try_clone().unwrap();
         let ark_writer = ark_sock;
 
-        // Server side: note the number before any session and after each of
-        // the two requests, the second one arriving in a second session.
+        // Server side: note the number before any session, after the first
+        // request, at the report of the first session ending, the second one
+        // standing by then, and after the request arriving in it.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
             let mut numbers = vec![server.session()];
-            for _ in 0..2 {
-                server.next_message().unwrap();
-                numbers.push(server.session());
-            }
+            server.next_message().unwrap();
+            numbers.push(server.session());
+            let result = server.next_message();
+            assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
+            numbers.push(server.session());
+            server.next_message().unwrap();
+            numbers.push(server.session());
             numbers
         });
 
@@ -732,7 +758,7 @@ mod tests {
         assert_eq!(client.session(), 2);
         client.send_message(&payload(2)).unwrap();
 
-        assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 2]);
+        assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 2, 2]);
     }
 
     // Tests that the server resetting a session tells the client, whose next

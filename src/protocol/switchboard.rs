@@ -10,7 +10,7 @@
 use crate::protocol;
 use crate::protocol::envelope::{Envelope, Ids, Kind, Parity};
 use crate::protocol::mux::{Closer, Error, INBOX, Reader, Responder, WINDOW, Writer};
-use crate::transport::{self, Attester, Emitter, Side};
+use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::SyncSender;
@@ -216,23 +216,26 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     }
 
     /// Registers a request with its bytes, waiting for room in the window,
-    /// unless the multiplexer no longer takes calls. Hands back the emitter
+    /// unless the multiplexer no longer takes calls or the wire would refuse
+    /// the message, which gets no place to wait for. Hands back the emitter
     /// of the session the request is registered in, taken under the same
     /// lock, so the send that follows cannot cross into the next session.
     fn admit(&self, id: u64, bytes: usize, tx: Answer<In>) -> Result<Emitter<Writer>, Error> {
         let mut registry = lock(&self.registry);
-        loop {
-            registry.accepting()?;
-            if registry.inflight + bytes <= WINDOW {
-                registry.inflight += bytes;
-                registry.pending.insert(id, (tx, bytes));
-                return Ok(lock(&self.emitter).clone());
-            }
+        registry.accepting()?;
+        if bytes > MAX_MESSAGE_SIZE {
+            return Err(Error::TooLarge(bytes));
+        }
+        while registry.inflight + bytes > WINDOW {
             registry = self
                 .room
                 .wait(registry)
                 .unwrap_or_else(PoisonError::into_inner);
+            registry.accepting()?;
         }
+        registry.inflight += bytes;
+        registry.pending.insert(id, (tx, bytes));
+        Ok(lock(&self.emitter).clone())
     }
 
     /// Forgets a request on the caller's behalf, its answer discarded on
@@ -445,8 +448,9 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
 
 /// Reads messages until the transport ends, routing each, the end failing
 /// the multiplexer with the reason, a close needing no notification. A server
-/// handshakes the next client inside its read, so a message arriving in a new
-/// session first resets the one before it, the peer having moved on. The
+/// handshakes the next client inside its read and reports the session that
+/// ended, the next one live by then if the handshake made one, so the
+/// multiplexer moves on the report and not on the client's next message. The
 /// source goes with the thread, ending the session for the emitters.
 fn read<Out: Envelope, In: Envelope>(
     switchboard: Arc<Switchboard<Out, In>>,
@@ -454,46 +458,51 @@ fn read<Out: Envelope, In: Envelope>(
 ) {
     let mut session = source.session();
     loop {
-        match source.next_message() {
-            Ok(message) => {
-                if source.session() != session {
-                    // A client's session is its connection, so the number
-                    // only moves when the session died under a failed write,
-                    // which ends the multiplexer
-                    if switchboard.side == Side::Client {
-                        let reason = Error::Disconnected(Arc::new(transport::Error::Terminated));
-                        switchboard.fail(reason);
-                        continue;
-                    }
-                    // A new session on the server, the one before it reset by
-                    // the peer, if there was one, and the responders made from
-                    // here on answering into the new one
-                    let emitter = source.emitter();
-                    if session == 0 {
-                        *lock(&switchboard.emitter) = emitter;
-                    } else {
-                        let reason = Error::Disconnected(Arc::new(transport::Error::SessionReset));
-                        switchboard.reset(reason, emitter);
-                    }
-                    session = source.session();
-                }
-                // A peer breaking the protocol has its session ended, which
-                // on a client is the multiplexer's end and on a server the
-                // session's alone, the next client served after it
-                if let Err(fault) = switchboard.route(message) {
-                    match switchboard.side {
-                        Side::Client => switchboard.fail(fault),
-                        Side::Server => {
-                            source.reset_session();
-                            switchboard.reset(fault, source.emitter());
-                            session = source.session();
-                        }
-                    }
-                }
-            }
+        let message = match source.next_message() {
+            Ok(message) => Some(message),
+            // The peer reset the session on a server, nothing to route but
+            // the session number to follow below
+            Err(transport::Error::SessionReset) if switchboard.side == Side::Server => None,
             Err(err) => {
                 switchboard.fail(Error::Disconnected(Arc::new(err)));
                 return;
+            }
+        };
+        if source.session() != session {
+            // A client's session is its connection, so the number only moves
+            // when the session died under a failed write, which ends the
+            // multiplexer
+            if switchboard.side == Side::Client {
+                let reason = Error::Disconnected(Arc::new(transport::Error::Terminated));
+                switchboard.fail(reason);
+                continue;
+            }
+            // A new session on the server, or none, the one before it reset
+            // by the peer, if there was one, and the responders made from
+            // here on answering into whatever is live
+            let emitter = source.emitter();
+            if session == 0 {
+                *lock(&switchboard.emitter) = emitter;
+            } else {
+                let reason = Error::Disconnected(Arc::new(transport::Error::SessionReset));
+                switchboard.reset(reason, emitter);
+            }
+            session = source.session();
+        }
+        let Some(message) = message else {
+            continue;
+        };
+        // A peer breaking the protocol has its session ended, which on a
+        // client is the multiplexer's end and on a server the session's
+        // alone, the next client served after it
+        if let Err(fault) = switchboard.route(message) {
+            match switchboard.side {
+                Side::Client => switchboard.fail(fault),
+                Side::Server => {
+                    source.reset_session();
+                    switchboard.reset(fault, source.emitter());
+                    session = source.session();
+                }
             }
         }
     }
