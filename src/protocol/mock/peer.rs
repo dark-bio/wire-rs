@@ -113,6 +113,10 @@ pub enum Step {
     Refuse,
     /// The handler lets the request it holds go unanswered.
     Ignore,
+    /// The handler answers the request it holds with more than the wire
+    /// carries, which never reaches the peer, then answers again with the
+    /// payload echoed, the request still being its to answer.
+    Bloat,
     /// The peer opens a session, the one before it reset. Nothing on a client,
     /// whose transport is its session.
     Reset,
@@ -311,15 +315,18 @@ enum Order {
     Reply,
     Refuse,
     Ignore,
+    Bloat,
 }
 
 /// A request waiting for room in the window, made on a thread of its own so
-/// the driver goes on. It returns once an answer or a fault frees the room.
+/// the driver goes on. It returns once an answer or a fault frees the room,
+/// or the session it waits in ends, which refuses it.
 struct Blocked<In: Envelope> {
-    tag: Option<u8>,  // Tag it is kept under, none for one too large to seal
-    id: u64,          // Id the multiplexer allocated for it
-    bytes: usize,     // Bytes it takes of the window
-    message: Vec<u8>, // The envelope it sends
+    tag: Option<u8>,     // Tag it is kept under, none for one too large to seal
+    id: u64,             // Id the multiplexer allocated for it
+    bytes: usize,        // Bytes it takes of the window
+    message: Vec<u8>,    // The envelope it sends
+    ended: Option<Kind>, // Reason the session ended for under the wait, refusing it
     result: mpsc::Receiver<Result<Pending<In::Content>, Error>>,
     call: JoinHandle<()>, // The thread making the call
 }
@@ -394,6 +401,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             Step::Reply => self.serve(Order::Reply),
             Step::Refuse => self.serve(Order::Refuse),
             Step::Ignore => self.serve(Order::Ignore),
+            Step::Bloat => self.serve(Order::Bloat),
             Step::Reset => self.reset_session(),
             Step::Unplug => self.unplug(),
             Step::Break => self.set_broken(true),
@@ -444,28 +452,32 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         // or a fault frees it
         if self.inflight + bytes > WINDOW {
             let (results, result) = mpsc::channel();
-            let (entering, entered) = mpsc::sync_channel(0);
             let mux = self.mux.clone();
             let call = thread::Builder::new()
                 .name("mock-caller".into())
                 .spawn(move || {
-                    let _ = entering.send(());
                     let _ = results.send(mux.request(content));
                 })
                 .expect("failed to spawn the calling thread");
 
-            // Wait for the thread to reach the call, so it is parked on the
-            // window by the time a later step frees the room, rather than
-            // still starting up and finding it free
-            entered
-                .recv_timeout(PATIENCE)
-                .expect("request thread reaching the call");
+            // Wait for the thread to park on the window, so it is there by
+            // the time a later step frees the room or ends the session,
+            // rather than still on its way and finding either done
+            let deadline = Instant::now() + PATIENCE;
+            while self.mux.waiting() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "request thread parking on the window"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
 
             self.blocked = Some(Blocked {
                 tag,
                 id,
                 bytes,
                 message,
+                ended: None,
                 result,
                 call,
             });
@@ -758,6 +770,13 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             }
             Order::Refuse => self.failure(held.handle, held.id, REFUSAL),
             Order::Ignore => self.failure(held.handle, held.id, UNANSWERED),
+            // An answer the wire cannot carry is refused before it is sealed
+            // and never reaches the peer, so only the one after it does
+            Order::Bloat => {
+                let content = Some(Out::develop(payload(held.tag, held.size)));
+                let message = Out::response(held.id, content, None);
+                self.send(held.handle, message.encode_to_vec())
+            }
         };
         if let Some(kind) = failed {
             self.disconnected(kind);
@@ -848,10 +867,14 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     }
 
     /// Moves the multiplexer onto the next session of the transport, every
-    /// pending request failed with the reason, the queued ones dropped and
-    /// the disconnect handler told.
+    /// pending request failed with the reason, a request waiting for room
+    /// refused with it, the queued ones dropped and the disconnect handler
+    /// told.
     fn reset(&mut self, reason: Kind) {
         self.drain(reason);
+        if let Some(blocked) = self.blocked.as_mut() {
+            blocked.ended = Some(reason);
+        }
         self.handle = self.live;
         self.inbox.clear();
         self.queued = 0;
@@ -982,18 +1005,20 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     }
 
     /// Joins the request waiting for room in the window once an answer or a
-    /// fault freed it, checking the call against the model.
+    /// fault freed it, or its session ended under it, checking the call
+    /// against the model.
     fn unblock(&mut self) {
         let Some(blocked) = self.blocked.as_ref() else {
             return;
         };
-        if self.open() && self.inflight + blocked.bytes > WINDOW {
+        if self.open() && blocked.ended.is_none() && self.inflight + blocked.bytes > WINDOW {
             return;
         }
         let blocked = self.blocked.take().expect("checked just above");
-        let refusal = match self.open() {
-            false => Some(self.refusal()),
-            true => self.admit(blocked.tag, blocked.id, blocked.bytes, blocked.message),
+        let refusal = match (self.open(), blocked.ended) {
+            (false, _) => Some(self.refusal()),
+            (true, Some(ended)) => Some(ended),
+            (true, None) => self.admit(blocked.tag, blocked.id, blocked.bytes, blocked.message),
         };
         let result = blocked
             .result
@@ -1133,7 +1158,7 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
     // deciding what it answers, so the worker never runs ahead of the model
     let (taken, entered) = mpsc::channel();
     let (orders, ordered) = mpsc::channel();
-    mux.on_request(move |content, responder: Responder<Out>| {
+    mux.on_request(move |content, mut responder: Responder<Out>| {
         let payload = In::payload(content);
         let _ = taken.send(payload.clone());
         match ordered.recv() {
@@ -1145,6 +1170,11 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
                     code: REFUSAL.0,
                     msg: REFUSAL.1.into(),
                 });
+            }
+            Ok(Order::Bloat) => {
+                let bloated = super::payload(HOUSEKEEPING, MAX_MESSAGE_SIZE + 1);
+                let _ = responder.reply(Out::develop(bloated));
+                let _ = responder.reply(Out::develop(payload));
             }
             Ok(Order::Ignore) | Err(_) => drop(responder),
         }

@@ -612,6 +612,29 @@ fn test_scripted_message_too_large() {
     );
 }
 
+// Tests an answer too large for the wire, refused before it is sealed, the
+// request still the handler's to answer after it, so a smaller answer takes
+// its place and the session is none the worse for it.
+#[test]
+fn test_scripted_answer_too_large() {
+    let summary = client(&[
+        Step::Ask(1),
+        Step::Bloat,
+        Step::Request(1),
+        Step::Answer(1),
+        Step::Wait(1),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 1,
+            answered: 1,
+            served: 1,
+            ..Summary::default()
+        }
+    );
+}
+
 // Tests the window, eight bulk requests filling it and the ninth waiting for
 // room until an answer frees some.
 #[test]
@@ -693,6 +716,40 @@ fn test_scripted_window_closed() {
             sent: 8,
             refused: 1,
             closed: true,
+            ..Summary::default()
+        }
+    );
+}
+
+// Tests a request waiting for room in the window when the peer reconnects on
+// a server, which is refused as reset rather than sent to the next peer, the
+// new session serving requests made in it.
+#[test]
+fn test_scripted_window_reset() {
+    let summary = server(&[
+        Step::Bulk(1),
+        Step::Bulk(2),
+        Step::Bulk(3),
+        Step::Bulk(4),
+        Step::Bulk(5),
+        Step::Bulk(6),
+        Step::Bulk(7),
+        Step::Bulk(8),
+        Step::Bulk(9),
+        Step::Reset,
+        Step::Stray,
+        Step::Request(10),
+        Step::Answer(10),
+        Step::Wait(10),
+    ]);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 9,
+            refused: 1,
+            answered: 1,
+            disconnects: 1,
+            sessions: 2,
             ..Summary::default()
         }
     );

@@ -147,10 +147,15 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// undecryptable packets and failed handshakes are logged, answered with
     /// an empty frame and skipped.
     ///
-    /// A read that ends a live session, the client resetting it, a frame
-    /// that does not decode or a packet that does not open, reports with
-    /// `SessionReset` A session the server dropped itself, is not reported.
-    /// Only transport failures surface as other errors.
+    /// A read that changes the session under the server reports it with
+    /// `SessionReset` rather than reading on, so a caller bound to the
+    /// session hears of it without waiting for the client to say anything.
+    /// A live session ends that way, the client resetting it, a frame that
+    /// does not decode or a packet that does not open, and so does the
+    /// handshake after a reset establishing the next one, `session` telling
+    /// which of the two happened. A session the server dropped itself is not
+    /// reported, its caller knowing. Only transport failures surface as other
+    /// errors.
     pub fn next_message(&mut self) -> Result<Vec<u8>, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and call for a handshake, run on the pass after them.
@@ -169,12 +174,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                         self.send_dropped();
                     }
                     // Handshake successful, the ack read ahead of anything
-                    // sealed into the session
+                    // sealed into the session, which is reported so a caller
+                    // can send into it before the client says anything
                     Ok((sender, receiver)) => {
                         info!("new wire session established");
                         self.receiver = Some(receiver);
                         self.funnel.establish_session(sender);
                         self.emitter = self.funnel.emitter();
+                        return Err(Error::SessionReset);
                     }
                 }
                 continue;

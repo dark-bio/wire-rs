@@ -138,10 +138,11 @@ impl<T> Drop for Pending<T> {
 }
 
 /// Handle answering one request of the peer's, made by the multiplexer for
-/// its handler and answering once, with a reply or a failure. Dropped
-/// unanswered, it fails the request for the peer, so a handler that panics or
-/// forgets does not leave the peer waiting. It is bound to the session the
-/// request arrived in and refused once that ended.
+/// its handler and answering once, with a reply or a failure. An answer the
+/// wire cannot carry leaves it unanswered, so a handler may try a smaller
+/// one. Dropped unanswered, it fails the request for the peer, so a handler
+/// that panics, forgets or gives up does not leave the peer waiting. It is
+/// bound to the session the request arrived in and refused once that ended.
 pub struct Responder<Out: Envelope> {
     switchboard: Weak<dyn Sender>, // Answers through it, a failed write tearing the session down
     emitter: Emitter<Writer>,      // Handle of the session the request arrived in
@@ -164,27 +165,35 @@ impl<Out: Envelope> Responder<Out> {
     }
 
     /// Answers the request with the content.
-    pub fn reply(mut self, content: Out::Content) -> Result<(), Error> {
-        self.answered = true;
+    pub fn reply(&mut self, content: Out::Content) -> Result<(), Error> {
         self.send(Out::response(self.id, Some(content), None))
     }
 
     /// Fails the request with the error.
-    pub fn fail(mut self, err: protocol::Error) -> Result<(), Error> {
-        self.answered = true;
+    pub fn fail(&mut self, err: protocol::Error) -> Result<(), Error> {
         self.send(Out::response(self.id, None, Some(err)))
     }
 
     /// Sends an answer through the switchboard, into the session the request
     /// arrived in, so a failed write ends that session the side's way rather
-    /// than going unnoticed. A refusal once the multiplexer no longer takes
-    /// calls needs no session touched.
-    fn send(&self, answer: Out) -> Result<(), Error> {
+    /// than going unnoticed. An answer the wire refuses before sealing never
+    /// reached the peer, which leaves the request unanswered for a smaller
+    /// answer to take, and the drop fails it for the peer if none comes. A
+    /// refusal once the multiplexer no longer takes calls needs no session
+    /// touched, and answering twice is the handler's bug, the second one
+    /// dropped rather than sent.
+    fn send(&mut self, answer: Out) -> Result<(), Error> {
+        if self.answered {
+            warn!("dropping a second answer to request {}", self.id);
+            return Ok(());
+        }
         let message = answer.encode_to_vec();
-        match self.switchboard.upgrade() {
+        let result = match self.switchboard.upgrade() {
             Some(switchboard) => switchboard.send(&self.emitter, &message),
             None => Err(Error::Closed),
-        }
+        };
+        self.answered = !matches!(result, Err(Error::TooLarge(_)));
+        result
     }
 }
 
@@ -195,7 +204,7 @@ impl<Out: Envelope> Drop for Responder<Out> {
                 code: 0,
                 msg: "request left unanswered".into(),
             };
-            if let Err(err) = self.send(Out::response(self.id, None, Some(failure))) {
+            if let Err(err) = self.fail(failure) {
                 warn!("failed to fail an unanswered request: {}", err);
             }
         }
@@ -218,6 +227,14 @@ impl<Out: Envelope, In: Envelope> Mux<Out, In> {
         Self {
             switchboard: Switchboard::start(side, source, closer),
         }
+    }
+
+    /// Callers parked on the window, see the switchboard's. Not part of the
+    /// API.
+    #[cfg(any(test, feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) fn waiting(&self) -> usize {
+        self.switchboard.waiting()
     }
 
     /// Sends a request, returning its answer to wait on once the frame is
@@ -417,7 +434,7 @@ mod tests {
     fn echoing(
         served: mpsc::Sender<Vec<u8>>,
     ) -> impl FnMut(host_to_ark::Content, Responder<ArkToHost>) + Send + 'static {
-        move |content, responder| match content {
+        move |content, mut responder| match content {
             host_to_ark::Content::Develop(bytes) => {
                 responder.reply(pong(&bytes)).unwrap();
                 served.send(bytes).unwrap();
@@ -498,7 +515,7 @@ mod tests {
 
         // A handler answers it, on the worker thread
         let (served_tx, served) = mpsc::channel();
-        mux.on_request(move |content, responder: Responder<HostToArk>| {
+        mux.on_request(move |content, mut responder: Responder<HostToArk>| {
             served_tx.send(thread::current().id()).unwrap();
             assert_eq!(content, pong(b"question"));
             responder.reply(ping(b"answer")).unwrap();

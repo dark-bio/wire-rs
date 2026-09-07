@@ -34,29 +34,33 @@ enum State {
     Closed,        // Closed by the owner, calls refused
 }
 
-/// The requests waiting for their answer along with the state deciding
-/// whether new ones are taken and the bytes they hold of the window. One
-/// lock, so a failure draining the requests cannot miss one being registered.
+/// The requests waiting for their answer, along with the counters deciding if
+/// new ones can be admitted.
 struct Registry<In: Envelope> {
-    state: State,                               // Whether calls are taken
+    state: State,                               // Whether calls are admitted in
     pending: HashMap<u64, (Answer<In>, usize)>, // Waiting callers by id, with their bytes
+
     inflight: usize, // Bytes of the pending requests, bounded by the window
+    waiting: usize,  // Callers parked on the window
+    session: u64,    // Session the switchboard is bound to, zero for none
+
+    ended: Option<Error>, // Reason the session before it ended for, none before the first
 }
 
 impl<In: Envelope> Registry<In> {
-    /// Fails every pending request with the reason, freeing the window.
-    fn drain(&mut self, reason: &Error) {
-        self.inflight = 0;
-        for (_, (tx, _)) in std::mem::take(&mut self.pending) {
-            let _ = tx.send(Err(reason.clone()));
-        }
-    }
-
-    /// Checks that calls are still taken, failing with the refusal otherwise.
+    /// Checks that requests are admitted.
     fn accepting(&self) -> Result<(), Error> {
         match &self.state {
             State::Open => Ok(()),
             _ => Err(self.refusal()),
+        }
+    }
+
+    /// Fails every pending request with a reason.
+    fn drain(&mut self, reason: &Error) {
+        self.inflight = 0;
+        for (_, (tx, _)) in std::mem::take(&mut self.pending) {
+            let _ = tx.send(Err(reason.clone()));
         }
     }
 
@@ -74,7 +78,7 @@ impl<In: Envelope> Registry<In> {
 /// arrived in, so its answer goes nowhere else whatever session is live by
 /// the time the worker gets to it.
 struct Request<In: Envelope> {
-    id: u64,                  // Id of the request, echoed by the answer
+    id: u64,                  // Id of the request, echoed by the response
     content: In::Content,     // Content for the handler
     bytes: usize,             // Bytes the request holds of the inbox
     emitter: Emitter<Writer>, // Handle of the session it arrived in
@@ -179,6 +183,9 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
                 state: State::Open,
                 pending: HashMap::new(),
                 inflight: 0,
+                waiting: 0,
+                session: source.session(),
+                ended: None,
             }),
             room: Condvar::new(),
             emitter: Mutex::new(source.emitter()),
@@ -224,24 +231,41 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         Ok(())
     }
 
-    /// Registers a request with its bytes, waiting for room in the window,
-    /// unless the multiplexer no longer takes calls or the wire would refuse
-    /// the message, which gets no place to wait for. Hands back the emitter
-    /// of the session the request is registered in, taken under the same
-    /// lock, so the send that follows cannot cross into the next session.
+    /// Registers a request, waiting for enough room in the window to avoid
+    /// overloading the remote peer. Hands back the emitter of the session
+    /// the request is registered in.
     fn admit(&self, id: u64, bytes: usize, tx: Answer<In>) -> Result<Emitter<Writer>, Error> {
+        // If no messages are being accepted, don't even look at it
         let mut registry = lock(&self.registry);
         registry.accepting()?;
+
+        // Registry is accepting messages, ensure it's decently sized
         if bytes > MAX_MESSAGE_SIZE {
             return Err(Error::TooLarge(bytes));
         }
+        // Fetch the session we've accepted the message into
+        let session = registry.session;
+
+        // If sending is throttled, stash it away and account for it
         while registry.inflight + bytes > WINDOW {
+            // Stash it away and wait until something wakes us
+            registry.waiting += 1;
             registry = self
                 .room
                 .wait(registry)
                 .unwrap_or_else(PoisonError::into_inner);
+            registry.waiting -= 1;
+
+            // Sanity check whether the registry is accepting messages
             registry.accepting()?;
+
+            // Sanity chek that no new session was established since
+            if registry.session != session {
+                let ended = registry.ended.clone();
+                return Err(ended.expect("a session that ended left its reason"));
+            }
         }
+        // Message admitted into the registry, insert it
         registry.inflight += bytes;
         registry.pending.insert(id, (tx, bytes));
         Ok(lock(&self.emitter).clone())
@@ -263,6 +287,26 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             registry.inflight -= bytes;
             self.room.notify_all();
         }
+    }
+
+    /// Session the switchboard is bound to, zero for none.
+    pub(super) fn session(&self) -> u64 {
+        lock(&self.registry).session
+    }
+
+    /// Callers parked on the window, for the mock to tell one parked from one
+    /// still on its way to the call. Not part of the API.
+    #[cfg(any(test, feature = "fuzz"))]
+    pub(super) fn waiting(&self) -> usize {
+        lock(&self.registry).waiting
+    }
+
+    /// Binds the switchboard to the first session of the source, nothing
+    /// before it to end, the responders made from here on answering into it.
+    pub(super) fn bind(&self, emitter: Emitter<Writer>, session: u64) {
+        let mut registry = lock(&self.registry);
+        registry.session = session;
+        *lock(&self.emitter) = emitter;
     }
 
     /// Plugs in the handler of the peer's requests, replacing the previous
@@ -367,7 +411,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// Fails a request of the peer's on the multiplexer's own account, from
     /// whichever thread found the fault. The frame is a few bytes the peer's
     /// reader always drains, so the reader may send it too.
-    fn refuse(&self, responder: Responder<Out>, msg: &str) {
+    fn refuse(&self, mut responder: Responder<Out>, msg: &str) {
         let id = responder.id;
         let failure = protocol::Error {
             code: 0,
@@ -390,18 +434,20 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         }
     }
 
-    /// Moves the switchboard to the next session of the source, the one
-    /// before it having ended for the reason. Every pending request fails
-    /// with it, the callers waiting for window room wake up, the requests
-    /// queued for the worker are dropped, the responders made from here on
-    /// answer into the new session, and the disconnect handler is told. The
-    /// multiplexer carries on. The emitter moves under the registry's lock,
-    /// the one a request registers under, so no request straddles the two
-    /// sessions.
-    fn reset(&self, reason: Error, emitter: Emitter<Writer>) {
+    /// Moves the switchboard to the next session of the source, or to none,
+    /// the one before it having ended for the reason. Every pending request
+    /// fails with it, the callers waiting for window room wake up to be
+    /// refused with it, the requests queued for the worker are dropped, the
+    /// responders made from here on answer into the new session, and the
+    /// disconnect handler is told. The multiplexer carries on. The session
+    /// and the emitter move under the registry's lock, the one a request
+    /// registers under, so no request straddles the two sessions.
+    pub(super) fn reset(&self, reason: Error, emitter: Emitter<Writer>, session: u64) {
         {
             let mut registry = lock(&self.registry);
             registry.drain(&reason);
+            registry.session = session;
+            registry.ended = Some(reason.clone());
             *lock(&self.emitter) = emitter;
         }
         self.room.notify_all();
@@ -473,7 +519,6 @@ fn read<Out: Envelope, In: Envelope>(
     switchboard: Arc<Switchboard<Out, In>>,
     mut source: impl Source,
 ) {
-    let mut session = source.session();
     loop {
         let message = match source.next_message() {
             Ok(message) => Some(message),
@@ -490,15 +535,15 @@ fn read<Out: Envelope, In: Envelope>(
         // answering into whatever is live. A client's session is its
         // connection, every way it can end already reported to the reader
         // or failed on the send that ended it, so the number is left alone
-        if switchboard.side == Side::Server && source.session() != session {
-            let emitter = source.emitter();
-            if session == 0 {
-                *lock(&switchboard.emitter) = emitter;
-            } else {
+        if switchboard.side == Side::Server {
+            let bound = switchboard.session();
+            let live = source.session();
+            if live != bound && bound == 0 {
+                switchboard.bind(source.emitter(), live);
+            } else if live != bound {
                 let reason = Error::Disconnected(Arc::new(transport::Error::SessionReset));
-                switchboard.reset(reason, emitter);
+                switchboard.reset(reason, source.emitter(), live);
             }
-            session = source.session();
         }
         let Some(message) = message else {
             continue;
@@ -511,8 +556,7 @@ fn read<Out: Envelope, In: Envelope>(
                 Side::Client => switchboard.fail(fault),
                 Side::Server => {
                     source.reset_session();
-                    switchboard.reset(fault, source.emitter());
-                    session = source.session();
+                    switchboard.reset(fault, source.emitter(), source.session());
                 }
             }
         }
