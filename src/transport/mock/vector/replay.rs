@@ -8,7 +8,6 @@
 //! with the server's keys.
 
 use super::{Event, ReadError, Vector};
-use crate::protocol::HostToArk;
 use crate::transport::mock::server::check_session;
 use crate::transport::mock::{TIMESTAMP, unframe};
 use crate::transport::{
@@ -16,7 +15,6 @@ use crate::transport::{
 };
 use base64::prelude::*;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
-use prost::Message;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Write};
@@ -128,12 +126,11 @@ pub fn run(vector: &Vector) {
                 settle(&tape, &mut peer, None, result);
             }
             Event::Send { message } => {
-                let request = HostToArk::decode(&message[..]).unwrap();
-                let result = client.send_message(request).map(|_| None);
+                let result = client.send_message(&message).map(|_| None);
                 settle(&tape, &mut peer, Some(&message), result);
             }
             Event::Recv => {
-                let result = client.next_message().map(|msg| Some(msg.encode_to_vec()));
+                let result = client.next_message().map(Some);
                 settle(&tape, &mut peer, None, result);
             }
             Event::Session { established } => check_session(&mut client, established),

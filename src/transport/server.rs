@@ -1,7 +1,6 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
-use crate::protocol::{ArkToHost, HostToArk};
 use crate::transport::emitter::{Emitter, Funnel, Side};
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
@@ -61,8 +60,8 @@ impl Attester for Attestation {
     }
 }
 
-/// Server side of the wire, an encrypted transport for serving protobuf requests
-/// from a connected client. It waits for session resets (empty frames), responds
+/// Server side of the wire, an encrypted transport for serving the messages
+/// of a connected client. It waits for session resets (empty frames), responds
 /// to handshake and afterward decrypts inbound and encrypts outbound messages.
 ///
 /// Whenever the server drops a session, fails a handshake or receives data while
@@ -79,7 +78,7 @@ pub struct Server<R: Read, W: Write, A: Attester> {
     attester: A,             // Source of the device attestation for handshakes
 
     receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
-    emitter: Emitter<W, ArkToHost>,    // Handle of the live session, cloned for the emitters
+    emitter: Emitter<W>,               // Handle of the live session, cloned for the emitters
 
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     timestamp: Option<i64>, // Signing time of the ArkHello pinned by a test, the clock otherwise
@@ -129,16 +128,15 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// server blocks in `next_message`. The handle is bound to the live
     /// session, the next handshake needing a new one, so a message meant for
     /// one host never reaches the next. See `Emitter`.
-    pub fn emitter(&self) -> Emitter<W, ArkToHost> {
+    pub fn emitter(&self) -> Emitter<W> {
         self.emitter.clone()
     }
 
-    /// Serves the next host-to-ark message, decrypting and protobuf decoding it.
-    /// Empty frames are session resets and run the handshake inline. Junk
-    /// outside a session, undecryptable packets and failed handshakes are
-    /// logged, answered with an empty frame and skipped. Only transport
-    /// failures and malformed messages surface as errors.
-    pub fn next_message(&mut self) -> Result<HostToArk, Error> {
+    /// Serves the next host-to-ark message, decrypting it. Empty frames are
+    /// session resets and run the handshake inline. Junk outside a session,
+    /// undecryptable packets and failed handshakes are logged, answered with
+    /// an empty frame and skipped. Only transport failures surface as errors.
+    pub fn next_message(&mut self) -> Result<Vec<u8>, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and trigger a new session handshake.
         loop {
@@ -206,24 +204,22 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 }
                 Some(receiver) => receiver,
             };
-            // Decrypt the message and parse it with protobuf
-            let req = match sealing::open(receiver, packet) {
-                // If decryption fails, the HPKE context is most probably
-                // broken, no point continuing with it.
-                Err(Error::EncryptionFailed(err)) => {
+            // Decrypt the message. If that fails, the HPKE context is most
+            // probably broken, no point continuing with it.
+            let message = match sealing::open(receiver, packet) {
+                Err(err) => {
                     warn!("decryption failed, resetting session: {}", err);
                     self.drop_session();
                     self.send_dropped();
                     continue;
                 }
-                Err(err) => return Err(err),
-                Ok(req) => req,
+                Ok(message) => message,
             };
             trace!(
                 "read host-to-ark message ({} bytes encrypted)",
                 packet.len()
             );
-            return Ok(req);
+            return Ok(message);
         }
     }
 
@@ -243,14 +239,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
-    /// Protobuf encodes an ark-to-host message, seals it with the session and
-    /// sends it. Fails without an active session. A failure after sealing
-    /// drops the session and signals the client, as the client's HPKE sequence can
-    /// no longer be caught up with.
-    pub fn send_message(&mut self, res: ArkToHost) -> Result<(), Error> {
+    /// Seals an ark-to-host message with the session and sends it. Fails
+    /// without an active session. A failure after sealing drops the session
+    /// and signals the client, as the client's HPKE sequence can no longer be
+    /// caught up with.
+    pub fn send_message(&mut self, message: &[u8]) -> Result<(), Error> {
         // The funnel dropping the session, on this send or on an emitter's
         // before it, drops it for the reads too
-        let result = self.emitter.send_message(res);
+        let result = self.emitter.send_message(message);
         if !self.funnel.has_session() {
             self.receiver = None;
         }
@@ -378,6 +374,7 @@ impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::transport::mock::payload;
     use crate::transport::{Client, Verifier};
     use darkbio_cobs as cobs;
     use std::io::Write;
@@ -435,19 +432,13 @@ mod tests {
         // Server side: receive two messages (across two sessions), echo each back.
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
-            let mut ids = Vec::new();
+            let mut requests = Vec::new();
             for _ in 0..2 {
                 let req = server.next_message().unwrap();
-                ids.push(req.id);
-                server
-                    .send_message(ArkToHost {
-                        id: req.id,
-                        err: None,
-                        content: None,
-                    })
-                    .unwrap();
+                server.send_message(&req).unwrap();
+                requests.push(req);
             }
-            ids
+            requests
         });
 
         // Raw handle to inject bytes past the client side.
@@ -457,14 +448,8 @@ mod tests {
         let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
         let attest = client.handshake(&signer_pub).unwrap();
         assert_eq!(attest.as_bytes(), presented.as_bytes());
-        client
-            .send_message(HostToArk {
-                id: Some(1),
-                content: None,
-            })
-            .unwrap();
-        let res = client.next_message().unwrap();
-        assert_eq!(res.id, Some(1));
+        client.send_message(&payload(1)).unwrap();
+        assert_eq!(client.next_message().unwrap(), payload(1));
 
         // Inject a frame the server cannot decrypt. It drops the session and
         // signals it, the client surfacing the signal as a reset on its next
@@ -474,10 +459,7 @@ mod tests {
             .unwrap();
         let result = client.next_message();
         assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-        let result = client.send_message(HostToArk {
-            id: Some(2),
-            content: None,
-        });
+        let result = client.send_message(&payload(2));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
@@ -485,17 +467,11 @@ mod tests {
 
         // Session 2: new handshake on the same wire, exchange one message.
         client.handshake(&signer_pub).unwrap();
-        client
-            .send_message(HostToArk {
-                id: Some(2),
-                content: None,
-            })
-            .unwrap();
-        let res = client.next_message().unwrap();
-        assert_eq!(res.id, Some(2));
+        client.send_message(&payload(2)).unwrap();
+        assert_eq!(client.next_message().unwrap(), payload(2));
 
-        let ids = ark_thread.join().unwrap();
-        assert_eq!(ids, vec![Some(1), Some(2)]);
+        let requests = ark_thread.join().unwrap();
+        assert_eq!(requests, vec![payload(1), payload(2)]);
     }
 
     // Tests that an untrusting verifier rejects the session on the client side.
@@ -731,50 +707,32 @@ mod tests {
                     let emitter = server.emitter();
                     std::thread::spawn(move || {
                         for i in 0..25 {
-                            emitter
-                                .send_message(ArkToHost {
-                                    id: Some(thread * 100 + i),
-                                    err: None,
-                                    content: None,
-                                })
-                                .unwrap();
+                            emitter.send_message(&payload(thread * 100 + i)).unwrap();
                         }
                     })
                 })
                 .collect();
-            let req = server.next_message().unwrap();
+            let stop = server.next_message().unwrap();
             for pusher in pushers {
                 pusher.join().unwrap();
             }
-            req.id
+            stop
         });
 
         // Client side: request the push, receive it all, then request the stop.
         let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
         client.handshake(&signer_pub).unwrap();
-        client
-            .send_message(HostToArk {
-                id: Some(1),
-                content: None,
-            })
-            .unwrap();
+        client.send_message(&payload(1)).unwrap();
 
-        let mut ids: Vec<u64> = (0..100)
-            .map(|_| client.next_message().unwrap().id.unwrap())
-            .collect();
-        ids.sort_unstable();
-        let mut expected: Vec<u64> = (0..4)
-            .flat_map(|thread| (0..25).map(move |i| thread * 100 + i))
+        let mut pushed: Vec<Vec<u8>> = (0..100).map(|_| client.next_message().unwrap()).collect();
+        pushed.sort_unstable();
+        let mut expected: Vec<Vec<u8>> = (0..4)
+            .flat_map(|thread| (0..25).map(move |i| payload(thread * 100 + i)))
             .collect();
         expected.sort_unstable();
-        assert_eq!(ids, expected);
+        assert_eq!(pushed, expected);
 
-        client
-            .send_message(HostToArk {
-                id: Some(2),
-                content: None,
-            })
-            .unwrap();
-        assert_eq!(ark_thread.join().unwrap(), Some(2));
+        client.send_message(&payload(2)).unwrap();
+        assert_eq!(ark_thread.join().unwrap(), payload(2));
     }
 }

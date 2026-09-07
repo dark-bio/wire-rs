@@ -28,8 +28,8 @@ use std::io;
 /// wire protocol.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
-/// Largest protobuf message the wire carries, being what still fits a frame
-/// after the session's sealing and the COBS framing overheads are added.
+/// Largest message the wire carries, being what still fits a frame after the
+/// session's sealing and the COBS framing overheads are added.
 pub const MAX_MESSAGE_SIZE: usize = {
     let mut size = MAX_FRAME_SIZE;
     while darkbio_cobs::encode_buffer(size + sealing::OVERHEAD) > MAX_FRAME_SIZE {
@@ -62,12 +62,6 @@ pub(crate) const CRYPTO_DOMAIN_WIRE_HOST_TO_ARK: &[u8] = b"wire-v1:host-to-ark";
 pub enum Error {
     #[error("wire packet too large: {0} bytes, max {MAX_MESSAGE_SIZE} bytes")]
     PacketTooLarge(usize),
-
-    #[error("wire packet encode failed: {0}")]
-    PacketEncodingFailed(prost::EncodeError),
-
-    #[error("wire packet decode failed: {0}")]
-    PacketDecodingFailed(prost::DecodeError),
 
     #[error("wire frame too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
     FrameTooLarge(usize),

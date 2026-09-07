@@ -1,7 +1,6 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-use crate::protocol::{ArkToHost, HostToArk};
 use crate::transport::emitter::{Emitter, Funnel, Side};
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
@@ -76,8 +75,8 @@ impl Verifier for Roots<'_> {
         Ok((device.signer.clone(), device))
     }
 }
-/// Client side of the wire, an encrypted transport for issuing protobuf requests
-/// to a connected server. It initiates sessions by signaling a transport reset and
+/// Client side of the wire, an encrypted transport for exchanging messages
+/// with a connected server. It initiates sessions by signaling a transport reset and
 /// driving the handshake, afterward encrypting outbound and decrypting inbound
 /// messages.
 ///
@@ -91,7 +90,7 @@ pub struct Client<R: Read, W: Write> {
     reader: FrameReader<R>,            // COBS framed transport for ingress data
     receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
     funnel: Arc<Funnel<W>>,            // Funnel of the session's sends, shared with the emitters
-    emitter: Emitter<W, HostToArk>,    // Handle of the live session, cloned for the emitters
+    emitter: Emitter<W>,               // Handle of the live session, cloned for the emitters
 }
 
 impl<R: Read, W: Write> Client<R, W> {
@@ -112,7 +111,7 @@ impl<R: Read, W: Write> Client<R, W> {
     /// Creates a handle for sending messages from another thread, while the
     /// client blocks in `next_message`. The handle is bound to the live
     /// session, a new handshake needing a new one. See `Emitter`.
-    pub fn emitter(&self) -> Emitter<W, HostToArk> {
+    pub fn emitter(&self) -> Emitter<W> {
         self.emitter.clone()
     }
 
@@ -269,12 +268,12 @@ impl<R: Read, W: Write> Client<R, W> {
         Ok(info)
     }
 
-    /// Reads the next ark-to-host message, decrypting and protobuf decoding it.
-    /// A frame that cannot be decoded or a packet that cannot be decrypted
-    /// drops the session, as the server's HPKE sequence can no longer be followed.
-    /// So does an empty frame, the server signaling it dropped the session on its
-    /// end. Only a fresh handshake recovers from either.
-    pub fn next_message(&mut self) -> Result<ArkToHost, Error> {
+    /// Reads the next ark-to-host message, decrypting it. A frame that cannot
+    /// be decoded or a packet that cannot be decrypted drops the session, as
+    /// the server's HPKE sequence can no longer be followed. So does an empty
+    /// frame, the server signaling it dropped the session on its end. Only a
+    /// fresh handshake recovers from either.
+    pub fn next_message(&mut self) -> Result<Vec<u8>, Error> {
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
         // An empty frame is the server telling us it has no session with us.
@@ -294,36 +293,34 @@ impl<R: Read, W: Write> Client<R, W> {
         if !self.funnel.has_session() {
             self.receiver = None;
         }
-        // Decrypt the message and parse it with protobuf, dropping the session
-        // if the HPKE sequence cannot be followed anymore
+        // Decrypt the message, dropping the session if the HPKE sequence
+        // cannot be followed anymore
         let receiver = self
             .receiver
             .as_mut()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
 
-        let res = match sealing::open(receiver, packet) {
-            Err(err @ Error::EncryptionFailed(_)) => {
+        let message = match sealing::open(receiver, packet) {
+            Err(err) => {
                 self.drop_session();
                 return Err(err);
             }
-            Err(err) => return Err(err),
-            Ok(res) => res,
+            Ok(message) => message,
         };
         trace!(
             "read ark-to-host message ({} bytes encrypted)",
             packet.len()
         );
-        Ok(res)
+        Ok(message)
     }
 
-    /// Protobuf encodes a host-to-ark message, seals it with the session and
-    /// sends it. Fails without an active session, and a failure after sealing
-    /// drops the session, as the server's HPKE sequence can no longer be caught up
-    /// with.
-    pub fn send_message(&mut self, req: HostToArk) -> Result<(), Error> {
+    /// Seals a host-to-ark message with the session and sends it. Fails without
+    /// an active session, and a failure after sealing drops the session, as the
+    /// server's HPKE sequence can no longer be caught up with.
+    pub fn send_message(&mut self, message: &[u8]) -> Result<(), Error> {
         // The funnel dropping the session, on this send or on an emitter's
         // before it, drops it for the reads too
-        let result = self.emitter.send_message(req);
+        let result = self.emitter.send_message(message);
         if !self.funnel.has_session() {
             self.receiver = None;
         }
@@ -416,7 +413,7 @@ impl<R: Read, W: Write> Drop for Client<R, W> {
 mod tests {
     use super::*;
     use crate::testing;
-    use crate::transport::mock::self_attestation;
+    use crate::transport::mock::{payload, self_attestation};
     use crate::transport::server::Server;
     use std::io;
     use std::thread;
@@ -427,14 +424,6 @@ mod tests {
         let (sender, encap) = secret.public_key().new_sender(b"test").unwrap();
         let receiver = secret.new_receiver(&encap, b"test").unwrap();
         (sender, receiver)
-    }
-
-    /// A message with the id.
-    fn message(id: u64) -> HostToArk {
-        HostToArk {
-            id: Some(id),
-            ..Default::default()
-        }
     }
 
     // Tests that emitters send from other threads while the client blocks in
@@ -455,12 +444,7 @@ mod tests {
             let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
             for _ in 0..100 {
                 let req = server.next_message().unwrap();
-                server
-                    .send_message(ArkToHost {
-                        id: req.id,
-                        ..Default::default()
-                    })
-                    .unwrap();
+                server.send_message(&req).unwrap();
             }
         });
         let mut client = Client::new(host_reader, host_writer);
@@ -472,25 +456,23 @@ mod tests {
                 let emitter = client.emitter();
                 thread::spawn(move || {
                     for i in 0..25 {
-                        emitter.send_message(message(thread * 100 + i)).unwrap();
+                        emitter.send_message(&payload(thread * 100 + i)).unwrap();
                     }
                 })
             })
             .collect();
-        let mut ids: Vec<u64> = (0..100)
-            .map(|_| client.next_message().unwrap().id.unwrap())
-            .collect();
+        let mut echoes: Vec<Vec<u8>> = (0..100).map(|_| client.next_message().unwrap()).collect();
         for sender in senders {
             sender.join().unwrap();
         }
         ark.join().unwrap();
 
-        ids.sort_unstable();
-        let mut expected: Vec<u64> = (0..4)
-            .flat_map(|thread| (0..25).map(move |i| thread * 100 + i))
+        echoes.sort_unstable();
+        let mut expected: Vec<Vec<u8>> = (0..4)
+            .flat_map(|thread| (0..25).map(move |i| payload(thread * 100 + i)))
             .collect();
         expected.sort_unstable();
-        assert_eq!(ids, expected);
+        assert_eq!(echoes, expected);
     }
 
     // Tests that an emitter is bound to the session it was made in, a new
@@ -509,25 +491,20 @@ mod tests {
         let ark = thread::spawn(move || {
             let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
             let req = server.next_message().unwrap();
-            server
-                .send_message(ArkToHost {
-                    id: req.id,
-                    ..Default::default()
-                })
-                .unwrap();
+            server.send_message(&req).unwrap();
         });
         let mut client = Client::new(host_reader, host_writer);
         client.handshake(&identity).unwrap();
         let stale = client.emitter();
         client.handshake(&identity).unwrap();
 
-        let result = stale.send_message(message(1));
+        let result = stale.send_message(&payload(1));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "session ended"),
             "{result:?}"
         );
-        client.emitter().send_message(message(2)).unwrap();
-        assert_eq!(client.next_message().unwrap().id, Some(2));
+        client.emitter().send_message(&payload(2)).unwrap();
+        assert_eq!(client.next_message().unwrap(), payload(2));
         ark.join().unwrap();
     }
 
@@ -546,12 +523,12 @@ mod tests {
 
         let result = client.next_message();
         assert!(matches!(result, Err(Error::Terminated)), "{result:?}");
-        let result = client.send_message(message(1));
+        let result = client.send_message(&payload(1));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
         );
-        let result = emitter.send_message(message(1));
+        let result = emitter.send_message(&payload(1));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
@@ -573,7 +550,7 @@ mod tests {
         let mut client = Client::new(io::empty(), Broken);
         client.establish_session(sender, receiver);
 
-        let result = client.send_message(message(1));
+        let result = client.send_message(&payload(1));
         assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
         assert!(client.receiver.is_none());
 
@@ -584,7 +561,7 @@ mod tests {
         client.establish_session(sender, receiver);
         let emitter = client.emitter();
 
-        let result = emitter.send_message(message(1));
+        let result = emitter.send_message(&payload(1));
         assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
         let result = client.next_message();
         assert!(
@@ -605,10 +582,10 @@ mod tests {
         let mut client = Client::new(io::empty(), writer);
         client.establish_session(sender, receiver);
         let emitter = client.emitter();
-        emitter.send_message(message(1)).unwrap();
+        emitter.send_message(&payload(1)).unwrap();
         drop(client);
 
-        let result = emitter.send_message(message(2));
+        let result = emitter.send_message(&payload(2));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"

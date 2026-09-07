@@ -33,6 +33,12 @@ pub const MAX_STEPS: usize = 64;
 /// wire never checks it, so a fixed one keeps the transcripts off the clock.
 pub const TIMESTAMP: i64 = 0;
 
+/// Payload of a message the mocks exchange, the tag as eight big endian
+/// bytes. It only tells the messages apart, the transport never reads it.
+pub fn payload(tag: u64) -> Vec<u8> {
+    tag.to_be_bytes().to_vec()
+}
+
 /// Self-signed attestation of a never onboarded server, embedding the identity
 /// key that signs the handshake.
 pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {

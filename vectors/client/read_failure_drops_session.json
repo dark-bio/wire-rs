@@ -20,7 +20,7 @@
     {"event": "read", "error": "failed"},
     {"event": "error", "kind": "RecvFailed"},
     {"event": "session", "established": false},
-    {"event": "send", "message": "CAE="},
+    {"event": "send", "message": "AAAAAAAAAAE="},
     {"event": "error", "kind": "EncryptionFailed"},
     {"event": "session", "established": false}
   ]

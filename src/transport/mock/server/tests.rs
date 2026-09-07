@@ -144,8 +144,8 @@ fn test_scripted_handshake_interrupted() {
     assert_eq!(summary.failures, 1);
 }
 
-// Tests that a packet decrypting into something that is not a message
-// surfaces as an error but leaves the session usable.
+// Tests that a packet decrypting into something that is not a message is
+// delivered as bytes like any other and leaves the session usable.
 #[test]
 fn test_scripted_garbage_keeps_session() {
     let summary = run_logged(&[
@@ -157,8 +157,8 @@ fn test_scripted_garbage_keeps_session() {
         Step::Recv,
     ]);
     assert!(summary.established);
-    assert_eq!(summary.messages, 1);
-    assert_eq!(summary.failures, 1);
+    assert_eq!(summary.messages, 2);
+    assert_eq!(summary.failures, 0);
 }
 
 // Tests that packets the session cannot open drop it. That is a replayed

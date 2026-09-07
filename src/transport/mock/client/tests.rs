@@ -206,8 +206,8 @@ fn test_scripted_replays() {
     assert_eq!(summary.dropped, 0);
 }
 
-// Tests that a packet decrypting into something that is not a message
-// surfaces as an error but leaves the session usable.
+// Tests that a packet decrypting into something that is not a message is
+// delivered as bytes all the same and leaves the session usable.
 #[test]
 fn test_scripted_garbage_keeps_session() {
     let summary = run_logged(&[

@@ -16,23 +16,19 @@ use super::{
     CutPoint, MAX_STEPS, Outbox, Recorder, TIMESTAMP, cloud_attestation, frame, self_attestation,
     trace, unframe, would_block,
 };
-use crate::protocol::{ArkToHost, HostToArk, host_to_ark};
 use crate::transport::client::MAX_STALE_FRAMES;
 use crate::transport::handshake;
+use crate::transport::mock::payload;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
-use prost::Message;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
-
-/// Message id of the probes the driver sends on the client's behalf.
-const PROBE_ID: u64 = u64::MAX;
 
 /// One step of a script, either a call the driver makes into the client or a
 /// frame the mock server puts in front of it. Frames needing a session or a
@@ -147,8 +143,6 @@ impl Step {
 /// Error kinds the model distinguishes in the client's results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// `Error::PacketDecodingFailed`, a packet opening but not decoding.
-    PacketDecoding,
     /// `Error::FrameDecodingFailed`, a frame failing COBS decoding.
     FrameDecoding,
     /// `Error::SendFailed`, the transport refusing a write.
@@ -249,10 +243,10 @@ enum Call {
 }
 
 /// Predicted result of a client call, the message id for a read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Expect {
-    /// The call succeeds, with the message id if it was a read.
-    Ok(Option<u64>),
+    /// The call succeeds, with the message if it was a read.
+    Ok(Option<Vec<u8>>),
     /// The call fails with the error kind.
     Err(Kind),
 }
@@ -551,12 +545,7 @@ impl Server {
             return self.junk(b"reply without a session");
         };
         let plaintext = match tag {
-            Some(tag) => ArkToHost {
-                id: Some(tag as u64),
-                err: None,
-                content: None,
-            }
-            .encode_to_vec(),
+            Some(tag) => payload(tag as u64),
             None => vec![0x07],
         };
         let packet = session.sender.seal(&plaintext, &[]).unwrap();
@@ -585,12 +574,7 @@ impl Server {
         let Some(session) = self.session.as_mut() else {
             return self.junk(b"tampered reply without a session");
         };
-        let plaintext = ArkToHost {
-            id: Some(0),
-            err: None,
-            content: None,
-        }
-        .encode_to_vec();
+        let plaintext = payload(0);
         let mut packet = session.sender.seal(&plaintext, &[]).unwrap();
         session.seq += 1;
         *packet.last_mut().unwrap() ^= 0xff;
@@ -636,9 +620,8 @@ impl Server {
                 continue;
             }
             if let Some(session) = self.session.as_mut()
-                && let Ok(plain) = session.receiver.open(&packet, &[])
+                && session.receiver.open(&packet, &[]).is_ok()
             {
-                HostToArk::decode(&plain[..]).expect("client request undecodable");
                 continue;
             }
             panic!(
@@ -753,10 +736,11 @@ impl Server {
                         },
                     ) if session == id && seq == self.client_seq => {
                         self.client_seq += 1;
+                        // Garbage opens like any reply and is delivered as is
                         if garbage {
-                            Expect::Err(Kind::PacketDecoding)
+                            Expect::Ok(Some(vec![0x07]))
                         } else {
-                            Expect::Ok(Some(tag as u64))
+                            Expect::Ok(Some(payload(tag as u64)))
                         }
                     }
                     // Anything the session cannot open ends it
@@ -802,13 +786,13 @@ impl Server {
 
     /// Checks a finished call against the model's prediction and takes in
     /// whatever the client wrote during it.
-    fn finish(&mut self, result: Result<Option<u64>, Kind>) {
+    fn finish(&mut self, result: Result<Option<Vec<u8>>, Kind>) {
         let expected = self
             .expect
             .take()
             .expect("call returned before the model settled it");
         let actual = match result {
-            Ok(id) => Expect::Ok(id),
+            Ok(message) => Expect::Ok(message),
             Err(kind) => Expect::Err(kind),
         };
         assert_eq!(actual, expected);
@@ -941,7 +925,6 @@ fn classify(bytes: &[u8]) -> Frame {
 /// Maps a client error onto the kind the model predicts.
 fn kind(err: Error) -> Kind {
     match err {
-        Error::PacketDecodingFailed(_) => Kind::PacketDecoding,
         Error::FrameDecodingFailed(_) => Kind::FrameDecoding,
         Error::SendFailed(_) => Kind::Send,
         Error::RecvFailed(_) => Kind::Recv,
@@ -961,11 +944,7 @@ pub(super) fn check_session<R: Read, W: Write>(
     client: &mut crate::transport::Client<R, W>,
     established: bool,
 ) {
-    let oversized = vec![0x42; MAX_MESSAGE_SIZE + 1];
-    let refused = client.send_message(HostToArk {
-        id: Some(PROBE_ID),
-        content: Some(host_to_ark::Content::Develop(oversized)),
-    });
+    let refused = client.send_message(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "client has a session the model does not")
@@ -1094,14 +1073,11 @@ pub fn run(steps: &[Step]) -> Summary {
                         (false, _) => Err(Kind::Encryption),
                     }
                 };
-                let request = HostToArk {
-                    id: Some(tag as u64),
-                    content: None,
-                };
+                let request = payload(tag as u64);
                 trace(&recorder, || Event::Send {
-                    message: request.encode_to_vec(),
+                    message: request.clone(),
                 });
-                let result = client.send_message(request);
+                let result = client.send_message(&request);
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
                     Err(err) => Event::Err {
@@ -1117,14 +1093,14 @@ pub fn run(steps: &[Step]) -> Summary {
                 trace(&recorder, || Event::Recv);
                 let result = client.next_message();
                 trace(&recorder, || match &result {
-                    Ok(msg) => Event::Ok {
-                        message: Some(msg.encode_to_vec()),
+                    Ok(message) => Event::Ok {
+                        message: Some(message.clone()),
                     },
                     Err(err) => Event::Err {
                         kind: <&str>::from(err).into(),
                     },
                 });
-                let result = result.map(|msg| msg.id).map_err(kind);
+                let result = result.map(Some).map_err(kind);
                 let mut server = server.borrow_mut();
                 match result {
                     Ok(_) => server.summary.messages += 1,

@@ -9,13 +9,11 @@
 //! from the sealing order. An emitter is bound to the session it was made in
 //! and holds the funnel only as long as the owner does.
 
+use crate::transport::Error;
 use crate::transport::framing::FrameWriter;
 use crate::transport::sealing;
-use crate::transport::{Error, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
-use prost::Message;
 use std::io::Write;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use tracing::{trace, warn};
@@ -54,11 +52,9 @@ impl Side {
     }
 }
 
-/// Sealing phase of the funnel, the context fixing the sequence and the
-/// scratch space the protobuf encoding goes through.
+/// Sealing phase of the funnel, the context fixing the sequence.
 struct Sealer {
     sender: Option<xhpke::Sender>, // Context sealing the live session's messages, none without one
-    scratch: Vec<u8>,              // Scratch for protobuf encoding a message before sealing
     sessions: u64,                 // Number of sessions established so far, the live one's number
 }
 
@@ -97,7 +93,6 @@ impl<W: Write> Funnel<W> {
         Self {
             sealer: Mutex::new(Sealer {
                 sender: None,
-                scratch: Vec::with_capacity(MAX_MESSAGE_SIZE),
                 sessions: 0,
             }),
             framer: Mutex::new(framer),
@@ -108,7 +103,7 @@ impl<W: Write> Funnel<W> {
 
     /// Creates a handle sending into the live session, refused once that one
     /// ended, and refused outright without a session.
-    pub fn emitter<M: Message>(self: &Arc<Self>) -> Emitter<W, M> {
+    pub fn emitter(self: &Arc<Self>) -> Emitter<W> {
         Emitter::new(Arc::downgrade(self), self.session.load(Ordering::Acquire))
     }
 
@@ -150,12 +145,11 @@ impl<W: Write> Funnel<W> {
         self.session.store(CLOSED, Ordering::Release);
     }
 
-    /// Protobuf encodes a message, seals it with the session and sends it.
-    /// Fails unless the session is the live one. A message too large or
-    /// refusing to encode is rejected before sealing and leaves the session
-    /// alone, a failure after sealing ends it, as the peer's HPKE sequence can
-    /// no longer be caught up with.
-    pub fn send<M: Message>(&self, session: u64, msg: &M) -> Result<(), Error> {
+    /// Seals a message with the session and sends it. Fails unless the session
+    /// is the live one. A message too large is rejected before sealing and
+    /// leaves the session alone, a failure after sealing ends it, as the peer's
+    /// HPKE sequence can no longer be caught up with.
+    pub fn send(&self, session: u64, message: &[u8]) -> Result<(), Error> {
         // Refuse before taking any lock what the locks would refuse anyway, so
         // a send does not queue behind one stuck in the transport for nothing
         self.check(session)?;
@@ -164,12 +158,12 @@ impl<W: Write> Funnel<W> {
         let mut sealer = self.lock(&self.sealer);
         self.check(session)?;
 
-        let Sealer {
-            sender, scratch, ..
-        } = &mut *sealer;
-        let sender = sender.as_mut().expect("live session has its context");
+        let sender = sealer
+            .sender
+            .as_mut()
+            .expect("live session has its context");
 
-        let packet = match sealing::seal(sender, msg, scratch) {
+        let packet = match sealing::seal(sender, message) {
             Err(err @ Error::EncryptionFailed(_)) => {
                 self.end_session();
                 drop(sealer);
@@ -308,34 +302,29 @@ impl<W: Write> Funnel<W> {
 /// handle from the owner. The handle keeps nothing alive on its own, once the
 /// owner is gone only a send in progress holds the transport, until it
 /// returns.
-pub struct Emitter<W: Write, M: Message> {
+pub struct Emitter<W: Write> {
     funnel: Weak<Funnel<W>>, // Funnel of the session's sends, held while the owner lives
     session: u64,            // Number of the session the handle sends into
-    message: PhantomData<fn() -> M>, // Type of the messages the handle sends
 }
 
-impl<W: Write, M: Message> Emitter<W, M> {
+impl<W: Write> Emitter<W> {
     /// Creates a handle onto a funnel, bound to the session.
     fn new(funnel: Weak<Funnel<W>>, session: u64) -> Self {
-        Self {
-            funnel,
-            session,
-            message: PhantomData,
-        }
+        Self { funnel, session }
     }
 
-    /// Protobuf encodes a message, seals it with the session and sends it,
-    /// see `Funnel::send`. Fails once the owner is gone.
-    pub fn send_message(&self, msg: M) -> Result<(), Error> {
+    /// Seals a message with the session and sends it, see `Funnel::send`.
+    /// Fails once the owner is gone.
+    pub fn send_message(&self, message: &[u8]) -> Result<(), Error> {
         let funnel = self
             .funnel
             .upgrade()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
-        funnel.send(self.session, &msg)
+        funnel.send(self.session, message)
     }
 }
 
-impl<W: Write, M: Message> Clone for Emitter<W, M> {
+impl<W: Write> Clone for Emitter<W> {
     fn clone(&self) -> Self {
         Self::new(self.funnel.clone(), self.session)
     }
@@ -345,9 +334,9 @@ impl<W: Write, M: Message> Clone for Emitter<W, M> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::protocol::HostToArk;
     use crate::testing;
     use crate::transport::framing::FrameReader;
+    use crate::transport::mock::payload;
     use std::io;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::mpsc;
@@ -360,14 +349,6 @@ mod tests {
         let (sender, encap) = secret.public_key().new_sender(b"test").unwrap();
         let receiver = secret.new_receiver(&encap, b"test").unwrap();
         (sender, receiver)
-    }
-
-    /// A message with the id.
-    fn message(id: u64) -> HostToArk {
-        HostToArk {
-            id: Some(id),
-            ..Default::default()
-        }
     }
 
     /// Writer collecting everything written into a shared buffer.
@@ -476,10 +457,10 @@ mod tests {
 
         let threads: Vec<_> = (0..8)
             .map(|thread| {
-                let emitter: Emitter<Collector, HostToArk> = funnel.emitter();
+                let emitter: Emitter<Collector> = funnel.emitter();
                 thread::spawn(move || {
                     for i in 0..20 {
-                        emitter.send_message(message(thread * 100 + i)).unwrap();
+                        emitter.send_message(&payload(thread * 100 + i)).unwrap();
                     }
                 })
             })
@@ -491,21 +472,20 @@ mod tests {
         // Every frame must open in the order written, or the sequence is off
         let written = collector.0.lock().unwrap().clone();
         let mut reader = FrameReader::new(&written[..]);
-        let mut ids = Vec::new();
+        let mut messages = Vec::new();
         loop {
             let packet = match reader.next_packet() {
                 Err(Error::Terminated) => break,
                 result => result.unwrap().unwrap(),
             };
-            let msg: HostToArk = sealing::open(&mut receiver, packet).unwrap();
-            ids.push(msg.id.unwrap());
+            messages.push(sealing::open(&mut receiver, packet).unwrap());
         }
-        ids.sort_unstable();
-        let mut expected: Vec<u64> = (0..8)
-            .flat_map(|thread| (0..20).map(move |i| thread * 100 + i))
+        messages.sort_unstable();
+        let mut expected: Vec<Vec<u8>> = (0..8)
+            .flat_map(|thread| (0..20).map(move |i| payload(thread * 100 + i)))
             .collect();
         expected.sort_unstable();
-        assert_eq!(ids, expected);
+        assert_eq!(messages, expected);
     }
 
     // Tests that a failed write is reported to the sender it failed, that a
@@ -519,19 +499,19 @@ mod tests {
         let (sender, _) = contexts();
         let funnel = Arc::new(Funnel::new(gate, Side::Client));
         funnel.establish_session(sender);
-        let emitter: Emitter<Gate, HostToArk> = funnel.emitter();
+        let emitter: Emitter<Gate> = funnel.emitter();
 
         // The first sender blocks inside its write, the second seals behind it
         // and waits for the write lock. The wait gives it time to get there,
         // though it is refused the same if it only seals after the failure.
         let first = {
             let emitter = emitter.clone();
-            thread::spawn(move || emitter.send_message(message(1)))
+            thread::spawn(move || emitter.send_message(&payload(1)))
         };
         entered.recv().unwrap();
         let second = {
             let emitter = emitter.clone();
-            thread::spawn(move || emitter.send_message(message(2)))
+            thread::spawn(move || emitter.send_message(&payload(2)))
         };
         thread::sleep(Duration::from_millis(50));
 
@@ -544,7 +524,7 @@ mod tests {
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
         );
-        let result = emitter.send_message(message(3));
+        let result = emitter.send_message(&payload(3));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
@@ -561,8 +541,8 @@ mod tests {
         testing::init_tracing();
 
         let funnel = Arc::new(Funnel::new(Vec::new(), Side::Client));
-        let detached: Emitter<Vec<u8>, HostToArk> = funnel.emitter();
-        let result = detached.send_message(message(1));
+        let detached: Emitter<Vec<u8>> = funnel.emitter();
+        let result = detached.send_message(&payload(1));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
             "{result:?}"
@@ -571,9 +551,9 @@ mod tests {
         // A session established, only a handle made in it sends
         let (sender, _) = contexts();
         funnel.establish_session(sender);
-        let first: Emitter<Vec<u8>, HostToArk> = funnel.emitter();
-        first.send_message(message(2)).unwrap();
-        let result = detached.send_message(message(3));
+        let first: Emitter<Vec<u8>> = funnel.emitter();
+        first.send_message(&payload(2)).unwrap();
+        let result = detached.send_message(&payload(3));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "session ended"),
             "{result:?}"
@@ -582,7 +562,7 @@ mod tests {
         // The session ended, nothing sends without one
         funnel.drop_session();
         assert!(!funnel.has_session());
-        let result = first.send_message(message(4));
+        let result = first.send_message(&payload(4));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
             "{result:?}"
@@ -592,24 +572,24 @@ mod tests {
         let (sender, _) = contexts();
         funnel.establish_session(sender);
         assert!(funnel.has_session());
-        let result = first.send_message(message(5));
+        let result = first.send_message(&payload(5));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "session ended"),
             "{result:?}"
         );
-        let second: Emitter<Vec<u8>, HostToArk> = funnel.emitter();
-        second.send_message(message(6)).unwrap();
+        let second: Emitter<Vec<u8>> = funnel.emitter();
+        second.send_message(&payload(6)).unwrap();
 
         // The owner closed the funnel and went, nothing sends ever again
         funnel.close();
         assert!(!funnel.has_session());
-        let result = second.send_message(message(7));
+        let result = second.send_message(&payload(7));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
             "{result:?}"
         );
         drop(funnel);
-        let result = second.send_message(message(8));
+        let result = second.send_message(&payload(8));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
             "{result:?}"
@@ -628,18 +608,18 @@ mod tests {
         let (sender, _) = contexts();
         let funnel = Arc::new(Funnel::new(gate, Side::Client));
         funnel.establish_session(sender);
-        let emitter: Emitter<Gate, HostToArk> = funnel.emitter();
+        let emitter: Emitter<Gate> = funnel.emitter();
 
         // The first send is stuck in its write holding the framer, the second
         // seals behind it and waits for the framer holding the sealer
         let first = {
             let emitter = emitter.clone();
-            thread::spawn(move || emitter.send_message(message(1)))
+            thread::spawn(move || emitter.send_message(&payload(1)))
         };
         entered.recv().unwrap();
         let second = {
             let emitter = emitter.clone();
-            thread::spawn(move || emitter.send_message(message(2)))
+            thread::spawn(move || emitter.send_message(&payload(2)))
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(funnel.sealer.try_lock(), Err(TryLockError::WouldBlock)) {
@@ -666,7 +646,7 @@ mod tests {
         let (refused_tx, refused) = mpsc::channel();
         {
             let emitter = emitter.clone();
-            thread::spawn(move || refused_tx.send(emitter.send_message(message(3))).unwrap());
+            thread::spawn(move || refused_tx.send(emitter.send_message(&payload(3))).unwrap());
         }
         let result = refused.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
@@ -686,7 +666,7 @@ mod tests {
         );
         drop(funnel);
         dropped.recv_timeout(Duration::from_secs(5)).unwrap();
-        let result = emitter.send_message(message(4));
+        let result = emitter.send_message(&payload(4));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
             "{result:?}"
@@ -706,11 +686,11 @@ mod tests {
         let (sender, _) = contexts();
         let funnel = Arc::new(Funnel::new(gate, Side::Client));
         funnel.establish_session(sender);
-        let emitter: Emitter<Gate, HostToArk> = funnel.emitter();
+        let emitter: Emitter<Gate> = funnel.emitter();
 
         // The send is stuck in its write when the owner closes the funnel
         let sending = thread::spawn(move || {
-            panic::catch_unwind(AssertUnwindSafe(|| emitter.send_message(message(1))))
+            panic::catch_unwind(AssertUnwindSafe(|| emitter.send_message(&payload(1))))
         });
         entered.recv().unwrap();
         funnel.close();
@@ -740,13 +720,13 @@ mod tests {
             Side::Client,
         ));
         funnel.establish_session(sender);
-        let emitter: Emitter<Panicky, HostToArk> = funnel.emitter();
+        let emitter: Emitter<Panicky> = funnel.emitter();
 
-        let result = panic::catch_unwind(AssertUnwindSafe(|| emitter.send_message(message(1))));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| emitter.send_message(&payload(1))));
         assert!(result.is_err());
 
         // The session is gone, refused on the next send at the latest
-        let result = emitter.send_message(message(2));
+        let result = emitter.send_message(&payload(2));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
@@ -758,14 +738,14 @@ mod tests {
         // terminating whatever the panic left behind
         let (sender, mut receiver) = contexts();
         funnel.establish_session(sender);
-        let emitter: Emitter<Panicky, HostToArk> = funnel.emitter();
-        emitter.send_message(message(3)).unwrap();
+        let emitter: Emitter<Panicky> = funnel.emitter();
+        emitter.send_message(&payload(3)).unwrap();
 
         let written = written.lock().unwrap().clone();
         let mut reader = FrameReader::new(&written[..]);
         assert!(reader.next_packet().unwrap().is_none());
         let packet = reader.next_packet().unwrap().unwrap();
-        let msg: HostToArk = sealing::open(&mut receiver, packet).unwrap();
-        assert_eq!(msg.id, Some(3));
+        let opened = sealing::open(&mut receiver, packet).unwrap();
+        assert_eq!(opened, payload(3));
     }
 }

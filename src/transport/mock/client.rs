@@ -15,8 +15,8 @@
 use super::{
     CutPoint, MAX_STEPS, Outbox, TIMESTAMP, frame, self_attestation, unframe, would_block,
 };
-use crate::protocol::{ArkToHost, HostToArk, ark_to_host};
 use crate::transport::handshake;
+use crate::transport::mock::payload;
 use crate::transport::sealing;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
@@ -230,8 +230,8 @@ enum Outcome {
     Absorbed,
     /// A HostToArk with the id is delivered.
     Message(u64),
-    /// `Error::PacketDecodingFailed`, the session staying intact.
-    Undecodable,
+    /// Garbage delivered like any message, the session staying intact.
+    Garbage,
     /// `Error::RecvFailed` carrying `WouldBlock`.
     Yield,
     /// `Error::Terminated`, the script having run out.
@@ -481,11 +481,7 @@ impl Client {
             Step::Request(tag) => match self.sender.as_mut() {
                 Some(sender) => {
                     let id = tag as u64;
-                    let request = HostToArk {
-                        id: Some(id),
-                        content: None,
-                    };
-                    let packet = sealing::seal(sender, &request, &mut Vec::new()).unwrap();
+                    let packet = sealing::seal(sender, &payload(id)).unwrap();
                     let framed = frame(&packet);
                     self.record(&framed);
                     self.last_request = Some(framed.clone());
@@ -502,11 +498,7 @@ impl Client {
             }
             Step::RequestTampered => match self.sender.as_mut() {
                 Some(sender) => {
-                    let request = HostToArk {
-                        id: Some(0),
-                        content: None,
-                    };
-                    let mut packet = sealing::seal(sender, &request, &mut Vec::new()).unwrap();
+                    let mut packet = sealing::seal(sender, &payload(0)).unwrap();
                     *packet.last_mut().unwrap() ^= 0xff;
                     self.junk(&packet);
                 }
@@ -643,9 +635,9 @@ impl Client {
             (State::Established, Frame::Request(id)) => {
                 self.outcome = Outcome::Message(id);
             }
-            // Garbage surfaces as an error but leaves the session intact
+            // Garbage is delivered like any message, the session intact
             (State::Established, Frame::Garbage) => {
-                self.outcome = Outcome::Undecodable;
+                self.outcome = Outcome::Garbage;
             }
             // Anything else drops whatever the server had, the client told so
             _ => {
@@ -789,9 +781,9 @@ impl Client {
                     self.summary.handshakes += 1;
                 }
                 Emit::Reply(id, receiver) => {
-                    let msg: ArkToHost = sealing::open(&mut receiver.borrow_mut(), &unframe(frame))
+                    let opened = sealing::open(&mut receiver.borrow_mut(), &unframe(frame))
                         .expect("reply failed to open");
-                    assert_eq!(msg.id, Some(id));
+                    assert_eq!(opened, payload(id));
                     self.summary.replies += 1;
                 }
             }
@@ -888,12 +880,7 @@ type Server = crate::transport::Server<Feed, Outbox, Attestation>;
 /// without any frame going out.
 fn check_session(server: &mut Server, client: &Client) {
     let established = client.state == State::Established;
-    let oversized = vec![0x42; MAX_MESSAGE_SIZE + 1];
-    let refused = server.send_message(ArkToHost {
-        id: Some(PROBE_ID),
-        err: None,
-        content: Some(ark_to_host::Content::Develop(oversized)),
-    });
+    let refused = server.send_message(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "server has a session the model does not")
@@ -925,11 +912,7 @@ fn send(server: &mut Server, client: &mut Client, id: u64) {
         }
         sent
     });
-    let sent = server.send_message(ArkToHost {
-        id: Some(id),
-        err: None,
-        content: None,
-    });
+    let sent = server.send_message(&payload(id));
     match (expected, sent) {
         (Some(true), Ok(())) => {}
         (Some(false), Err(Error::SendFailed(_))) => {}
@@ -956,16 +939,22 @@ pub fn run(steps: &[Step]) -> Summary {
 
     loop {
         match server.next_message() {
-            // Reply to every request delivered, as a server would
-            Ok(msg) => {
-                let id = msg.id.expect("delivered message without an id");
+            // Reply to every request delivered, as a server would. The model
+            // predicted the delivery, so the payload says which it was, and
+            // garbage is nothing to answer.
+            Ok(message) => {
                 let mut client = client.borrow_mut();
-                client.surfaced(Outcome::Message(id));
-                client.summary.delivered += 1;
-                send(&mut server, &mut client, id);
-            }
-            Err(Error::PacketDecodingFailed(_)) => {
-                client.borrow_mut().surfaced(Outcome::Undecodable);
+                match client.outcome {
+                    Outcome::Message(id) if message == payload(id) => {
+                        client.surfaced(Outcome::Message(id));
+                        client.summary.delivered += 1;
+                        send(&mut server, &mut client, id);
+                    }
+                    _ if message == [0x07] => client.surfaced(Outcome::Garbage),
+                    outcome => {
+                        panic!("server delivered {message:?} where the model has {outcome:?}")
+                    }
+                }
             }
             // Probe the send path whenever the script hands control back
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::WouldBlock => {
