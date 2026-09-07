@@ -70,11 +70,14 @@ impl<In: Envelope> Registry<In> {
     }
 }
 
-/// A request of the peer's ahead of the worker.
+/// A request of the peer's ahead of the worker, bound to the session it
+/// arrived in, so its answer goes nowhere else whatever session is live by
+/// the time the worker gets to it.
 struct Request<In: Envelope> {
-    id: u64,              // Id of the request, echoed by the answer
-    content: In::Content, // Content for the handler
-    bytes: usize,         // Bytes the request holds of the inbox
+    id: u64,                  // Id of the request, echoed by the answer
+    content: In::Content,     // Content for the handler
+    bytes: usize,             // Bytes the request holds of the inbox
+    emitter: Emitter<Writer>, // Handle of the session it arrived in
 }
 
 /// The requests ahead of the worker, capped in bytes.
@@ -198,16 +201,32 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         self.ids.next()
     }
 
+    /// Sends a request registered under its id, the answer to reach the
+    /// caller, waiting for room in the window first. It is registered before
+    /// it is sent, so an answer racing the send finds its caller, and it goes
+    /// into the session it was registered in and no other, a reset in between
+    /// failing it rather than handing it to the next peer.
+    pub(super) fn request(&self, id: u64, message: &[u8], tx: Answer<In>) -> Result<(), Error> {
+        let emitter = self.admit(id, message.len(), tx)?;
+        if let Err(err) = self.send(&emitter, message) {
+            self.withdraw(id);
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Registers a request with its bytes, waiting for room in the window,
-    /// unless the multiplexer no longer takes calls.
-    pub(super) fn admit(&self, id: u64, bytes: usize, tx: Answer<In>) -> Result<(), Error> {
+    /// unless the multiplexer no longer takes calls. Hands back the emitter
+    /// of the session the request is registered in, taken under the same
+    /// lock, so the send that follows cannot cross into the next session.
+    fn admit(&self, id: u64, bytes: usize, tx: Answer<In>) -> Result<Emitter<Writer>, Error> {
         let mut registry = lock(&self.registry);
         loop {
             registry.accepting()?;
             if registry.inflight + bytes <= WINDOW {
                 registry.inflight += bytes;
                 registry.pending.insert(id, (tx, bytes));
-                return Ok(());
+                return Ok(lock(&self.emitter).clone());
             }
             registry = self
                 .room
@@ -216,26 +235,32 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         }
     }
 
-    /// Forgets a request, freeing its bytes of the window, and tells whether
-    /// it was still pending.
+    /// Forgets a request on the caller's behalf, its answer discarded on
+    /// arrival, and tells whether it is still unanswered. The bytes stay
+    /// charged to the window until the answer comes or the session ends, the
+    /// peer holding the work until then whether anyone waits for it or not.
     pub(super) fn forget(&self, id: u64) -> bool {
-        let mut registry = lock(&self.registry);
-        let Some((_, bytes)) = registry.pending.remove(&id) else {
-            return false;
-        };
-        registry.inflight -= bytes;
-        self.room.notify_all();
-        true
+        lock(&self.registry).pending.contains_key(&id)
     }
 
-    /// Sends an encoded message through the session's emitter. A message
+    /// Withdraws a request that never went out, freeing its bytes of the
+    /// window.
+    fn withdraw(&self, id: u64) {
+        let mut registry = lock(&self.registry);
+        if let Some((_, bytes)) = registry.pending.remove(&id) {
+            registry.inflight -= bytes;
+            self.room.notify_all();
+        }
+    }
+
+    /// Sends an encoded message through the emitter of a session. A message
     /// refused before sealing leaves the session alone. Any other failure
     /// means the session ended, which ends a client's multiplexer with it,
     /// while a server's carries on, the failure the caller's alone and the
     /// reader minding the sessions.
-    pub(super) fn send(&self, message: &[u8]) -> Result<(), Error> {
+    fn send(&self, emitter: &Emitter<Writer>, message: &[u8]) -> Result<(), Error> {
         lock(&self.registry).accepting()?;
-        match self.emitter().send_message(message) {
+        match emitter.send_message(message) {
             Ok(()) => Ok(()),
             Err(transport::Error::PacketTooLarge(size)) => Err(Error::TooLarge(size)),
             Err(err) => match self.side {
@@ -317,7 +342,13 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
                     self.refuse(responder, "request not understood");
                     return Ok(());
                 };
-                self.push(Request { id, content, bytes })
+                let emitter = self.emitter();
+                self.push(Request {
+                    id,
+                    content,
+                    bytes,
+                    emitter,
+                })
             }
         }
     }
@@ -368,12 +399,17 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// with it, the callers waiting for window room wake up, the requests
     /// queued for the worker are dropped, the responders made from here on
     /// answer into the new session, and the disconnect handler is told. The
-    /// multiplexer carries on.
+    /// multiplexer carries on. The emitter moves under the registry's lock,
+    /// the one a request registers under, so no request straddles the two
+    /// sessions.
     fn reset(&self, reason: Error, emitter: Emitter<Writer>) {
-        lock(&self.registry).drain(&reason);
+        {
+            let mut registry = lock(&self.registry);
+            registry.drain(&reason);
+            *lock(&self.emitter) = emitter;
+        }
         self.room.notify_all();
         lock(&self.inbox).clear();
-        *lock(&self.emitter) = emitter;
         if let Some(handler) = lock(&self.disconnect).as_mut() {
             handler(reason);
         }
@@ -456,7 +492,9 @@ fn read<Out: Envelope, In: Envelope>(
 }
 
 /// Runs the handler over the inbox in arrival order until the end, a panic
-/// in it being its own bug, the session carrying on.
+/// in it being its own bug, the session carrying on. A request is answered
+/// into the session it arrived in, one that ended meanwhile refusing the
+/// answer rather than the next session taking it.
 fn work<Out: Envelope, In: Envelope>(switchboard: Arc<Switchboard<Out, In>>) {
     loop {
         let request = {
@@ -479,7 +517,7 @@ fn work<Out: Envelope, In: Envelope>(switchboard: Arc<Switchboard<Out, In>>) {
                 }
             }
         };
-        let responder = Responder::new(switchboard.emitter(), request.id);
+        let responder = Responder::new(request.emitter, request.id);
         match lock(&switchboard.handler).as_mut() {
             Some(handler) => {
                 if panic::catch_unwind(AssertUnwindSafe(|| handler(request.content, responder)))

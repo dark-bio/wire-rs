@@ -100,7 +100,9 @@ impl Server {
 }
 
 /// Answer to a request still on its way, waited for once. Dropped, the
-/// request is forgotten and its answer discarded on arrival.
+/// request is forgotten and its answer discarded on arrival, the request
+/// keeping its place in the window until then, the peer still holding the
+/// work.
 pub struct Pending<T> {
     answer: mpsc::Receiver<Result<T, Error>>, // Answer, or the reason there is none
     forget: Option<Box<dyn FnOnce() -> bool + Send>>, // Forgets the request, telling if it was still pending
@@ -208,15 +210,8 @@ impl<Out: Envelope, In: Envelope> Mux<Out, In> {
     pub fn request(&self, content: Out::Content) -> Result<Pending<In::Content>, Error> {
         let id = self.switchboard.next_id();
         let message = Out::request(id, content).encode_to_vec();
-
-        // Register the request before sending it, so an answer racing the
-        // send finds its caller
         let (tx, rx) = mpsc::sync_channel(1);
-        self.switchboard.admit(id, message.len(), tx)?;
-        if let Err(err) = self.switchboard.send(&message) {
-            self.switchboard.forget(id);
-            return Err(err);
-        }
+        self.switchboard.request(id, &message, tx)?;
         let switchboard = self.switchboard.clone();
         Ok(Pending {
             answer: rx,
@@ -758,6 +753,70 @@ mod tests {
         assert_eq!(issued.load(Ordering::SeqCst), 15);
 
         // Answering one makes room for the sixteenth
+        let reply = |id: u64| ArkToHost::response(id, Some(pong(b"ok")), None).encode_to_vec();
+        emitter.send_message(&reply(ids.remove(0))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while issued.load(Ordering::SeqCst) < 16 {
+            assert!(Instant::now() < deadline, "sixteenth request never issued");
+            thread::sleep(Duration::from_millis(10));
+        }
+        ids.push(held.recv_timeout(Duration::from_secs(5)).unwrap());
+        for id in ids {
+            emitter.send_message(&reply(id)).unwrap();
+        }
+        requester.join().unwrap();
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests that a forgotten request keeps its place in the window until its
+    // answer arrives, dropping the pendings making no room for more.
+    #[test]
+    fn test_forgotten() {
+        testing::init_tracing();
+
+        // A peer holding every request, handing its emitter out so the test
+        // answers them when it pleases
+        let (held_tx, held) = mpsc::channel();
+        let (emitter_tx, emitter_rx) = mpsc::channel();
+        let mut emitter_tx = Some(emitter_tx);
+        let (mux, peer) = connect(Box::new(move |server, message| {
+            if let Some(tx) = emitter_tx.take() {
+                tx.send(server.emitter()).unwrap();
+            }
+            held_tx.send(pinged(message).0).unwrap();
+            true
+        }));
+        let mux = Arc::new(mux);
+
+        // Requests of a megabyte each with their pendings dropped on the
+        // spot, fifteen filling the window and the sixteenth waiting for
+        // room all the same
+        let payload = vec![0x42; 1024 * 1024];
+        let issued = Arc::new(AtomicUsize::new(0));
+        let requester = {
+            let mux = mux.clone();
+            let issued = issued.clone();
+            let payload = payload.clone();
+            thread::spawn(move || {
+                for _ in 0..15 {
+                    drop(mux.request(ping(&payload)).unwrap());
+                    issued.fetch_add(1, Ordering::SeqCst);
+                }
+                let pending = mux.request(ping(&payload)).unwrap();
+                issued.fetch_add(1, Ordering::SeqCst);
+                wait(pending).unwrap();
+            })
+        };
+        let emitter = emitter_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut ids: Vec<u64> = (0..15)
+            .map(|_| held.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(issued.load(Ordering::SeqCst), 15);
+
+        // Answering a forgotten one makes room for the sixteenth
         let reply = |id: u64| ArkToHost::response(id, Some(pong(b"ok")), None).encode_to_vec();
         emitter.send_message(&reply(ids.remove(0))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
