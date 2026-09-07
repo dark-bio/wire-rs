@@ -156,9 +156,14 @@ impl<W: Write> Funnel<W> {
     /// alone, a failure after sealing ends it, as the peer's HPKE sequence can
     /// no longer be caught up with.
     pub fn send<M: Message>(&self, session: u64, msg: &M) -> Result<(), Error> {
+        // Refuse before taking any lock what the locks would refuse anyway, so
+        // a send does not queue behind one stuck in the transport for nothing
+        self.check(session)?;
+
         // Seal under the seal lock, fixing the message's place in the sequence
         let mut sealer = self.lock(&self.sealer);
         self.check(session)?;
+
         let Sealer {
             sender, scratch, ..
         } = &mut *sealer;
@@ -656,6 +661,19 @@ mod tests {
         closed.recv_timeout(Duration::from_secs(5)).unwrap();
         owner.join().unwrap();
 
+        // A send after the close is refused at once rather than queued behind
+        // the stuck ones, which still hold the funnel alive
+        let (refused_tx, refused) = mpsc::channel();
+        {
+            let emitter = emitter.clone();
+            thread::spawn(move || refused_tx.send(emitter.send_message(message(3))).unwrap());
+        }
+        let result = refused.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
+            "{result:?}"
+        );
+
         // The stuck write fails once released, the one behind it is refused,
         // and the funnel goes with the last reference to it
         release.send(()).unwrap();
@@ -668,7 +686,7 @@ mod tests {
         );
         drop(funnel);
         dropped.recv_timeout(Duration::from_secs(5)).unwrap();
-        let result = emitter.send_message(message(3));
+        let result = emitter.send_message(message(4));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
             "{result:?}"
