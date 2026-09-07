@@ -1,17 +1,18 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
-use crate::framing::{FrameReader, FrameWriter};
+use crate::emitter::{Emitter, Funnel, Side};
+use crate::framing::FrameReader;
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
 use crate::sealing;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
-    MAX_MESSAGE_SIZE,
 };
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use tracing::{info, trace, warn};
 
 /// Device attestation a server presents in the handshake, a CWT in one of the
@@ -72,14 +73,13 @@ impl Attester for Attestation {
 /// `Attester` and forwarded to the client verbatim.
 pub struct Server<R: Read, W: Write, A: Attester> {
     reader: FrameReader<R>, // COBS framed transport for ingress data
-    writer: FrameWriter<W>, // COBS framed transport for egress data
+    funnel: Arc<Funnel<W>>, // Funnel of the session's sends, shared with the emitters
 
     signer: xdsa::SecretKey, // Server's identity key, signing the ArkHello
     attester: A,             // Source of the device attestation for handshakes
 
-    sender: Option<xhpke::Sender>, // Outbound context of the session (if handshake completed)
     receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
-    scratch: Vec<u8>,              // Scratch for protobuf encoding a message before sealing
+    emitter: Emitter<W, ArkToHost>,    // Handle of the live session, cloned for the emitters
 
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     timestamp: Option<i64>, // Signing time of the ArkHello pinned by a test, the clock otherwise
@@ -92,14 +92,15 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// must match. Reads block per the transport's semantics, so any timeout
     /// must be configured on the reader passed in.
     pub fn new(reader: R, writer: W, signer: xdsa::SecretKey, attester: A) -> Self {
+        let funnel = Arc::new(Funnel::new(writer, Side::Server));
+        let emitter = funnel.emitter();
         Self {
             reader: FrameReader::new(reader),
-            writer: FrameWriter::new(writer),
+            funnel,
             signer,
             attester,
-            sender: None,
             receiver: None,
-            scratch: Vec::with_capacity(MAX_MESSAGE_SIZE),
+            emitter,
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
         }
@@ -122,6 +123,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         let mut server = Self::new(reader, writer, signer, attester);
         server.timestamp = Some(timestamp);
         server
+    }
+
+    /// Creates a handle for sending messages from another thread, while the
+    /// server blocks in `next_message`. The handle is bound to the live
+    /// session, the next handshake needing a new one, so a message meant for
+    /// one host never reaches the next. See `Emitter`.
+    pub fn emitter(&self) -> Emitter<W, ArkToHost> {
+        self.emitter.clone()
     }
 
     /// Serves the next host-to-ark message, decrypting and protobuf decoding it.
@@ -168,11 +177,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                             self.send_dropped();
                             continue;
                         }
-                        // Handshake successful
+                        // Handshake successful, the ack read ahead of anything
+                        // sealed into the session
                         Ok((sender, receiver)) => {
                             info!("new wire session established");
-                            self.sender = Some(sender);
                             self.receiver = Some(receiver);
+                            self.funnel.establish_session(sender);
+                            self.emitter = self.funnel.emitter();
                             continue;
                         }
                     }
@@ -180,8 +191,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // Valid COBS packet
                 Ok(Some(packet)) => packet,
             };
-            // Non-empty packet without a session is considered junk, the client
-            // may still think it has a session though, tell it otherwise
+            // An emitter may have ended the session on its own thread, in which
+            // case the receiver side goes down with it here. A non-empty packet
+            // without a session is junk either way, the client may still think
+            // it has a session though, tell it otherwise.
+            if !self.funnel.has_session() {
+                self.receiver = None;
+            }
             let receiver = match self.receiver.as_mut() {
                 None => {
                     warn!("dropping data outside session");
@@ -214,14 +230,15 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// Drops the session, both of its contexts going together, and reports
     /// whether there was one to drop.
     fn drop_session(&mut self) -> bool {
-        self.sender = None;
-        self.receiver.take().is_some()
+        let active = self.receiver.take().is_some() && self.funnel.has_session();
+        self.funnel.drop_session();
+        active
     }
 
     /// Tells the client that the server has no session with it by sending an empty
     /// frame.
-    fn send_dropped(&mut self) {
-        if let Err(err) = self.writer.send_dropped() {
+    fn send_dropped(&self) {
+        if let Err(err) = self.funnel.send_dropped() {
             warn!("failed to signal dropped session: {}", err);
         }
     }
@@ -231,31 +248,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// drops the session and signals the client, as the client's HPKE sequence can
     /// no longer be caught up with.
     pub fn send_message(&mut self, res: ArkToHost) -> Result<(), Error> {
-        // Encode and seal the message, oversized messages are rejected before
-        // the HPKE sequence advances, only a failed seal breaks the session
-        let sender = self
-            .sender
-            .as_mut()
-            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
-
-        let blob = match sealing::seal(sender, &res, &mut self.scratch) {
-            Err(err @ Error::EncryptionFailed(_)) => {
-                self.drop_session();
-                self.send_dropped();
-                return Err(err);
-            }
-            Err(err) => return Err(err),
-            Ok(blob) => blob,
-        };
-        // Send the sealed message, tearing down the session if the transport
-        // fails to deliver it
-        if let Err(err) = self.writer.send_packet(&blob) {
-            self.drop_session();
-            self.send_dropped();
-            return Err(err);
+        // The funnel dropping the session, on this send or on an emitter's
+        // before it, drops it for the reads too
+        let result = self.emitter.send_message(res);
+        if !self.funnel.has_session() {
+            self.receiver = None;
         }
-        trace!("sent ark-to-host message ({} bytes)", blob.len());
-        Ok(())
+        result
     }
 
     /// Responds to the handshake after a session reset, establishing the
@@ -326,7 +325,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Error::HandshakeFailed(format!("failed to seal server hello: {}", err))
             })?;
 
-            self.writer.send_packet(&ark_hello)?;
+            self.funnel.send_packet(&ark_hello)?;
 
             // Message 3: Read and open the HostAck. An empty frame probably
             // means the client is restarting the session, start over.
@@ -362,6 +361,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             // Session established
             return Ok((sender, receiver));
         }
+    }
+}
+
+impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
+    /// Ends the session for the emitters and lets go of the transport writer,
+    /// so nothing stays open on their account.
+    fn drop(&mut self) {
+        self.funnel.close();
     }
 }
 
@@ -695,5 +702,78 @@ mod tests {
             matches!(result, Err(Error::InvalidAttestation)),
             "{result:?}"
         );
+    }
+
+    // Tests that the server sends through emitters from other threads while
+    // it blocks in a read, the client receiving every message in the order
+    // sealed, or it would find its session dropped instead.
+    #[test]
+    fn test_emitters() {
+        testing::init_tracing();
+
+        let signer_key = xdsa::SecretKey::generate();
+        let signer_pub = signer_key.public_key();
+        let attestation = self_attestation(&signer_key);
+
+        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
+        let ark_reader = ark_sock.try_clone().unwrap();
+        let ark_writer = ark_sock;
+
+        // Server side: on the first request, push messages from a few threads
+        // while waiting for the second request.
+        let ark_thread = std::thread::spawn(move || {
+            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            server.next_message().unwrap();
+
+            let pushers: Vec<_> = (0..4)
+                .map(|thread| {
+                    let emitter = server.emitter();
+                    std::thread::spawn(move || {
+                        for i in 0..25 {
+                            emitter
+                                .send_message(ArkToHost {
+                                    id: Some(thread * 100 + i),
+                                    err: None,
+                                    content: None,
+                                })
+                                .unwrap();
+                        }
+                    })
+                })
+                .collect();
+            let req = server.next_message().unwrap();
+            for pusher in pushers {
+                pusher.join().unwrap();
+            }
+            req.id
+        });
+
+        // Client side: request the push, receive it all, then request the stop.
+        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        client.handshake(&signer_pub).unwrap();
+        client
+            .send_message(HostToArk {
+                id: Some(1),
+                content: None,
+            })
+            .unwrap();
+
+        let mut ids: Vec<u64> = (0..100)
+            .map(|_| client.next_message().unwrap().id.unwrap())
+            .collect();
+        ids.sort_unstable();
+        let mut expected: Vec<u64> = (0..4)
+            .flat_map(|thread| (0..25).map(move |i| thread * 100 + i))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+
+        client
+            .send_message(HostToArk {
+                id: Some(2),
+                content: None,
+            })
+            .unwrap();
+        assert_eq!(ark_thread.join().unwrap(), Some(2));
     }
 }

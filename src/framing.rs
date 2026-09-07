@@ -174,14 +174,14 @@ impl<W: Write> FrameWriter<W> {
     /// so a reset resyncs the stream by itself.
     pub fn send_reset(&mut self) -> Result<(), Error> {
         self.resync = false;
-        self.send(&[0x00, 0x00])
+        Self::send(&mut self.writer, &mut self.resync, &[0x00, 0x00])
     }
 
     /// Signals a dropped session by writing a single frame delimiter, forming
     /// an empty frame. After a failed send it goes out behind the delimiter
     /// terminating what that send left behind, so it is not swallowed as one.
     pub fn send_dropped(&mut self) -> Result<(), Error> {
-        self.send(&[0x00])
+        Self::send(&mut self.writer, &mut self.resync, &[0x00])
     }
 
     /// COBS encodes a packet and sends it as a delimited frame. Packets whose
@@ -205,23 +205,22 @@ impl<W: Write> FrameWriter<W> {
     #[inline]
     fn send_frame(&mut self, size: usize) -> Result<(), Error> {
         self.frame[size] = 0;
-        let frame = std::mem::take(&mut self.frame);
-        let result = self.send(&frame[..size + 1]);
-        self.frame = frame;
-        result
+        Self::send(&mut self.writer, &mut self.resync, &self.frame[..size + 1])
     }
 
     /// Writes the bytes and flushes them, starting with a frame delimiter if
     /// the send before failed, and tracks whether this one failed for the next.
-    fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    /// The flag is raised while the write runs, so a writer panicking midway
+    /// leaves it raised and the next send terminates what was left behind.
+    fn send(writer: &mut W, resync: &mut bool, bytes: &[u8]) -> Result<(), Error> {
         let result = (|| {
-            if self.resync {
-                self.writer.write_all(&[0x00])?;
+            if std::mem::replace(resync, true) {
+                writer.write_all(&[0x00])?;
             }
-            self.writer.write_all(bytes)?;
-            self.writer.flush()
+            writer.write_all(bytes)?;
+            writer.flush()
         })();
-        self.resync = result.is_err();
+        *resync = result.is_err();
         result.map_err(Error::SendFailed)
     }
 
@@ -243,7 +242,8 @@ mod tests {
     use super::*;
     use crate::testing;
     use std::collections::VecDeque;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
+    use std::panic::{self, AssertUnwindSafe};
 
     // Tests corner-cases when consuming a packet from the framed transport.
     #[test]
@@ -551,5 +551,42 @@ mod tests {
             let written = &wire_to_host.get_ref()[..];
             assert_eq!(written, tt.expected, "test {i}");
         }
+    }
+
+    // Tests that a writer panicking midway leaves the framer usable, the frame
+    // buffer in place and the next send starting with the delimiter that
+    // terminates whatever the panic left behind.
+    #[test]
+    fn test_send_panic() {
+        testing::init_tracing();
+
+        /// Writer panicking on its first write and collecting the ones after.
+        struct Panicky {
+            armed: bool,
+            written: Vec<u8>,
+        }
+
+        impl Write for Panicky {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if std::mem::take(&mut self.armed) {
+                    panic!("injected panic");
+                }
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut framing = FrameWriter::new(Panicky {
+            armed: true,
+            written: Vec::new(),
+        });
+        let result = panic::catch_unwind(AssertUnwindSafe(|| framing.send_packet(&[1, 2, 3])));
+        assert!(result.is_err());
+
+        framing.send_packet(&[1, 2, 3]).unwrap();
+        assert_eq!(framing.writer.written, [0x00, 0x04, 1, 2, 3, 0x00]);
     }
 }

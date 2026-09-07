@@ -1,18 +1,19 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-use crate::framing::{FrameReader, FrameWriter};
+use crate::emitter::{Emitter, Funnel, Side};
+use crate::framing::FrameReader;
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
 use crate::sealing;
 use crate::server::Attestation;
 use crate::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
-    MAX_MESSAGE_SIZE,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
 
@@ -75,7 +76,6 @@ impl Verifier for Roots<'_> {
         Ok((device.signer.clone(), device))
     }
 }
-
 /// Client side of the wire, an encrypted transport for issuing protobuf requests
 /// to a connected server. It initiates sessions by signaling a transport reset and
 /// driving the handshake, afterward encrypting outbound and decrypting inbound
@@ -87,32 +87,11 @@ impl Verifier for Roots<'_> {
 ///
 /// The device attestation presented in the handshake is not interpreted by the
 /// wire, it is handed to a `Verifier` deciding whether to trust the server.
-///
-/// The client is a reading and a writing half joined, `split` taking them
-/// apart once a session is established, so one thread can block in a read
-/// while others send. Joined, a failure of either half drops the session as a
-/// whole. Apart, each half drops only its own context, whoever split them
-/// ending the other.
 pub struct Client<R: Read, W: Write> {
-    reader: MessageReader<R>, // Reading half, the frames coming in and the context opening them
-    writer: MessageWriter<W>, // Writing half, the context sealing messages and the frames going out
-}
-
-/// Reading half of a split client, receiving and opening the messages of the
-/// server. A failure drops its inbound context, `next_message` refusing to go
-/// on until a fresh handshake, which only the joined client can run.
-pub struct MessageReader<R: Read> {
-    framing: FrameReader<R>,           // COBS framed transport for ingress data
+    reader: FrameReader<R>,            // COBS framed transport for ingress data
     receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
-}
-
-/// Writing half of a split client, sealing and sending messages to the server.
-/// A failure drops its outbound context, `send_message` refusing to go on
-/// until a fresh handshake, which only the joined client can run.
-pub struct MessageWriter<W: Write> {
-    framing: FrameWriter<W>,       // COBS framed transport for egress data
-    sender: Option<xhpke::Sender>, // Outbound context of the session (if handshake completed)
-    scratch: Vec<u8>,              // Scratch for protobuf encoding a message before sealing
+    funnel: Arc<Funnel<W>>,            // Funnel of the session's sends, shared with the emitters
+    emitter: Emitter<W, HostToArk>,    // Handle of the live session, cloned for the emitters
 }
 
 impl<R: Read, W: Write> Client<R, W> {
@@ -120,18 +99,21 @@ impl<R: Read, W: Write> Client<R, W> {
     /// per the transport's semantics, so a timeout for an unresponsive server must
     /// be configured on the reader passed in.
     pub fn new(reader: R, writer: W) -> Self {
+        let funnel = Arc::new(Funnel::new(writer, Side::Client));
+        let emitter = funnel.emitter();
         Self {
-            reader: MessageReader::new(reader),
-            writer: MessageWriter::new(writer),
+            reader: FrameReader::new(reader),
+            receiver: None,
+            funnel,
+            emitter,
         }
     }
 
-    /// Takes the client apart into its reading and writing halves, each usable
-    /// from its own thread. The halves keep the session established so far,
-    /// but fail independently from then on, so the caller ends the other half
-    /// when one fails.
-    pub fn split(self) -> (MessageReader<R>, MessageWriter<W>) {
-        (self.reader, self.writer)
+    /// Creates a handle for sending messages from another thread, while the
+    /// client blocks in `next_message`. The handle is bound to the live
+    /// session, a new handshake needing a new one. See `Emitter`.
+    pub fn emitter(&self) -> Emitter<W, HostToArk> {
+        self.emitter.clone()
     }
 
     /// Sends a session reset and drives the encrypted handshake with the server:
@@ -159,12 +141,12 @@ impl<R: Read, W: Write> Client<R, W> {
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: Option<i64>,
     ) -> Result<V::Info, Error> {
-        self.reader.receiver = None;
-        self.writer.sender = None;
+        // The old session ends here, its emitters refused from now on
+        self.drop_session();
 
         // Send two zero bytes: first terminates any interrupted message, second
         // signals a fresh session.
-        self.writer.framing.send_reset()?;
+        self.funnel.send_reset()?;
 
         let host_xdsa_pk = host_xdsa_sk.public_key();
         let host_xhpke_pk = host_xhpke_sk.public_key();
@@ -176,7 +158,7 @@ impl<R: Read, W: Write> Client<R, W> {
         })
         .map_err(|err| Error::HandshakeFailed(format!("failed to encode client hello: {}", err)))?;
 
-        self.writer.framing.send_packet(&hello)?;
+        self.funnel.send_packet(&hello)?;
 
         // Message 2: Read ArkHello (COSE seal'd, COBS-framed). Frames the server
         // emitted before processing the reset may still be queued, so skip
@@ -188,7 +170,7 @@ impl<R: Read, W: Write> Client<R, W> {
             // Empty frames are the server signaling an earlier session dropped,
             // stale junk too by now. So are frames failing to decode, the
             // leftovers of a transfer that was cut short.
-            let packet: &[u8] = match self.reader.framing.next_packet() {
+            let packet: &[u8] = match self.reader.next_packet() {
                 Ok(Some(packet)) => packet,
                 Ok(None) | Err(Error::FrameDecodingFailed(_)) => &[],
                 Err(err) => return Err(err),
@@ -280,11 +262,10 @@ impl<R: Read, W: Write> Client<R, W> {
         }
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
-        self.writer.framing.send_packet(&ack)?;
+        self.funnel.send_packet(&ack)?;
 
-        // Session established
-        self.reader.receiver = Some(receiver);
-        self.writer.sender = Some(sender);
+        // Session established, the ack ahead of anything sealed into it
+        self.establish_session(sender, receiver);
         Ok(info)
     }
 
@@ -294,12 +275,45 @@ impl<R: Read, W: Write> Client<R, W> {
     /// So does an empty frame, the server signaling it dropped the session on its
     /// end. Only a fresh handshake recovers from either.
     pub fn next_message(&mut self) -> Result<ArkToHost, Error> {
-        // The reading half dropping its context drops the session as a whole
-        let res = self.reader.next_message();
-        if self.reader.receiver.is_none() {
-            self.writer.sender = None;
+        // Retrieve the next COBS encoded packet. A skipped frame may have
+        // carried a sealed message, so the session cannot continue past it.
+        // An empty frame is the server telling us it has no session with us.
+        let packet = match self.reader.next_packet() {
+            Err(err) => {
+                self.drop_session();
+                return Err(err);
+            }
+            Ok(None) => {
+                self.drop_session();
+                return Err(Error::SessionReset);
+            }
+            Ok(Some(packet)) => packet,
+        };
+        // An emitter may have ended the session on its own thread, in which
+        // case the receiver side goes down with it here
+        if !self.funnel.has_session() {
+            self.receiver = None;
         }
-        res
+        // Decrypt the message and parse it with protobuf, dropping the session
+        // if the HPKE sequence cannot be followed anymore
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
+
+        let res = match sealing::open(receiver, packet) {
+            Err(err @ Error::EncryptionFailed(_)) => {
+                self.drop_session();
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+            Ok(res) => res,
+        };
+        trace!(
+            "read ark-to-host message ({} bytes encrypted)",
+            packet.len()
+        );
+        Ok(res)
     }
 
     /// Protobuf encodes a host-to-ark message, seals it with the session and
@@ -307,12 +321,27 @@ impl<R: Read, W: Write> Client<R, W> {
     /// drops the session, as the server's HPKE sequence can no longer be caught up
     /// with.
     pub fn send_message(&mut self, req: HostToArk) -> Result<(), Error> {
-        // The writing half dropping its context drops the session as a whole
-        let res = self.writer.send_message(req);
-        if self.writer.sender.is_none() {
-            self.reader.receiver = None;
+        // The funnel dropping the session, on this send or on an emitter's
+        // before it, drops it for the reads too
+        let result = self.emitter.send_message(req);
+        if !self.funnel.has_session() {
+            self.receiver = None;
         }
-        res
+        result
+    }
+
+    /// Installs the contexts of a freshly established session, the client's
+    /// own handle bound to it.
+    fn establish_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) {
+        self.receiver = Some(receiver);
+        self.funnel.establish_session(sender);
+        self.emitter = self.funnel.emitter();
+    }
+
+    /// Drops the session, both of its contexts going together.
+    fn drop_session(&mut self) {
+        self.receiver = None;
+        self.funnel.drop_session();
     }
 
     /// Test helper running the handshake with the given ephemeral keys instead
@@ -339,7 +368,7 @@ impl<R: Read, W: Write> Client<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_packet_blob(&mut self) -> Result<Option<&[u8]>, Error> {
-        self.reader.framing.next_packet()
+        self.reader.next_packet()
     }
 
     /// Test and benchmark helper exposing the framer's `send_packet`. Not part
@@ -349,7 +378,7 @@ impl<R: Read, W: Write> Client<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn send_packet_blob(&mut self, packet: &[u8]) -> Result<(), Error> {
-        self.writer.framing.send_packet(packet)
+        self.funnel.send_packet(packet)
     }
 
     /// Test and benchmark helper exposing the framer's `next_frame` with the raw
@@ -359,7 +388,7 @@ impl<R: Read, W: Write> Client<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_frame_blob(&mut self) -> Result<&[u8], Error> {
-        self.reader.framing.next_frame_blob()
+        self.reader.next_frame_blob()
     }
 
     /// Test and benchmark helper exposing the framer's `send_frame` with the raw
@@ -369,102 +398,15 @@ impl<R: Read, W: Write> Client<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn send_frame_blob(&mut self, frame: &[u8]) -> Result<(), Error> {
-        self.writer.framing.send_frame_blob(frame)
+        self.funnel.send_frame_blob(frame)
     }
 }
 
-impl<R: Read> MessageReader<R> {
-    /// Creates the reading half around a low level reader, without a context
-    /// until the joined client's handshake fills one in.
-    fn new(reader: R) -> Self {
-        Self {
-            framing: FrameReader::new(reader),
-            receiver: None,
-        }
-    }
-
-    /// Reads the next ark-to-host message, decrypting and protobuf decoding it.
-    /// A frame that cannot be decoded or a packet that cannot be decrypted
-    /// drops the inbound context, as the server's HPKE sequence can no longer be
-    /// followed. So does an empty frame, the server signaling it dropped the
-    /// session on its end. Only a fresh handshake recovers from either.
-    pub fn next_message(&mut self) -> Result<ArkToHost, Error> {
-        // Retrieve the next COBS encoded packet. A skipped frame may have
-        // carried a sealed message, so the session cannot continue past it.
-        // An empty frame is the server telling us it has no session with us.
-        let packet = match self.framing.next_packet() {
-            Err(err) => {
-                self.receiver = None;
-                return Err(err);
-            }
-            Ok(None) => {
-                self.receiver = None;
-                return Err(Error::SessionReset);
-            }
-            Ok(Some(packet)) => packet,
-        };
-        // Decrypt the message and parse it with protobuf, dropping the context
-        // if the HPKE sequence cannot be followed anymore
-        let receiver = self
-            .receiver
-            .as_mut()
-            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
-
-        let res = match sealing::open(receiver, packet) {
-            Err(err @ Error::EncryptionFailed(_)) => {
-                self.receiver = None;
-                return Err(err);
-            }
-            Err(err) => return Err(err),
-            Ok(res) => res,
-        };
-        trace!(
-            "read ark-to-host message ({} bytes encrypted)",
-            packet.len()
-        );
-        Ok(res)
-    }
-}
-
-impl<W: Write> MessageWriter<W> {
-    /// Creates the writing half around a low level writer, without a context
-    /// until the joined client's handshake fills one in.
-    fn new(writer: W) -> Self {
-        Self {
-            framing: FrameWriter::new(writer),
-            sender: None,
-            scratch: Vec::with_capacity(MAX_MESSAGE_SIZE),
-        }
-    }
-
-    /// Protobuf encodes a host-to-ark message, seals it with the session and
-    /// sends it. Fails without an active session, and a failure after sealing
-    /// drops the outbound context, as the server's HPKE sequence can no longer
-    /// be caught up with.
-    pub fn send_message(&mut self, req: HostToArk) -> Result<(), Error> {
-        // Encode and seal the message, oversized messages are rejected before
-        // the HPKE sequence advances, only a failed seal breaks the context
-        let sender = self
-            .sender
-            .as_mut()
-            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
-
-        let blob = match sealing::seal(sender, &req, &mut self.scratch) {
-            Err(err @ Error::EncryptionFailed(_)) => {
-                self.sender = None;
-                return Err(err);
-            }
-            Err(err) => return Err(err),
-            Ok(blob) => blob,
-        };
-        // Send the sealed message, tearing down the context if the transport
-        // fails to deliver it
-        if let Err(err) = self.framing.send_packet(&blob) {
-            self.sender = None;
-            return Err(err);
-        }
-        trace!("sent host-to-ark message ({} bytes)", blob.len());
-        Ok(())
+impl<R: Read, W: Write> Drop for Client<R, W> {
+    /// Ends the session for the emitters and lets go of the transport writer,
+    /// so nothing stays open on their account.
+    fn drop(&mut self) {
+        self.funnel.close();
     }
 }
 
@@ -478,13 +420,85 @@ mod tests {
     use std::io;
     use std::thread;
 
-    // Tests that a split client reads on one thread while writing on another,
-    // the halves carrying the session the joined client established.
+    /// A pair of contexts standing in for an established session.
+    fn contexts() -> (xhpke::Sender, xhpke::Receiver) {
+        let secret = xhpke::SecretKey::generate();
+        let (sender, encap) = secret.public_key().new_sender(b"test").unwrap();
+        let receiver = secret.new_receiver(&encap, b"test").unwrap();
+        (sender, receiver)
+    }
+
+    /// A message with the id.
+    fn message(id: u64) -> HostToArk {
+        HostToArk {
+            id: Some(id),
+            ..Default::default()
+        }
+    }
+
+    // Tests that emitters send from other threads while the client blocks in
+    // a read, the server receiving every message in the order sealed, or it
+    // would drop the session instead of echoing them.
     #[test]
-    fn test_split() {
+    fn test_emitters() {
         testing::init_tracing();
 
-        // Serve the first request over pipes, then hang up
+        // Echo every request over pipes, then hang up
+        let (ark_reader, host_writer) = io::pipe().unwrap();
+        let (host_reader, ark_writer) = io::pipe().unwrap();
+
+        let signer = xdsa::SecretKey::generate();
+        let identity = signer.public_key();
+        let attestation = self_attestation(&signer);
+        let ark = thread::spawn(move || {
+            let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
+            for _ in 0..100 {
+                let req = server.next_message().unwrap();
+                server
+                    .send_message(ArkToHost {
+                        id: req.id,
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+        });
+        let mut client = Client::new(host_reader, host_writer);
+        client.handshake(&identity).unwrap();
+
+        // Send from a few threads at once while reading the echoes on this one
+        let senders: Vec<_> = (0..4)
+            .map(|thread| {
+                let emitter = client.emitter();
+                thread::spawn(move || {
+                    for i in 0..25 {
+                        emitter.send_message(message(thread * 100 + i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let mut ids: Vec<u64> = (0..100)
+            .map(|_| client.next_message().unwrap().id.unwrap())
+            .collect();
+        for sender in senders {
+            sender.join().unwrap();
+        }
+        ark.join().unwrap();
+
+        ids.sort_unstable();
+        let mut expected: Vec<u64> = (0..4)
+            .flat_map(|thread| (0..25).map(move |i| thread * 100 + i))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    // Tests that an emitter is bound to the session it was made in, a new
+    // handshake refusing it while a fresh one sends into the new session.
+    #[test]
+    fn test_emitter_session_bound() {
+        testing::init_tracing();
+
+        // Echo one request over pipes, then hang up
         let (ark_reader, host_writer) = io::pipe().unwrap();
         let (host_reader, ark_writer) = io::pipe().unwrap();
 
@@ -503,63 +517,46 @@ mod tests {
         });
         let mut client = Client::new(host_reader, host_writer);
         client.handshake(&identity).unwrap();
-        let (mut reader, mut writer) = client.split();
+        let stale = client.emitter();
+        client.handshake(&identity).unwrap();
 
-        // Wait for the response on one thread while sending on this one
-        let reading = thread::spawn(move || reader.next_message().map(|res| res.id));
-        writer
-            .send_message(HostToArk {
-                id: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(reading.join().unwrap().unwrap(), Some(7));
+        let result = stale.send_message(message(1));
+        assert!(
+            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "session ended"),
+            "{result:?}"
+        );
+        client.emitter().send_message(message(2)).unwrap();
+        assert_eq!(client.next_message().unwrap().id, Some(2));
         ark.join().unwrap();
     }
 
-    // Tests that the halves fail independently, a failed read dropping only
-    // the inbound context, whereas the joined client drops both contexts on a
-    // failure of either.
+    // Tests that the session drops as a whole, a failed read refusing the
+    // sends and a failed send refusing the reads, whether the client or an
+    // emitter sent.
     #[test]
-    fn test_split_contexts() {
+    fn test_session_lockstep() {
         testing::init_tracing();
 
-        // A pair of contexts standing in for an established session
-        let contexts = || {
-            let secret = xhpke::SecretKey::generate();
-            let (sender, encap) = secret.public_key().new_sender(b"test").unwrap();
-            let receiver = secret.new_receiver(&encap, b"test").unwrap();
-            (sender, receiver)
-        };
-        let message = || HostToArk {
-            id: Some(1),
-            ..Default::default()
-        };
-
-        // Apart, the reader ending the wire leaves the writer sealing
-        let (sender, receiver) = contexts();
-        let mut reader = MessageReader::new(io::empty());
-        reader.receiver = Some(receiver);
-        let mut writer = MessageWriter::new(Vec::new());
-        writer.sender = Some(sender);
-        assert!(matches!(reader.next_message(), Err(Error::Terminated)));
-        assert!(reader.receiver.is_none());
-        writer.send_message(message()).unwrap();
-        assert!(writer.sender.is_some());
-
-        // Joined, the reader ending the wire refuses the writer too
+        // The reader ending the wire refuses the sends
         let (sender, receiver) = contexts();
         let mut client = Client::new(io::empty(), Vec::new());
-        client.reader.receiver = Some(receiver);
-        client.writer.sender = Some(sender);
-        assert!(matches!(client.next_message(), Err(Error::Terminated)));
-        assert!(client.writer.sender.is_none());
-        assert!(matches!(
-            client.send_message(message()),
-            Err(Error::EncryptionFailed(_))
-        ));
+        client.establish_session(sender, receiver);
+        let emitter = client.emitter();
 
-        // Joined, the writer failing to deliver refuses the reader too
+        let result = client.next_message();
+        assert!(matches!(result, Err(Error::Terminated)), "{result:?}");
+        let result = client.send_message(message(1));
+        assert!(
+            matches!(result, Err(Error::EncryptionFailed(_))),
+            "{result:?}"
+        );
+        let result = emitter.send_message(message(1));
+        assert!(
+            matches!(result, Err(Error::EncryptionFailed(_))),
+            "{result:?}"
+        );
+
+        // The writer failing to deliver refuses the reads
         struct Broken;
 
         impl Write for Broken {
@@ -573,13 +570,51 @@ mod tests {
         }
         let (sender, receiver) = contexts();
         let mut client = Client::new(io::empty(), Broken);
-        client.reader.receiver = Some(receiver);
-        client.writer.sender = Some(sender);
-        assert!(matches!(
-            client.send_message(message()),
-            Err(Error::SendFailed(_))
-        ));
-        assert!(client.reader.receiver.is_none());
-        assert!(matches!(client.next_message(), Err(Error::Terminated)));
+        client.establish_session(sender, receiver);
+
+        let result = client.send_message(message(1));
+        assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
+        assert!(client.receiver.is_none());
+
+        // An emitter failing to deliver refuses the reads once the client
+        // gets to them, a frame waiting notwithstanding
+        let (sender, receiver) = contexts();
+        let mut client = Client::new(&[0x02, 0x05, 0x00][..], Broken);
+        client.establish_session(sender, receiver);
+        let emitter = client.emitter();
+
+        let result = emitter.send_message(message(1));
+        assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
+        let result = client.next_message();
+        assert!(
+            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
+            "{result:?}"
+        );
+        assert!(client.receiver.is_none());
+    }
+
+    // Tests that dropping the client ends the session for its emitters and
+    // lets go of the transport writer, so nothing stays open on their account.
+    #[test]
+    fn test_emitter_outlives_client() {
+        testing::init_tracing();
+
+        let (mut reader, writer) = io::pipe().unwrap();
+        let (sender, receiver) = contexts();
+        let mut client = Client::new(io::empty(), writer);
+        client.establish_session(sender, receiver);
+        let emitter = client.emitter();
+        emitter.send_message(message(1)).unwrap();
+        drop(client);
+
+        let result = emitter.send_message(message(2));
+        assert!(
+            matches!(result, Err(Error::EncryptionFailed(_))),
+            "{result:?}"
+        );
+        // The read only returns once the writer is gone
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert!(!bytes.is_empty());
     }
 }

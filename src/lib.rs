@@ -9,6 +9,7 @@
 pub mod protocol;
 
 mod client;
+mod emitter;
 mod framing;
 mod handshake;
 mod sealing;
@@ -19,7 +20,8 @@ mod server;
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub mod mock;
 
-pub use client::{Client, MessageReader, MessageWriter, Roots, Verifier};
+pub use client::{Client, Roots, Verifier};
+pub use emitter::Emitter;
 pub use protocol::{ArkToHost, HostToArk};
 pub use server::{Attestation, Attester, Server};
 
