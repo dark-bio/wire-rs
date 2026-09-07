@@ -17,7 +17,7 @@ use super::{
 };
 use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk, ark_to_host};
-use crate::session::Session;
+use crate::sealing;
 use crate::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
@@ -191,8 +191,8 @@ enum Emit {
     Fragment,
     /// The handshake reply, sealed to the hello with the keys.
     ArkHello(Box<Keys>),
-    /// A sealed ArkToHost with the id, opening in the session.
-    Reply(u64, Rc<RefCell<Session>>),
+    /// A sealed ArkToHost with the id, opening with the receiver.
+    Reply(u64, Rc<RefCell<xhpke::Receiver>>),
 }
 
 impl fmt::Debug for Emit {
@@ -288,9 +288,9 @@ struct Pending {
 }
 
 impl Pending {
-    /// The HostAck completing the handshake, along with the session it opens
-    /// on the client's side.
-    fn ack(self, identity: &xdsa::PublicKey) -> (Vec<u8>, Session) {
+    /// The HostAck completing the handshake, along with the two contexts of
+    /// the session it opens on the client's side.
+    fn ack(self, identity: &xdsa::PublicKey) -> (Vec<u8>, xhpke::Sender, xhpke::Receiver) {
         let (sender, encap) = self
             .ark_crypto
             .new_sender(CRYPTO_DOMAIN_WIRE_HOST_TO_ARK)
@@ -309,11 +309,7 @@ impl Pending {
             TIMESTAMP,
         )
         .unwrap();
-        let session = Session {
-            sender,
-            receiver: self.receiver,
-        };
-        (ack, session)
+        (ack, sender, self.receiver)
     }
 
     /// A HostAck flawed as requested, so the server refuses it for that one
@@ -386,7 +382,8 @@ pub struct Client {
     outcome: Outcome,   // What next_message should surface for the last step
 
     pending: Option<Pending>, // ArkHello received, awaiting the client's ack
-    session: Option<Rc<RefCell<Session>>>, // Live session of the client, shared with its replies
+    sender: Option<xhpke::Sender>, // Outbound context of the live session, sealing the requests
+    receiver: Option<Rc<RefCell<xhpke::Receiver>>>, // Inbound context of the live session, shared with the replies opening in it
 
     last_hello: Option<(Vec<u8>, Keys)>, // Last HostHello sent, framed
     last_ack: Option<Vec<u8>>,           // Last HostAck sent, framed
@@ -415,7 +412,8 @@ impl Client {
             emits: Vec::new(),
             outcome: Outcome::Absorbed,
             pending: None,
-            session: None,
+            sender: None,
+            receiver: None,
             last_hello: None,
             last_ack: None,
             last_request: None,
@@ -458,11 +456,12 @@ impl Client {
             }
             Step::Ack => match self.pending.take() {
                 Some(pending) => {
-                    let (ack, session) = pending.ack(&self.identity);
+                    let (ack, sender, receiver) = pending.ack(&self.identity);
                     let framed = frame(&ack);
                     self.record(&framed);
                     self.last_ack = Some(framed.clone());
-                    self.session = Some(Rc::new(RefCell::new(session)));
+                    self.sender = Some(sender);
+                    self.receiver = Some(Rc::new(RefCell::new(receiver)));
                     self.deliver(Frame::Ack);
                     self.bytes.extend(framed);
                 }
@@ -479,17 +478,14 @@ impl Client {
             Step::AckBadSigner => self.bad_ack(AckFlaw::Signer),
             Step::AckBadPayload => self.bad_ack(AckFlaw::Payload),
             Step::AckBadEncap => self.bad_ack(AckFlaw::Encap),
-            Step::Request(tag) => match self.session.as_ref() {
-                Some(session) => {
+            Step::Request(tag) => match self.sender.as_mut() {
+                Some(sender) => {
                     let id = tag as u64;
                     let request = HostToArk {
                         id: Some(id),
                         content: None,
                     };
-                    let packet = session
-                        .borrow_mut()
-                        .seal(&request, &mut Vec::new())
-                        .unwrap();
+                    let packet = sealing::seal(sender, &request, &mut Vec::new()).unwrap();
                     let framed = frame(&packet);
                     self.record(&framed);
                     self.last_request = Some(framed.clone());
@@ -504,24 +500,21 @@ impl Client {
                     self.bytes.extend(framed);
                 }
             }
-            Step::RequestTampered => match self.session.as_ref() {
-                Some(session) => {
+            Step::RequestTampered => match self.sender.as_mut() {
+                Some(sender) => {
                     let request = HostToArk {
                         id: Some(0),
                         content: None,
                     };
-                    let mut packet = session
-                        .borrow_mut()
-                        .seal(&request, &mut Vec::new())
-                        .unwrap();
+                    let mut packet = sealing::seal(sender, &request, &mut Vec::new()).unwrap();
                     *packet.last_mut().unwrap() ^= 0xff;
                     self.junk(&packet);
                 }
                 None => self.junk(b"tampered request without a session"),
             },
-            Step::Garbage => match self.session.as_ref() {
-                Some(session) => {
-                    let packet = session.borrow_mut().sender.seal(&[0x07], &[]).unwrap();
+            Step::Garbage => match self.sender.as_mut() {
+                Some(sender) => {
+                    let packet = sender.seal(&[0x07], &[]).unwrap();
                     let framed = frame(&packet);
                     self.record(&framed);
                     self.deliver(Frame::Garbage);
@@ -733,10 +726,11 @@ impl Client {
         });
     }
 
-    /// Forgets any session or handshake in progress. A session stays with the
-    /// replies still to be checked against it.
+    /// Forgets any session or handshake in progress. The receiver stays with
+    /// the replies still to be checked against it.
     fn forget(&mut self) {
-        self.session = None;
+        self.sender = None;
+        self.receiver = None;
         self.pending = None;
     }
 
@@ -794,10 +788,8 @@ impl Client {
                     self.receive_hello(frame, *keys);
                     self.summary.handshakes += 1;
                 }
-                Emit::Reply(id, session) => {
-                    let msg: ArkToHost = session
-                        .borrow_mut()
-                        .open(&unframe(frame))
+                Emit::Reply(id, receiver) => {
+                    let msg: ArkToHost = sealing::open(&mut receiver.borrow_mut(), &unframe(frame))
                         .expect("reply failed to open");
                     assert_eq!(msg.id, Some(id));
                     self.summary.replies += 1;
@@ -921,11 +913,11 @@ fn send(server: &mut Server, client: &mut Client, id: u64) {
     // fails it, in which case the server drops the session and signals
     let established = client.state == State::Established;
     let expected = established.then(|| {
-        let session = client
-            .session
+        let receiver = client
+            .receiver
             .clone()
             .expect("established without a session");
-        let sent = client.send(Payload::Frame(Emit::Reply(id, session)));
+        let sent = client.send(Payload::Frame(Emit::Reply(id, receiver)));
         if !sent {
             client.forget();
             client.state = State::Idle;

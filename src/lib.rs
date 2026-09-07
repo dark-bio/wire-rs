@@ -9,10 +9,11 @@
 pub mod protocol;
 
 mod client;
+mod emitter;
 mod framing;
 mod handshake;
+mod sealing;
 mod server;
-mod session;
 
 #[cfg(any(test, feature = "fuzz"))]
 #[doc(hidden)]
@@ -20,6 +21,7 @@ mod session;
 pub mod mock;
 
 pub use client::{Client, Roots, Verifier};
+pub use emitter::Emitter;
 pub use protocol::{ArkToHost, HostToArk};
 pub use server::{Attestation, Attester, Server};
 
@@ -33,7 +35,7 @@ pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 /// after the session's sealing and the COBS framing overheads are added.
 pub const MAX_MESSAGE_SIZE: usize = {
     let mut size = MAX_FRAME_SIZE;
-    while darkbio_cobs::encode_buffer(size + session::Session::SEAL_OVERHEAD) > MAX_FRAME_SIZE {
+    while darkbio_cobs::encode_buffer(size + sealing::OVERHEAD) > MAX_FRAME_SIZE {
         size -= 1;
     }
     size
