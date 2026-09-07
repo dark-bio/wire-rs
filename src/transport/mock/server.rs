@@ -16,10 +16,10 @@ use super::{
     CutPoint, MAX_STEPS, Outbox, Recorder, TIMESTAMP, cloud_attestation, frame, self_attestation,
     trace, unframe, would_block,
 };
-use crate::client::MAX_STALE_FRAMES;
-use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk, host_to_ark};
-use crate::{
+use crate::transport::client::MAX_STALE_FRAMES;
+use crate::transport::handshake;
+use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
@@ -925,7 +925,7 @@ impl Read for Feed {
 }
 
 /// The client under test, reading the script and writing into the outbox.
-type Client = crate::Client<Feed, Outbox>;
+type Client = crate::transport::Client<Feed, Outbox>;
 
 /// The frame the bytes of a frame cut short or merged with another make,
 /// junk if they still decode and undecodable if not, neither meaning
@@ -958,7 +958,7 @@ fn kind(err: Error) -> Kind {
 /// oversized message is refused before sealing, so it probes the session
 /// without any frame going out.
 pub(super) fn check_session<R: Read, W: Write>(
-    client: &mut crate::Client<R, W>,
+    client: &mut crate::transport::Client<R, W>,
     established: bool,
 ) {
     let oversized = vec![0x42; MAX_MESSAGE_SIZE + 1];

@@ -1,13 +1,13 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-use crate::emitter::{Emitter, Funnel, Side};
-use crate::framing::FrameReader;
-use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
-use crate::sealing;
-use crate::server::Attestation;
-use crate::{
+use crate::transport::emitter::{Emitter, Funnel, Side};
+use crate::transport::framing::FrameReader;
+use crate::transport::handshake;
+use crate::transport::sealing;
+use crate::transport::server::Attestation;
+use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
@@ -415,9 +415,9 @@ impl<R: Read, W: Write> Drop for Client<R, W> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::mock::self_attestation;
-    use crate::server::Server;
     use crate::testing;
+    use crate::transport::mock::self_attestation;
+    use crate::transport::server::Server;
     use std::io;
     use std::thread;
 

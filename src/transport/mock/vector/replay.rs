@@ -8,10 +8,11 @@
 //! with the server's keys.
 
 use super::{Event, ReadError, Vector};
-use crate::mock::server::check_session;
-use crate::mock::{TIMESTAMP, unframe};
-use crate::{
-    CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Client, Error, HostToArk, handshake,
+use crate::protocol::HostToArk;
+use crate::transport::mock::server::check_session;
+use crate::transport::mock::{TIMESTAMP, unframe};
+use crate::transport::{
+    CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Client, Error, handshake,
 };
 use base64::prelude::*;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};

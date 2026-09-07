@@ -1,0 +1,98 @@
+// wire-rs: encrypted protocol between Ark and host
+// Copyright 2026 Dark Bio AG. All rights reserved.
+
+//! Transport of the wire, sessions over a byte stream. The framing delimits
+//! packets with COBS, the handshake establishes a session's contexts, the
+//! sealing encrypts the messages within it, and the client and the server
+//! drive it from either end, with emitters for other threads to send through.
+
+mod client;
+mod emitter;
+mod framing;
+mod handshake;
+mod sealing;
+mod server;
+
+#[cfg(any(test, feature = "fuzz"))]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod mock;
+
+pub use client::{Client, Roots, Verifier};
+pub use emitter::Emitter;
+pub use server::{Attestation, Attester, Server};
+
+use std::io;
+
+/// Maximum limit for a frame size, above which it will be discarded from the
+/// wire protocol.
+pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
+
+/// Largest protobuf message the wire carries, being what still fits a frame
+/// after the session's sealing and the COBS framing overheads are added.
+pub const MAX_MESSAGE_SIZE: usize = {
+    let mut size = MAX_FRAME_SIZE;
+    while darkbio_cobs::encode_buffer(size + sealing::OVERHEAD) > MAX_FRAME_SIZE {
+        size -= 1;
+    }
+    size
+};
+
+/// Domain separator for the COSE envelopes of the handshake, sealing the server's
+/// hello and the client's ack (the client's hello is plain CBOR). It binds their
+/// signatures and encryption to the wire, so a handshake signed by the server's
+/// identity key cannot be replayed into other protocols using the same key.
+pub(crate) const CRYPTO_DOMAIN_WIRE: &[u8] = b"wire-v1";
+
+/// HPKE info string for the ark-to-host encryption context of an established
+/// session (message traffic after the handshake, not the handshake itself).
+pub(crate) const CRYPTO_DOMAIN_WIRE_ARK_TO_HOST: &[u8] = b"wire-v1:ark-to-host";
+
+/// HPKE info string for the host-to-ark encryption context of an established
+/// session (message traffic after the handshake, not the handshake itself).
+pub(crate) const CRYPTO_DOMAIN_WIRE_HOST_TO_ARK: &[u8] = b"wire-v1:host-to-ark";
+
+/// Things that can go wrong in the wire transport.
+#[derive(Debug, thiserror::Error)]
+// The mocks name the variants in their transcripts
+#[cfg_attr(
+    all(any(test, feature = "fuzz"), not(docsrs)),
+    derive(strum::IntoStaticStr)
+)]
+pub enum Error {
+    #[error("wire packet too large: {0} bytes, max {MAX_MESSAGE_SIZE} bytes")]
+    PacketTooLarge(usize),
+
+    #[error("wire packet encode failed: {0}")]
+    PacketEncodingFailed(prost::EncodeError),
+
+    #[error("wire packet decode failed: {0}")]
+    PacketDecodingFailed(prost::DecodeError),
+
+    #[error("wire frame too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
+    FrameTooLarge(usize),
+
+    #[error("wire frame decode failed: {0}")]
+    FrameDecodingFailed(darkbio_cobs::DecodeError),
+
+    #[error("wire send failed: {0}")]
+    SendFailed(io::Error),
+
+    #[error("wire receive failed: {0}")]
+    RecvFailed(io::Error),
+
+    #[error("wire terminated")]
+    Terminated,
+
+    #[error("wire session reset by the server")]
+    SessionReset,
+
+    #[error("attestation is not for a hardware or emulator")]
+    InvalidAttestation,
+
+    #[error("wire handshake failed: {0}")]
+    HandshakeFailed(String),
+
+    #[error("wire encryption failed: {0}")]
+    EncryptionFailed(String),
+}

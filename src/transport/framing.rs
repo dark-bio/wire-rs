@@ -18,7 +18,7 @@
 //! that leftover. A failed flush counts as a failed send, as some transports
 //! only report a lost transfer there.
 
-use crate::{Error, MAX_FRAME_SIZE};
+use crate::transport::{Error, MAX_FRAME_SIZE};
 use darkbio_cobs as cobs;
 use std::io::{self, Read, Write};
 use std::ops::Range;

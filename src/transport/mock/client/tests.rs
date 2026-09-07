@@ -4,8 +4,8 @@
 //! Scenario tests of the server, scripts run against it by the mock client.
 
 use super::*;
-use crate::client::MAX_STALE_FRAMES;
 use crate::testing;
+use crate::transport::client::MAX_STALE_FRAMES;
 
 /// Runs a script with logging enabled.
 fn run_logged(steps: &[Step]) -> Summary {

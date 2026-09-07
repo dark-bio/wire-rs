@@ -15,10 +15,10 @@
 use super::{
     CutPoint, MAX_STEPS, Outbox, TIMESTAMP, frame, self_attestation, unframe, would_block,
 };
-use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk, ark_to_host};
-use crate::sealing;
-use crate::{
+use crate::transport::handshake;
+use crate::transport::sealing;
+use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
 };
@@ -881,7 +881,7 @@ impl Read for Feed {
 }
 
 /// The server under test, reading the script and writing into the outbox.
-type Server = crate::Server<Feed, Outbox, Attestation>;
+type Server = crate::transport::Server<Feed, Outbox, Attestation>;
 
 /// Checks that the server has a session exactly when the model says so. An
 /// oversized message is refused before sealing, so it probes the session

@@ -4,7 +4,7 @@
 //! Sealing of protobuf messages into packets with the xHPKE context of a
 //! direction, and opening them again.
 
-use crate::{Error, MAX_MESSAGE_SIZE};
+use crate::transport::{Error, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
 use prost::Message;
 
@@ -53,7 +53,7 @@ pub(crate) fn open<M: Message + Default>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::MAX_FRAME_SIZE;
+    use crate::transport::MAX_FRAME_SIZE;
     use darkbio_cobs as cobs;
 
     // Tests that the sealing overhead constant matches what the session AEAD

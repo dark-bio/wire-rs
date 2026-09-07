@@ -15,7 +15,7 @@ pub mod seed;
 pub mod server;
 pub mod vector;
 
-use crate::Attestation;
+use crate::transport::Attestation;
 use darkbio_cobs as cobs;
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};

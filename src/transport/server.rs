@@ -1,12 +1,12 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
-use crate::emitter::{Emitter, Funnel, Side};
-use crate::framing::FrameReader;
-use crate::handshake;
 use crate::protocol::{ArkToHost, HostToArk};
-use crate::sealing;
-use crate::{
+use crate::transport::emitter::{Emitter, Funnel, Side};
+use crate::transport::framing::FrameReader;
+use crate::transport::handshake;
+use crate::transport::sealing;
+use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
 };
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
@@ -378,7 +378,7 @@ impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
 mod tests {
     use super::*;
     use crate::testing;
-    use crate::{Client, Verifier};
+    use crate::transport::{Client, Verifier};
     use darkbio_cobs as cobs;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -545,7 +545,7 @@ mod tests {
     fn test_roots_verifier() {
         testing::init_tracing();
 
-        use crate::Roots;
+        use crate::transport::Roots;
         use darkbio_crypto::cwt;
         use darkbio_crypto::cwt::claims::{self, eat};
         use darkbio_trust::device::{EmulatorClaims, HardwareClaims};

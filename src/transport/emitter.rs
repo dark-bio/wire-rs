@@ -9,9 +9,9 @@
 //! from the sealing order. An emitter is bound to the session it was made in
 //! and holds the funnel only as long as the owner does.
 
-use crate::framing::FrameWriter;
-use crate::sealing;
-use crate::{Error, MAX_MESSAGE_SIZE};
+use crate::transport::framing::FrameWriter;
+use crate::transport::sealing;
+use crate::transport::{Error, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
 use prost::Message;
 use std::io::Write;
@@ -345,9 +345,9 @@ impl<W: Write, M: Message> Clone for Emitter<W, M> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::framing::FrameReader;
     use crate::protocol::HostToArk;
     use crate::testing;
+    use crate::transport::framing::FrameReader;
     use std::io;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::mpsc;

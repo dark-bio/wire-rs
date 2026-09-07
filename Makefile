@@ -9,7 +9,7 @@ FUZZ_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 FUZZ_SANITIZER ?= none
 
 # Routes every random draw through the seeded backend of the mocks, see
-# src/mock/random.rs, for reproducible vectors and deterministic fuzzing.
+# src/transport/mock/random.rs, for reproducible vectors and deterministic fuzzing.
 SEEDED = RUSTFLAGS='--cfg getrandom_backend="custom"'
 
 # check runs the gates CI holds a push to, the formatting, clippy, the docs and
