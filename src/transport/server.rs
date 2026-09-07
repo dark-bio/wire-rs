@@ -124,6 +124,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         server
     }
 
+    /// Number of the live session, counting the handshakes served so far, or
+    /// zero without one. A client reconnecting on the same transport moves it,
+    /// which is how anything bound to the session above the wire tells.
+    pub fn session(&self) -> u64 {
+        self.funnel.session()
+    }
+
     /// Creates a handle for sending messages from another thread, while the
     /// server blocks in `next_message`. The handle is bound to the live
     /// session, the next handshake needing a new one, so a message meant for
@@ -679,6 +686,42 @@ mod tests {
             matches!(result, Err(Error::InvalidAttestation)),
             "{result:?}"
         );
+    }
+
+    // Tests that the session number counts the handshakes served and reads
+    // zero before the first one.
+    #[test]
+    fn test_session_number() {
+        testing::init_tracing();
+
+        let signer_key = xdsa::SecretKey::generate();
+        let signer_pub = signer_key.public_key();
+        let attestation = self_attestation(&signer_key);
+
+        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
+        let ark_reader = ark_sock.try_clone().unwrap();
+        let ark_writer = ark_sock;
+
+        // Server side: note the number before any session and after each of
+        // the two requests, the second one arriving in a second session.
+        let ark_thread = std::thread::spawn(move || {
+            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            let mut numbers = vec![server.session()];
+            for _ in 0..2 {
+                server.next_message().unwrap();
+                numbers.push(server.session());
+            }
+            numbers
+        });
+
+        // Client side: one request per session, over two sessions.
+        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        client.handshake(&signer_pub).unwrap();
+        client.send_message(&payload(1)).unwrap();
+        client.handshake(&signer_pub).unwrap();
+        client.send_message(&payload(2)).unwrap();
+
+        assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 2]);
     }
 
     // Tests that the server sends through emitters from other threads while

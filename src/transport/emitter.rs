@@ -134,7 +134,16 @@ impl<W: Write> Funnel<W> {
     /// Whether a session is live for the sends, as opposed to none established
     /// yet, the last one ended or the funnel closed.
     pub fn has_session(&self) -> bool {
-        !matches!(self.session.load(Ordering::Acquire), NONE | CLOSED)
+        self.session() != NONE
+    }
+
+    /// Number of the live session, counting the ones established so far, or
+    /// zero without one.
+    pub fn session(&self) -> u64 {
+        match self.session.load(Ordering::Acquire) {
+            CLOSED => NONE,
+            session => session,
+        }
     }
 
     /// Ends the sessions for good, every send refused from here on. The funnel
