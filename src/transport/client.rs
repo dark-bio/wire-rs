@@ -108,6 +108,13 @@ impl<R: Read, W: Write> Client<R, W> {
         }
     }
 
+    /// Number of the live session, counting the handshakes so far, or zero
+    /// without one. A fresh handshake moves it, which is how anything bound
+    /// to the session above the wire tells.
+    pub fn session(&self) -> u64 {
+        self.funnel.session()
+    }
+
     /// Creates a handle for sending messages from another thread, while the
     /// client blocks in `next_message`. The handle is bound to the live
     /// session, a new handshake needing a new one. See `Emitter`.

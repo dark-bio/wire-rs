@@ -246,6 +246,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
+    /// Resets the session on the server's account, dropping it and telling
+    /// the client with the empty frame, the next handshake being the client's
+    /// move. For ending the session of a client misbehaving above the wire.
+    pub fn reset_session(&mut self) {
+        self.drop_session();
+        self.send_dropped();
+    }
+
     /// Seals an ark-to-host message with the session and sends it. Fails
     /// without an active session. A failure after sealing drops the session
     /// and signals the client, as the client's HPKE sequence can no longer be
@@ -688,8 +696,8 @@ mod tests {
         );
     }
 
-    // Tests that the session number counts the handshakes served and reads
-    // zero before the first one.
+    // Tests that the session number counts the handshakes on both sides and
+    // reads zero before the first one.
     #[test]
     fn test_session_number() {
         testing::init_tracing();
@@ -716,12 +724,52 @@ mod tests {
 
         // Client side: one request per session, over two sessions.
         let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        assert_eq!(client.session(), 0);
         client.handshake(&signer_pub).unwrap();
+        assert_eq!(client.session(), 1);
         client.send_message(&payload(1)).unwrap();
         client.handshake(&signer_pub).unwrap();
+        assert_eq!(client.session(), 2);
         client.send_message(&payload(2)).unwrap();
 
         assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 2]);
+    }
+
+    // Tests that the server resetting a session tells the client, whose next
+    // read fails with the reset, the next handshake starting the next session.
+    #[test]
+    fn test_session_reset() {
+        testing::init_tracing();
+
+        let signer_key = xdsa::SecretKey::generate();
+        let signer_pub = signer_key.public_key();
+        let attestation = self_attestation(&signer_key);
+
+        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
+        let ark_reader = ark_sock.try_clone().unwrap();
+        let ark_writer = ark_sock;
+
+        // Server side: serve one request, reset the session, then serve the
+        // request of the next session.
+        let ark_thread = std::thread::spawn(move || {
+            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            server.next_message().unwrap();
+            server.reset_session();
+            server.next_message().unwrap();
+            server.session()
+        });
+
+        // Client side: one request, the reset read back, then a new session
+        // with a request of its own.
+        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        client.handshake(&signer_pub).unwrap();
+        client.send_message(&payload(1)).unwrap();
+        let result = client.next_message();
+        assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
+        client.handshake(&signer_pub).unwrap();
+        client.send_message(&payload(2)).unwrap();
+
+        assert_eq!(ark_thread.join().unwrap(), 2);
     }
 
     // Tests that the server sends through emitters from other threads while

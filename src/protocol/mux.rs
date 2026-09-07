@@ -11,10 +11,10 @@
 //! rules never overflows, and a peer that does not follow them has its
 //! session ended.
 
-use crate::protocol::envelope::{Envelope, Parity};
+use crate::protocol::envelope::Envelope;
 use crate::protocol::switchboard::Switchboard;
 use crate::protocol::{self, ArkToHost, HostToArk};
-use crate::transport::{self, Emitter, MAX_MESSAGE_SIZE};
+use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -70,8 +70,34 @@ pub enum Error {
 /// The client side of the protocol, what a host holds.
 pub type Client = Mux<HostToArk, ArkToHost>;
 
+impl Client {
+    /// Starts multiplexing over a transport client with its handshake done,
+    /// the closer ending the transport when the multiplexer closes or the
+    /// session fails.
+    pub fn new(client: transport::Client<Reader, Writer>, closer: Closer) -> Self {
+        Self {
+            switchboard: Switchboard::start(Side::Client, client, closer),
+        }
+    }
+}
+
 /// The server side of the protocol, what an Ark holds.
 pub type Server = Mux<ArkToHost, HostToArk>;
+
+impl Server {
+    /// Starts multiplexing over a transport server, serving the clients it
+    /// handshakes one session at a time, a new session failing whatever the
+    /// one before it left pending. The closer ends the transport when the
+    /// multiplexer closes or the transport fails.
+    pub fn new<A: Attester + Send + 'static>(
+        server: transport::Server<Reader, Writer, A>,
+        closer: Closer,
+    ) -> Self {
+        Self {
+            switchboard: Switchboard::start(Side::Server, server, closer),
+        }
+    }
+}
 
 /// Answer to a request still on its way, waited for once. Dropped, the
 /// request is forgotten and its answer discarded on arrival.
@@ -169,17 +195,6 @@ impl<Out: Envelope> Drop for Responder<Out> {
     }
 }
 
-impl Client {
-    /// Starts multiplexing over a transport client with its handshake done,
-    /// the closer ending the transport when the multiplexer closes or the
-    /// session fails.
-    pub fn new(client: transport::Client<Reader, Writer>, closer: Closer) -> Self {
-        Self {
-            switchboard: Switchboard::start(Parity::Odd, client, closer),
-        }
-    }
-}
-
 /// Multiplexer over one session, see the module docs. `Client` and `Server`
 /// are its two instantiations, one per side of the wire.
 pub struct Mux<Out: Envelope, In: Envelope> {
@@ -218,11 +233,13 @@ impl<Out: Envelope, In: Envelope> Mux<Out, In> {
         self.switchboard.on_request(Box::new(handler));
     }
 
-    /// Registers the handler invoked once if the session ends without a
-    /// close, with the reason, an unplug, the peer dropping the session, a
-    /// failed write, the peer overrunning its window or sending a malformed
-    /// message.
-    pub fn on_disconnect(&self, handler: impl FnOnce(Error) + Send + 'static) {
+    /// Registers the handler told each time a session ends short of a close,
+    /// with the reason, an unplug, the peer dropping the session, a failed
+    /// write, the peer overrunning its window or sending a malformed message.
+    /// On a client that is at most once, the multiplexer ending with its
+    /// session. On a server every client's session ends this way, the next one
+    /// served after. The handler must not register a handler itself.
+    pub fn on_disconnect(&self, handler: impl FnMut(Error) + Send + 'static) {
         self.switchboard.on_disconnect(Box::new(handler));
     }
 
@@ -260,7 +277,7 @@ mod tests {
     /// Transport server of a peer, over a socket.
     type PeerServer = transport::Server<Reader, Writer, Attestation>;
 
-    /// Script of a peer, told every message of the host and answering as it
+    /// Script of a peer, told every message of the client and answering as it
     /// pleases through the server, saying whether to keep serving.
     type Script = Box<dyn FnMut(&mut PeerServer, HostToArk) -> bool + Send>;
 
@@ -334,6 +351,68 @@ mod tests {
     /// Waits for the answer within a second.
     fn wait<T>(pending: Pending<T>) -> Result<T, Error> {
         pending.wait(Duration::from_secs(1))
+    }
+
+    /// Transport client of a peer, over a socket.
+    type PeerClient = transport::Client<Reader, Writer>;
+
+    /// Script of a peer, driving its transport client as it pleases with the
+    /// handshake done, the server's identity at hand for handshakes of its
+    /// own.
+    type ClientScript = Box<dyn FnOnce(&mut PeerClient, &xdsa::PublicKey) + Send>;
+
+    /// Starts a peer, a real transport client run by the script on its own
+    /// thread over a socket pair, and a server multiplexer serving it, its
+    /// closer shutting the socket down.
+    fn serve(script: ClientScript) -> (Server, JoinHandle<()>) {
+        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
+        let signer = xdsa::SecretKey::generate();
+        let identity = signer.public_key();
+        let attestation = self_attestation(&signer);
+
+        let host_reader: Reader = Box::new(host_sock.try_clone().unwrap());
+        let host_writer: Writer = Box::new(host_sock);
+        let peer = thread::spawn(move || {
+            let mut client = PeerClient::new(host_reader, host_writer);
+            client.handshake(&identity).unwrap();
+            script(&mut client, &identity);
+        });
+
+        let closing = ark_sock.try_clone().unwrap();
+        let ark_reader: Reader = Box::new(ark_sock.try_clone().unwrap());
+        let ark_writer: Writer = Box::new(ark_sock);
+        let server = transport::Server::new(ark_reader, ark_writer, signer, attestation);
+        let closer = Box::new(move || {
+            let _ = closing.shutdown(Shutdown::Both);
+        });
+        (Server::new(server, closer), peer)
+    }
+
+    /// Sends a message of the client's.
+    fn say(client: &mut PeerClient, envelope: HostToArk) {
+        client.send_message(&envelope.encode_to_vec()).unwrap();
+    }
+
+    /// Reads the next message of the server's, taken apart.
+    fn hear(
+        client: &mut PeerClient,
+    ) -> (u64, Option<protocol::Error>, Option<ark_to_host::Content>) {
+        let message = client.next_message().unwrap();
+        ArkToHost::decode(&message[..]).unwrap().into_parts()
+    }
+
+    /// A handler echoing every request's payload back as its reply and
+    /// reporting the payload served.
+    fn echoing(
+        served: mpsc::Sender<Vec<u8>>,
+    ) -> impl FnMut(host_to_ark::Content, Responder<ArkToHost>) + Send + 'static {
+        move |content, responder| match content {
+            host_to_ark::Content::Develop(bytes) => {
+                responder.reply(pong(&bytes)).unwrap();
+                served.send(bytes).unwrap();
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     // Tests a request answered, the ids of the client being odd.
@@ -744,6 +823,334 @@ mod tests {
         assert!(matches!(result, Err(Error::Flooded)), "{result:?}");
 
         release_tx.send(()).unwrap();
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests the server side serving a client's request through the responder,
+    // over the session the client opened.
+    #[test]
+    fn test_server_request() {
+        testing::init_tracing();
+
+        // A client sending one request once told to, reporting the answer
+        let (go_tx, go) = mpsc::channel();
+        let (answered_tx, answered) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, _| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"hello")));
+            answered_tx.send(hear(client)).unwrap();
+        }));
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+        go_tx.send(()).unwrap();
+
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"hello"
+        );
+        let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((id, err, content), (1, None, Some(pong(b"hello"))));
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests a client reconnecting over a request of the server's, the request
+    // failing as reset, the disconnect handler told, and the new session
+    // served through fresh responders.
+    #[test]
+    fn test_server_reset() {
+        testing::init_tracing();
+
+        // A client asking once told to, reading the server's question without
+        // answering it, then reconnecting and asking again
+        let (go_tx, go) = mpsc::channel();
+        let (answered_tx, answered) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, identity| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"first")));
+            hear(client);
+            assert_eq!(hear(client), (2, None, Some(pong(b"question"))));
+
+            client.handshake(identity).unwrap();
+            say(client, HostToArk::request(1, ping(b"second")));
+            answered_tx.send(hear(client)).unwrap();
+        }));
+        let (ended_tx, ended) = mpsc::channel();
+        mux.on_disconnect(move |reason| ended_tx.send(reason).unwrap());
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+        go_tx.send(()).unwrap();
+
+        // The server asks once the client's first request is served, the client
+        // reading the question and reconnecting instead of answering
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"first"
+        );
+        let pending = mux.request(pong(b"question")).unwrap();
+        let result = pending.wait(Duration::from_secs(5));
+        assert!(
+            matches!(&result, Err(Error::Disconnected(reason)) if matches!(**reason, transport::Error::SessionReset)),
+            "{result:?}"
+        );
+        let reason = ended.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            matches!(&reason, Error::Disconnected(reason) if matches!(**reason, transport::Error::SessionReset)),
+            "{reason:?}"
+        );
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"second"
+        );
+        let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((id, err, content), (1, None, Some(pong(b"second"))));
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests a client sending a malformed message over a request of the
+    // server's, the session dropped on it with the request failing as
+    // malformed and the disconnect handler told, and the client served again
+    // once it reconnects.
+    #[test]
+    fn test_server_malformed() {
+        testing::init_tracing();
+
+        // A client asking once told to, reading the server's question and
+        // answering with a byte that is no envelope, reading the reset that
+        // gets it, then reconnecting and asking again
+        let (go_tx, go) = mpsc::channel();
+        let (answered_tx, answered) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, identity| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"first")));
+            hear(client);
+            assert_eq!(hear(client), (2, None, Some(pong(b"question"))));
+            client.send_message(&[0x07]).unwrap();
+            let result = client.next_message();
+            assert!(
+                matches!(result, Err(transport::Error::SessionReset)),
+                "{result:?}"
+            );
+
+            client.handshake(identity).unwrap();
+            say(client, HostToArk::request(1, ping(b"second")));
+            answered_tx.send(hear(client)).unwrap();
+        }));
+        let (ended_tx, ended) = mpsc::channel();
+        mux.on_disconnect(move |reason| ended_tx.send(reason).unwrap());
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+        go_tx.send(()).unwrap();
+
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"first"
+        );
+        let pending = mux.request(pong(b"question")).unwrap();
+        let result = pending.wait(Duration::from_secs(5));
+        assert!(matches!(result, Err(Error::Malformed)), "{result:?}");
+        let reason = ended.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(reason, Error::Malformed), "{reason:?}");
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"second"
+        );
+        let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((id, err, content), (1, None, Some(pong(b"second"))));
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests a client overrunning its window on the server, its requests piling
+    // up in the inbox past the limit while the handler is stuck, the session
+    // dropped on it with the server's own request failing as flooded and the
+    // disconnect handler told, and the client served again once it reconnects.
+    #[test]
+    fn test_server_flood() {
+        testing::init_tracing();
+
+        // A client asking once told to, then sending four windows of requests
+        // and one more without reading, reading the server's question and
+        // the reset after it, then reconnecting and asking again
+        let (go_tx, go) = mpsc::channel();
+        let (answered_tx, answered) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, identity| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"first")));
+            go.recv().unwrap();
+            let payload = vec![0x42; MAX_MESSAGE_SIZE - 64];
+            for id in 0..INBOX / MAX_MESSAGE_SIZE + 1 {
+                say(
+                    client,
+                    HostToArk::request(2 * id as u64 + 3, ping(&payload)),
+                );
+            }
+            assert_eq!(hear(client), (2, None, Some(pong(b"question"))));
+            let result = client.next_message();
+            assert!(
+                matches!(result, Err(transport::Error::SessionReset)),
+                "{result:?}"
+            );
+
+            client.handshake(identity).unwrap();
+            say(client, HostToArk::request(1, ping(b"second")));
+            answered_tx.send(hear(client)).unwrap();
+        }));
+        let (ended_tx, ended) = mpsc::channel();
+        mux.on_disconnect(move |reason| ended_tx.send(reason).unwrap());
+
+        // A handler stuck on the first request until released and echoing
+        // the rest, its answer into the dropped session failing
+        let (served_tx, served) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let mut stuck = Some(release);
+        mux.on_request(move |content, responder: Responder<ArkToHost>| {
+            let bytes = match content {
+                host_to_ark::Content::Develop(bytes) => bytes,
+                other => panic!("{other:?}"),
+            };
+            served_tx.send(bytes.clone()).unwrap();
+            if let Some(release) = stuck.take() {
+                release.recv().unwrap();
+            }
+            let _ = responder.reply(pong(&bytes));
+        });
+        go_tx.send(()).unwrap();
+
+        // The server asks once the client's first request is in the handler,
+        // the client flooding the inbox instead of answering
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"first"
+        );
+        let pending = mux.request(pong(b"question")).unwrap();
+        go_tx.send(()).unwrap();
+        let result = pending.wait(Duration::from_secs(10));
+        assert!(matches!(result, Err(Error::Flooded)), "{result:?}");
+        let reason = ended.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(reason, Error::Flooded), "{reason:?}");
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"second"
+        );
+        let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((id, err, content), (1, None, Some(pong(b"second"))));
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests the server asking, the client answering one question and failing
+    // the other, the ids of the server being even.
+    #[test]
+    fn test_server_ask() {
+        testing::init_tracing();
+
+        // A client asking once told to, then answering the server's first
+        // question and failing its second
+        let (go_tx, go) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, _| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"first")));
+            hear(client);
+            assert_eq!(hear(client), (2, None, Some(pong(b"one"))));
+            say(client, HostToArk::response(2, Some(ping(b"answer")), None));
+            assert_eq!(hear(client), (4, None, Some(pong(b"two"))));
+            let failure = protocol::Error {
+                code: 7,
+                msg: "nope".into(),
+            };
+            say(client, HostToArk::response(4, None, Some(failure)));
+        }));
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+        go_tx.send(()).unwrap();
+
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"first"
+        );
+        let answer = wait(mux.request(pong(b"one")).unwrap()).unwrap();
+        assert_eq!(answer, ping(b"answer"));
+        let result = wait(mux.request(pong(b"two")).unwrap());
+        let Err(Error::Remote(err)) = &result else {
+            panic!("{result:?}");
+        };
+        assert_eq!((err.code, err.msg.as_str()), (7, "nope"));
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Tests the transport ending under a server, the multiplexer ending with
+    // it, the disconnect handler told and every later call refused.
+    #[test]
+    fn test_server_unplugged() {
+        testing::init_tracing();
+
+        // A client asking once told to, then going away with its answer
+        let (go_tx, go) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, _| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"hello")));
+            hear(client);
+        }));
+        let (ended_tx, ended) = mpsc::channel();
+        mux.on_disconnect(move |reason| ended_tx.send(reason).unwrap());
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+        go_tx.send(()).unwrap();
+
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"hello"
+        );
+        peer.join().unwrap();
+        let reason = ended.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&reason, Error::Disconnected(reason) if matches!(**reason, transport::Error::Terminated)),
+            "{reason:?}"
+        );
+        let result = mux.request(pong(b"more")).map(|_| ());
+        assert!(matches!(result, Err(Error::Disconnected(_))), "{result:?}");
+    }
+
+    // Tests a request of the server's with no client to send it to failing on
+    // its own, the multiplexer serving the client that comes after.
+    #[test]
+    fn test_server_no_client() {
+        testing::init_tracing();
+
+        // A client asking once told to, reporting the answer
+        let (go_tx, go) = mpsc::channel();
+        let (answered_tx, answered) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, _| {
+            go.recv().unwrap();
+            say(client, HostToArk::request(1, ping(b"hello")));
+            answered_tx.send(hear(client)).unwrap();
+        }));
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+
+        // No client has spoken yet, so there is nobody to ask
+        let result = mux.request(pong(b"early")).map(|_| ());
+        assert!(matches!(result, Err(Error::Disconnected(_))), "{result:?}");
+        go_tx.send(()).unwrap();
+
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"hello"
+        );
+        let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((id, err, content), (1, None, Some(pong(b"hello"))));
+
         drop(mux);
         peer.join().unwrap();
     }

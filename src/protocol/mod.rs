@@ -10,7 +10,7 @@ mod switchboard;
 
 pub use envelope::Envelope;
 pub use generated::*;
-pub use mux::{Client, Pending, Responder};
+pub use mux::{Client, Pending, Responder, Server};
 
 /// The generated bindings, kept out of the lints the crate holds itself to.
 #[allow(clippy::all)]

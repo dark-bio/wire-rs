@@ -20,6 +20,7 @@ pub mod mock;
 
 pub use client::{Client, Roots, Verifier};
 pub use emitter::Emitter;
+pub(crate) use emitter::Side;
 pub use server::{Attestation, Attester, Server};
 
 use std::io;
@@ -78,7 +79,7 @@ pub enum Error {
     #[error("wire terminated")]
     Terminated,
 
-    #[error("wire session reset by the server")]
+    #[error("wire session reset by the peer")]
     SessionReset,
 
     #[error("attestation is not for a hardware or emulator")]

@@ -9,6 +9,7 @@
 //! the peer's.
 
 use crate::protocol::{ArkToHost, Error, HostToArk, ark_to_host, host_to_ark};
+use crate::transport::Side;
 use prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,6 +34,15 @@ impl Parity {
         match self {
             Self::Odd => 1,
             Self::Even => 2,
+        }
+    }
+}
+
+impl From<Side> for Parity {
+    fn from(side: Side) -> Self {
+        match side {
+            Side::Client => Self::Odd,
+            Side::Server => Self::Even,
         }
     }
 }
@@ -206,8 +216,8 @@ mod tests {
     // order and never meet.
     #[test]
     fn test_ids() {
-        let client = Ids::new(Parity::Odd);
-        let server = Ids::new(Parity::Even);
+        let client = Ids::new(Parity::from(Side::Client));
+        let server = Ids::new(Parity::from(Side::Server));
 
         let clients: Vec<u64> = (0..4).map(|_| client.next()).collect();
         let servers: Vec<u64> = (0..4).map(|_| server.next()).collect();
