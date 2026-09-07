@@ -960,7 +960,7 @@ pub(super) fn check_session<R: Read, W: Write>(
 /// model, and reports what the run observed.
 pub fn run(steps: &[Step]) -> Summary {
     #[cfg(feature = "fuzz")]
-    super::seed::seed(super::seed::CLIENT_PROTOCOL, steps);
+    super::seed::seed(super::seed::TRANSPORT_CLIENT, steps);
 
     // Name the run up front when transcribing it, the deterministic randomness
     // of the vector builds restarting from the name ahead of the first key.
@@ -1028,7 +1028,15 @@ pub fn run(steps: &[Step]) -> Summary {
                     let mut server = server.borrow_mut();
                     server.client_session = None;
                     server.summary.failures += 1;
-                    server.apply_cut();
+
+                    // A broken transport lets only the reset out, and at two
+                    // bytes it is too short for a middle cut to fire on. Such a
+                    // cut stays armed for a later write rather than being spent
+                    // on this handshake, so the model leaves it be.
+                    let survives = server.broken && matches!(server.cut, Some(CutPoint::Middle(_)));
+                    if !survives {
+                        server.apply_cut();
+                    }
                     continue;
                 }
                 {

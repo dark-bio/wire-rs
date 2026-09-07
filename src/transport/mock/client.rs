@@ -925,7 +925,7 @@ fn send(server: &mut Server, client: &mut Client, id: u64) {
 /// model, and reports what the run observed.
 pub fn run(steps: &[Step]) -> Summary {
     #[cfg(feature = "fuzz")]
-    super::seed::seed(super::seed::SERVER_PROTOCOL, steps);
+    super::seed::seed(super::seed::TRANSPORT_SERVER, steps);
 
     let signer = xdsa::SecretKey::generate();
     let attestation = self_attestation(&signer);

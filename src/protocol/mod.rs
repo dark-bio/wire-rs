@@ -8,6 +8,11 @@ mod envelope;
 pub mod mux;
 mod switchboard;
 
+#[cfg(any(test, feature = "fuzz"))]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod mock;
+
 pub use envelope::Envelope;
 pub use generated::*;
 pub use mux::{Client, Pending, Responder, Server};

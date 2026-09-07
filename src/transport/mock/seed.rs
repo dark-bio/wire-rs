@@ -14,17 +14,17 @@ use std::path::Path;
 /// Environment variable naming the directory the seeds are written into.
 pub const ENV: &str = "WIRE_SEEDS";
 
-/// Fuzz target driving the real server through the mock client's scripts,
-/// which seed its corpus. Keep it in step with the binary in fuzz/Cargo.toml,
-/// the fuzz-seeds make target checks that every target listed there gets
-/// seeds.
-pub const SERVER_PROTOCOL: &str = "server-protocol";
+/// Fuzz target driving the transport's real server through the mock client's
+/// scripts, which seed its corpus. Keep it in step with the binary in
+/// fuzz/Cargo.toml, the fuzz-seeds make target checks that every target listed
+/// there gets seeds.
+pub const TRANSPORT_SERVER: &str = "transport-server";
 
-/// Fuzz target driving the real client through the mock server's scripts,
-/// which seed its corpus. Keep it in step with the binary in fuzz/Cargo.toml,
-/// the fuzz-seeds make target checks that every target listed there gets
-/// seeds.
-pub const CLIENT_PROTOCOL: &str = "client-protocol";
+/// Fuzz target driving the transport's real client through the mock server's
+/// scripts, which seed its corpus. Keep it in step with the binary in
+/// fuzz/Cargo.toml, the fuzz-seeds make target checks that every target listed
+/// there gets seeds.
+pub const TRANSPORT_CLIENT: &str = "transport-client";
 
 /// Encoder for the byte stream the fuzzers' `Arbitrary` decoding reads a
 /// script from. It mirrors arbitrary 1.4, integers little endian, a keep-going

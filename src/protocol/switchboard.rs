@@ -456,10 +456,18 @@ fn read<Out: Envelope, In: Envelope>(
     loop {
         match source.next_message() {
             Ok(message) => {
-                // A new session, the one before it reset by the peer, if
-                // there was one, and the responders made from here on
-                // answering into the new one
                 if source.session() != session {
+                    // A client's session is its connection, so the number
+                    // only moves when the session died under a failed write,
+                    // which ends the multiplexer
+                    if switchboard.side == Side::Client {
+                        let reason = Error::Disconnected(Arc::new(transport::Error::Terminated));
+                        switchboard.fail(reason);
+                        continue;
+                    }
+                    // A new session on the server, the one before it reset by
+                    // the peer, if there was one, and the responders made from
+                    // here on answering into the new one
                     let emitter = source.emitter();
                     if session == 0 {
                         *lock(&switchboard.emitter) = emitter;

@@ -622,3 +622,23 @@ fn test_scripted_noops() {
     assert!(summary.established);
     assert_eq!(summary.handshakes, 1);
 }
+
+// Tests a middle cut armed together with a broken transport, which the reset
+// of a handshake is too short to trigger, so the cut stays armed and fires on
+// the hello of the next handshake once the transport heals. Regression for the
+// model spending the cut on the reset and then mispredicting that later
+// handshake as one that reads a reply.
+#[test]
+fn test_scripted_cut_survives_broken_handshake() {
+    let summary = run_logged(&[
+        Step::Cut {
+            point: CutPoint::Middle(100),
+            then_broken: true,
+        },
+        Step::Handshake,
+        Step::Heal,
+        Step::Handshake,
+    ]);
+    assert_eq!(summary.handshakes, 0);
+    assert_eq!(summary.failures, 2);
+}

@@ -23,6 +23,12 @@ pub use emitter::Emitter;
 pub(crate) use emitter::Side;
 pub use server::{Attestation, Attester, Server};
 
+/// The funnel behind the emitters, for the protocol's mock to have a real
+/// sending side, sessions, sealing and the resets, without a transport under
+/// it.
+#[cfg(any(test, feature = "fuzz"))]
+pub(crate) use emitter::Funnel;
+
 use std::io;
 
 /// Maximum limit for a frame size, above which it will be discarded from the

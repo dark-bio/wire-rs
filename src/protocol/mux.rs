@@ -12,6 +12,8 @@
 //! session ended.
 
 use crate::protocol::envelope::Envelope;
+#[cfg(any(test, feature = "fuzz"))]
+use crate::protocol::switchboard::Source;
 use crate::protocol::switchboard::Switchboard;
 use crate::protocol::{self, ArkToHost, HostToArk};
 use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
@@ -204,6 +206,17 @@ pub struct Mux<Out: Envelope, In: Envelope> {
 }
 
 impl<Out: Envelope, In: Envelope> Mux<Out, In> {
+    /// Starts multiplexing over a mock transport, for the scenario tests and
+    /// the fuzzers to drive either side without a wire under it. Not part of
+    /// the API.
+    #[cfg(any(test, feature = "fuzz"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) fn mocked(side: Side, source: impl Source, closer: Closer) -> Self {
+        Self {
+            switchboard: Switchboard::start(side, source, closer),
+        }
+    }
+
     /// Sends a request, returning its answer to wait on once the frame is
     /// written. Waits first if the window of requests in flight is full, and
     /// refuses if the multiplexer is closed or the session ended.
