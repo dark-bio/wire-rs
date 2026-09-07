@@ -2,10 +2,11 @@
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
 //! Conventions of the envelopes, the two messages the sides of the wire
-//! exchange. A request carries an id its sender chose, a response echoes it
-//! and may carry an error instead of content, a notification carries none.
-//! Clients allocate odd ids and servers even ones, so the parity of an id
-//! tells a response to one's own request from a request of the peer's.
+//! exchange. Every message carries an id, a request one its sender chose and
+//! a response the one of the request it answers, with an error in place of
+//! content on failure. Clients allocate odd ids and servers even ones, so the
+//! parity of an id tells a response to one's own request from a request of
+//! the peer's.
 
 use crate::protocol::{ArkToHost, Error, HostToArk, ark_to_host, host_to_ark};
 use prost::Message;
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Parity of the ids a side allocates, telling its own requests from the
 /// peer's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Parity {
+pub(crate) enum Parity {
     /// The ids of a client's requests.
     Odd,
     /// The ids of a server's requests.
@@ -23,7 +24,7 @@ pub enum Parity {
 
 impl Parity {
     /// Parity of an id.
-    pub fn of(id: u64) -> Self {
+    pub(crate) fn of(id: u64) -> Self {
         if id % 2 == 1 { Self::Odd } else { Self::Even }
     }
 
@@ -38,9 +39,10 @@ impl Parity {
 
 /// One of the two messages traveling the wire. Sealed, the two being the
 /// only envelopes there are.
-pub trait Envelope: Message + Default + sealed::Sealed {
-    /// Content of the direction, its requests, responses and notifications.
-    type Content;
+pub trait Envelope: Message + Default + sealed::Sealed + 'static {
+    /// Content of the direction, its requests and responses, handed between
+    /// the threads of a multiplexer.
+    type Content: Send + 'static;
 
     /// A request with the id.
     fn request(id: u64, content: Self::Content) -> Self;
@@ -49,11 +51,8 @@ pub trait Envelope: Message + Default + sealed::Sealed {
     /// error on failure.
     fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self;
 
-    /// A notification, answered by nothing.
-    fn notification(content: Self::Content) -> Self;
-
     /// Takes the envelope apart into its id, its error and its content.
-    fn into_parts(self) -> (Option<u64>, Option<Error>, Option<Self::Content>);
+    fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>);
 }
 
 /// Supertrait nobody outside the crate can implement, closing the envelopes.
@@ -69,29 +68,17 @@ impl Envelope for HostToArk {
 
     fn request(id: u64, content: Self::Content) -> Self {
         Self {
-            id: Some(id),
+            id,
             err: None,
             content: Some(content),
         }
     }
 
     fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self {
-        Self {
-            id: Some(id),
-            err,
-            content,
-        }
+        Self { id, err, content }
     }
 
-    fn notification(content: Self::Content) -> Self {
-        Self {
-            id: None,
-            err: None,
-            content: Some(content),
-        }
-    }
-
-    fn into_parts(self) -> (Option<u64>, Option<Error>, Option<Self::Content>) {
+    fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }
@@ -101,73 +88,59 @@ impl Envelope for ArkToHost {
 
     fn request(id: u64, content: Self::Content) -> Self {
         Self {
-            id: Some(id),
+            id,
             err: None,
             content: Some(content),
         }
     }
 
     fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self {
-        Self {
-            id: Some(id),
-            err,
-            content,
-        }
+        Self { id, err, content }
     }
 
-    fn notification(content: Self::Content) -> Self {
-        Self {
-            id: None,
-            err: None,
-            content: Some(content),
-        }
-    }
-
-    fn into_parts(self) -> (Option<u64>, Option<Error>, Option<Self::Content>) {
+    fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }
 
 /// What an incoming envelope is to the side receiving it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     /// A request of the peer's, to be answered with its id.
     Request(u64),
     /// A response to a request of one's own, the id naming it.
     Response(u64),
-    /// A notification, answered by nothing.
-    Notification,
 }
 
 impl Kind {
     /// Classifies an incoming id on the side allocating ids of the parity,
     /// its own parity meaning a response, the other a request.
-    pub fn of(id: Option<u64>, parity: Parity) -> Self {
-        match id {
-            None => Self::Notification,
-            Some(id) if Parity::of(id) == parity => Self::Response(id),
-            Some(id) => Self::Request(id),
+    pub(crate) fn of(id: u64, parity: Parity) -> Self {
+        if Parity::of(id) == parity {
+            Self::Response(id)
+        } else {
+            Self::Request(id)
         }
     }
 }
 
 /// Allocator of the request ids of one side, handing out the ids of its
 /// parity in order, from any thread.
-pub struct Ids {
+pub(crate) struct Ids {
     next: AtomicU64, // Next id to hand out
 }
 
 impl Ids {
     /// Creates the allocator of a side, starting at the lowest positive id
     /// of the parity.
-    pub fn new(parity: Parity) -> Self {
+    pub(crate) fn new(parity: Parity) -> Self {
         Self {
             next: AtomicU64::new(parity.first()),
         }
     }
 
     /// Hands out the next id.
-    pub fn next(&self) -> u64 {
+    pub(crate) fn next(&self) -> u64 {
         self.next.fetch_add(2, Ordering::Relaxed)
     }
 }
@@ -182,48 +155,44 @@ mod tests {
     #[test]
     fn test_kinds() {
         struct TestCase {
-            id: Option<u64>,
+            id: u64,
             parity: Parity,
             kind: Kind,
         }
         let tests = [
             TestCase {
-                id: None,
-                parity: Parity::Odd,
-                kind: Kind::Notification,
-            },
-            TestCase {
-                id: None,
-                parity: Parity::Even,
-                kind: Kind::Notification,
-            },
-            TestCase {
-                id: Some(1),
+                id: 1,
                 parity: Parity::Odd,
                 kind: Kind::Response(1),
             },
             TestCase {
-                id: Some(2),
+                id: 2,
                 parity: Parity::Odd,
                 kind: Kind::Request(2),
             },
             TestCase {
-                id: Some(1),
+                id: 1,
                 parity: Parity::Even,
                 kind: Kind::Request(1),
             },
             TestCase {
-                id: Some(2),
+                id: 2,
                 parity: Parity::Even,
                 kind: Kind::Response(2),
             },
+            // An old Ark's message without an id decodes as zero, a request to a host
             TestCase {
-                id: Some(0),
+                id: 0,
+                parity: Parity::Odd,
+                kind: Kind::Request(0),
+            },
+            TestCase {
+                id: 0,
                 parity: Parity::Even,
                 kind: Kind::Response(0),
             },
             TestCase {
-                id: Some(u64::MAX),
+                id: u64::MAX,
                 parity: Parity::Even,
                 kind: Kind::Request(u64::MAX),
             },
@@ -246,12 +215,12 @@ mod tests {
         assert_eq!(servers, vec![2, 4, 6, 8]);
 
         for id in clients {
-            assert_eq!(Kind::of(Some(id), Parity::Odd), Kind::Response(id));
-            assert_eq!(Kind::of(Some(id), Parity::Even), Kind::Request(id));
+            assert_eq!(Kind::of(id, Parity::Odd), Kind::Response(id));
+            assert_eq!(Kind::of(id, Parity::Even), Kind::Request(id));
         }
         for id in servers {
-            assert_eq!(Kind::of(Some(id), Parity::Even), Kind::Response(id));
-            assert_eq!(Kind::of(Some(id), Parity::Odd), Kind::Request(id));
+            assert_eq!(Kind::of(id, Parity::Even), Kind::Response(id));
+            assert_eq!(Kind::of(id, Parity::Odd), Kind::Request(id));
         }
     }
 
@@ -269,7 +238,7 @@ mod tests {
         let (id, err_out, content) = HostToArk::decode(&request.encode_to_vec()[..])
             .unwrap()
             .into_parts();
-        assert_eq!((id, err_out), (Some(3), None));
+        assert_eq!((id, err_out), (3, None));
         assert_eq!(content, Some(host_to_ark::Content::Develop(vec![1, 2])));
 
         // An Ark response failing the request, the error surviving the trip
@@ -277,23 +246,13 @@ mod tests {
         let (id, err_out, content) = ArkToHost::decode(&response.encode_to_vec()[..])
             .unwrap()
             .into_parts();
-        assert_eq!((id, err_out, content), (Some(3), Some(err.clone()), None));
+        assert_eq!((id, err_out, content), (3, Some(err.clone()), None));
 
         // A host response failing an Ark request, its error field the new one
         let response = HostToArk::response(4, None, Some(err.clone()));
         let (id, err_out, content) = HostToArk::decode(&response.encode_to_vec()[..])
             .unwrap()
             .into_parts();
-        assert_eq!((id, err_out, content), (Some(4), Some(err), None));
-
-        // Notifications either way carry no id
-        let event = ArkToHost::notification(ark_to_host::Content::Develop(vec![9]));
-        let (id, err_out, content) = ArkToHost::decode(&event.encode_to_vec()[..])
-            .unwrap()
-            .into_parts();
-        assert_eq!((id, err_out), (None, None));
-        assert_eq!(content, Some(ark_to_host::Content::Develop(vec![9])));
-        let notification = HostToArk::notification(host_to_ark::Content::Develop(vec![8]));
-        assert_eq!(notification.into_parts().0, None);
+        assert_eq!((id, err_out, content), (4, Some(err), None));
     }
 }

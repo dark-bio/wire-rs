@@ -59,3 +59,9 @@ bench = false
 name = "main"
 harness = false
 required-features = ["bench"]
+
+# The tests push megabytes through the crypto, which crawls unoptimized, so the
+# dependencies build optimized under the dev profile too. The crate itself stays
+# unoptimized for debugging.
+[profile.dev.package."*"]
+opt-level = 2

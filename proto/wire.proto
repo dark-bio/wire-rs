@@ -8,14 +8,13 @@ package darkbio.wire;
 // HostToArk represents a message sent from the host to the Ark via the USB
 // connection. It embeds all possible message types to keep the protocol simple.
 //
-// A message carrying an id is either a request, its id chosen by the host, or
-// the host's response to a request of the Ark, echoing the Ark's id. To avoid
-// id collisions, hosts allocate odd ids and Arks even ones, so a receiver can
-// tell a response from a request by the parity of the id alone. A message
-// without an id is a notification, answered by nothing.
+// Every message carries an id and is either a request, its id chosen by the
+// host, or the host's response to a request of the Ark, echoing the Ark's id.
+// To avoid id collisions, hosts allocate odd ids and Arks even ones, so a
+// receiver can tell a response from a request by the parity of the id alone.
 message HostToArk {
   // Enveloping fields, reserved range 0x001-0x0ff
-  optional uint64 id = 1;  // Request identifier, the host's own or responded to (if any)
+  uint64 id = 1;           // Request identifier, the host's own or responded to
   optional Error err = 2;  // Error encountered while serving the Ark's request (if any)
 
   oneof content {
@@ -77,14 +76,13 @@ message HostToArk {
 // ArkToHost represents a message sent from the Ark to the host via the USB
 // connection. It embeds all possible message types to keep the protocol simple.
 //
-// A message carrying an id is either a request, its id chosen by the Ark, or
-// the Ark's response to a request of the host, echoing the host's id. To avoid
-// id collisions, hosts allocate odd ids and Arks even ones, so a receiver can
-// tell a response from a request by the parity of the id alone. A message
-// without an id is a notification, answered by nothing.
+// Every message carries an id and is either a request, its id chosen by the
+// Ark, or the Ark's response to a request of the host, echoing the host's id.
+// To avoid id collisions, hosts allocate odd ids and Arks even ones, so a
+// receiver can tell a response from a request by the parity of the id alone.
 message ArkToHost {
   // Enveloping fields, reserved range 0x001-0x0ff
-  optional uint64 id = 1;  // Request identifier, responded to or the Ark's own (if any)
+  uint64 id = 1;           // Request identifier, responded to or the Ark's own
   optional Error err = 2;  // Error encountered while serving the host's request (if any)
 
   oneof content {
