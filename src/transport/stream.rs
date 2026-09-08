@@ -333,7 +333,7 @@ mod tests {
 
     // Tests that handing a stream to a client transfers shutdown responsibility
     // without closing it. Dropping either owner invokes shutdown exactly once,
-    // repeated closes do nothing, and senders outliving the client fail.
+    // and repeated closes do nothing.
     #[test]
     fn test_ownership_and_repeated_close() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -350,11 +350,8 @@ mod tests {
             0,
             "handoff must keep the stream open"
         );
-        let sender = client.sender();
-        assert_eq!(sender.session_id(), 0);
         drop(client);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(matches!(sender.send(b"late"), Err(Error::Terminated)));
         closer.close();
         drop(closer.clone());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -514,7 +511,7 @@ mod tests {
             let closer = client.closer();
             let io = thread::spawn(move || {
                 let identity = xdsa::SecretKey::generate().public_key();
-                assert!(client.handshake(&identity).is_err());
+                assert!(client.connect(&identity).is_err());
                 client
             });
             entries.recv_timeout(PATIENCE).unwrap();
@@ -537,7 +534,7 @@ mod tests {
             assert!(matches!(client.recv(), Err(Error::Terminated)));
             let identity = xdsa::SecretKey::generate().public_key();
             assert!(matches!(
-                client.handshake(&identity),
+                client.connect(&identity),
                 Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::NotConnected
             ));
             assert_eq!(gate.calls.load(Ordering::SeqCst), calls);

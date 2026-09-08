@@ -20,7 +20,7 @@ use crate::transport::mock::payload;
 use crate::transport::sealing;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, Event, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, Event, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Sender,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use std::cell::RefCell;
@@ -41,7 +41,7 @@ const PROBE_ID: u64 = u64::MAX;
 pub enum Step {
     /// A lone zero, one empty frame.
     Reset,
-    /// Two zeros, the reset as `Client::handshake` sends it.
+    /// Two zeros, the reset as `Client::connect` sends it.
     ResetPair,
     /// A valid HostHello with fresh ephemeral keys.
     Hello,
@@ -232,10 +232,10 @@ enum Outcome {
     Message(u64),
     /// Garbage delivered like any message, the session staying intact.
     Garbage,
-    /// `Event::SessionClosed`, a session the server held ending at once, on
+    /// `Event::Disconnected`, a session the server held ending at once, on
     /// the reset ending it or the frame breaking it.
     Ended,
-    /// `Event::SessionOpened`, a handshake establishing a session, on the ack
+    /// `Event::Connected`, a handshake establishing a session, on the ack
     /// that concludes it.
     Opened,
     /// `Error::RecvFailed` carrying `WouldBlock`.
@@ -898,9 +898,9 @@ type Server = crate::transport::Server<Feed, Outbox, Attestation>;
 /// Checks that the server has a session exactly when the model says so. An
 /// oversized message is refused before sealing, so it probes the session
 /// without any frame going out.
-fn check_session(server: &mut Server, client: &Client) {
+fn check_session(sender: Option<&Sender<Outbox>>, client: &Client) {
     let established = client.state == State::Established;
-    let refused = server.sender().send(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
+    let refused = super::send(sender, &vec![0x42; MAX_MESSAGE_SIZE + 1]);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "server has a session the model does not")
@@ -916,7 +916,7 @@ fn check_session(server: &mut Server, client: &Client) {
 /// exactly in a session and fails exactly when the transport does. A failed
 /// send ends the sending session and signals the client. The server's receive
 /// side still holds its context until the next read reports the session ending.
-fn send(server: &mut Server, client: &mut Client, id: u64) {
+fn send(sender: Option<&Sender<Outbox>>, client: &mut Client, id: u64) {
     // Predict the send, a reply going out in a session unless the transport
     // fails it, in which case the server drops the session and signals
     let established = client.state == State::Established;
@@ -933,7 +933,7 @@ fn send(server: &mut Server, client: &mut Client, id: u64) {
         }
         sent
     });
-    let sent = server.sender().send(&payload(id));
+    let sent = super::send(sender, &payload(id));
     match (expected, sent) {
         (Some(true), Ok(())) => {}
         (Some(false), Err(Error::SendFailed(_))) => {}
@@ -963,6 +963,7 @@ pub fn run(steps: &[Step]) -> Summary {
         TIMESTAMP,
     );
 
+    let mut sender = None;
     loop {
         match server.recv() {
             // Reply to every request delivered, as a server would. The model
@@ -974,7 +975,7 @@ pub fn run(steps: &[Step]) -> Summary {
                     Outcome::Message(id) if message == payload(id) => {
                         client.surfaced(Outcome::Message(id));
                         client.summary.delivered += 1;
-                        send(&mut server, &mut client, id);
+                        send(sender.as_ref(), &mut client, id);
                     }
                     _ if message == [0x07] => client.surfaced(Outcome::Garbage),
                     outcome => {
@@ -984,24 +985,25 @@ pub fn run(steps: &[Step]) -> Summary {
             }
             // A session the server held ended, the client having reset or
             // broken it
-            Ok(Event::SessionClosed) => {
+            Ok(Event::Disconnected) => {
                 let mut client = client.borrow_mut();
                 client.surfaced(Outcome::Ended);
-                check_session(&mut server, &client);
+                check_session(sender.as_ref(), &client);
             }
             // A handshake opened a session, which the server can send into
             // before the client says anything more
-            Ok(Event::SessionOpened) => {
+            Ok(Event::Connected(opened)) => {
+                sender = Some(opened);
                 let mut client = client.borrow_mut();
                 client.surfaced(Outcome::Opened);
-                check_session(&mut server, &client);
+                check_session(sender.as_ref(), &client);
             }
             // Probe the send path whenever the script hands control back
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::WouldBlock => {
                 let mut client = client.borrow_mut();
                 client.surfaced(Outcome::Yield);
-                check_session(&mut server, &client);
-                send(&mut server, &mut client, PROBE_ID);
+                check_session(sender.as_ref(), &client);
+                send(sender.as_ref(), &mut client, PROBE_ID);
             }
             Err(Error::Terminated) => {
                 client.borrow_mut().surfaced(Outcome::Terminated);
@@ -1012,7 +1014,7 @@ pub fn run(steps: &[Step]) -> Summary {
     }
     let mut client = client.borrow_mut();
     client.sync();
-    check_session(&mut server, &client);
+    check_session(sender.as_ref(), &client);
     client.summary.state = client.state;
     client.summary
 }

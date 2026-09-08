@@ -926,18 +926,24 @@ fn test_scripted_answer_flooded() {
 
 // Tests that a request the handler holds across a reset is answered into the
 // session it arrived in, which is gone, so the answer never reaches anyone.
+// A pending request in the new session survives that late reply and completes.
 #[test]
 fn test_scripted_answer_into_dead_session() {
     let summary = server(&[
         Step::Ask(1),
         Step::Reset,
+        Step::Request(3),
         Step::Reply,
+        Step::Answer(3),
+        Step::Wait(3),
         Step::Ask(2),
         Step::Reply,
     ]);
     assert_eq!(
         summary,
         Summary {
+            sent: 1,
+            answered: 1,
             served: 2,
             disconnects: 1,
             sessions: 2,

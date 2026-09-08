@@ -113,31 +113,34 @@ pub fn run(vector: &Vector) {
         || {},
     ));
     let mut peer = Peer::new(vector);
+    let mut sender = None;
 
     while !tape.borrow().done() {
         let event = tape.borrow_mut().next();
         match event {
             Event::Handshake { xdsa, xhpke } => {
+                sender = None;
                 let signer = xdsa::SecretKey::from_bytes(xdsa[..].try_into().unwrap());
                 let crypto = xhpke::SecretKey::from_bytes(xhpke[..].try_into().unwrap());
                 peer.signer = Some(signer.public_key());
                 let result = client
                     .handshake_with_keys(&peer.identity, signer, crypto, TIMESTAMP)
-                    .map(|attestation| {
+                    .map(|(opened, attestation)| {
+                        sender = Some(opened);
                         assert_eq!(attestation.as_bytes(), &vector.attestation[..]);
                         None
                     });
                 settle(&tape, &mut peer, None, result);
             }
             Event::Send { message } => {
-                let result = client.sender().send(&message).map(|_| None);
+                let result = super::super::send(sender.as_ref(), &message).map(|_| None);
                 settle(&tape, &mut peer, Some(&message), result);
             }
             Event::Recv => {
                 let result = client.recv().map(Some);
                 settle(&tape, &mut peer, None, result);
             }
-            Event::Session { established } => check_session(&mut client, established),
+            Event::Session { established } => check_session(sender.as_ref(), established),
             event => panic!("transcript has {event:?} outside a call"),
         }
     }

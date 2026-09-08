@@ -61,33 +61,40 @@ impl Attester for Attestation {
     }
 }
 
-/// What a read of the server surfaces, a message of the client's or the
-/// session under it changing, see `Server::recv`.
+/// A decrypted message or encrypted session transition returned by [`Server::recv`].
+/// Events arrive in receive order and refer to sessions over the existing byte
+/// stream. Permanent stream closure is observed through I/O results.
 #[derive(Debug)]
-pub enum Event {
-    /// A handshake established a session, `Server::session_id` numbering it and
-    /// `Server::sender` sending into it.
-    SessionOpened,
+pub enum Event<W: Write> {
+    /// An encrypted session was established. The sender stays bound to it, even
+    /// after it ends and another session opens. This reports a completed handshake;
+    /// concurrent sending or stream closure may make the sender unusable before
+    /// the event is handled.
+    Connected(Sender<W>),
 
-    /// The session ended, the client resetting it or sending what cannot
-    /// belong to it, so nothing may be sealed into it anymore. A reset has
-    /// the client's handshake behind it, which the next read runs.
-    SessionClosed,
+    /// The previously opened session ended through a peer reset, invalid
+    /// incoming data or an observed send failure. A peer reset leaves a handshake
+    /// for the next read to run. A local [`Server::disconnect`] does not emit this
+    /// event. Permanent stream closure is reported through I/O results instead.
+    Disconnected,
 
     /// A message of the client's, decrypted.
     Message(Vec<u8>),
 }
 
-/// Server side of the wire, an encrypted transport for serving the messages
-/// of a connected client. It waits for session resets (empty frames), responds
-/// to handshake and afterward decrypts inbound and encrypts outbound messages.
+/// Server side of the wire, accepting encrypted sessions over a supplied byte
+/// stream. [`Server::recv`] handles client resets and handshakes, returning
+/// [`Event::Connected`] with a [`Sender`] for each established session. Subsequent
+/// reads deliver decrypted messages or report that the session ended.
+/// [`Server::disconnect`] ends a session while leaving the stream available for
+/// another; [`Server::close`] permanently closes the stream.
 ///
-/// Whenever the server drops a session, fails a handshake or receives data while
-/// it has no session, it answers with an empty frame of its own. A client still
-/// holding a session thus learns it is gone instead of having to time out.
+/// On a local disconnect, a session failure, a failed handshake or data received
+/// outside a session, the server sends an empty frame. A client still holding a
+/// session thus learns it is gone instead of having to time out.
 ///
 /// The device attestation is not interpreted by the wire, it is provided by an
-/// `Attester` and forwarded to the client verbatim.
+/// [`Attester`] and forwarded to the client verbatim.
 pub struct Server<R: Read, W: Write, A: Attester> {
     reader: FrameReader<R>,     // COBS framed transport for ingress data
     outbound: Arc<Outbound<W>>, // Outgoing transport, shared with the senders
@@ -154,35 +161,19 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         server
     }
 
-    /// Number of the installed session, counting the handshakes served so far, or
-    /// zero without one. A client reconnecting on the same transport moves it,
-    /// which is how anything bound to the session above the wire tells. This
-    /// records local session state; closing the stream alone does not clear it.
-    pub fn session_id(&self) -> u64 {
-        self.outbound.session_id()
-    }
-
-    /// Creates a handle for sending messages into the installed session.
-    /// It can be cloned and used from other threads while the server receives.
-    /// A new handshake needs a new handle; one obtained without a session
-    /// cannot send. See [`Sender`].
-    pub fn sender(&self) -> Sender<W> {
-        self.outbound.sender()
-    }
-
-    /// Serves the next host-to-ark message, decrypting it. Empty frames are
-    /// session resets and run the handshake inline. Junk outside a session,
-    /// undecryptable packets and failed handshakes are logged, answered with
-    /// an empty frame and skipped.
+    /// Receives a decrypted message or a session transition. A client reset
+    /// starts a handshake, whose completion returns [`Event::Connected`] with
+    /// a sender before any messages from that session are delivered.
     ///
-    /// A read that changes the session under the server surfaces that rather
-    /// than reading on, so a caller bound to the session hears of it without
-    /// waiting for the client to say anything. A live session ends on the
-    /// client resetting it, a frame that does not decode or a packet that
-    /// does not open, and a session opens on the handshake after a reset.
-    /// A session the server dropped itself is not reported, its caller
-    /// knowing. Only transport failures surface as errors.
-    pub fn recv(&mut self) -> Result<Event, Error> {
+    /// A client reset, invalid incoming data or an observed send failure ends
+    /// the current session and returns [`Event::Disconnected`]. After a reset,
+    /// the next call runs the handshake. A send failure does not wake a blocked
+    /// read; it is observed when receiving progresses. A session ended locally
+    /// by [`Server::disconnect`] is not reported again.
+    ///
+    /// Junk outside a session and failed handshakes are logged, answered with
+    /// an empty frame and skipped. Transport receive failures surface as errors.
+    pub fn recv(&mut self) -> Result<Event<W>, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and call for a handshake, run on the pass after them.
         loop {
@@ -205,8 +196,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     Ok((sender, receiver)) => {
                         info!("new wire session established");
                         self.receiver = Some(receiver);
-                        self.outbound.establish_session(sender);
-                        return Ok(Event::SessionOpened);
+                        let sender = self.outbound.establish_session(sender);
+                        return Ok(Event::Connected(sender));
                     }
                 }
                 continue;
@@ -230,7 +221,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     }
                     self.send_dropped();
                     if ended {
-                        return Ok(Event::SessionClosed);
+                        return Ok(Event::Disconnected);
                     }
                     continue;
                 }
@@ -240,7 +231,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Ok(None) => {
                     self.handshaking = true;
                     if self.drop_session() {
-                        return Ok(Event::SessionClosed);
+                        return Ok(Event::Disconnected);
                     }
                     continue;
                 }
@@ -255,7 +246,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 warn!("dropping data of a session a sender ended");
                 self.drop_session();
                 self.send_dropped();
-                return Ok(Event::SessionClosed);
+                return Ok(Event::Disconnected);
             }
             let receiver = match self.receiver.as_mut() {
                 None => {
@@ -272,7 +263,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     warn!("decryption failed, resetting session: {}", err);
                     self.drop_session();
                     self.send_dropped();
-                    return Ok(Event::SessionClosed);
+                    return Ok(Event::Disconnected);
                 }
                 Ok(message) => message,
             };
@@ -301,10 +292,11 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
-    /// Resets the session on the server's account, dropping it and telling
-    /// the client with the empty frame, the next handshake being the client's
-    /// move. For ending the session of a client misbehaving above the wire.
-    pub fn reset_session(&mut self) {
+    /// Ends the encrypted session and tells the client with an empty frame.
+    /// The stream remains available for the client to connect again. Notification
+    /// failures are logged. This local action does not produce an
+    /// [`Event::Disconnected`], since the caller already knows the session ended.
+    pub fn disconnect(&mut self) {
         self.drop_session();
         self.send_dropped();
     }
@@ -417,9 +409,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 }
 
 impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
-    /// Ends the session for the senders, the outbound side and the transport writer
-    /// going with the owner unless a send still holds them, so nothing stays
-    /// open on an idle sender's account.
+    /// Permanently closes the stream and waits for adapter shutdown. Idle senders
+    /// hold only weak references, so they cannot keep the outbound side alive.
     fn drop(&mut self) {
         self.outbound.close();
     }
@@ -492,10 +483,11 @@ mod tests {
                 signer_key,
                 attestation,
             );
+            let mut sender = None;
             let mut requests = Vec::new();
             for _ in 0..2 {
-                let req = testing::served(&mut server).unwrap();
-                server.sender().send(&req).unwrap();
+                let req = testing::served(&mut server, &mut sender).unwrap();
+                sender.as_ref().unwrap().send(&req).unwrap();
                 requests.push(req);
             }
             requests
@@ -510,9 +502,9 @@ mod tests {
             host_sock,
             || {},
         ));
-        let attest = client.handshake(&signer_pub).unwrap();
+        let (sender, attest) = client.connect(&signer_pub).unwrap();
         assert_eq!(attest.as_bytes(), presented.as_bytes());
-        client.sender().send(&payload(1)).unwrap();
+        sender.send(&payload(1)).unwrap();
         assert_eq!(client.recv().unwrap(), payload(1));
 
         // Inject a frame the server cannot decrypt. It drops the session and
@@ -523,15 +515,15 @@ mod tests {
             .unwrap();
         let result = client.recv();
         assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-        let result = client.sender().send(&payload(2));
+        let result = sender.send(&payload(2));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
         );
 
         // Session 2: new handshake on the same wire, exchange one message.
-        client.handshake(&signer_pub).unwrap();
-        client.sender().send(&payload(2)).unwrap();
+        let (sender, _) = client.connect(&signer_pub).unwrap();
+        sender.send(&payload(2)).unwrap();
         assert_eq!(client.recv().unwrap(), payload(2));
 
         let requests = ark_thread.join().unwrap();
@@ -569,7 +561,8 @@ mod tests {
                 signer_key,
                 attestation,
             );
-            testing::served(&mut server)
+            let mut sender = None;
+            testing::served(&mut server, &mut sender)
         });
 
         // Client side: refuse the attestation in the verifier.
@@ -578,7 +571,7 @@ mod tests {
             host_sock,
             || {},
         ));
-        let result = client.handshake(&Untrusting);
+        let result = client.connect(&Untrusting);
         assert!(result.is_err());
 
         // Dropping the client tears down the transport, unblocking the server.
@@ -623,14 +616,17 @@ mod tests {
                     signer_key,
                     attestation,
                 );
-                testing::served(&mut server)
+                let mut sender = None;
+                testing::served(&mut server, &mut sender)
             });
             let mut client = Client::new(Stream::new(
                 host_sock.try_clone().unwrap(),
                 host_sock,
                 || {},
             ));
-            let result = client.handshake(&Roots { hardware, emulator });
+            let result = client
+                .connect(&Roots { hardware, emulator })
+                .map(|(_, info)| info);
 
             // Dropping the client tears down the transport, unblocking the server
             drop(client);
@@ -761,56 +757,56 @@ mod tests {
         );
     }
 
-    // Tests that the session number counts the handshakes on both sides and
-    // reads zero before the first one.
+    // Tests the ordered lifecycle across two handshakes: each opening delivers
+    // a sender before any client message, and closing precedes the next opening.
+    // The old sender cannot send into the new session, whose sender still works.
     #[test]
-    fn test_session_number() {
+    fn test_session_events() {
         testing::init_tracing();
 
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-        let attestation = self_attestation(&signer_key);
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        // Server side: note the number before any session and after each of
-        // the two requests, the second one arriving in a second session.
-        let ark_thread = std::thread::spawn(move || {
+        let signer = xdsa::SecretKey::generate();
+        let identity = signer.public_key();
+        let attestation = self_attestation(&signer);
+        let (host, ark) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
             let mut server = Server::new(
-                Stream::new(ark_reader, ark_writer, || {}),
-                signer_key,
+                Stream::new(ark.try_clone().unwrap(), ark, || {}),
+                signer,
                 attestation,
             );
-            let mut numbers = vec![server.session_id()];
-            for _ in 0..2 {
-                testing::served(&mut server).unwrap();
-                numbers.push(server.session_id());
-            }
-            numbers
+            let Event::Connected(first) = server.recv().unwrap() else {
+                panic!("first handshake did not open a session");
+            };
+            first.send(&payload(0)).unwrap();
+            assert!(
+                matches!(server.recv().unwrap(), Event::Message(message) if message == payload(1))
+            );
+            assert!(matches!(server.recv().unwrap(), Event::Disconnected));
+            let Event::Connected(second) = server.recv().unwrap() else {
+                panic!("second handshake did not open a session");
+            };
+            assert!(matches!(
+                first.send(&payload(3)),
+                Err(Error::EncryptionFailed(_))
+            ));
+            second.send(&payload(2)).unwrap();
+            assert!(
+                matches!(server.recv().unwrap(), Event::Message(message) if message == payload(4))
+            );
         });
-
-        // Client side: one request per session, over two sessions.
-        let mut client = Client::new(Stream::new(
-            host_sock.try_clone().unwrap(),
-            host_sock,
-            || {},
-        ));
-        assert_eq!(client.session_id(), 0);
-        client.handshake(&signer_pub).unwrap();
-        assert_eq!(client.session_id(), 1);
-        client.sender().send(&payload(1)).unwrap();
-        client.handshake(&signer_pub).unwrap();
-        assert_eq!(client.session_id(), 2);
-        client.sender().send(&payload(2)).unwrap();
-
-        assert_eq!(ark_thread.join().unwrap(), vec![0, 1, 2]);
+        let mut client = Client::new(Stream::new(host.try_clone().unwrap(), host, || {}));
+        let (first, _) = client.connect(&identity).unwrap();
+        assert_eq!(client.recv().unwrap(), payload(0));
+        first.send(&payload(1)).unwrap();
+        let (second, _) = client.connect(&identity).unwrap();
+        assert_eq!(client.recv().unwrap(), payload(2));
+        second.send(&payload(4)).unwrap();
+        peer.join().unwrap();
     }
 
     // Tests that the server resetting a session tells the client, whose next
     // read fails with the reset, the next handshake starting the next session.
-    // Handles obtained before or just after the reset cannot send into it.
+    // The sender of the previous session cannot send into the new one.
     #[test]
     fn test_session_reset() {
         testing::init_tracing();
@@ -831,25 +827,20 @@ mod tests {
                 signer_key,
                 attestation,
             );
-            testing::served(&mut server).unwrap();
-            let stale = server.sender();
-            assert_eq!(stale.session_id(), 1);
-            server.reset_session();
-            let unbound = server.sender();
-            assert_eq!(unbound.session_id(), 0);
-            testing::served(&mut server).unwrap();
-            assert_eq!(stale.session_id(), 1);
+            let mut sender = None;
+            testing::served(&mut server, &mut sender).unwrap();
+            let stale = sender.as_ref().unwrap().clone();
+            server.disconnect();
             assert!(matches!(
                 stale.send(&payload(3)),
                 Err(Error::EncryptionFailed(_))
             ));
-            assert_eq!(unbound.session_id(), 0);
+            testing::served(&mut server, &mut sender).unwrap();
             assert!(matches!(
-                unbound.send(&payload(3)),
+                stale.send(&payload(3)),
                 Err(Error::EncryptionFailed(_))
             ));
-            assert_eq!(server.sender().session_id(), 2);
-            server.session_id()
+            sender.as_ref().unwrap().send(&payload(3)).unwrap();
         });
 
         // Client side: one request, the reset read back, then a new session
@@ -859,14 +850,15 @@ mod tests {
             host_sock,
             || {},
         ));
-        client.handshake(&signer_pub).unwrap();
-        client.sender().send(&payload(1)).unwrap();
+        let (sender, _) = client.connect(&signer_pub).unwrap();
+        sender.send(&payload(1)).unwrap();
         let result = client.recv();
         assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-        client.handshake(&signer_pub).unwrap();
-        client.sender().send(&payload(2)).unwrap();
+        let (sender, _) = client.connect(&signer_pub).unwrap();
+        sender.send(&payload(2)).unwrap();
 
-        assert_eq!(ark_thread.join().unwrap(), 2);
+        assert_eq!(client.recv().unwrap(), payload(3));
+        ark_thread.join().unwrap();
     }
 
     // Tests that the server sends through senders from other threads while
@@ -892,11 +884,12 @@ mod tests {
                 signer_key,
                 attestation,
             );
-            testing::served(&mut server).unwrap();
+            let mut sender = None;
+            testing::served(&mut server, &mut sender).unwrap();
 
             let pushers: Vec<_> = (0..4)
                 .map(|thread| {
-                    let sender = server.sender();
+                    let sender = sender.as_ref().unwrap().clone();
                     std::thread::spawn(move || {
                         for i in 0..25 {
                             sender.send(&payload(thread * 100 + i)).unwrap();
@@ -904,7 +897,7 @@ mod tests {
                     })
                 })
                 .collect();
-            let stop = testing::served(&mut server).unwrap();
+            let stop = testing::served(&mut server, &mut sender).unwrap();
             for pusher in pushers {
                 pusher.join().unwrap();
             }
@@ -917,8 +910,8 @@ mod tests {
             host_sock,
             || {},
         ));
-        client.handshake(&signer_pub).unwrap();
-        client.sender().send(&payload(1)).unwrap();
+        let (sender, _) = client.connect(&signer_pub).unwrap();
+        sender.send(&payload(1)).unwrap();
 
         let mut pushed: Vec<Vec<u8>> = (0..100).map(|_| client.recv().unwrap()).collect();
         pushed.sort_unstable();
@@ -928,7 +921,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(pushed, expected);
 
-        client.sender().send(&payload(2)).unwrap();
+        sender.send(&payload(2)).unwrap();
         assert_eq!(ark_thread.join().unwrap(), payload(2));
     }
 }

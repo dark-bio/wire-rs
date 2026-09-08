@@ -72,9 +72,9 @@ pub(crate) enum Delivery {
     Message(Vec<u8>),
     /// The session the read side held ended, ahead of the handshake that
     /// follows.
-    SessionClosed,
+    Disconnected,
     /// A handshake opened the next session.
-    SessionOpened,
+    Connected(Sender<Writer>),
     /// The read fails, ending the transport under the multiplexer.
     Failed(transport::Error),
 }
@@ -176,7 +176,7 @@ impl Link {
 
     /// Opens a session, the one before it dropped, and hands back the context
     /// opening what the multiplexer seals into it.
-    pub(crate) fn open_session(&self) -> xhpke::Receiver {
+    pub(crate) fn open_session(self: &Arc<Self>) -> (Sender<Writer>, xhpke::Receiver) {
         let secret = xhpke::SecretKey::generate();
         let (sender, encap) = secret
             .public_key()
@@ -186,9 +186,9 @@ impl Link {
             .new_receiver(&encap, CRYPTO_DOMAIN_MOCK)
             .expect("mock session opening context");
 
-        self.outbound.establish_session(sender);
+        let sender = self.outbound.establish_session(sender);
         self.held.store(true, Ordering::Release);
-        receiver
+        (sender, receiver)
     }
 
     /// Number of the live session, or zero without one.
@@ -259,29 +259,21 @@ impl Source for Feed {
     fn closer(&self) -> Closer {
         self.link.outbound.closer()
     }
-    fn recv(&mut self) -> Result<Event, transport::Error> {
+    fn recv(&mut self) -> Result<Event<Writer>, transport::Error> {
         // Tell the driver that the reader is back for more, which on the first
         // read means it started and took down the session it starts from, and
         // on every later one that the message before it is routed
         let _ = self.routed.send(());
         match self.deliveries.recv() {
             Ok(Delivery::Message(message)) => Ok(Event::Message(message)),
-            Ok(Delivery::SessionClosed) => Ok(Event::SessionClosed),
-            Ok(Delivery::SessionOpened) => Ok(Event::SessionOpened),
+            Ok(Delivery::Disconnected) => Ok(Event::Disconnected),
+            Ok(Delivery::Connected(sender)) => Ok(Event::Connected(sender)),
             Ok(Delivery::Failed(err)) => Err(err),
             Err(_) => Err(transport::Error::Terminated),
         }
     }
 
-    fn session_id(&self) -> u64 {
-        self.link.session_id()
-    }
-
-    fn sender(&self) -> Sender<Writer> {
-        self.link.outbound.sender()
-    }
-
-    fn reset_session(&mut self) {
+    fn disconnect(&mut self) {
         self.link.drop_session();
         let _ = self.link.outbound.send_dropped();
     }

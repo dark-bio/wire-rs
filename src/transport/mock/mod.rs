@@ -15,7 +15,7 @@ pub mod seed;
 pub mod server;
 pub mod vector;
 
-use crate::transport::Attestation;
+use crate::transport::{Attestation, Error, Sender};
 use darkbio_cobs as cobs;
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
@@ -37,6 +37,16 @@ pub const TIMESTAMP: i64 = 0;
 /// bytes. It only tells the messages apart, the transport never reads it.
 pub fn payload(tag: u64) -> Vec<u8> {
     tag.to_be_bytes().to_vec()
+}
+
+/// Attempts a scripted send through the most recently delivered sender.
+/// Before any successful handshake, the driver itself refuses the attempt;
+/// no sender exists to call. Retaining ended senders exercises their refusal.
+pub(super) fn send<W: Write>(sender: Option<&Sender<W>>, message: &[u8]) -> Result<(), Error> {
+    match sender {
+        Some(sender) => sender.send(message),
+        None => Err(Error::EncryptionFailed("no active session".into())),
+    }
 }
 
 /// Self-signed attestation of a never onboarded server, embedding the identity

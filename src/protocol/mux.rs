@@ -16,7 +16,7 @@
 use crate::protocol::envelope::{Envelope, Side};
 #[cfg(any(test, feature = "fuzz"))]
 use crate::protocol::switchboard::Source;
-use crate::protocol::switchboard::{Release, ReplySender, Switchboard};
+use crate::protocol::switchboard::{Release, ReplySender, Session, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
 use crate::transport::{self, Attester, MAX_MESSAGE_SIZE, Sender};
 use std::io::{Read, Write};
@@ -85,11 +85,12 @@ pub enum Error {
 pub type Client = Mux<HostToArk, ArkToHost>;
 
 impl Client {
-    /// Starts multiplexing over a transport client with its handshake done.
+    /// Starts multiplexing over a transport client and the sender returned by
+    /// [`transport::Client::connect`]. The sender must belong to that client's session.
     /// Closing or failing the multiplexer closes the client's byte stream.
-    pub fn new(client: transport::Client<Reader, Writer>) -> Self {
+    pub fn new(client: transport::Client<Reader, Writer>, sender: Sender<Writer>) -> Self {
         Self {
-            switchboard: Switchboard::start(Side::Client, client),
+            switchboard: Switchboard::start(Side::Client, client, Some(sender)),
         }
     }
 }
@@ -104,7 +105,7 @@ impl Server {
     /// byte stream.
     pub fn new<A: Attester + Send + 'static>(server: transport::Server<Reader, Writer, A>) -> Self {
         Self {
-            switchboard: Switchboard::start(Side::Server, server),
+            switchboard: Switchboard::start(Side::Server, server, None),
         }
     }
 }
@@ -157,7 +158,7 @@ impl<T> Drop for Pending<T> {
 /// bound to the session the request arrived in and refused once that ended.
 pub struct Responder<Out: Envelope> {
     switchboard: Weak<dyn ReplySender>, // Answers through it, a failed write tearing the session down
-    sender: Sender<Writer>,             // Handle of the session the request arrived in
+    session: Arc<Session>,              // Mux session the request arrived in
     pub(super) id: u64,                 // Id of the request, echoed by the answer
     answered: bool,                     // Whether an answer went out
     envelope: PhantomData<fn() -> Out>, // Envelope the answer travels in
@@ -166,10 +167,10 @@ pub struct Responder<Out: Envelope> {
 impl<Out: Envelope> Responder<Out> {
     /// Creates the responder of a request, answering through the switchboard
     /// into the session the request arrived in.
-    pub(super) fn new(switchboard: Weak<dyn ReplySender>, sender: Sender<Writer>, id: u64) -> Self {
+    pub(super) fn new(switchboard: Weak<dyn ReplySender>, session: Arc<Session>, id: u64) -> Self {
         Self {
             switchboard,
-            sender,
+            session,
             id,
             answered: false,
             envelope: PhantomData,
@@ -201,7 +202,7 @@ impl<Out: Envelope> Responder<Out> {
         }
         let message = answer.encode_to_vec();
         let result = match self.switchboard.upgrade() {
-            Some(switchboard) => switchboard.send(&self.sender, &message),
+            Some(switchboard) => switchboard.send(&self.session, &message),
             None => Err(Error::Closed),
         };
         self.answered = !matches!(result, Err(Error::TooLarge(_)));
@@ -235,9 +236,9 @@ impl<Out: Envelope, In: Envelope> Mux<Out, In> {
     /// the API.
     #[cfg(any(test, feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(super) fn mocked(side: Side, source: impl Source) -> Self {
+    pub(super) fn mocked(side: Side, source: impl Source, sender: Option<Sender<Writer>>) -> Self {
         Self {
-            switchboard: Switchboard::start(side, source),
+            switchboard: Switchboard::start(side, source, sender),
         }
     }
 
@@ -319,7 +320,7 @@ mod tests {
 
     /// Script of a peer, told every message of the client and answering as it
     /// pleases through the server, saying whether to keep serving.
-    type Script = Box<dyn FnMut(&mut PeerServer, HostToArk) -> bool + Send>;
+    type Script = Box<dyn FnMut(&Sender<Writer>, HostToArk) -> bool + Send>;
 
     /// Starts a peer, a real transport server run by the script on its own
     /// thread over a socket pair, and a client multiplexer talking to it with
@@ -338,9 +339,10 @@ mod tests {
                 let _ = ark_closing.shutdown(Shutdown::Both);
             });
             let mut server = PeerServer::new(stream, signer, attestation);
-            while let Ok(message) = testing::served(&mut server) {
+            let mut sender = None;
+            while let Ok(message) = testing::served(&mut server, &mut sender) {
                 let message = HostToArk::decode(&message[..]).unwrap();
-                if !script(&mut server, message) {
+                if !script(sender.as_ref().unwrap(), message) {
                     break;
                 }
             }
@@ -353,8 +355,8 @@ mod tests {
             let _ = closing.shutdown(Shutdown::Both);
         });
         let mut client = transport::Client::new(stream);
-        client.handshake(&identity).unwrap();
-        (Client::new(client), peer)
+        let (sender, _) = client.connect(&identity).unwrap();
+        (Client::new(client, sender), peer)
     }
 
     /// A request payload.
@@ -378,8 +380,8 @@ mod tests {
     }
 
     /// Sends an answer of the peer's.
-    fn answer(server: &mut PeerServer, envelope: ArkToHost) {
-        server.sender().send(&envelope.encode_to_vec()).unwrap();
+    fn answer(sender: &Sender<Writer>, envelope: ArkToHost) {
+        sender.send(&envelope.encode_to_vec()).unwrap();
     }
 
     /// A peer echoing every request's payload back as its response.
@@ -403,7 +405,7 @@ mod tests {
     /// Script of a peer, driving its transport client as it pleases with the
     /// handshake done, the server's identity at hand for handshakes of its
     /// own.
-    type ClientScript = Box<dyn FnOnce(&mut PeerClient, &xdsa::PublicKey) + Send>;
+    type ClientScript = Box<dyn FnOnce(&mut PeerClient, Sender<Writer>, &xdsa::PublicKey) + Send>;
 
     /// Starts a peer, a real transport client run by the script on its own
     /// thread over a socket pair, and a server multiplexer serving it, its
@@ -422,8 +424,8 @@ mod tests {
                 let _ = host_closing.shutdown(Shutdown::Both);
             });
             let mut client = PeerClient::new(stream);
-            client.handshake(&identity).unwrap();
-            script(&mut client, &identity);
+            let (sender, _) = client.connect(&identity).unwrap();
+            script(&mut client, sender, &identity);
         });
 
         let closing = ark_sock.try_clone().unwrap();
@@ -437,8 +439,8 @@ mod tests {
     }
 
     /// Sends a message of the client's.
-    fn say(client: &mut PeerClient, envelope: HostToArk) {
-        client.sender().send(&envelope.encode_to_vec()).unwrap();
+    fn say(sender: &Sender<Writer>, envelope: HostToArk) {
+        sender.send(&envelope.encode_to_vec()).unwrap();
     }
 
     /// Reads the next message of the server's, taken apart.
@@ -583,7 +585,7 @@ mod tests {
         let mut sender_tx = Some(sender_tx);
         let (mux, peer) = connect(Box::new(move |server, message| {
             if let Some(tx) = sender_tx.take() {
-                tx.send(server.sender()).unwrap();
+                tx.send(server.clone()).unwrap();
             }
             held_tx.send(pinged(message).0).unwrap();
             true
@@ -649,7 +651,7 @@ mod tests {
         let mut sender_tx = Some(sender_tx);
         let (mux, peer) = connect(Box::new(move |server, message| {
             if let Some(tx) = sender_tx.take() {
-                tx.send(server.sender()).unwrap();
+                tx.send(server.clone()).unwrap();
             }
             held_tx.send(pinged(message).0).unwrap();
             true
@@ -713,21 +715,25 @@ mod tests {
         // gets it, then reconnecting and asking again
         let (go_tx, go) = mpsc::channel();
         let (answered_tx, answered) = mpsc::channel();
-        let (mux, peer) = serve(Box::new(move |client, identity| {
+        let (done_tx, done) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, mut sender, identity| {
             go.recv().unwrap();
-            say(client, HostToArk::request(1, ping(b"first")));
+            say(&sender, HostToArk::request(1, ping(b"first")));
             hear(client);
             assert_eq!(hear(client), (2, None, Some(pong(b"question"))));
-            client.sender().send(&[0x07]).unwrap();
+            sender.send(&[0x07]).unwrap();
             let result = client.recv();
             assert!(
                 matches!(result, Err(transport::Error::SessionReset)),
                 "{result:?}"
             );
 
-            client.handshake(identity).unwrap();
-            say(client, HostToArk::request(1, ping(b"second")));
+            sender = client.connect(identity).unwrap().0;
+            say(&sender, HostToArk::request(1, ping(b"second")));
             answered_tx.send(hear(client)).unwrap();
+            // Receiving the bytes can precede the server's flush. Keep the
+            // stream alive until the test observes the handler completing.
+            done.recv().unwrap();
         }));
         let (ended_tx, ended) = mpsc::channel();
         mux.on_disconnect(move |reason| ended_tx.send(reason).unwrap());
@@ -751,6 +757,7 @@ mod tests {
         let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((id, err, content), (1, None, Some(pong(b"second"))));
 
+        done_tx.send(()).unwrap();
         drop(mux);
         peer.join().unwrap();
     }
@@ -767,15 +774,19 @@ mod tests {
         // before asking again
         let (go_tx, go) = mpsc::channel();
         let (answered_tx, answered) = mpsc::channel();
-        let (mux, peer) = serve(Box::new(move |client, identity| {
+        let (done_tx, done) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, mut sender, identity| {
             go.recv().unwrap();
-            say(client, HostToArk::request(1, ping(b"first")));
+            say(&sender, HostToArk::request(1, ping(b"first")));
             hear(client);
             assert_eq!(hear(client), (2, None, Some(pong(b"question"))));
-            client.handshake(identity).unwrap();
+            sender = client.connect(identity).unwrap().0;
             go.recv().unwrap();
-            say(client, HostToArk::request(1, ping(b"second")));
+            say(&sender, HostToArk::request(1, ping(b"second")));
             answered_tx.send(hear(client)).unwrap();
+            // Receiving the bytes can precede the server's flush. Keep the
+            // stream alive until the test observes the handler completing.
+            done.recv().unwrap();
         }));
         let (ended_tx, ended) = mpsc::channel();
         mux.on_disconnect(move |reason| ended_tx.send(reason).unwrap());
@@ -808,6 +819,7 @@ mod tests {
         let (id, err, content) = answered.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((id, err, content), (1, None, Some(pong(b"second"))));
 
+        done_tx.send(()).unwrap();
         drop(mux);
         peer.join().unwrap();
     }
@@ -820,16 +832,17 @@ mod tests {
         testing::init_tracing();
 
         let rounds = 40;
-        let (mux, peer) = serve(Box::new(move |client, identity| {
+        let (mux, peer) = serve(Box::new(move |client, mut sender, identity| {
             for round in 0..rounds {
                 // Ask the server something, its handler echoing it back
                 let mine = 2 * round + 1;
-                if client
-                    .sender()
+                if sender
                     .send(&HostToArk::request(mine, ping(b"host")).encode_to_vec())
                     .is_err()
                 {
-                    let _ = client.handshake(identity);
+                    if let Ok((opened, _)) = client.connect(identity) {
+                        sender = opened;
+                    }
                     continue;
                 }
                 // Read until the answer comes, answering whatever the server
@@ -837,7 +850,9 @@ mod tests {
                 // handshake
                 loop {
                     let Ok(message) = client.recv() else {
-                        let _ = client.handshake(identity);
+                        if let Ok((opened, _)) = client.connect(identity) {
+                            sender = opened;
+                        }
                         break;
                     };
                     let (id, _, content) = ArkToHost::decode(&message[..]).unwrap().into_parts();
@@ -845,15 +860,19 @@ mod tests {
                         break;
                     }
                     let answer = HostToArk::response(id, Some(ping(b"answered")), None);
-                    if client.sender().send(&answer.encode_to_vec()).is_err() {
-                        let _ = client.handshake(identity);
+                    if sender.send(&answer.encode_to_vec()).is_err() {
+                        if let Ok((opened, _)) = client.connect(identity) {
+                            sender = opened;
+                        }
                         break;
                     }
                     let _ = content;
                 }
                 // Reconnect now and then, under whatever is in flight
-                if round % 4 == 3 {
-                    let _ = client.handshake(identity);
+                if round % 4 == 3
+                    && let Ok((opened, _)) = client.connect(identity)
+                {
+                    sender = opened;
                 }
             }
         }));
@@ -893,13 +912,17 @@ mod tests {
     fn test_server_disconnect_handler_panics() {
         testing::init_tracing();
 
-        let (mux, peer) = serve(Box::new(move |client, identity| {
-            say(client, HostToArk::request(1, ping(b"first")));
+        let (done_tx, done) = mpsc::channel();
+        let (mux, peer) = serve(Box::new(move |client, mut sender, identity| {
+            say(&sender, HostToArk::request(1, ping(b"first")));
             hear(client);
             // Reconnect, which ends the session and fires the handler
-            client.handshake(identity).unwrap();
-            say(client, HostToArk::request(1, ping(b"second")));
+            sender = client.connect(identity).unwrap().0;
+            say(&sender, HostToArk::request(1, ping(b"second")));
             hear(client);
+            // Receiving the bytes can precede the server's flush. Keep the
+            // stream alive until the test observes the handler completing.
+            done.recv().unwrap();
         }));
         mux.on_disconnect(|_| panic!("injected panic"));
         let (served_tx, served) = mpsc::channel();
@@ -915,6 +938,7 @@ mod tests {
             "the reader stopped after the disconnect handler panicked"
         );
 
+        done_tx.send(()).unwrap();
         drop(mux);
         peer.join().unwrap();
     }

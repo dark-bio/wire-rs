@@ -33,7 +33,7 @@ pub struct Vector {
 /// One thing happening during the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The driver calls `handshake` with the client keys, as seeds.
+    /// The driver calls `handshake_with_keys` with the client keys, as seeds.
     Handshake { xdsa: Vec<u8>, xhpke: Vec<u8> },
     /// The driver calls `send` with the protobuf encoded message.
     Send { message: Vec<u8> },

@@ -76,17 +76,17 @@ impl Verifier for Roots<'_> {
         Ok((device.signer.clone(), device))
     }
 }
-/// Client side of the wire, an encrypted transport for exchanging messages
-/// with a connected server. It initiates sessions by signaling a transport reset and
-/// driving the handshake, afterward encrypting outbound and decrypting inbound
-/// messages.
+/// Client side of the wire, exchanging encrypted messages over a supplied byte
+/// stream. [`Client::connect`] initiates a session by signaling a reset and driving
+/// the handshake. It returns a [`Sender`] for outbound messages, while
+/// [`Client::recv`] decrypts inbound messages.
 ///
 /// An empty frame from the server means it has no session with the client anymore.
-/// It surfaces as `Error::SessionReset` with the client's session dropped too,
-/// so the caller can handshake again instead of waiting on a dead session.
+/// It surfaces as [`Error::SessionReset`] with the client's session dropped too,
+/// so the caller can connect again instead of waiting on a dead session.
 ///
 /// The device attestation presented in the handshake is not interpreted by the
-/// wire, it is handed to a `Verifier` deciding whether to trust the server.
+/// wire, it is handed to a [`Verifier`] deciding whether to trust the server.
 pub struct Client<R: Read, W: Write> {
     reader: FrameReader<R>,            // COBS framed transport for ingress data
     receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
@@ -94,7 +94,8 @@ pub struct Client<R: Read, W: Write> {
 }
 
 impl<R: Read, W: Write> Client<R, W> {
-    /// Creates a client owning the byte stream and its shutdown operation.
+    /// Creates a client owning the byte stream and its shutdown operation, without
+    /// an encrypted session. Call [`Client::connect`] to establish one.
     /// I/O deadlines and cancellation bounds are supplied by the stream adapter.
     pub fn new(stream: Stream<R, W>) -> Self {
         let (reader, writer, close) = stream.into_parts();
@@ -120,47 +121,35 @@ impl<R: Read, W: Write> Client<R, W> {
         self.outbound.close();
     }
 
-    /// Number of the installed session, counting the handshakes so far, or zero
-    /// without one. A fresh handshake moves it, which is how anything bound
-    /// to the session above the wire tells. This records local session state;
-    /// closing the stream alone does not clear it.
-    pub fn session_id(&self) -> u64 {
-        self.outbound.session_id()
-    }
-
-    /// Creates a handle for sending messages into the installed session.
-    /// It can be cloned and used from other threads while the client receives.
-    /// A new handshake needs a new handle; one obtained without a session
-    /// cannot send. See [`Sender`].
-    pub fn sender(&self) -> Sender<W> {
-        self.outbound.sender()
-    }
-
-    /// Sends a session reset and drives the encrypted handshake with the server:
+    /// Establishes an encrypted session over the supplied stream, ending any
+    /// previous session first. Sends a reset and drives the handshake:
     ///
     ///   1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
     ///   2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
     ///   3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
     ///
-    /// The verifier receives the raw device attestation from the server's hello and
-    /// its accepted info is returned once the session is established.
-    pub fn handshake<V: Verifier>(&mut self, verifier: &V) -> Result<V::Info, Error> {
+    /// The verifier receives the raw device attestation from the server's hello
+    /// and its accepted info is returned alongside the sender of the established
+    /// session. The sender stays bound to that session through later calls to
+    /// `connect`; it cannot send into a replacement session. If connecting fails,
+    /// the client has no session and previously issued senders remain invalid.
+    pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
         // Generate ephemeral client keys for this session
         let host_xdsa_sk = xdsa::SecretKey::generate();
         let host_xhpke_sk = xhpke::SecretKey::generate();
-        self.handshake_with(verifier, host_xdsa_sk, host_xhpke_sk, None)
+        self.handshake(verifier, host_xdsa_sk, host_xhpke_sk, None)
     }
 
-    /// Drives the handshake with the given ephemeral keys, the ack signed at
-    /// the given time instead of now if one is given. This method is internally
-    /// used to generate deterministic test vectors for 3rd party implementations.
-    fn handshake_with<V: Verifier>(
+    /// Ends any previous session, sends a reset and drives the handshake with the
+    /// given ephemeral keys. Returns the new session's sender and verified info.
+    /// The optional signing time makes the exchange deterministic for test vectors.
+    fn handshake<V: Verifier>(
         &mut self,
         verifier: &V,
         host_xdsa_sk: xdsa::SecretKey,
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: Option<i64>,
-    ) -> Result<V::Info, Error> {
+    ) -> Result<(Sender<W>, V::Info), Error> {
         // The old session ends here, its senders refused from now on
         self.drop_session();
 
@@ -285,15 +274,15 @@ impl<R: Read, W: Write> Client<R, W> {
         self.outbound.send_packet(&ack)?;
 
         // Session established, the ack ahead of anything sealed into it
-        self.establish_session(sender, receiver);
-        Ok(info)
+        let sender = self.establish_session(sender, receiver);
+        Ok((sender, info))
     }
 
     /// Reads the next ark-to-host message, decrypting it. A frame that cannot
     /// be decoded or a packet that cannot be decrypted drops the session, as
     /// the server's HPKE sequence can no longer be followed. So does an empty
-    /// frame, the server signaling it dropped the session on its end. Only a
-    /// fresh handshake recovers from either.
+    /// frame, the server signaling it dropped the session on its end. Call
+    /// [`Client::connect`] to establish a new session after either failure.
     pub fn recv(&mut self) -> Result<Vec<u8>, Error> {
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
@@ -336,9 +325,9 @@ impl<R: Read, W: Write> Client<R, W> {
     }
 
     /// Installs the contexts of a freshly established session.
-    fn establish_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) {
+    fn establish_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) -> Sender<W> {
         self.receiver = Some(receiver);
-        self.outbound.establish_session(sender);
+        self.outbound.establish_session(sender)
     }
 
     /// Drops the session, both of its contexts going together.
@@ -360,8 +349,8 @@ impl<R: Read, W: Write> Client<R, W> {
         host_xdsa_sk: xdsa::SecretKey,
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: i64,
-    ) -> Result<V::Info, Error> {
-        self.handshake_with(verifier, host_xdsa_sk, host_xhpke_sk, Some(timestamp))
+    ) -> Result<(Sender<W>, V::Info), Error> {
+        self.handshake(verifier, host_xdsa_sk, host_xhpke_sk, Some(timestamp))
     }
 
     /// Test and benchmark helper exposing the framer's `next_packet` with the
@@ -406,9 +395,8 @@ impl<R: Read, W: Write> Client<R, W> {
 }
 
 impl<R: Read, W: Write> Drop for Client<R, W> {
-    /// Ends the session for the senders, the outbound side and the transport writer
-    /// going with the owner unless a send still holds them, so nothing stays
-    /// open on an idle sender's account.
+    /// Permanently closes the stream and waits for adapter shutdown. Idle senders
+    /// hold only weak references, so they cannot keep the outbound side alive.
     fn drop(&mut self) {
         self.outbound.close();
     }
@@ -452,18 +440,19 @@ mod tests {
                 signer,
                 attestation,
             );
+            let mut sender = None;
             for _ in 0..100 {
-                let req = testing::served(&mut server).unwrap();
-                server.sender().send(&req).unwrap();
+                let req = testing::served(&mut server, &mut sender).unwrap();
+                sender.as_ref().unwrap().send(&req).unwrap();
             }
         });
         let mut client = Client::new(Stream::new(host_reader, host_writer, || {}));
-        client.handshake(&identity).unwrap();
+        let (sender, _) = client.connect(&identity).unwrap();
 
         // Send from a few threads at once while reading the echoes on this one
         let senders: Vec<_> = (0..4)
             .map(|thread| {
-                let sender = client.sender();
+                let sender = sender.clone();
                 thread::spawn(move || {
                     for i in 0..25 {
                         sender.send(&payload(thread * 100 + i)).unwrap();
@@ -485,9 +474,8 @@ mod tests {
         assert_eq!(echoes, expected);
     }
 
-    // Tests that a sender keeps the session ID it was made with: a handle
-    // obtained before handshaking cannot send, and a new handshake refuses
-    // the previous session's handle while a fresh one sends successfully.
+    // Tests that handshakes return senders bound to their own sessions. A
+    // second handshake refuses the first sender while the new one still sends.
     #[test]
     fn test_sender_session_bound() {
         testing::init_tracing();
@@ -505,30 +493,19 @@ mod tests {
                 signer,
                 attestation,
             );
-            let req = testing::served(&mut server).unwrap();
-            server.sender().send(&req).unwrap();
+            let mut sender = None;
+            let req = testing::served(&mut server, &mut sender).unwrap();
+            sender.as_ref().unwrap().send(&req).unwrap();
         });
         let mut client = Client::new(Stream::new(host_reader, host_writer, || {}));
-        let unbound = client.sender();
-        assert_eq!(unbound.session_id(), 0);
-        client.handshake(&identity).unwrap();
-        let stale = client.sender();
-        assert_eq!(stale.session_id(), 1);
-        client.handshake(&identity).unwrap();
+        let (stale, _) = client.connect(&identity).unwrap();
+        let (sender, _) = client.connect(&identity).unwrap();
 
-        assert_eq!(unbound.session_id(), 0);
-        assert!(matches!(
-            unbound.send(&payload(1)),
-            Err(Error::EncryptionFailed(_))
-        ));
-        assert_eq!(stale.session_id(), 1);
         let result = stale.send(&payload(1));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "session ended"),
             "{result:?}"
         );
-        let sender = client.sender();
-        assert_eq!(sender.session_id(), 2);
         sender.send(&payload(2)).unwrap();
         assert_eq!(client.recv().unwrap(), payload(2));
         ark.join().unwrap();
@@ -544,16 +521,10 @@ mod tests {
         // The reader ending the wire refuses the sends
         let (sender, receiver) = contexts();
         let mut client = Client::new(Stream::new(io::empty(), Vec::new(), || {}));
-        client.establish_session(sender, receiver);
-        let sender = client.sender();
+        let sender = client.establish_session(sender, receiver);
 
         let result = client.recv();
         assert!(matches!(result, Err(Error::Terminated)), "{result:?}");
-        let result = client.sender().send(&payload(1));
-        assert!(
-            matches!(result, Err(Error::EncryptionFailed(_))),
-            "{result:?}"
-        );
         let result = sender.send(&payload(1));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
@@ -575,11 +546,11 @@ mod tests {
         }
         let (sender, receiver) = contexts();
         let mut client = Client::new(Stream::new(io::empty(), Broken, || {}));
-        client.establish_session(sender, receiver);
+        let sender = client.establish_session(sender, receiver);
 
-        let result = client.sender().send(&payload(1));
+        let result = sender.send(&payload(1));
         assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
-        assert_eq!(client.session_id(), 0);
+        assert!(!client.outbound.has_session());
         assert!(matches!(client.recv(), Err(Error::Terminated)));
         assert!(client.receiver.is_none());
 
@@ -587,8 +558,7 @@ mod tests {
         // gets to them, a frame waiting notwithstanding
         let (sender, receiver) = contexts();
         let mut client = Client::new(Stream::new(&[0x02, 0x05, 0x00][..], Broken, || {}));
-        client.establish_session(sender, receiver);
-        let sender = client.sender();
+        let sender = client.establish_session(sender, receiver);
 
         let result = sender.send(&payload(1));
         assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
@@ -609,8 +579,7 @@ mod tests {
         let (mut reader, writer) = io::pipe().unwrap();
         let (sender, receiver) = contexts();
         let mut client = Client::new(Stream::new(io::empty(), writer, || {}));
-        client.establish_session(sender, receiver);
-        let sender = client.sender();
+        let sender = client.establish_session(sender, receiver);
         sender.send(&payload(1)).unwrap();
         drop(client);
 

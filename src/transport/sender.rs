@@ -20,11 +20,10 @@ use tracing::{trace, warn};
 /// Session number used when no outgoing session is installed.
 const NONE: u64 = 0;
 
-/// Side of the wire the outgoing transport serves. The server lives across sessions,
-/// clients come and go on it, so after a failed send it tells the client with
-/// an empty frame that its session is gone and a handshake is due. A client
-/// is made per connection and recovers by starting that handshake itself, so
-/// it never has to tell the server anything.
+/// Side of the wire the outgoing transport serves. After a failed send, the
+/// server tells the client with an empty frame that its session is gone. The
+/// client initiates reconnection itself, sending a reset before the handshake,
+/// so it needs no separate failure notification to the server.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     Client,
@@ -99,15 +98,9 @@ impl<W: Write> Outbound<W> {
         }
     }
 
-    /// Creates a handle sending into the live session, refused once that one
-    /// ended, and refused outright without a session.
-    pub fn sender(self: &Arc<Self>) -> Sender<W> {
-        Sender::new(Arc::downgrade(self), self.session.load(Ordering::Acquire))
-    }
-
     /// Installs the context of a freshly established session, the next one by
-    /// number, sends going out from here on.
-    pub fn establish_session(&self, sender: xhpke::Sender) {
+    /// number, returning a handle bound to it. Sends go out from here on.
+    pub fn establish_session(self: &Arc<Self>, sender: xhpke::Sender) -> Sender<W> {
         let mut sealer = self.lock(&self.sealer);
         sealer.sender = Some(sender);
 
@@ -116,6 +109,7 @@ impl<W: Write> Outbound<W> {
         // billion years at a thousand a second, so nothing guards against it
         sealer.sessions += 1;
         self.session.store(sealer.sessions, Ordering::Release);
+        Sender::new(Arc::downgrade(self), sealer.sessions)
     }
 
     /// Ends the session for the sends, the handles made in it refused from
@@ -132,11 +126,12 @@ impl<W: Write> Outbound<W> {
     /// Whether a session is installed for sends. Stream closure is observed
     /// through I/O; this does not report whether the stream is open.
     pub fn has_session(&self) -> bool {
-        self.session_id() != NONE
+        self.session.load(Ordering::Acquire) != NONE
     }
 
-    /// Number of the installed session, counting the ones established so far,
-    /// or zero without one. Closing the stream alone does not clear the session.
+    /// Mock helper exposing the installed session number, or zero without one.
+    /// Closing the stream alone does not clear the session.
+    #[cfg(any(test, feature = "fuzz"))]
     pub fn session_id(&self) -> u64 {
         self.session.load(Ordering::Acquire)
     }
@@ -300,6 +295,8 @@ impl<W: Write> Outbound<W> {
 }
 
 /// Cloneable handle for sending messages into a session from any thread.
+/// Delivered by [`Client::connect`](super::Client::connect) or a server's
+/// [`Event::Connected`](super::Event::Connected) event.
 /// Sends share one encryption sequence and are written in that order, each
 /// waiting for its own frame and getting its own result. The
 /// handle is bound to the session it was made in and refused once that ended,
@@ -308,20 +305,13 @@ impl<W: Write> Outbound<W> {
 /// handle from the owner. The handle keeps nothing alive on its own, once the
 /// owner is gone only a send in progress holds the transport, until it
 /// returns.
+#[derive(Debug)]
 pub struct Sender<W: Write> {
     outbound: Weak<Outbound<W>>, // Outgoing transport, kept alive by the owner and active sends
     session: u64,                // Number of the session the handle sends into
 }
 
 impl<W: Write> Sender<W> {
-    /// Number of the session the handle was created for, even after it ends.
-    /// Zero identifies a handle obtained without an installed session; it
-    /// cannot send, even after a later handshake establishes a session.
-    /// Numbers are local to one transport owner, not globally unique.
-    pub fn session_id(&self) -> u64 {
-        self.session
-    }
-
     /// Creates a handle onto an outbound side, bound to the session.
     fn new(outbound: Weak<Outbound<W>>, session: u64) -> Self {
         Self { outbound, session }
@@ -472,11 +462,11 @@ mod tests {
             Side::Client,
             Closer::new(|| {}),
         ));
-        outbound.establish_session(sender);
+        let sender = outbound.establish_session(sender);
 
         let threads: Vec<_> = (0..8)
             .map(|thread| {
-                let sender: Sender<Collector> = outbound.sender();
+                let sender = sender.clone();
                 thread::spawn(move || {
                     for i in 0..20 {
                         sender.send(&payload(thread * 100 + i)).unwrap();
@@ -517,8 +507,7 @@ mod tests {
         let (gate, entered, release, _) = Gate::new();
         let (sender, _) = contexts();
         let outbound = Arc::new(Outbound::new(gate, Side::Client, Closer::new(|| {})));
-        outbound.establish_session(sender);
-        let sender: Sender<Gate> = outbound.sender();
+        let sender: Sender<Gate> = outbound.establish_session(sender);
 
         // The first sender blocks inside its write, the second seals behind it
         // and waits for the write lock. The wait gives it time to get there,
@@ -560,7 +549,7 @@ mod tests {
         testing::init_tracing();
 
         let outbound = Arc::new(Outbound::new(Vec::new(), Side::Client, Closer::new(|| {})));
-        let detached: Sender<Vec<u8>> = outbound.sender();
+        let detached = Sender::new(Arc::downgrade(&outbound), NONE);
         let result = detached.send(&payload(1));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
@@ -569,8 +558,7 @@ mod tests {
 
         // A session established, only a handle made in it sends
         let (sender, _) = contexts();
-        outbound.establish_session(sender);
-        let first: Sender<Vec<u8>> = outbound.sender();
+        let first: Sender<Vec<u8>> = outbound.establish_session(sender);
         first.send(&payload(2)).unwrap();
         let result = detached.send(&payload(3));
         assert!(
@@ -589,19 +577,18 @@ mod tests {
 
         // The next session refuses the handle of the previous one
         let (sender, _) = contexts();
-        outbound.establish_session(sender);
+        let second = outbound.establish_session(sender);
         assert!(outbound.has_session());
         let result = first.send(&payload(5));
         assert!(
             matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "session ended"),
             "{result:?}"
         );
-        let second: Sender<Vec<u8>> = outbound.sender();
         second.send(&payload(6)).unwrap();
 
         // Closure is observed by the next write, which ends the session.
         outbound.close();
-        assert_eq!(outbound.session_id(), second.session_id());
+        assert_eq!(outbound.session_id(), second.session);
         let result = second.send(&payload(7));
         assert!(
             matches!(&result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::NotConnected),
@@ -626,8 +613,7 @@ mod tests {
             let _ = release.send(());
         });
         let outbound = Arc::new(Outbound::new(gate, Side::Client, closer));
-        outbound.establish_session(sender);
-        let sender = outbound.sender();
+        let sender = outbound.establish_session(sender);
 
         let first = {
             let sender = sender.clone();
@@ -682,8 +668,7 @@ mod tests {
             let _ = release.send(());
         });
         let outbound = Arc::new(Outbound::new(gate, Side::Client, closer));
-        outbound.establish_session(sender);
-        let sender = outbound.sender();
+        let sender = outbound.establish_session(sender);
 
         let sending = thread::spawn(move || {
             panic::catch_unwind(AssertUnwindSafe(|| sender.send(&payload(1))))
@@ -712,8 +697,7 @@ mod tests {
             Side::Client,
             Closer::new(|| {}),
         ));
-        outbound.establish_session(sender);
-        let sender: Sender<Panicky> = outbound.sender();
+        let sender: Sender<Panicky> = outbound.establish_session(sender);
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| sender.send(&payload(1))));
         assert!(result.is_err());
@@ -730,8 +714,7 @@ mod tests {
         // The next session sends, the framer having kept its buffer and first
         // terminating whatever the panic left behind
         let (sender, mut receiver) = contexts();
-        outbound.establish_session(sender);
-        let sender: Sender<Panicky> = outbound.sender();
+        let sender: Sender<Panicky> = outbound.establish_session(sender);
         sender.send(&payload(3)).unwrap();
 
         let written = written.lock().unwrap().clone();

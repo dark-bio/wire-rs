@@ -22,7 +22,7 @@ pub use transport::{
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod testing {
-    use crate::transport::{Attester, Error, Event, Server};
+    use crate::transport::{Attester, Error, Event, Sender, Server};
     use std::io::{Read, Write};
     use std::sync::Once;
 
@@ -42,14 +42,17 @@ pub(crate) mod testing {
         });
     }
 
-    // served reads the next message of a server, the sessions it takes to get
-    // there passing unseen, for tests holding nothing of a session.
+    // served reads the next message and retains the sender delivered by the
+    // latest Connected event, for tests exchanging messages across sessions.
     pub fn served<R: Read, W: Write, A: Attester>(
         server: &mut Server<R, W, A>,
+        sender: &mut Option<Sender<W>>,
     ) -> Result<Vec<u8>, Error> {
         loop {
-            if let Event::Message(message) = server.recv()? {
-                return Ok(message);
+            match server.recv()? {
+                Event::Connected(opened) => *sender = Some(opened),
+                Event::Disconnected => *sender = None,
+                Event::Message(message) => return Ok(message),
             }
         }
     }

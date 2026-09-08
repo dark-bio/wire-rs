@@ -376,8 +376,9 @@ struct Peer<Out: Tagged, In: Tagged> {
     closed: bool, // Whether the closer ended the transport for good
     resync: bool, // Whether the last write failed, the next starting with a delimiter
 
-    live: u64,   // Session the outbound side carries, zero without one
-    handle: u64, // Session the multiplexer's handle sends into
+    live: u64,           // Session the outbound side carries, zero without one
+    handle: u64,         // Session the multiplexer's handle sends into
+    ended: Option<Kind>, // Last session failure, returned to work with no current session
 
     ids: u64,  // Next id the multiplexer hands out
     asks: u64, // Next id the peer hands out
@@ -881,12 +882,13 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         if self.link.held() {
             self.link.drop_session();
             self.live = 0;
-            self.deliver(Delivery::SessionClosed);
+            self.deliver(Delivery::Disconnected);
         }
-        self.receiver = Some(self.link.open_session());
+        let (sender, receiver) = self.link.open_session();
+        self.receiver = Some(receiver);
         self.live = self.link.session_id();
         self.summary.sessions += 1;
-        self.deliver(Delivery::SessionOpened);
+        self.deliver(Delivery::Connected(sender));
     }
 
     /// Ends the transport under the reader, which ends the multiplexer with
@@ -920,8 +922,8 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             return false;
         }
         let session = match delivery {
-            Delivery::SessionClosed => Some(false),
-            Delivery::SessionOpened => Some(true),
+            Delivery::Disconnected => Some(false),
+            Delivery::Connected(_) => Some(true),
             _ => None,
         };
         self.deliveries
@@ -965,6 +967,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             blocked.ended = Some(reason);
         }
         self.handle = self.live;
+        self.ended = Some(reason);
         self.inbox.clear();
         self.queued = 0;
         self.told.push(reason);
@@ -1044,11 +1047,15 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     }
 
     /// Applies a send of the multiplexer through the handle of a session,
-    /// handing back what it fails with, if it does. It mirrors the outbound side, a
-    /// send into any but the live session refused before the transport is
+    /// handing back what it fails with, if it does. The mux refuses work from
+    /// an ended session with its last failure; otherwise the outbound side
+    /// refuses a send into any but the live session before the transport is
     /// touched, a message too large refused before sealing, and a failed write
     /// ending the session and, on a server, telling the peer.
     fn send(&mut self, handle: u64, message: Vec<u8>) -> Option<Kind> {
+        if self.handle == 0 || self.handle != handle {
+            return Some(self.ended.unwrap_or(Kind::Reset));
+        }
         if self.live == 0 || self.live != handle {
             return Some(Kind::NoSession);
         }
@@ -1236,10 +1243,16 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
 
     // A client's transport hands over the session its handshake opened, a
     // server's waits for a peer to open the first one
-    let receiver = (side == Side::Client).then(|| link.open_session());
+    let (sender, receiver) = match side {
+        Side::Client => {
+            let (sender, receiver) = link.open_session();
+            (Some(sender), Some(receiver))
+        }
+        Side::Server => (None, None),
+    };
     let session = link.session_id();
 
-    let mux = Arc::new(Mux::<Out, In>::mocked(side, feed));
+    let mux = Arc::new(Mux::<Out, In>::mocked(side, feed, sender));
 
     // Wait for the reader to reach its first read, which is where it takes
     // down the session it starts from, so no step can move that under it
@@ -1299,6 +1312,7 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
         resync: false,
         live: session,
         handle: session,
+        ended: None,
         ids: match side {
             Side::Client => 1,
             Side::Server => 2,

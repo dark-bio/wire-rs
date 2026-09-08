@@ -21,7 +21,7 @@ use crate::transport::handshake;
 use crate::transport::mock::payload;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Sender,
 };
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
@@ -940,11 +940,8 @@ fn kind(err: Error) -> Kind {
 /// Checks that the client has a session exactly when the model says so. An
 /// oversized message is refused before sealing, so it probes the session
 /// without any frame going out.
-pub(super) fn check_session<R: Read, W: Write>(
-    client: &mut crate::transport::Client<R, W>,
-    established: bool,
-) {
-    let refused = client.sender().send(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
+pub(super) fn check_session<W: Write>(sender: Option<&Sender<W>>, established: bool) {
+    let refused = super::send(sender, &vec![0x42; MAX_MESSAGE_SIZE + 1]);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "client has a session the model does not")
@@ -1002,12 +999,14 @@ pub fn run(steps: &[Step]) -> Summary {
         server.borrow().attestation.as_bytes().to_vec(),
     );
 
+    let mut sender = None;
     loop {
         let call = server.borrow_mut().next_call();
         let Some(call) = call else { break };
 
         match call {
             Step::Handshake => {
+                sender = None;
                 // On a broken transport not even the reset gets out, and a cut
                 // takes the reset or the hello, the client failing before reading
                 // anything either way
@@ -1058,7 +1057,12 @@ pub fn run(steps: &[Step]) -> Summary {
                         kind: <&str>::from(err).into(),
                     },
                 });
-                let result = result.map(|_| None).map_err(kind);
+                let result = result
+                    .map(|(opened, _)| {
+                        sender = Some(opened);
+                        None
+                    })
+                    .map_err(kind);
                 let mut server = server.borrow_mut();
                 match result {
                     Ok(_) => server.summary.handshakes += 1,
@@ -1069,7 +1073,7 @@ pub fn run(steps: &[Step]) -> Summary {
             Step::Send(tag) => {
                 let established = server.borrow().client_session.is_some();
                 trace(&recorder, || Event::Session { established });
-                check_session(&mut client, established);
+                check_session(sender.as_ref(), established);
 
                 // A failed send takes the session down with it, a cut firing
                 // ahead of a broken transport
@@ -1089,7 +1093,7 @@ pub fn run(steps: &[Step]) -> Summary {
                 trace(&recorder, || Event::Send {
                     message: request.clone(),
                 });
-                let result = client.sender().send(&request);
+                let result = super::send(sender.as_ref(), &request);
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
                     Err(err) => Event::Err {
@@ -1128,7 +1132,7 @@ pub fn run(steps: &[Step]) -> Summary {
     server.ingest();
     let established = server.client_session.is_some();
     trace(&recorder, || Event::Session { established });
-    check_session(&mut client, established);
+    check_session(sender.as_ref(), established);
     server.summary.established = established;
 
     if let Some(vector) = recorder.borrow().as_ref() {
