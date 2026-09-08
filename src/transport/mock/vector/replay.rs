@@ -473,6 +473,17 @@ impl Peer {
         }
         match cose::recipient(&packet) {
             Ok(fingerprint) => {
+                // Encryption may change the bytes and frame length, but not
+                // the recipient. A failed recording can end mid-frame even
+                // when the fresh, shorter replay frame was fully accepted.
+                if !failed || recorded.last() == Some(&0) {
+                    let recorded_packet = unframe(&recorded[..recorded.len() - 1]);
+                    assert_eq!(
+                        fingerprint,
+                        cose::recipient(&recorded_packet).expect("recorded ack has no recipient"),
+                        "client ack recipient differs from the recorded one"
+                    );
+                }
                 let crypto = self
                     .xhpke
                     .iter()
@@ -708,4 +719,58 @@ fn test_checker_accepts_recorded_partial_output() {
     peer.check(&[2, 42, 0], &[2, 42], true, None);
     peer.check(&[2, 42], &[2, 42], false, None);
     peer.check(&[0], &[0], false, None);
+}
+
+// Tests that an ACK cannot use another saved server key, even with a valid
+// signature from the current client. Randomized encryption preserves its recipient.
+#[test]
+fn test_checker_requires_recorded_ack_recipient() {
+    use crate::transport::mock::frame;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let (mut peer, recorded_ack, _) = checker_session();
+    let stale_crypto = xhpke::SecretKey::from_bytes(&[9; xhpke::SECRET_KEY_SIZE]);
+    let signer = xdsa::SecretKey::from_bytes(&[3; xdsa::SECRET_KEY_SIZE]);
+    let (_, encap) = stale_crypto
+        .public_key()
+        .new_sender(CRYPTO_DOMAIN_WIRE_HOST_TO_ARK)
+        .unwrap();
+    let wrong_ack = cose::seal_at(
+        &handshake::HostAck {
+            h2a_encap: encap.to_vec(),
+        },
+        &handshake::HostAckAuth {
+            ark_signer: peer.identity.clone(),
+            ark_crypto: stale_crypto.public_key(),
+        },
+        &signer,
+        &stale_crypto.public_key(),
+        CRYPTO_DOMAIN_WIRE,
+        TIMESTAMP,
+    )
+    .unwrap();
+    peer.xhpke.push(stale_crypto);
+
+    for failed in [false, true] {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                peer.check(&recorded_ack, &frame(&wrong_ack), failed, None);
+            }))
+            .is_err(),
+            "accepted an ack for a different recorded server key"
+        );
+    }
+}
+
+// Tests a shorter replay ACK fully accepted before a deferred write failure,
+// when the recording contains only an unfinished prefix of its longer frame.
+#[test]
+fn test_checker_accepts_complete_ack_after_recorded_prefix_failure() {
+    let (mut peer, ack, _) = checker_session();
+    // The unfinished recording must be longer than the actual frame for the
+    // writer to accept that frame in full before reporting its deferred error.
+    let mut prefix = ack[..ack.len() - 1].to_vec();
+    prefix.extend_from_slice(&[1, 1]);
+    peer.check(&prefix, &ack, true, None);
+    assert!(peer.receiver.is_some());
 }
