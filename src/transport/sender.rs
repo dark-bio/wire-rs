@@ -4,10 +4,10 @@
 //! Handles bound to individual transport sessions. Neither an idle sender nor
 //! any of its clones keeps the session or the byte stream alive.
 
+use super::Write;
 use super::outbound::Outbound;
 use super::{Error, sealing};
 use darkbio_crypto::xhpke;
-use std::io::Write;
 use std::sync::{Mutex, Weak};
 
 /// Cloneable handle for sending messages into a session from any thread.
@@ -41,10 +41,16 @@ impl<W: Write> Sender<W> {
     /// Seals a message and writes and flushes its complete frame. Concurrent
     /// sends retain encryption order on the wire while the next message can
     /// seal during the preceding write. An oversized message is refused without
-    /// advancing encryption or ending the session.
+    /// advancing encryption or ending the session. Once the writer is acquired,
+    /// all partial writes, resynchronization and flush share the stream's write
+    /// timeout. Encryption and waiting for the writer are outside that budget.
     ///
     /// A write failure ends the binding before returning: subsequent sends and
-    /// receive completions are refused. This does not wake a blocked receive.
+    /// receive completions are refused. A timeout returns [`Error::SendFailed`]
+    /// containing [`std::io::ErrorKind::TimedOut`] and leaves the byte stream
+    /// reusable. Server failure notification uses only the failed frame's
+    /// remaining budget and is skipped after timeout. This does not wake a
+    /// blocked receive.
     /// Ending elsewhere waits for a write already holding the writer lock;
     /// queued sends can still seal but must match the binding before writing.
     ///
@@ -86,9 +92,11 @@ mod tests {
     use super::*;
     use crate::testing;
     use crate::transport::Closer;
+    use crate::transport::DEFAULT_WRITE_TIMEOUT;
     use crate::transport::framing::FrameReader;
     use crate::transport::mock::payload;
     use crate::transport::outbound::Side;
+    use crate::transport::testing::Memory;
     use std::io;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, TryLockError, mpsc};
@@ -131,6 +139,13 @@ mod tests {
     struct Collector(Arc<Mutex<Vec<u8>>>);
 
     impl Write for Collector {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            testing::remaining(deadline)?;
+            Ok(())
+        }
+    }
+
+    impl io::Write for Collector {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
@@ -148,6 +163,7 @@ mod tests {
         release: Option<mpsc::Receiver<()>>,
         dropped: mpsc::Sender<()>,
         panics: bool,
+        deadline: Option<Instant>,
     }
 
     impl Gate {
@@ -168,17 +184,29 @@ mod tests {
                 release: Some(release_rx),
                 dropped: dropped_tx,
                 panics: false,
+                deadline: None,
             };
             (gate, entered, release, dropped)
         }
     }
 
     impl Write for Gate {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    impl io::Write for Gate {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let deadline = self.deadline.expect("write deadline installed");
+            testing::remaining(deadline)?;
             match self.release.take() {
                 Some(release) => {
                     let _ = self.entered.send(());
-                    let _ = release.recv();
+                    release
+                        .recv_timeout(testing::remaining(deadline)?)
+                        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
                     if self.panics {
                         panic!("injected panic");
                     }
@@ -189,6 +217,7 @@ mod tests {
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            testing::remaining(self.deadline.expect("write deadline installed"))?;
             Ok(())
         }
     }
@@ -211,6 +240,7 @@ mod tests {
             collector.clone(),
             Side::Client,
             Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
         ));
         let (_sealer, sender) = connect(&outbound, sender);
 
@@ -230,10 +260,10 @@ mod tests {
 
         // Every frame must open in the order written, or the sequence is off
         let written = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(&written[..], Closer::new(|| {}));
+        let mut reader = FrameReader::new(Memory::new(&written[..]), Closer::new(|| {}));
         let mut messages = Vec::new();
         loop {
-            let packet = match reader.next_packet() {
+            let packet = match reader.next_packet(None) {
                 Err(Error::Terminated) => break,
                 result => result.unwrap().unwrap(),
             };
@@ -259,6 +289,7 @@ mod tests {
             collector.clone(),
             Side::Client,
             Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
         ));
         let (crypto, _) = contexts();
         let (sealer, sender) = connect(&outbound, crypto);
@@ -279,10 +310,10 @@ mod tests {
         ));
 
         let bytes = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(&bytes[..], Closer::new(|| {}));
-        let packet = reader.next_packet().unwrap().unwrap();
+        let mut reader = FrameReader::new(Memory::new(&bytes[..]), Closer::new(|| {}));
+        let packet = reader.next_packet(None).unwrap().unwrap();
         assert_eq!(sealing::open(&mut peer, packet).unwrap(), payload(2));
-        assert!(matches!(reader.next_packet(), Err(Error::Terminated)));
+        assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
     }
 
     // Tests that a failed write is reported to the sender it failed, that a
@@ -294,7 +325,12 @@ mod tests {
 
         let (gate, entered, release, _) = Gate::new();
         let (sender, _) = contexts();
-        let outbound = Arc::new(Outbound::new(gate, Side::Client, Closer::new(|| {})));
+        let outbound = Arc::new(Outbound::new(
+            gate,
+            Side::Client,
+            Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
+        ));
         let (sealer, sender) = connect(&outbound, sender);
 
         // The first sender blocks inside its write, the second seals behind it
@@ -336,7 +372,12 @@ mod tests {
     fn test_send_refusals() {
         testing::init_tracing();
 
-        let outbound = Arc::new(Outbound::new(Vec::new(), Side::Client, Closer::new(|| {})));
+        let outbound = Arc::new(Outbound::new(
+            Memory::new(Vec::new()),
+            Side::Client,
+            Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
+        ));
         let (crypto, _) = contexts();
         let (first_sealer, first) = connect(&outbound, crypto);
         first.send(&payload(1)).unwrap();
@@ -392,7 +433,12 @@ mod tests {
         let closer = Closer::new(move || {
             let _ = release.send(());
         });
-        let outbound = Arc::new(Outbound::new(gate, Side::Client, closer));
+        let outbound = Arc::new(Outbound::new(
+            gate,
+            Side::Client,
+            closer,
+            DEFAULT_WRITE_TIMEOUT,
+        ));
         let (sealer, sender) = connect(&outbound, sender);
 
         let first = {
@@ -455,7 +501,12 @@ mod tests {
         let closer = Closer::new(move || {
             let _ = release.send(());
         });
-        let outbound = Arc::new(Outbound::new(gate, Side::Client, closer));
+        let outbound = Arc::new(Outbound::new(
+            gate,
+            Side::Client,
+            closer,
+            DEFAULT_WRITE_TIMEOUT,
+        ));
         let (_sealer, sender) = connect(&outbound, sender);
 
         let sending = thread::spawn(move || {

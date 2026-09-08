@@ -7,10 +7,19 @@
 //! drive it from either end. The client/server owns the receive context directly
 //! and shares the sending context with active sends. Senders bind that context
 //! to the stream writer for sending messages from any thread.
+//!
+//! Adapters implement standard byte I/O plus the deadline setters in [`Read`]
+//! and [`Write`]. Each outgoing
+//! frame has one configurable budget covering partial writes and flush; timeout
+//! ends that send or handshake without closing the byte stream. Idle input is
+//! polled internally for cancellation and has no session timeout. Reconnecting
+//! clients drain old input concurrently with reset and hello output, allowing
+//! both directions to progress even when the underlying buffers are bounded.
 
 mod client;
 mod framing;
 mod handshake;
+mod io;
 mod outbound;
 mod sealing;
 mod sender;
@@ -22,16 +31,20 @@ mod stream;
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub mod mock;
 
+#[cfg(any(test, feature = "bench", feature = "fuzz"))]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod testing;
+
 pub use client::{Client, Roots, Verifier};
+pub use io::{Read, Write};
 pub use sender::Sender;
 pub use server::{Attestation, Attester, Event, Server};
-pub use stream::{Closer, Stream};
+pub use stream::{Closer, DEFAULT_WRITE_TIMEOUT, Stream};
 
 /// Stream writer for the protocol mock's real framing and reset notifications.
 #[cfg(any(test, feature = "fuzz"))]
 pub(crate) use outbound::{Outbound, Side};
-
-use std::io;
 
 /// Maximum encoded frame size, excluding its trailing delimiter. An oversized
 /// incoming frame is a framing error that ends any active session. Its remainder
@@ -87,11 +100,15 @@ pub enum Error {
     #[error("wire frame decode failed: {0}")]
     FrameDecodingFailed(darkbio_cobs::DecodeError),
 
+    /// The adapter failed to write or flush a frame. [`std::io::ErrorKind::TimedOut`]
+    /// means its output budget expired. The affected session or handshake cannot
+    /// continue. This error does not itself close the stream; an otherwise-open
+    /// adapter remains available for another handshake.
     #[error("wire send failed: {0}")]
-    SendFailed(io::Error),
+    SendFailed(std::io::Error),
 
     #[error("wire receive failed: {0}")]
-    RecvFailed(io::Error),
+    RecvFailed(std::io::Error),
 
     #[error("wire terminated")]
     Terminated,

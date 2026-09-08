@@ -22,13 +22,14 @@ pub mod seed;
 use crate::protocol::envelope::Side;
 use crate::protocol::mux::Writer;
 use crate::protocol::switchboard::Source;
-use crate::transport::{self, Closer, Event, Outbound, Sender, Stream};
+use crate::transport::testing::Memory;
+use crate::transport::{self, Closer, Event, Outbound, Sender, Stream, Write};
 use darkbio_crypto::xhpke;
-use std::io::{self, Write};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Most steps a script is run for. It bounds the runtime of a fuzz iteration
 /// along with the floods a script may ask for.
@@ -88,6 +89,7 @@ pub(crate) struct Sink {
     broken: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     writes: mpsc::Sender<()>, // Tells the driver that a write attempt finished
+    deadline: Option<Instant>, // Fixed budget shared by this writer's frame operations
 }
 
 impl Sink {
@@ -100,6 +102,7 @@ impl Sink {
             broken: Arc::default(),
             closed: Arc::default(),
             writes,
+            deadline: None,
         };
         (sink, attempts)
     }
@@ -131,8 +134,15 @@ impl Sink {
     }
 }
 
-impl Write for Sink {
+impl io::Write for Sink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let _ = self.writes.send(());
+            return Err(io::ErrorKind::TimedOut.into());
+        }
         if self.failing() {
             let _ = self.writes.send(());
             return Err(io::ErrorKind::BrokenPipe.into());
@@ -146,6 +156,19 @@ impl Write for Sink {
 
     fn flush(&mut self) -> io::Result<()> {
         let _ = self.writes.send(());
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
+}
+
+impl Write for Sink {
+    fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        self.deadline = Some(deadline);
         Ok(())
     }
 }
@@ -168,13 +191,13 @@ struct LinkSession {
 impl Link {
     /// Creates the link of a side over the sink, without a session until the
     /// peer opens one.
-    pub(super) fn new(side: Side, stream: Stream<io::Empty, Writer>) -> Arc<Self> {
-        let (_, writer, close) = stream.into_parts();
+    pub(super) fn new(side: Side, stream: Stream<Memory<io::Empty>, Writer>) -> Arc<Self> {
+        let (_, writer, close, write_timeout) = stream.into_parts();
         let side = match side {
             Side::Client => transport::Side::Client,
             Side::Server => transport::Side::Server,
         };
-        let outbound = Arc::new(Outbound::new(writer, side, close));
+        let outbound = Arc::new(Outbound::new(writer, side, close, write_timeout));
         Arc::new(Self {
             outbound,
             session: Mutex::new(LinkSession {
@@ -278,13 +301,17 @@ impl Feed {
         let (deliveries, inbound) = mpsc::channel();
         let (routed, routes) = mpsc::sync_channel(0);
         let (finished, ends) = mpsc::channel();
-        let stream = Stream::new(io::empty(), Box::new(sink.clone()) as Writer, {
-            let deliveries = deliveries.clone();
-            move || {
-                sink.close();
-                let _ = deliveries.send(Delivery::Failed(transport::Error::Terminated));
-            }
-        });
+        let stream = Stream::new(
+            Memory::new(io::empty()),
+            Box::new(sink.clone()) as Writer,
+            {
+                let deliveries = deliveries.clone();
+                move || {
+                    sink.close();
+                    let _ = deliveries.send(Delivery::Failed(transport::Error::Terminated));
+                }
+            },
+        );
         let link = Link::new(side, stream);
         let feed = Self {
             link,

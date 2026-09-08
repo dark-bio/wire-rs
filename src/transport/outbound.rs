@@ -6,10 +6,12 @@
 //! orders receive completion with those boundaries without waiting for I/O.
 
 use super::framing::FrameWriter;
-use super::{Closer, Error, Sender};
+use super::{Closer, Error, Sender, Write};
 use darkbio_crypto::xhpke;
-use std::io::Write;
+use std::io;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 use tracing::{trace, warn};
 
 /// Side of the wire served by the writer. A server announces failed sends with
@@ -42,18 +44,20 @@ impl Side {
 pub(crate) struct Outbound<W: Write> {
     writer: Mutex<FrameWriter<W>>, // Serializes complete writes, flushes and binding changes
     binding: Mutex<Weak<Mutex<xhpke::Sender>>>, // Sole authority for the current session
-    side: Side,                    // Whether a failed send needs an empty frame notification
-    closer: Closer,                // Shutdown independent of encryption, writer and binding locks
+    timeout: Duration, // Absolute budget for each frame, including partial writes and flush
+    side: Side,        // Whether a failed send needs an empty frame notification
+    closer: Closer,    // Shutdown independent of encryption, writer and binding locks
 }
 
 impl<W: Write> Outbound<W> {
     /// Creates an unbound writer around the byte stream's writing half.
-    pub(crate) fn new(writer: W, side: Side, closer: Closer) -> Self {
+    pub(crate) fn new(writer: W, side: Side, closer: Closer, timeout: Duration) -> Self {
         Self {
             writer: Mutex::new(FrameWriter::new(writer, closer.clone())),
             binding: Mutex::new(Weak::new()),
             side,
             closer,
+            timeout,
         }
     }
 
@@ -133,12 +137,20 @@ impl<W: Write> Outbound<W> {
         self.closer.close();
     }
 
-    /// Retires the binding and sends the client's reset under one writer lock.
-    /// No old frame or failure notification can follow it onto the stream.
-    pub(super) fn send_reset(&self) -> Result<(), Error> {
+    /// Retires the old binding and writes the client's reset and fresh hello.
+    /// The caller drains incoming traffic concurrently, including while this
+    /// waits for a previous send. Holding the writer throughout prevents old
+    /// output from entering between the reset and hello. Each frame has its own
+    /// deadline; cancellation refuses further adapter calls for this attempt.
+    pub(super) fn begin_handshake(&self, hello: &[u8], canceled: &AtomicBool) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
-        writer.framer.send_reset()
+        writer
+            .framer
+            .send_reset(Instant::now() + self.timeout, Some(canceled))?;
+        writer
+            .framer
+            .send_packet(hello, Instant::now() + self.timeout, Some(canceled))
     }
 
     /// Retires the binding and tells the client that the server has no session.
@@ -146,20 +158,31 @@ impl<W: Write> Outbound<W> {
     pub(crate) fn send_dropped(&self) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
-        writer.framer.send_dropped()
+        writer
+            .framer
+            .send_dropped(Instant::now() + self.timeout, None)
     }
 
     /// Writes a handshake packet through the same framer as session messages.
     /// The owner retires its old binding before starting the handshake.
     pub(super) fn send_packet(&self, packet: &[u8]) -> Result<(), Error> {
-        self.lock().framer.send_packet(packet)
+        let mut writer = self.lock();
+        let deadline = Instant::now() + self.timeout;
+        let result = writer.framer.send_packet(packet, deadline, None);
+        if let Err(err @ Error::SendFailed(_)) = &result {
+            writer.notify_failure(err, deadline);
+        }
+        result
     }
 
     /// Test and benchmark helper writing an already encoded frame.
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn send_frame_blob(&self, frame: &[u8]) -> Result<(), Error> {
-        self.lock().framer.send_frame_blob(frame)
+        let mut writer = self.lock();
+        writer
+            .framer
+            .send_frame_blob(frame, Instant::now() + self.timeout, None)
     }
 
     /// Acquires exclusive output ownership. A sender retains its encryption
@@ -238,8 +261,11 @@ impl<W: Write> Writer<'_, W> {
                 return Err(Error::EncryptionFailed("session ended".into()));
             }
         }
-        if let Err(err) = self.framer.send_packet(packet) {
-            self.fail(sealer);
+        let deadline = Instant::now() + self.outbound.timeout;
+        if let Err(err) = self.framer.send_packet(packet, deadline, None) {
+            if self.end(sealer) {
+                self.notify_failure(&err, deadline);
+            }
             return Err(err);
         }
         trace!(
@@ -250,15 +276,15 @@ impl<W: Write> Writer<'_, W> {
         Ok(())
     }
 
-    /// Retires a failed session and, on the server, writes an empty frame while
-    /// still owning the writer. Only the call that removes the matching binding
-    /// sends a notification. Repeated and obsolete failures have no effect, so
-    /// they cannot interrupt a later handshake or session. Notification failures
-    /// are logged instead of replacing the operation's original error.
-    fn fail(&mut self, sealer: &Arc<Mutex<xhpke::Sender>>) {
-        if self.end(sealer)
-            && self.outbound.side == Side::Server
-            && let Err(err) = self.framer.send_dropped()
+    /// Notifies a client about failed output within that frame's remaining
+    /// budget. A timeout leaves no notification budget, even when reported by
+    /// the adapter before the local clock reaches the deadline. Other failures
+    /// may leave a partial frame, which the framer terminates before its signal.
+    /// Notification errors never replace the original operation's error.
+    fn notify_failure(&mut self, error: &Error, deadline: Instant) {
+        if self.outbound.side == Side::Server
+            && !matches!(error, Error::SendFailed(err) if err.kind() == io::ErrorKind::TimedOut)
+            && let Err(err) = self.framer.send_dropped(deadline, None)
         {
             warn!("failed to notify client of ended session: {}", err);
         }
@@ -270,18 +296,27 @@ impl<W: Write> Writer<'_, W> {
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::transport::DEFAULT_WRITE_TIMEOUT;
     use crate::transport::framing::FrameReader;
+    use crate::transport::testing::Memory;
     use crate::transport::{mock::payload, sealing};
     use std::io;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Writer exposing its bytes for assertions about frame and notification order.
     #[derive(Clone, Default)]
     struct Collector(Arc<Mutex<Vec<u8>>>);
 
     impl Write for Collector {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            testing::remaining(deadline)?;
+            Ok(())
+        }
+    }
+
+    impl io::Write for Collector {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
@@ -299,6 +334,131 @@ mod tests {
         (sender, key.new_receiver(&encap, b"test").unwrap())
     }
 
+    // Tests the budget across an output failure and its notification, for both
+    // session data and handshake output. The adapter records exact deadlines
+    // after a partial write so a fresh notification budget cannot go unnoticed.
+    #[test]
+    fn test_failure_notification_keeps_frame_deadline() {
+        /// Records adapter deadlines and fails the second partial write once.
+        struct Probe {
+            calls: Arc<Mutex<Vec<Instant>>>,
+            deadline: Option<Instant>,
+        }
+
+        impl Write for Probe {
+            fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+                self.deadline = Some(deadline);
+                Ok(())
+            }
+        }
+
+        impl io::Write for Probe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(self.deadline.expect("write deadline installed"));
+                match calls.len() {
+                    1 => Ok(1),
+                    2 => Err(io::Error::new(io::ErrorKind::BrokenPipe, "frame failed")),
+                    3 => {
+                        assert_eq!(bytes, [0, 0]); // Resynchronization and notification together.
+                        Ok(bytes.len())
+                    }
+                    _ => panic!("unexpected additional write"),
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(self.deadline.expect("write deadline installed"));
+                Ok(())
+            }
+        }
+
+        for handshake in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let outbound = Arc::new(Outbound::new(
+                Probe {
+                    calls: calls.clone(),
+                    deadline: None,
+                },
+                Side::Server,
+                Closer::new(|| {}),
+                DEFAULT_WRITE_TIMEOUT,
+            ));
+            let sealer = Arc::new(Mutex::new(contexts().0));
+            let sender = outbound.bind(&sealer);
+            let result = if handshake {
+                outbound.unbind();
+                outbound.send_packet(b"hello")
+            } else {
+                sender.send(b"message")
+            };
+            assert!(
+                matches!(result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::BrokenPipe)
+            );
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 4); // Partial write, failure, resync with signal, flush.
+            assert!(calls.iter().all(|deadline| *deadline == calls[0]));
+            drop(calls);
+            assert!(matches!(
+                sender.send(b"late"),
+                Err(Error::EncryptionFailed(_))
+            ));
+        }
+    }
+
+    // Tests that failing to install the frame deadline ends the session before
+    // adapter I/O. The sender reports the original error and retained handles
+    // cannot send or accept a received message after that failure.
+    #[test]
+    fn test_deadline_setter_failure_ends_session() {
+        /// Rejects output configuration and records attempts without accepting bytes.
+        struct Refused(Arc<Mutex<usize>>);
+
+        impl Write for Refused {
+            fn set_write_deadline(&mut self, _: Instant) -> io::Result<()> {
+                *self.0.lock().unwrap() += 1;
+                Err(io::Error::new(io::ErrorKind::TimedOut, "deadline refused"))
+            }
+        }
+
+        impl io::Write for Refused {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("write after deadline setter failed")
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("flush after deadline setter failed")
+            }
+        }
+
+        let settings = Arc::new(Mutex::new(0));
+        let outbound = Arc::new(Outbound::new(
+            Refused(settings.clone()),
+            Side::Server,
+            Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
+        ));
+        let sealer = Arc::new(Mutex::new(contexts().0));
+        let sender = outbound.bind(&sealer);
+        assert!(matches!(
+            sender.send(b"message"),
+            Err(Error::SendFailed(err))
+                if err.kind() == io::ErrorKind::TimedOut && err.to_string() == "deadline refused"
+        ));
+        assert!(matches!(
+            sender.send(b"late"),
+            Err(Error::EncryptionFailed(_))
+        ));
+        assert!(matches!(
+            outbound.finish_receive(&sealer, Ok(Vec::new())),
+            Err(Error::EncryptionFailed(_))
+        ));
+        assert_eq!(*settings.lock().unwrap(), 1);
+    }
+
     // Tests both orders of receive acceptance and a send failure. A message
     // accepted first remains a completed result. Another already decrypted
     // message, representing a receiver paused before acceptance, is refused
@@ -308,9 +468,10 @@ mod tests {
         testing::init_tracing();
 
         let outbound = Arc::new(Outbound::new(
-            io::Cursor::new([0u8; 0]),
+            Memory::new(io::Cursor::new([0u8; 0])),
             Side::Client,
             Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
         let sender = outbound.bind(&sealer);
@@ -339,7 +500,12 @@ mod tests {
     fn test_end_while_sealing() {
         testing::init_tracing();
 
-        let outbound = Arc::new(Outbound::new(Vec::new(), Side::Client, Closer::new(|| {})));
+        let outbound = Arc::new(Outbound::new(
+            Memory::new(Vec::new()),
+            Side::Client,
+            Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
+        ));
         let sealer = Arc::new(Mutex::new(contexts().0));
         let sender = outbound.bind(&sealer);
         let sealing = sealer.lock().unwrap();
@@ -369,7 +535,12 @@ mod tests {
     fn test_repeated_end_waits_for_writer() {
         testing::init_tracing();
 
-        let outbound = Arc::new(Outbound::new(Vec::new(), Side::Client, Closer::new(|| {})));
+        let outbound = Arc::new(Outbound::new(
+            Memory::new(Vec::new()),
+            Side::Client,
+            Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
+        ));
         let sealer = Arc::new(Mutex::new(contexts().0));
         outbound.bind(&sealer);
         let mut writer = outbound.lock();
@@ -415,32 +586,42 @@ mod tests {
             collector.clone(),
             Side::Server,
             Closer::new(|| {}),
+            DEFAULT_WRITE_TIMEOUT,
         ));
         let old = Arc::new(Mutex::new(contexts().0));
         outbound.bind(&old);
         let delayed = old.clone();
-        outbound.lock().fail(&delayed);
-        outbound.lock().fail(&delayed);
+        let fail = || {
+            let mut writer = outbound.lock();
+            if writer.end(&delayed) {
+                writer.notify_failure(
+                    &Error::SendFailed(io::Error::other("injected failure")),
+                    Instant::now() + DEFAULT_WRITE_TIMEOUT,
+                );
+            }
+        };
+        fail();
+        fail();
 
         // Only the first failure notifies, and none can cross the new handshake.
         assert_eq!(*collector.0.lock().unwrap(), [0]);
         outbound.unbind();
         outbound.send_packet(b"hello").unwrap();
-        outbound.lock().fail(&delayed);
+        fail();
 
         let (crypto, mut peer) = contexts();
         let replacement = Arc::new(Mutex::new(crypto));
         let sender = outbound.bind(&replacement);
-        outbound.lock().fail(&delayed);
+        fail();
         drop(old);
         sender.send(&payload(1)).unwrap();
 
         let bytes = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(&bytes[..], Closer::new(|| {}));
-        assert!(reader.next_packet().unwrap().is_none());
-        assert_eq!(reader.next_packet().unwrap(), Some(&b"hello"[..]));
-        let packet = reader.next_packet().unwrap().unwrap();
+        let mut reader = FrameReader::new(Memory::new(&bytes[..]), Closer::new(|| {}));
+        assert!(reader.next_packet(None).unwrap().is_none());
+        assert_eq!(reader.next_packet(None).unwrap(), Some(&b"hello"[..]));
+        let packet = reader.next_packet(None).unwrap().unwrap();
         assert_eq!(sealing::open(&mut peer, packet).unwrap(), payload(1));
-        assert!(matches!(reader.next_packet(), Err(Error::Terminated)));
+        assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
     }
 }

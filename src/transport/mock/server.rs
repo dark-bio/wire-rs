@@ -16,19 +16,19 @@ use super::{
     CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, Recorder, TIMESTAMP, cloud_attestation, frame,
     self_attestation, trace, unframe, would_block,
 };
-use crate::transport::client::MAX_STALE_FRAMES;
 use crate::transport::handshake;
 use crate::transport::mock::payload;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, Sender,
 };
+use crate::transport::{Read, Write};
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
-use std::rc::Rc;
+use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// One step of a script, either a call the driver makes into the client or a
 /// frame the mock server puts in front of it. Frames needing a session or a
@@ -121,6 +121,11 @@ pub enum Step {
     SendRetained(u8),
     /// Sends a message one byte over the size limit through the current sender.
     SendOversized,
+    /// The next matching output operation expires after the selected prefix.
+    /// The stream remains reusable after the failed send or handshake.
+    Timeout(CutPoint),
+    /// An idle read poll expires. Receiving retries without ending the session.
+    ReadTimeout,
 }
 
 impl Step {
@@ -155,6 +160,8 @@ impl Step {
                 | Step::Cut { .. }
                 | Step::Chunk(_)
                 | Step::Batch(_)
+                | Step::Timeout(_)
+                | Step::ReadTimeout
         )
     }
 }
@@ -261,9 +268,9 @@ enum Partial {
 enum Call {
     /// No call in progress, a frame read now being a bug.
     None,
-    /// A handshake awaiting the ArkHello of the generation, having skipped
-    /// the count of stale frames so far.
-    Handshake { generation: u64, stale: usize },
+    /// A handshake awaiting the ArkHello of the generation. Older frames are
+    /// drained regardless of their count until the matching hello arrives.
+    Handshake { generation: u64 },
     /// A read of the next message.
     Recv,
 }
@@ -302,9 +309,10 @@ pub struct Server {
     recorder: Recorder,                        // Transcript of the run, if recorded
     queue: VecDeque<(Vec<u8>, Option<Frame>)>, // Bytes and their frame result, including an overflow before its delimiter
     bytes: Vec<u8>,                            // Bytes of the frame being handed over
-    chunk: usize,                              // Most bytes a read hands over, zero for all
-    batch: usize,                              // Frames left to hand to the client in one read
-    broken: bool,                              // Whether the client's writes fail
+    offset: usize,         // Bytes already delivered, avoiding a copy per small read
+    chunk: usize,          // Most bytes a read hands over, zero for all
+    batch: usize,          // Frames left to hand to the client in one read
+    broken: bool,          // Whether the client's writes fail
     cut: Option<CutPoint>, // Cut armed for the next write of the client it applies to
     fragment: bool,        // Whether a frame cut in the middle awaits its terminator
     partial: Partial,      // Unterminated frame in front of the client
@@ -336,6 +344,7 @@ impl Server {
             recorder,
             queue: VecDeque::new(),
             bytes: Vec::new(),
+            offset: 0,
             chunk: 0,
             batch: 0,
             broken: false,
@@ -439,6 +448,11 @@ impl Server {
                 }
                 return;
             }
+            Step::Timeout(point) => {
+                self.cut = Some(point);
+                self.outbox.set_timeout(point);
+                return;
+            }
             Step::Chunk(n) => {
                 self.chunk = n as usize;
                 return;
@@ -452,6 +466,7 @@ impl Server {
             | Step::Recv
             | Step::Yield
             | Step::Interrupt
+            | Step::ReadTimeout
             | Step::Retain
             | Step::SendRetained(_)
             | Step::SendOversized => {
@@ -490,7 +505,7 @@ impl Server {
             return self.junk(b"server hello without a client hello");
         };
         let crypto = xhpke::SecretKey::generate();
-        if let Some(vector) = self.recorder.borrow_mut().as_mut() {
+        if let Some(vector) = self.recorder.lock().unwrap().as_mut() {
             vector.server_key(crypto.to_bytes().to_vec());
         }
         let (sender, encap) = host_crypto
@@ -717,7 +732,7 @@ impl Server {
     /// the call in progress once the frame decides its result.
     fn consume(&mut self, frame: Frame) {
         match self.call {
-            Call::Handshake { generation, stale } => {
+            Call::Handshake { generation } => {
                 let result = match frame {
                     Frame::ArkHello {
                         generation: answered,
@@ -739,17 +754,9 @@ impl Server {
                         Flaw::Attest => Expect::Err(Kind::InvalidAttestation),
                         Flaw::Stale => unreachable!("stale hellos answer no generation"),
                     },
-                    // Anything else is skipped as stale, up to the bound
-                    _ => {
-                        if stale < MAX_STALE_FRAMES {
-                            self.call = Call::Handshake {
-                                generation,
-                                stale: stale + 1,
-                            };
-                            return;
-                        }
-                        Expect::Err(Kind::Handshake)
-                    }
+                    // Old output may contain any number of frames. Keep
+                    // draining until the hello for this attempt arrives.
+                    _ => return,
                 };
                 if result == Expect::Ok(None) {
                     self.client_session = Some(generation);
@@ -855,7 +862,7 @@ impl Server {
             match self.steps.pop_front() {
                 None => return None,
                 Some(step) if step.is_call() => return Some(step),
-                Some(Step::Yield) | Some(Step::Interrupt) => {}
+                Some(Step::Yield) | Some(Step::Interrupt) | Some(Step::ReadTimeout) => {}
                 Some(step) => self.execute(step),
             }
         }
@@ -863,20 +870,38 @@ impl Server {
 }
 
 /// Read half handed to the client, pulling the script forward as the client reads.
-struct Feed(Rc<RefCell<Server>>);
+struct Feed {
+    server: Arc<Mutex<Server>>,
+    deadline: Instant, // Configured read deadline, also bounding the prefix gate
+}
 
 impl Read for Feed {
+    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        self.deadline = deadline;
+        Ok(())
+    }
+}
+
+impl io::Read for Feed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut server = self.0.borrow_mut();
+        let outbox = self.server.lock().unwrap().outbox.clone();
+        if !outbox.await_handshake(self.deadline) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let mut server = self.server.lock().unwrap();
         loop {
             // Hand over the frames in progress, in pieces if capped
             if !server.bytes.is_empty() {
-                let mut n = buf.len().min(server.bytes.len());
+                let mut n = buf.len().min(server.bytes.len() - server.offset);
                 if server.chunk > 0 {
                     n = n.min(server.chunk);
                 }
-                buf[..n].copy_from_slice(&server.bytes[..n]);
-                server.bytes.drain(..n);
+                buf[..n].copy_from_slice(&server.bytes[server.offset..server.offset + n]);
+                server.offset += n;
+                if server.offset == server.bytes.len() {
+                    server.bytes.clear();
+                    server.offset = 0;
+                }
                 server.summary.reads += 1;
                 return Ok(n);
             }
@@ -947,6 +972,13 @@ impl Read for Feed {
                         error: ReadError::Interrupted,
                     });
                     return Err(io::ErrorKind::Interrupted.into());
+                }
+                Some(Step::ReadTimeout) => {
+                    server.steps.pop_front();
+                    server.trace(|| Event::ReadFailed {
+                        error: ReadError::TimedOut,
+                    });
+                    return Err(io::ErrorKind::TimedOut.into());
                 }
                 Some(_) => {
                     let step = server.steps.pop_front().unwrap();
@@ -1026,14 +1058,17 @@ pub fn run(steps: &[Step]) -> Summary {
         recorder: recorder.clone(),
         ..Outbox::default()
     };
-    let server = Rc::new(RefCell::new(Server::new(
+    let server = Arc::new(Mutex::new(Server::new(
         steps,
         outbox.clone(),
         recorder.clone(),
     )));
-    let identity = server.borrow().identity.public_key();
+    let identity = server.lock().unwrap().identity.public_key();
     let mut client = Client::new(crate::transport::Stream::new(
-        Feed(server.clone()),
+        Feed {
+            server: server.clone(),
+            deadline: Instant::now(),
+        },
         outbox,
         || {},
     ));
@@ -1043,20 +1078,20 @@ pub fn run(steps: &[Step]) -> Summary {
     let steps = &steps[..steps.len().min(MAX_STEPS)];
     let write_failures = steps
         .iter()
-        .any(|step| matches!(step, Step::Break | Step::Cut { .. }));
-    *recorder.borrow_mut() = Vector::open(
+        .any(|step| matches!(step, Step::Break | Step::Cut { .. } | Step::Timeout(_)));
+    *recorder.lock().unwrap() = Vector::open(
         scenario,
         steps,
         write_failures,
         identity.to_bytes().to_vec(),
-        server.borrow().attestation.as_bytes().to_vec(),
+        server.lock().unwrap().attestation.as_bytes().to_vec(),
     );
 
     let mut sender = None;
     let mut retained = None;
     let mut retained_session = None; // Model identity captured with the retained handle
     loop {
-        let call = server.borrow_mut().next_call();
+        let call = server.lock().unwrap().next_call();
         let Some(call) = call else { break };
 
         match call {
@@ -1071,21 +1106,28 @@ pub fn run(steps: &[Step]) -> Summary {
                     xdsa: signer.to_bytes().to_vec(),
                     xhpke: crypto.to_bytes().to_vec(),
                 });
+                server.lock().unwrap().outbox.prepare_handshake();
                 let failing = {
-                    let server = server.borrow();
+                    let server = server.lock().unwrap();
                     server.broken || server.cut.is_some()
                 };
                 if failing {
                     let result = client
                         .handshake_with_keys(&identity, signer, crypto, TIMESTAMP)
                         .map(|_| ());
+                    server.lock().unwrap().outbox.finish_handshake();
                     assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
                     trace(&recorder, || Event::Err {
                         kind: "SendFailed".into(),
                     });
-                    let mut server = server.borrow_mut();
+                    let mut server = server.lock().unwrap();
                     server.client_session = None;
                     server.summary.failures += 1;
+
+                    // The reset may have terminated an earlier fragment. Take
+                    // it in before marking this attempt's newly cut hello, so
+                    // each fragment is discarded at its own boundary.
+                    server.ingest();
 
                     // A broken transport lets only the reset out, and at two
                     // bytes it is too short for a middle cut to fire on. Such a
@@ -1098,14 +1140,14 @@ pub fn run(steps: &[Step]) -> Summary {
                     continue;
                 }
                 {
-                    let mut server = server.borrow_mut();
+                    let mut server = server.lock().unwrap();
                     server.client_session = None;
                     server.call = Call::Handshake {
                         generation: server.generation + 1,
-                        stale: 0,
                     };
                 }
                 let result = client.handshake_with_keys(&identity, signer, crypto, TIMESTAMP);
+                server.lock().unwrap().outbox.finish_handshake();
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
                     Err(err) => Event::Err {
@@ -1118,7 +1160,7 @@ pub fn run(steps: &[Step]) -> Summary {
                         None
                     })
                     .map_err(kind);
-                let mut server = server.borrow_mut();
+                let mut server = server.lock().unwrap();
                 match result {
                     Ok(_) => server.summary.handshakes += 1,
                     Err(_) => server.summary.failures += 1,
@@ -1127,11 +1169,11 @@ pub fn run(steps: &[Step]) -> Summary {
             }
             Step::Retain => {
                 retained = sender.clone();
-                retained_session = server.borrow().client_session;
+                retained_session = server.lock().unwrap().client_session;
                 trace(&recorder, || Event::Retain);
             }
             Step::SendOversized => {
-                let established = server.borrow().client_session.is_some();
+                let established = server.lock().unwrap().client_session.is_some();
                 trace(&recorder, || Event::Send {
                     message: OVERSIZED_MESSAGE.to_vec(),
                 });
@@ -1147,16 +1189,16 @@ pub fn run(steps: &[Step]) -> Summary {
                     other => panic!("unexpected oversized send result: {other:?}"),
                 }
                 check_session(sender.as_ref(), established);
-                server.borrow_mut().ingest();
+                server.lock().unwrap().ingest();
             }
             Step::Send(tag) | Step::SendRetained(tag) => {
-                let established = server.borrow().client_session.is_some();
+                let established = server.lock().unwrap().client_session.is_some();
                 trace(&recorder, || Event::Session { established });
                 check_session(sender.as_ref(), established);
 
                 let use_retained = matches!(call, Step::SendRetained(_));
                 let admitted = established
-                    && (!use_retained || retained_session == server.borrow().client_session);
+                    && (!use_retained || retained_session == server.lock().unwrap().client_session);
                 let sending = if use_retained {
                     retained.as_ref()
                 } else {
@@ -1166,7 +1208,7 @@ pub fn run(steps: &[Step]) -> Summary {
                 // A failed send takes the session down with it, a cut firing
                 // ahead of a broken transport
                 let expected: Result<Option<u64>, Kind> = {
-                    let mut server = server.borrow_mut();
+                    let mut server = server.lock().unwrap();
                     match (admitted, server.broken || server.cut.is_some()) {
                         (true, false) => Ok(None),
                         (true, true) => {
@@ -1198,10 +1240,10 @@ pub fn run(steps: &[Step]) -> Summary {
                 });
                 let result = result.map(|_| None).map_err(kind);
                 assert_eq!(result, expected);
-                server.borrow_mut().ingest();
+                server.lock().unwrap().ingest();
             }
             Step::Recv => {
-                server.borrow_mut().call = Call::Recv;
+                server.lock().unwrap().call = Call::Recv;
                 trace(&recorder, || Event::Recv);
                 let result = client.recv();
                 trace(&recorder, || match &result {
@@ -1213,7 +1255,7 @@ pub fn run(steps: &[Step]) -> Summary {
                     },
                 });
                 let result = result.map(Some).map_err(kind);
-                let mut server = server.borrow_mut();
+                let mut server = server.lock().unwrap();
                 match result {
                     Ok(_) => server.summary.messages += 1,
                     Err(Kind::SessionReset) => server.summary.resets += 1,
@@ -1224,14 +1266,14 @@ pub fn run(steps: &[Step]) -> Summary {
             _ => unreachable!("only calls reach the driver"),
         }
     }
-    let mut server = server.borrow_mut();
+    let mut server = server.lock().unwrap();
     server.ingest();
     let established = server.client_session.is_some();
     trace(&recorder, || Event::Session { established });
     check_session(sender.as_ref(), established);
     server.summary.established = established;
 
-    if let Some(vector) = recorder.borrow().as_ref() {
+    if let Some(vector) = recorder.lock().unwrap().as_ref() {
         vector.write();
         #[cfg(test)]
         {

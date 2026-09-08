@@ -3,8 +3,24 @@
 
 //! The byte stream and its shutdown operation, owned together by the transport.
 
-use std::io::{self, Read, Write};
+use super::io::check_deadline;
+use super::{Read, Write};
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Default deadline for writing and flushing one complete transport frame.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time an idle adapter read runs before checking cancellation again.
+/// Polling is needed because we can't wake a system call when a session dies.
+const READ_POLL: Duration = Duration::from_millis(100);
+
+/// Marks an operation refused by its reconnect scope, without closing the stream.
+#[derive(Debug, thiserror::Error)]
+#[error("reconnect I/O cancelled")]
+pub(super) struct Cancelled;
 
 /// A duplex byte stream with a shutdown operation for both directions.
 ///
@@ -17,7 +33,7 @@ use std::sync::{Arc, Condvar, Mutex};
 /// waits for those operations to return.
 ///
 /// Closing refuses further adapter I/O. Admitted operations return their normal
-/// results and may succeed while shutdown is in progress. A failed operation
+/// results and may succeed while shutdown is in progress. A failed frame send
 /// may have moved any prefix of its bytes. A successful write and flush means
 /// the adapter took the bytes, not that the peer received or processed them.
 /// Data already buffered by the transport may still be received after closing.
@@ -28,6 +44,7 @@ use std::sync::{Arc, Condvar, Mutex};
 pub struct Stream<R: Read, W: Write> {
     io: Option<(R, W)>, // Taken when ownership passes to the transport
     closer: Closer,
+    timeout: Duration, // One budget for the frame's writes and flush
 }
 
 impl<R: Read, W: Write> Stream<R, W> {
@@ -36,7 +53,16 @@ impl<R: Read, W: Write> Stream<R, W> {
         Self {
             io: Some((reader, writer)),
             closer: Closer::new(shutdown),
+            timeout: DEFAULT_WRITE_TIMEOUT,
         }
+    }
+
+    /// Sets the budget for writing and flushing one complete frame, including
+    /// any delimiter needed after failed output. Progress does not restart it.
+    /// Zero refuses output immediately.
+    pub fn set_write_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// A handle that can close the stream from another thread.
@@ -50,9 +76,9 @@ impl<R: Read, W: Write> Stream<R, W> {
     }
 
     /// Transfers ownership to a transport without closing the stream.
-    pub(crate) fn into_parts(mut self) -> (R, W, Closer) {
+    pub(crate) fn into_parts(mut self) -> (R, W, Closer, Duration) {
         let (reader, writer) = self.io.take().expect("stream consumed once");
-        (reader, writer, self.closer.clone())
+        (reader, writer, self.closer.clone(), self.timeout)
     }
 }
 
@@ -111,7 +137,8 @@ impl Closer {
     }
 
     /// Permanently closes the stream. Every caller waits until the shutdown
-    /// callback and all admitted reads, writes and flushes have returned.
+    /// callback and all admitted adapter calls, including deadline setters,
+    /// reads, writes and flushes, have returned.
     /// New I/O is refused as soon as closing begins. This does not join the
     /// threads using the transport or wait for application handlers.
     ///
@@ -193,12 +220,43 @@ pub(super) struct ReadHalf<R> {
     pub(super) closer: Closer,
 }
 
-impl<R: Read> Read for ReadHalf<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let Some(_active) = self.closer.enter() else {
-            return Ok(0);
-        };
-        self.inner.read(buf)
+impl<R: Read> ReadHalf<R> {
+    /// Reads with bounded idle polls, admitting each independently against
+    /// closure and the optional cancellation flag. A read admitted before the
+    /// flag is set may still finish normally. Idle timeouts and interrupted
+    /// reads are retried; deadline configuration errors surface without retrying.
+    pub(super) fn read(
+        &mut self,
+        buf: &mut [u8],
+        canceled: Option<&AtomicBool>,
+    ) -> io::Result<usize> {
+        loop {
+            // If the read was requested to be canceled, abort
+            if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(io::Error::other(Cancelled));
+            }
+            // Attempt the read (tracked for teardown)
+            let result = {
+                let Some(_active) = self.closer.enter() else {
+                    return Ok(0);
+                };
+                self.inner.set_read_deadline(Instant::now() + READ_POLL)?;
+                self.inner.read(buf)
+            };
+            // Timeouts (caused by our poller) or an OS interruption gets to try
+            // again, any other error bubbles up as a failure
+            match result {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
     }
 }
 
@@ -208,16 +266,62 @@ pub(super) struct WriteHalf<W> {
     pub(super) closer: Closer,
 }
 
-impl<W: Write> Write for WriteHalf<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let _active = self
-            .closer
-            .enter()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))?;
-        self.inner.write(buf)
-    }
+impl<W: Write> WriteHalf<W> {
+    /// Writes all bytes and flushes them under one absolute deadline, installing
+    /// it once before I/O. Each partial write and flush is admitted independently
+    /// against cancellation and closure. Interrupted writes are retried; zero
+    /// progress fails with WriteZero. Setter and flush errors are not retried.
+    /// An admitted call may finish after cancellation or closure begins. Failure
+    /// can leave a written prefix; framing applies the final deadline check.
+    pub(super) fn write(
+        &mut self,
+        mut bytes: &[u8],
+        deadline: Instant,
+        canceled: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        // Short circuit if the operation was canceled or already timed out
+        if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(io::Error::other(Cancelled));
+        }
+        check_deadline(deadline)?;
 
-    fn flush(&mut self) -> io::Result<()> {
+        // Set the deadline for the next write, taking care of racy shutdowns
+        {
+            let _active = self
+                .closer
+                .enter()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))?;
+            self.inner.set_write_deadline(deadline)?;
+        }
+        // Keep flushing the data while we have any bytes left
+        while !bytes.is_empty() {
+            // Ensure that a loop iteration didn't hit a cancellation or timeout
+            if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(io::Error::other(Cancelled));
+            }
+            check_deadline(deadline)?;
+
+            // Attempt to write as much data as possible
+            let result = {
+                let _active = self
+                    .closer
+                    .enter()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))?;
+                self.inner.write(bytes)
+            };
+            match result {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => bytes = &bytes[n..],
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        // Flush is part of the same operation and gets its own admission
+        if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(io::Error::other(Cancelled));
+        }
+        check_deadline(deadline)?;
+
         let _active = self
             .closer
             .enter()
@@ -230,9 +334,9 @@ impl<W: Write> Write for WriteHalf<W> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::transport::{Client, Error};
-    use darkbio_crypto::xdsa;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::transport::Client;
+    use crate::transport::testing::Memory;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -245,14 +349,18 @@ mod tests {
         entered: mpsc::Sender<()>,
         released: mpsc::Receiver<()>,
         fails: bool,
+        deadline: Option<Instant>,
     }
 
     impl Adapter {
-        fn wait(&self) -> io::Result<()> {
+        /// Waits for the test's release without exceeding this adapter call's deadline.
+        fn wait(&self, deadline: Instant) -> io::Result<()> {
             self.entered.send(()).unwrap();
-            self.released.recv_timeout(PATIENCE).unwrap();
+            self.released
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
             if self.fails {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "adapter timeout"))
+                Err(io::Error::other("adapter failure"))
             } else {
                 Ok(())
             }
@@ -260,21 +368,35 @@ mod tests {
     }
 
     impl Read for Adapter {
+        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    impl io::Read for Adapter {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.wait()?;
+            self.wait(self.deadline.expect("read deadline installed"))?;
             buf[0] = 0x5a;
             Ok(1)
         }
     }
 
     impl Write for Adapter {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    impl io::Write for Adapter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.wait()?;
+            self.wait(self.deadline.expect("write deadline installed"))?;
             Ok(buf.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            self.wait()
+            self.wait(self.deadline.expect("write deadline installed"))
         }
     }
 
@@ -294,6 +416,7 @@ mod tests {
                         entered,
                         released,
                         fails,
+                        deadline: None,
                     },
                     closer,
                 )
@@ -304,30 +427,38 @@ mod tests {
         let result = io.join().unwrap();
         if fails {
             let err = result.unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-            assert_eq!(err.to_string(), "adapter timeout");
+            assert_eq!(err.kind(), io::ErrorKind::Other);
+            assert_eq!(err.to_string(), "adapter failure");
         } else {
             result.unwrap();
         }
     }
 
-    // Tests that shutdown preserves successful adapter results and original
-    // errors, releasing admitted reads, writes and flushes from the shutdown
-    // callback so each operation completes after closing has begun.
+    // Tests that shutdown preserves admitted read and final flush results,
+    // including original errors. An admitted write can accept its bytes after
+    // closing starts, but the full operation then refuses the subsequent flush.
     #[test]
     fn test_admitted_io_preserves_results_during_shutdown() {
         for fails in [false, true] {
             during_shutdown(fails, |inner, closer| {
                 let mut buf = [0];
-                assert_eq!(ReadHalf { inner, closer }.read(&mut buf)?, 1);
+                assert_eq!(ReadHalf { inner, closer }.read(&mut buf, None)?, 1);
                 assert_eq!(buf, [0x5a]);
                 Ok(())
             });
-            during_shutdown(fails, |inner, closer| {
-                assert_eq!(WriteHalf { inner, closer }.write(&[1, 2, 3])?, 3);
-                Ok(())
+            during_shutdown(fails, move |inner, closer| {
+                let result =
+                    WriteHalf { inner, closer }.write(&[1, 2, 3], Instant::now() + PATIENCE, None);
+                if fails {
+                    result
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotConnected);
+                    Ok(())
+                }
             });
-            during_shutdown(fails, |inner, closer| WriteHalf { inner, closer }.flush());
+            during_shutdown(fails, |inner, closer| {
+                WriteHalf { inner, closer }.write(&[], Instant::now() + PATIENCE, None)
+            });
         }
     }
 
@@ -337,7 +468,7 @@ mod tests {
     #[test]
     fn test_ownership_and_repeated_close() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let stream = Stream::new(io::empty(), io::sink(), {
+        let stream = Stream::new(Memory::new(io::empty()), Memory::new(io::sink()), {
             let calls = calls.clone();
             move || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -356,7 +487,7 @@ mod tests {
         drop(closer.clone());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let stream = Stream::new(io::empty(), io::sink(), {
+        let stream = Stream::new(Memory::new(io::empty()), Memory::new(io::sink()), {
             let calls = calls.clone();
             move || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -377,10 +508,14 @@ mod tests {
     fn test_every_closer_waits_for_the_shutdown_callback() {
         let (entered, callback) = mpsc::channel();
         let (release, released) = mpsc::channel();
-        let stream = Stream::new(io::empty(), io::sink(), move || {
-            entered.send(()).unwrap();
-            released.recv_timeout(PATIENCE).unwrap();
-        });
+        let stream = Stream::new(
+            Memory::new(io::empty()),
+            Memory::new(io::sink()),
+            move || {
+                entered.send(()).unwrap();
+                released.recv_timeout(PATIENCE).unwrap();
+            },
+        );
         let closer = stream.closer();
         let (finished, finishes) = mpsc::channel();
         let first = thread::spawn({
@@ -443,20 +578,27 @@ mod tests {
     }
 
     impl Gate {
-        fn call(&self, at: BlockAt) {
+        /// Holds the selected operation until released or its supplied deadline expires.
+        fn call(&self, at: BlockAt, deadline: Instant) -> io::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if at == self.at {
                 self.entered.send(()).unwrap();
                 let (released, _) = self
                     .changed
-                    .wait_timeout_while(self.released.lock().unwrap(), PATIENCE, |released| {
-                        !*released
-                    })
+                    .wait_timeout_while(
+                        self.released.lock().unwrap(),
+                        deadline.saturating_duration_since(Instant::now()),
+                        |released| !*released,
+                    )
                     .unwrap();
-                assert!(*released, "driver never completed cancellation");
+                if !*released {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
             }
+            Ok(())
         }
 
+        /// Allows the admitted operation to finish after shutdown was requested.
         fn release(&self) {
             *self.released.lock().unwrap() = true;
             self.changed.notify_all();
@@ -464,30 +606,55 @@ mod tests {
     }
 
     /// Two byte-stream halves sharing the driver's cancellation gate.
-    struct GatedAdapter(Arc<Gate>);
+    struct GatedAdapter {
+        gate: Arc<Gate>,
+        deadline: Option<Instant>,
+    }
 
     impl Read for GatedAdapter {
+        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    impl io::Read for GatedAdapter {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            self.0.call(BlockAt::Read);
+            self.gate.call(
+                BlockAt::Read,
+                self.deadline.expect("read deadline installed"),
+            )?;
             Ok(0)
         }
     }
 
     impl Write for GatedAdapter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.call(BlockAt::Write);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.call(BlockAt::Flush);
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
             Ok(())
         }
     }
 
+    impl io::Write for GatedAdapter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.gate.call(
+                BlockAt::Write,
+                self.deadline.expect("write deadline installed"),
+            )?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.gate.call(
+                BlockAt::Flush,
+                self.deadline.expect("write deadline installed"),
+            )
+        }
+    }
+
     // Tests that close waits for an admitted read, write or flush even after
-    // the shutdown callback returns. A gate holds the operation during a client
-    // handshake; subsequent client I/O must never reach the closed adapter.
+    // the shutdown callback returns. A gate holds each operation independently;
+    // subsequent I/O must never reach the closed adapter.
     #[test]
     fn test_every_closer_waits_for_active_io_and_refuses_new_io() {
         for at in [BlockAt::Read, BlockAt::Write, BlockAt::Flush] {
@@ -501,18 +668,39 @@ mod tests {
             });
             let (requested, requests) = mpsc::channel();
             let stream = Stream::new(
-                GatedAdapter(gate.clone()),
-                GatedAdapter(gate.clone()),
+                GatedAdapter {
+                    gate: gate.clone(),
+                    deadline: None,
+                },
+                GatedAdapter {
+                    gate: gate.clone(),
+                    deadline: None,
+                },
                 move || {
                     requested.send(()).unwrap();
                 },
             );
-            let mut client = Client::new(stream);
-            let closer = client.closer();
+            let (reader, writer, closer, _) = stream.into_parts();
+            let io_closer = closer.clone();
             let io = thread::spawn(move || {
-                let identity = xdsa::SecretKey::generate().public_key();
-                assert!(client.connect(&identity).is_err());
-                client
+                let mut reader = ReadHalf {
+                    inner: reader,
+                    closer: io_closer.clone(),
+                };
+                let mut writer = WriteHalf {
+                    inner: writer,
+                    closer: io_closer,
+                };
+                let deadline = Instant::now() + PATIENCE;
+                match at {
+                    BlockAt::Read => assert_eq!(reader.read(&mut [0], None).unwrap(), 0),
+                    BlockAt::Write => assert_eq!(
+                        writer.write(&[1], deadline, None).unwrap_err().kind(),
+                        io::ErrorKind::NotConnected
+                    ),
+                    BlockAt::Flush => writer.write(&[], deadline, None).unwrap(),
+                }
+                (reader, writer)
             });
             entries.recv_timeout(PATIENCE).unwrap();
             let (finished, finishes) = mpsc::channel();
@@ -529,17 +717,438 @@ mod tests {
             gate.release();
             finishes.recv_timeout(PATIENCE).unwrap();
             closing.join().unwrap();
-            let mut client = io.join().unwrap();
+            let (mut reader, mut writer) = io.join().unwrap();
             let calls = gate.calls.load(Ordering::SeqCst);
-            assert!(matches!(client.recv(), Err(Error::Terminated)));
-            let identity = xdsa::SecretKey::generate().public_key();
+            assert_eq!(reader.read(&mut [0], None).unwrap(), 0);
             assert!(matches!(
-                client.connect(&identity),
-                Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::NotConnected
+                writer.write(&[1], Instant::now() + PATIENCE, None),
+                Err(err) if err.kind() == io::ErrorKind::NotConnected
             ));
             assert_eq!(gate.calls.load(Ordering::SeqCst), calls);
-            drop(client);
+            closer.close();
             assert!(requests.try_recv().is_err(), "shutdown called twice");
+        }
+    }
+
+    /// Accepts one byte per write and can hold flush until its supplied deadline.
+    /// Recorded deadlines reveal whether partial progress restarts the budget.
+    struct BudgetWriter {
+        bytes: Vec<u8>,
+        deadlines: Vec<Instant>,
+        stall_flush: bool,
+        deadline: Option<Instant>,
+        settings: usize,
+    }
+
+    impl Write for BudgetWriter {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            self.settings += 1;
+            Ok(())
+        }
+    }
+
+    impl io::Write for BudgetWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let deadline = self.deadline.expect("write deadline installed");
+            check_deadline(deadline)?;
+            self.deadlines.push(deadline);
+            self.bytes.push(bytes[0]);
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let deadline = self.deadline.expect("write deadline installed");
+            self.deadlines.push(deadline);
+            if self.stall_flush {
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            check_deadline(deadline)
+        }
+    }
+
+    // Tests that partial writes and a blocked flush share one absolute deadline,
+    // a timeout leaves the stream reusable, and a zero budget never calls I/O.
+    #[test]
+    fn test_output_deadline_and_reuse() {
+        let timeout = Duration::from_millis(40);
+        let stream = Stream::new(
+            Memory::new(io::empty()),
+            BudgetWriter {
+                bytes: Vec::new(),
+                deadlines: Vec::new(),
+                stall_flush: true,
+                deadline: None,
+                settings: 0,
+            },
+            || {},
+        )
+        .set_write_timeout(timeout);
+        let (_, inner, closer, configured) = stream.into_parts();
+        assert_eq!(configured, timeout);
+        let mut writer = WriteHalf { inner, closer };
+        let deadline = Instant::now() + configured;
+        assert_eq!(
+            writer.write(b"abc", deadline, None).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(writer.inner.deadlines, vec![deadline; 4]);
+        assert_eq!(writer.inner.settings, 1);
+
+        writer.inner.stall_flush = false;
+        let deadline = Instant::now() + PATIENCE;
+        writer.write(b"d", deadline, None).unwrap();
+        assert_eq!(writer.inner.bytes, b"abcd");
+        assert_eq!(writer.inner.settings, 2);
+
+        let calls = writer.inner.deadlines.len();
+        let deadline = Instant::now();
+        assert!(matches!(
+            writer.write(b"e", deadline, None),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert_eq!(writer.inner.deadlines.len(), calls);
+        assert_eq!(writer.inner.settings, 2);
+        writer.closer.close();
+    }
+
+    // Tests the complete write operation with interruption and partial progress:
+    // retries retain the unsent suffix, zero progress fails without flushing,
+    // and an interrupted flush is returned directly rather than retried.
+    #[test]
+    fn test_partial_write_retries_and_failures() {
+        /// Scripts adapter results and records offered and accepted byte sequences.
+        struct Script {
+            results: std::collections::VecDeque<io::Result<usize>>,
+            offered: Vec<Vec<u8>>,
+            accepted: Vec<u8>,
+            interrupted_flush: bool,
+            flushes: usize,
+            settings: usize,
+            deadline: Option<Instant>,
+        }
+
+        impl Write for Script {
+            fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+                self.settings += 1;
+                self.deadline = Some(deadline);
+                Ok(())
+            }
+        }
+
+        impl io::Write for Script {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                check_deadline(self.deadline.expect("write deadline installed"))?;
+                self.offered.push(bytes.to_vec());
+                let result = self.results.pop_front().expect("unexpected write");
+                if let Ok(size) = &result {
+                    self.accepted.extend_from_slice(&bytes[..*size]);
+                }
+                result
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                check_deadline(self.deadline.expect("write deadline installed"))?;
+                self.flushes += 1;
+                assert_eq!(self.flushes, 1, "flush retried");
+                if self.interrupted_flush {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        for (stalls, interrupted_flush) in [(false, false), (true, false), (false, true)] {
+            let mut writer = WriteHalf {
+                inner: Script {
+                    results: [
+                        Err(io::ErrorKind::Interrupted.into()),
+                        Ok(1),
+                        Ok(usize::from(!stalls)),
+                    ]
+                    .into(),
+                    offered: Vec::new(),
+                    accepted: Vec::new(),
+                    interrupted_flush,
+                    flushes: 0,
+                    settings: 0,
+                    deadline: None,
+                },
+                closer: Closer::new(|| {}),
+            };
+            let result = writer.write(b"ab", Instant::now() + PATIENCE, None);
+            if stalls {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
+            } else if interrupted_flush {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                writer.inner.offered,
+                [b"ab".to_vec(), b"ab".to_vec(), b"b".to_vec()]
+            );
+            assert_eq!(
+                writer.inner.accepted,
+                if stalls { &b"a"[..] } else { &b"ab"[..] }
+            );
+            assert_eq!(writer.inner.flushes, usize::from(!stalls));
+            assert_eq!(writer.inner.settings, 1);
+            writer.closer.close();
+        }
+    }
+
+    // Tests that a failed deadline setter prevents byte I/O and preserves its
+    // error, including Interrupted and TimedOut: only retryable errors from an
+    // actual read may start another attempt.
+    #[test]
+    fn test_deadline_setter_failure_prevents_io() {
+        /// Rejects deadline installation and panics if byte I/O is attempted.
+        struct Refused {
+            settings: usize,
+            kind: io::ErrorKind,
+        }
+
+        impl Refused {
+            /// Fails once so an incorrect polling retry fails the test promptly.
+            fn reject(&mut self) -> io::Result<()> {
+                self.settings += 1;
+                assert_eq!(self.settings, 1, "deadline setter failure retried");
+                Err(io::Error::new(self.kind, "deadline refused"))
+            }
+        }
+
+        impl Read for Refused {
+            fn set_read_deadline(&mut self, _: Instant) -> io::Result<()> {
+                self.reject()
+            }
+        }
+
+        impl io::Read for Refused {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("read after deadline setter failed")
+            }
+        }
+
+        impl Write for Refused {
+            fn set_write_deadline(&mut self, _: Instant) -> io::Result<()> {
+                self.reject()
+            }
+        }
+
+        impl io::Write for Refused {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("write after deadline setter failed")
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("flush after deadline setter failed")
+            }
+        }
+
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::TimedOut] {
+            let closer = Closer::new(|| {});
+            let mut reader = ReadHalf {
+                inner: Refused { settings: 0, kind },
+                closer: closer.clone(),
+            };
+            let err = reader.read(&mut [0], None).unwrap_err();
+            assert_eq!(err.kind(), kind);
+            assert_eq!(err.to_string(), "deadline refused");
+            let mut writer = WriteHalf {
+                inner: Refused { settings: 0, kind },
+                closer: closer.clone(),
+            };
+            assert!(matches!(
+                writer.write(&[1], Instant::now() + PATIENCE, None),
+                Err(err) if err.kind() == kind && err.to_string() == "deadline refused"
+            ));
+
+            closer.close();
+            assert_eq!(reader.read(&mut [0], None).unwrap(), 0);
+            assert!(matches!(
+                writer.write(&[1], Instant::now() + PATIENCE, None),
+                Err(err) if err.kind() == io::ErrorKind::NotConnected
+            ));
+            assert_eq!(reader.inner.settings, 1);
+            assert_eq!(writer.inner.settings, 1);
+        }
+    }
+
+    // Tests that a partial write returning after its deadline leaves its
+    // accepted byte intact but fails the complete operation. Depending on the
+    // input length, either the remaining write or flush is refused before I/O.
+    #[test]
+    fn test_late_write_preserves_progress() {
+        /// Accepts one byte but delays returning until its installed deadline.
+        #[derive(Default)]
+        struct LateWriter {
+            deadline: Option<Instant>,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for LateWriter {
+            fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+                self.deadline = Some(deadline);
+                Ok(())
+            }
+        }
+
+        impl io::Write for LateWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.push(bytes[0]);
+                thread::sleep(
+                    self.deadline
+                        .expect("write deadline installed")
+                        .saturating_duration_since(Instant::now()),
+                );
+                Ok(1)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("flush admitted after deadline expired")
+            }
+        }
+
+        for bytes in [&b"a"[..], &b"ab"[..]] {
+            let mut writer = WriteHalf {
+                inner: LateWriter::default(),
+                closer: Closer::new(|| {}),
+            };
+            let deadline = Instant::now() + Duration::from_millis(40);
+            assert_eq!(
+                writer.write(bytes, deadline, None).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert_eq!(writer.inner.bytes, b"a");
+            writer.closer.close();
+        }
+    }
+
+    /// An idle reader timing out each poll until the test makes a byte available.
+    struct PollReader {
+        ready: Arc<AtomicBool>,
+        entered: mpsc::Sender<()>,
+        deadline: Option<Instant>,
+    }
+
+    impl Read for PollReader {
+        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    impl io::Read for PollReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.ready.load(Ordering::Acquire) {
+                buf[0] = 0x5a;
+                return Ok(1);
+            }
+            self.entered.send(()).unwrap();
+            thread::sleep(
+                self.deadline
+                    .expect("read deadline installed")
+                    .saturating_duration_since(Instant::now()),
+            );
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    // Tests that idle polls observe scope cancellation without closing the
+    // stream, and a fresh scope can immediately receive on the same adapter.
+    #[test]
+    fn test_cancel_idle_read_and_reuse() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let closer = Closer::new({
+            let closes = closes.clone();
+            move || {
+                closes.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let (entered, entries) = mpsc::channel();
+        let reader = ReadHalf {
+            inner: PollReader {
+                ready: ready.clone(),
+                entered,
+                deadline: None,
+            },
+            closer,
+        };
+        let reading = thread::spawn({
+            let cancellation = cancellation.clone();
+            move || {
+                let mut reader = reader;
+                let result = reader.read(&mut [0], Some(&cancellation));
+                (reader, result)
+            }
+        });
+        entries.recv_timeout(PATIENCE).unwrap();
+        cancellation.store(true, Ordering::Relaxed);
+        let (mut reader, result) = reading.join().unwrap();
+        let err = result.unwrap_err();
+        assert!(err.get_ref().unwrap().is::<Cancelled>());
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+
+        ready.store(true, Ordering::Release);
+        let fresh = AtomicBool::new(false);
+        let mut bytes = [0];
+        assert_eq!(reader.read(&mut bytes, Some(&fresh)).unwrap(), 1);
+        assert_eq!(bytes, [0x5a]);
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        reader.closer.close();
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    // Tests cancellation during a blocked write or final flush. Cancellation
+    // after an admitted write refuses its remaining flush, while an admitted
+    // final flush may finish successfully. Both cases refuse later output.
+    #[test]
+    fn test_cancel_output_preserves_admitted_result() {
+        for at in [BlockAt::Write, BlockAt::Flush] {
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let (entered, entries) = mpsc::channel();
+            let gate = Arc::new(Gate {
+                at,
+                entered,
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+                calls: AtomicUsize::new(0),
+            });
+            let mut writer = WriteHalf {
+                inner: GatedAdapter {
+                    gate: gate.clone(),
+                    deadline: None,
+                },
+                closer: Closer::new(|| {}),
+            };
+            let running = thread::spawn({
+                let cancellation = cancellation.clone();
+                move || {
+                    let result = writer.write(&[7], Instant::now() + PATIENCE, Some(&cancellation));
+                    (writer, result)
+                }
+            });
+            entries.recv_timeout(PATIENCE).unwrap();
+            cancellation.store(true, Ordering::Relaxed);
+            gate.release();
+            let (mut writer, result) = running.join().unwrap();
+            if at == BlockAt::Write {
+                assert!(result.unwrap_err().get_ref().unwrap().is::<Cancelled>());
+            } else {
+                result.unwrap();
+            }
+            assert!(matches!(
+                writer.write(&[8], Instant::now() + PATIENCE, Some(&cancellation)),
+                Err(err) if err.get_ref().unwrap().is::<Cancelled>()
+            ));
+            let expected_calls = if at == BlockAt::Write { 1 } else { 2 };
+            assert_eq!(gate.calls.load(Ordering::SeqCst), expected_calls);
+            writer.closer.close();
         }
     }
 }

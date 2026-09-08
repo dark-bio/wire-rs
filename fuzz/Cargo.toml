@@ -45,3 +45,10 @@ path = "fuzz_targets/protocol_client.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "transport-duplex"
+path = "fuzz_targets/transport_duplex.rs"
+test = false
+doc = false
+bench = false

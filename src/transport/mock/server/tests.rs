@@ -195,8 +195,8 @@ fn test_scripted_flawed_hellos() {
     }
 }
 
-// Tests that frames not meant for the handshake in progress are skipped
-// as stale, up to the bound.
+// Tests that frames not meant for the handshake in progress are drained until
+// the fresh hello arrives, including backlogs larger than the old fixed limit.
 #[test]
 fn test_scripted_stale_skipping() {
     let summary = run_logged(&[
@@ -238,18 +238,15 @@ fn test_scripted_stale_skipping() {
     assert_eq!(summary.handshakes, 2);
     assert!(summary.established);
 
-    let mut steps = vec![Step::Handshake];
-    steps.extend(std::iter::repeat_n(Step::Dropped, MAX_STALE_FRAMES));
-    steps.push(Step::Hello);
-    let summary = run_logged(&steps);
-    assert!(summary.established);
-
-    let mut steps = vec![Step::Handshake];
-    steps.extend(std::iter::repeat_n(Step::Dropped, MAX_STALE_FRAMES + 1));
-    steps.push(Step::Hello);
-    let summary = run_logged(&steps);
-    assert!(!summary.established);
-    assert_eq!(summary.failures, 1);
+    // A backlog larger than the old fixed allowance is still drained fully.
+    for stale in [40, MAX_STEPS - 2] {
+        let mut steps = vec![Step::Handshake];
+        steps.extend(std::iter::repeat_n(Step::Dropped, stale));
+        steps.push(Step::Hello);
+        let summary = run_logged(&steps);
+        assert!(summary.established);
+        assert_eq!(summary.failures, 0);
+    }
 
     // A frame failing to decode, the leftover of a transfer cut short, is
     // stale like any other
@@ -525,6 +522,50 @@ fn test_scripted_cut_sends() {
     assert_eq!(summary.failures, 1);
 }
 
+// Tests consecutive failed handshakes followed by a successful exchange. Each
+// reset must retire the previous truncated hello before another output failure
+// leaves its own tail. Covers cuts and timeouts, including a failed reset that
+// leaves the earlier fragment untouched and one that only terminates it.
+#[test]
+fn test_scripted_consecutive_handshake_failures() {
+    for timeout in [false, true] {
+        for point in [
+            CutPoint::Middle(5),
+            CutPoint::Start,
+            CutPoint::Middle(0),
+            CutPoint::Middle(u16::MAX),
+            CutPoint::Delimiter,
+            CutPoint::Flush,
+        ] {
+            let fault = |point| {
+                if timeout {
+                    Step::Timeout(point)
+                } else {
+                    Step::Cut {
+                        point,
+                        then_broken: false,
+                    }
+                }
+            };
+            let summary = run_logged(&[
+                fault(CutPoint::Middle(5)),
+                Step::Handshake,
+                fault(point),
+                Step::Handshake,
+                Step::Handshake,
+                Step::Hello,
+                Step::Send(1),
+                Step::Reply(1),
+                Step::Recv,
+            ]);
+            assert!(summary.established, "{point:?}, timeout: {timeout}");
+            assert_eq!(summary.handshakes, 1, "{point:?}, timeout: {timeout}");
+            assert_eq!(summary.messages, 1, "{point:?}, timeout: {timeout}");
+            assert_eq!(summary.failures, 2, "{point:?}, timeout: {timeout}");
+        }
+    }
+}
+
 // Tests that frames arriving in pieces, down to a byte per read, are
 // reassembled and read like whole ones.
 #[test]
@@ -709,6 +750,88 @@ fn test_scripted_interrupted_reads() {
     assert_eq!(summary.failures, 0);
 }
 
+// Tests that expired idle read polls are retried during the handshake and an
+// established receive, without invalidating a retained sender or either crypto
+// sequence. Only actual input completes the receive.
+#[test]
+fn test_scripted_read_timeouts() {
+    let summary = run_logged(&[
+        Step::Handshake,
+        Step::ReadTimeout,
+        Step::Hello,
+        Step::Retain,
+        Step::SendRetained(1),
+        Step::Recv,
+        Step::ReadTimeout,
+        Step::ReadTimeout,
+        Step::Reply(1),
+        Step::SendRetained(2),
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.handshakes, 1);
+    assert_eq!(summary.messages, 1);
+    assert_eq!(summary.failures, 0);
+}
+
+// Tests write and flush timeouts during the concurrently written handshake
+// prefix. The synthetic reader waits for that prefix and must be cancelled when
+// output fails; a subsequent handshake reuses the same stream successfully.
+#[test]
+fn test_scripted_handshake_timeouts() {
+    for point in [
+        CutPoint::Start,
+        CutPoint::Middle(7),
+        CutPoint::Delimiter,
+        CutPoint::Flush,
+    ] {
+        let summary = run_logged(&[
+            Step::Timeout(point),
+            Step::Handshake,
+            Step::Handshake,
+            Step::Hello,
+            Step::Send(1),
+            Step::Recv,
+            Step::Reply(1),
+        ]);
+        assert!(summary.established, "{point:?}");
+        assert_eq!(summary.handshakes, 1, "{point:?}");
+        assert_eq!(summary.messages, 1, "{point:?}");
+        assert_eq!(summary.failures, 1, "{point:?}");
+    }
+}
+
+// Tests a timed-out established send ending its binding and retained handles.
+// Reconnecting drains any interrupted output and issues a new sender; the old
+// handle remains refused and cannot affect the replacement's exchange.
+#[test]
+fn test_scripted_send_timeouts() {
+    for point in [
+        CutPoint::Start,
+        CutPoint::Middle(7),
+        CutPoint::Delimiter,
+        CutPoint::Flush,
+    ] {
+        let summary = run_logged(&[
+            Step::Handshake,
+            Step::Hello,
+            Step::Retain,
+            Step::Timeout(point),
+            Step::Send(1),
+            Step::SendRetained(2),
+            Step::Handshake,
+            Step::Hello,
+            Step::SendRetained(3),
+            Step::Send(4),
+            Step::Recv,
+            Step::Reply(4),
+        ]);
+        assert!(summary.established, "{point:?}");
+        assert_eq!(summary.handshakes, 2, "{point:?}");
+        assert_eq!(summary.messages, 1, "{point:?}");
+        assert_eq!(summary.failures, 0, "{point:?}");
+    }
+}
+
 // Tests that an oversized receive ends the session and invalidates retained
 // senders before accepting a queued reply. Draining the failed frame does not
 // restore the session; only a new handshake supplies a working sender.
@@ -766,22 +889,38 @@ fn test_scripted_oversized_fragments() {
     }
 }
 
-// Tests that a skipped oversized frame consumes exactly one stale-frame slot
-// during a handshake. Filling the remaining slots still permits the hello;
-// exceeding the budget fails that handshake and a new attempt can recover.
+// Tests an oversized stale frame arriving one byte per read after a partial
+// hello, followed by a successful handshake. The driver and vector replay must
+// advance through these chunks without copying the unread frame on every byte.
 #[test]
-fn test_scripted_oversized_stale_budget() {
-    for stale in [MAX_STALE_FRAMES - 1, MAX_STALE_FRAMES] {
+fn test_scripted_bytewise_oversized_frame() {
+    let summary = run_logged(&[
+        Step::Chunk(1),
+        Step::Handshake,
+        Step::Batch(3),
+        Step::Partial,
+        Step::Oversized,
+        Step::Hello,
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.handshakes, 1);
+    assert_eq!(summary.failures, 0);
+    assert!(summary.reads > MAX_FRAME_SIZE);
+}
+
+// Tests that an oversized stale frame and a large backlog after it are drained
+// before the matching hello. The number of queued old frames cannot reject an
+// otherwise valid handshake.
+#[test]
+fn test_scripted_oversized_stale_frames() {
+    for stale in [40, MAX_STEPS - 4] {
         let mut steps = vec![Step::Handshake, Step::Batch(255), Step::Oversized];
         steps.extend(std::iter::repeat_n(Step::Dropped, stale));
         steps.push(Step::Hello);
-        if stale == MAX_STALE_FRAMES {
-            steps.extend([Step::Handshake, Step::Hello]);
-        }
         let summary = run_logged(&steps);
         assert!(summary.established, "stale {stale}");
         assert_eq!(summary.handshakes, 1, "stale {stale}");
-        assert_eq!(summary.failures, usize::from(stale == MAX_STALE_FRAMES));
+        assert_eq!(summary.failures, 0, "stale {stale}");
     }
 }
 

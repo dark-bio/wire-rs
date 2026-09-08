@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::testing;
-use crate::transport::client::MAX_STALE_FRAMES;
 
 /// Runs a script with logging enabled.
 fn run_logged(steps: &[Step]) -> Summary {
@@ -427,21 +426,22 @@ fn test_scripted_junk_signals_dropped() {
 }
 
 // Tests that every request into a session the server no longer has earns a
-// signal of its own. A client pipelining a stale bound's worth of them
+// signal of its own. A client pipelining a backlog of them
 // queues up as many in front of its next handshake.
 #[test]
 fn test_scripted_requests_into_dead_session() {
+    let stale = 40;
     let mut steps = vec![
         Step::Reset,
         Step::Hello,
         Step::Ack,
         Step::Junk(vec![0xde, 0xad]),
     ];
-    steps.extend((0..MAX_STALE_FRAMES as u8).map(Step::Request));
+    steps.extend((0..stale).map(Step::Request));
     let summary = run_logged(&steps);
     assert_eq!(summary.state, State::Idle);
     assert_eq!(summary.delivered, 0);
-    assert_eq!(summary.dropped, MAX_STALE_FRAMES + 1);
+    assert_eq!(summary.dropped, usize::from(stale) + 1);
 }
 
 // Tests that truncated copies of valid frames are junk in every state.
@@ -593,6 +593,203 @@ fn test_scripted_broken_transport() {
     assert_eq!(summary.delivered, 0);
     assert_eq!(summary.replies, 0);
     assert_eq!(summary.dropped, 2);
+}
+
+// Tests expired read polls while idle, during both handshake phases, and in an
+// established session. Polling timeouts leave every phase intact and produce no
+// notification or extra session transition.
+#[test]
+fn test_scripted_read_timeouts() {
+    let summary = run_logged(&[
+        Step::ReadTimeout,
+        Step::Reset,
+        Step::ReadTimeout,
+        Step::Hello,
+        Step::ReadTimeout,
+        Step::Ack,
+        Step::ReadTimeout,
+        Step::Request(1),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 1);
+    assert_eq!(summary.delivered, 1);
+    assert_eq!(summary.replies, 1);
+    assert_eq!(summary.dropped, 0);
+}
+
+// Tests an oversized frame arriving one byte at a time, ending the session and
+// refusing its retained sender before a fresh handshake recovers. Advancing the
+// mock input must not copy the unread multi-megabyte frame for every byte.
+#[test]
+fn test_scripted_bytewise_oversized_frame() {
+    let summary = run_logged(&[
+        Step::Chunk(1),
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::Retain,
+        Step::Oversized,
+        Step::SendRetained(1),
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::Request(2),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.delivered, 1);
+    assert_eq!(summary.dropped, 1);
+    assert!(summary.reads > MAX_FRAME_SIZE);
+}
+
+// Tests ArkHello write and flush timeouts surfacing from receive without a new
+// notification budget. The failed attempt leaves the stream reusable, and the
+// next handshake resynchronizes whatever prefix reached the client.
+#[test]
+fn test_scripted_handshake_timeouts() {
+    for point in [
+        CutPoint::Start,
+        CutPoint::Middle(7),
+        CutPoint::Delimiter,
+        CutPoint::Flush,
+    ] {
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Timeout(point),
+            Step::Hello,
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Request(1),
+        ]);
+        assert_eq!(summary.state, State::Established, "{point:?}");
+        assert_eq!(summary.delivered, 1, "{point:?}");
+        assert_eq!(summary.replies, 1, "{point:?}");
+        assert_eq!(
+            summary.dropped,
+            usize::from(matches!(point, CutPoint::Start | CutPoint::Flush)),
+            "{point:?}"
+        );
+    }
+}
+
+// Tests that an expired send does not start a fresh notification write, and
+// repeated use of its retained sender emits nothing. A later reset allows a new
+// handshake; only that handshake's resync delimiter terminates any old prefix.
+#[test]
+fn test_scripted_send_timeouts() {
+    for point in [
+        CutPoint::Start,
+        CutPoint::Middle(7),
+        CutPoint::Delimiter,
+        CutPoint::Flush,
+    ] {
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Retain,
+            Step::Timeout(point),
+            Step::Send(1),
+            Step::SendRetained(2),
+            Step::SendRetained(3),
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Request(4),
+        ]);
+        assert_eq!(summary.state, State::Established, "{point:?}");
+        assert_eq!(summary.delivered, 1, "{point:?}");
+        assert_eq!(
+            summary.dropped,
+            usize::from(matches!(point, CutPoint::Start | CutPoint::Flush)),
+            "{point:?}"
+        );
+        assert_eq!(
+            summary.replies,
+            1 + usize::from(matches!(point, CutPoint::Delimiter | CutPoint::Flush)),
+            "{point:?}"
+        );
+    }
+}
+
+// Tests cutting a combined recovery delimiter and ArkHello after an earlier
+// timeout. Offset zero accepts only recovery; positive offsets leave a fragment.
+// The cut must fire even when ordinary writes are also configured to fail.
+#[test]
+fn test_scripted_recovery_prefix_cuts() {
+    for offset in [0, 1, u16::MAX] {
+        for broken in [false, true] {
+            let summary = run_logged(&[
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Timeout(CutPoint::Start),
+                Step::Send(1),
+                Step::Cut {
+                    point: CutPoint::Middle(offset),
+                    then_broken: broken,
+                },
+                Step::Reset,
+                Step::Hello,
+                Step::Heal,
+                Step::Reset,
+                Step::Hello,
+                Step::Ack,
+                Step::Request(2),
+            ]);
+            assert_eq!(
+                summary.state,
+                State::Established,
+                "offset {offset}, broken {broken}"
+            );
+            assert_eq!(summary.handshakes, 2, "offset {offset}, broken {broken}");
+            assert_eq!(summary.delivered, 1, "offset {offset}, broken {broken}");
+            assert_eq!(
+                summary.fragments,
+                usize::from(offset != 0),
+                "offset {offset}, broken {broken}"
+            );
+            assert_eq!(
+                summary.dropped,
+                1 + usize::from(offset == 0) + usize::from(!broken),
+                "offset {offset}, broken {broken}"
+            );
+        }
+    }
+}
+
+// Tests cuts that apply to a recovery delimiter and dropped-session signal
+// offered together. Delimiter accepts only recovery; Flush accepts both zeros
+// before failing. The next handshake recovers the same stream in either case.
+#[test]
+fn test_scripted_recovery_signal_cuts() {
+    for point in [CutPoint::Delimiter, CutPoint::Flush] {
+        let summary = run_logged(&[
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Timeout(CutPoint::Start),
+            Step::Send(1),
+            Step::Cut {
+                point,
+                then_broken: false,
+            },
+            Step::Junk(vec![0xde, 0xad]),
+            Step::Reset,
+            Step::Hello,
+            Step::Ack,
+            Step::Request(2),
+        ]);
+        assert_eq!(summary.state, State::Established, "{point:?}");
+        assert_eq!(summary.handshakes, 2, "{point:?}");
+        assert_eq!(summary.delivered, 1, "{point:?}");
+        assert_eq!(
+            summary.dropped,
+            2 + usize::from(point == CutPoint::Flush),
+            "{point:?}"
+        );
+    }
 }
 
 // Tests the server's reply cut short. The bytes that got out are terminated

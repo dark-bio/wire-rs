@@ -7,21 +7,31 @@ use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
 use crate::transport::sender::Sender;
 use crate::transport::server::Attestation;
+use crate::transport::stream::Cancelled;
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
-    Error, Stream,
+    Error, Read, Stream, Write,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
-use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
 
-/// Maximum number of queued frames skipped while waiting for the ArkHello of a
-/// handshake, before giving up on the server. A well-behaved server only ever leaves
-/// a handful behind, as its writer blocks once the transport buffers fill up.
-pub(crate) const MAX_STALE_FRAMES: usize = 32;
+/// Cancels a reconnect's reader if its output helper fails or unwinds. On
+/// success the helper disarms this guard, allowing an ordinary idle read to
+/// continue. A helper panic still propagates when the scoped thread is joined.
+struct CancelRead<'a>(Option<&'a AtomicBool>);
+
+impl Drop for CancelRead<'_> {
+    fn drop(&mut self) {
+        if let Some(canceled) = self.0 {
+            canceled.store(true, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Trust policy for the device attestation a server presents in the handshake.
 /// It owns everything the wire deliberately does not (which roots to trust,
@@ -98,11 +108,12 @@ pub struct Client<R: Read, W: Write> {
 impl<R: Read, W: Write> Client<R, W> {
     /// Creates a client owning the byte stream and its shutdown operation, without
     /// an encrypted session. Call [`Client::connect`] to establish one.
-    /// I/O deadlines and cancellation bounds are supplied by the stream adapter.
+    /// Output uses the stream's configured write timeout; its adapter must
+    /// enforce deadlines and the shutdown cancellation contract.
     pub fn new(stream: Stream<R, W>) -> Self {
-        let (reader, writer, close) = stream.into_parts();
+        let (reader, writer, close, timeout) = stream.into_parts();
 
-        let outbound = Arc::new(Outbound::new(writer, Side::Client, close.clone()));
+        let outbound = Arc::new(Outbound::new(writer, Side::Client, close.clone(), timeout));
 
         Self {
             reader: FrameReader::new(reader, close),
@@ -134,9 +145,18 @@ impl<R: Read, W: Write> Client<R, W> {
     /// The verifier receives the raw device attestation from the server's hello
     /// and its accepted info is returned alongside the sender of the established
     /// session. The sender stays bound to that session through later calls to
-    /// `connect`; it cannot send into a replacement session. If connecting fails,
+    /// `connect`; it cannot send into a replacement session. Reset and hello
+    /// output run on a scoped native thread while this caller drains old input,
+    /// preventing reconnect deadlocks on bounded duplex streams. Output failures
+    /// cancel the companion read; read failures cancel further helper I/O. The
+    /// helper is always joined before returning, leaving the stream reusable.
+    /// Each outgoing frame has the stream's configured deadline; waiting for a
+    /// peer's reply has no overall timeout. If connecting fails,
     /// the client has no session and previously issued senders remain invalid.
-    pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
+    pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error>
+    where
+        W: Send,
+    {
         // Generate ephemeral client keys for this session
         let host_xdsa_sk = xdsa::SecretKey::generate();
         let host_xhpke_sk = xhpke::SecretKey::generate();
@@ -152,14 +172,10 @@ impl<R: Read, W: Write> Client<R, W> {
         host_xdsa_sk: xdsa::SecretKey,
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: Option<i64>,
-    ) -> Result<(Sender<W>, V::Info), Error> {
-        // The old session ends here, its senders refused from now on
-        self.end_session();
-
-        // Send two zero bytes: first terminates any interrupted message, second
-        // signals a fresh session.
-        self.outbound.send_reset()?;
-
+    ) -> Result<(Sender<W>, V::Info), Error>
+    where
+        W: Send,
+    {
         let host_xdsa_pk = host_xdsa_sk.public_key();
         let host_xhpke_pk = host_xhpke_sk.public_key();
 
@@ -168,37 +184,12 @@ impl<R: Read, W: Write> Client<R, W> {
             host_signer: host_xdsa_pk.clone(),
             host_crypto: host_xhpke_pk.clone(),
         })
-        .map_err(|err| Error::HandshakeFailed(format!("failed to encode client hello: {}", err)))?;
+        .map_err(|err| {
+            self.end_session();
+            Error::HandshakeFailed(format!("failed to encode client hello: {}", err))
+        })?;
 
-        self.outbound.send_packet(&hello)?;
-
-        // Message 2: Read ArkHello (COSE seal'd, COBS-framed). Frames the server
-        // emitted before processing the reset may still be queued, so skip
-        // everything not sealed to the fresh client key.
-        let host_xhpke_fp = host_xhpke_pk.fingerprint();
-
-        let mut stale = 0;
-        let packet = loop {
-            // Empty frames are the server signaling an earlier session dropped,
-            // stale junk too by now. So are oversized or undecodable frames,
-            // the leftovers of a transfer that was cut short. The framer reports
-            // an oversized frame once and drains its remainder on the next call.
-            let packet: &[u8] = match self.reader.next_packet() {
-                Ok(Some(packet)) => packet,
-                Ok(None) | Err(Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) => &[],
-                Err(err) => return Err(err),
-            };
-            if cose::recipient(packet).is_ok_and(|fp| fp == host_xhpke_fp) {
-                break packet;
-            }
-            stale += 1;
-            if stale > MAX_STALE_FRAMES {
-                return Err(Error::HandshakeFailed(
-                    "too many stale frames before server hello".into(),
-                ));
-            }
-            warn!("skipping stale frame during handshake");
-        };
+        let packet = self.exchange_hello(&hello, host_xhpke_pk.fingerprint())?;
         let auth = handshake::ArkHelloAuth {
             host_signer: host_xdsa_pk.clone(),
             host_crypto: host_xhpke_pk.clone(),
@@ -206,7 +197,7 @@ impl<R: Read, W: Write> Client<R, W> {
 
         // Step 2a: Decrypt the outer COSE_Encrypt0 layer
         let sign1 =
-            cose::decrypt(packet, &auth, &host_xhpke_sk, CRYPTO_DOMAIN_WIRE).map_err(|err| {
+            cose::decrypt(&packet, &auth, &host_xhpke_sk, CRYPTO_DOMAIN_WIRE).map_err(|err| {
                 Error::HandshakeFailed(format!("failed to decrypt server hello: {}", err))
             })?;
 
@@ -282,6 +273,77 @@ impl<R: Read, W: Write> Client<R, W> {
         Ok((sender, info))
     }
 
+    /// Exchanges the reset and hello while draining output from earlier
+    /// sessions. Retirement and writes run on a helper so waiting for the old
+    /// writer cannot prevent reads. Only a reply addressed to the fresh key is
+    /// retained; authentication remains the handshake caller's responsibility.
+    /// Both directions finish before returning, including when either fails.
+    fn exchange_hello(
+        &mut self,
+        hello: &[u8],
+        recipient: xhpke::Fingerprint,
+    ) -> Result<Vec<u8>, Error>
+    where
+        W: Send,
+    {
+        // Release the client's old contexts. Active sends may still retain
+        // the sending allocation; the helper retires its binding in order with
+        // their writes. Draining must already run during that writer wait:
+        // otherwise both peers can block writing into each other's full pipe.
+        self.receiver = None;
+        self.sealer = None;
+        // Each attempt owns a fresh stop flag. It publishes no other state;
+        // joining the helper synchronizes its result before this attempt ends.
+        let canceled = AtomicBool::new(false);
+        let outbound = &self.outbound;
+        let reader = &mut self.reader;
+        thread::scope(|scope| {
+            let cancellation = &canceled;
+            let writer = scope.spawn(|| {
+                let mut cancel_read = CancelRead(Some(cancellation));
+                let result = outbound.begin_handshake(hello, cancellation);
+                if result.is_ok() {
+                    cancel_read.0 = None;
+                }
+                result
+            });
+
+            // Message 2: Read ArkHello while the helper sends reset/HostHello.
+            // Discard buffered output from earlier sessions or attempts until
+            // a reply names our fresh key. There is no frame-count limit: the
+            // amount of legitimate stale traffic depends on adapter buffering.
+            let received = loop {
+                let packet = match reader.next_packet(Some(cancellation)) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) | Err(Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) => &[],
+                    Err(err) => break Err(err),
+                };
+                if cose::recipient(packet).is_ok_and(|fp| fp == recipient) {
+                    break Ok(packet.to_vec());
+                }
+                warn!("skipping stale frame during handshake");
+            };
+            if received.is_err() {
+                cancellation.store(true, Ordering::Relaxed);
+            }
+            // Join even on read failure. No helper or delayed cancellation can
+            // escape this attempt and interfere with the next use of the stream.
+            let sent = writer
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            match (received, sent) {
+                (Err(Error::RecvFailed(err)), Err(output))
+                    if err.get_ref().is_some_and(|cause| cause.is::<Cancelled>()) =>
+                {
+                    Err(output)
+                }
+                (Err(err), _) => Err(err),
+                (Ok(_), Err(err)) => Err(err),
+                (Ok(packet), Ok(())) => Ok(packet),
+            }
+        })
+    }
+
     /// Reads the next ark-to-host message, decrypting it. An oversized or
     /// undecodable frame, or a packet that cannot be decrypted, drops the session:
     /// the server's HPKE sequence can no longer be followed. So does an empty
@@ -297,7 +359,7 @@ impl<R: Read, W: Write> Client<R, W> {
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
         // An empty frame is the server telling us it has no session with us.
-        let packet = match self.reader.next_packet() {
+        let packet = match self.reader.next_packet(None) {
             Err(err) => {
                 self.end_session();
                 return Err(err);
@@ -358,8 +420,9 @@ impl<R: Read, W: Write> Client<R, W> {
     /// No encryption lock is taken and extra crypto work is not waited for.
     ///
     /// The stream stays open and no notification is sent. The caller decides
-    /// whether to send a reset or empty frame. A stuck write can delay ending;
-    /// an independently held Closer can cancel it without taking the writer lock.
+    /// whether to send a reset or empty frame. An active write may delay ending
+    /// until its frame deadline. An independently held Closer can cancel it
+    /// earlier without taking the writer lock.
     fn end_session(&mut self) {
         if let Some(sealer) = self.sealer.as_ref() {
             self.outbound.end(sealer);
@@ -381,7 +444,10 @@ impl<R: Read, W: Write> Client<R, W> {
         host_xdsa_sk: xdsa::SecretKey,
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: i64,
-    ) -> Result<(Sender<W>, V::Info), Error> {
+    ) -> Result<(Sender<W>, V::Info), Error>
+    where
+        W: Send,
+    {
         self.handshake(verifier, host_xdsa_sk, host_xhpke_sk, Some(timestamp))
     }
 
@@ -392,7 +458,7 @@ impl<R: Read, W: Write> Client<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_packet_blob(&mut self) -> Result<Option<&[u8]>, Error> {
-        self.reader.next_packet()
+        self.reader.next_packet(None)
     }
 
     /// Test and benchmark helper exposing the framer's `send_packet`. Not part
@@ -441,13 +507,15 @@ impl<R: Read, W: Write> Drop for Client<R, W> {
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::transport::DEFAULT_WRITE_TIMEOUT;
     use crate::transport::framing::FrameWriter;
     use crate::transport::mock::{payload, self_attestation};
     use crate::transport::server::Server;
-    use std::io;
+    use crate::transport::testing::Memory;
+    use std::io::{self, Read as _};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A pair of contexts standing in for an established session.
     fn contexts() -> (xhpke::Sender, xhpke::Receiver) {
@@ -463,17 +531,30 @@ mod tests {
     struct BlockedFlush {
         entered: Option<mpsc::Sender<()>>,
         release: mpsc::Receiver<()>,
+        deadline: Option<Instant>,
     }
 
     impl Write for BlockedFlush {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    impl io::Write for BlockedFlush {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            testing::remaining(self.deadline.expect("write deadline installed"))?;
             Ok(bytes.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            let deadline = self.deadline.expect("write deadline installed");
+            testing::remaining(deadline)?;
             if let Some(entered) = self.entered.take() {
                 entered.send(()).unwrap();
-                self.release.recv().unwrap();
+                self.release
+                    .recv_timeout(testing::remaining(deadline)?)
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
             }
             Ok(())
         }
@@ -488,10 +569,11 @@ mod tests {
         let (entered_tx, entered) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
         let mut client = Client::new(Stream::new(
-            io::empty(),
+            Memory::new(io::empty()),
             BlockedFlush {
                 entered: Some(entered_tx),
                 release: release_rx,
+                deadline: None,
             },
             || {},
         ));
@@ -542,16 +624,17 @@ mod tests {
         let (mut peer, receiver) = contexts();
         let packet = sealing::seal(&mut peer, &payload(1)).unwrap();
         let mut bytes = Vec::new();
-        FrameWriter::new(&mut bytes, Closer::new(|| {}))
-            .send_packet(&packet)
+        FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
+            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
             .unwrap();
         let (entered_tx, entered) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
         let mut client = Client::new(Stream::new(
-            io::Cursor::new(bytes),
+            Memory::new(io::Cursor::new(bytes)),
             BlockedFlush {
                 entered: Some(entered_tx),
                 release: release_rx,
+                deadline: None,
             },
             || {},
         ));
@@ -583,10 +666,14 @@ mod tests {
         let (mut peer, receiver) = contexts();
         let packet = sealing::seal(&mut peer, &payload(2)).unwrap();
         let mut bytes = Vec::new();
-        FrameWriter::new(&mut bytes, Closer::new(|| {}))
-            .send_packet(&packet)
+        FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
+            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
             .unwrap();
-        let mut client = Client::new(Stream::new(&bytes[..], Vec::new(), || {}));
+        let mut client = Client::new(Stream::new(
+            Memory::new(&bytes[..]),
+            Memory::new(Vec::new()),
+            || {},
+        ));
         let (crypto, old_receiver) = contexts();
         let stale = client.new_session(crypto, old_receiver);
         let old_sealer = client.sealer.as_ref().unwrap().clone();
@@ -619,8 +706,8 @@ mod tests {
         testing::init_tracing();
 
         // Echo every request over pipes, then hang up
-        let (ark_reader, host_writer) = io::pipe().unwrap();
-        let (host_reader, ark_writer) = io::pipe().unwrap();
+        let (ark_reader, host_writer) = testing::pipe();
+        let (host_reader, ark_writer) = testing::pipe();
 
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
@@ -671,9 +758,9 @@ mod tests {
     fn test_sender_outlives_client() {
         testing::init_tracing();
 
-        let (mut reader, writer) = io::pipe().unwrap();
+        let (mut reader, writer) = testing::pipe();
         let (sender, receiver) = contexts();
-        let mut client = Client::new(Stream::new(io::empty(), writer, || {}));
+        let mut client = Client::new(Stream::new(Memory::new(io::empty()), writer, || {}));
         let sender = client.new_session(sender, receiver);
         sender.send(&payload(1)).unwrap();
         drop(client);
@@ -682,6 +769,9 @@ mod tests {
         assert!(matches!(result, Err(Error::Terminated)), "{result:?}");
         // The read only returns once the writer is gone
         let mut bytes = Vec::new();
+        reader
+            .set_read_deadline(Instant::now() + DEFAULT_WRITE_TIMEOUT)
+            .unwrap();
         reader.read_to_end(&mut bytes).unwrap();
         assert!(!bytes.is_empty());
     }

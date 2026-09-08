@@ -57,9 +57,16 @@ pub enum Event {
     ReadFailed { error: ReadError },
     /// The client writes the bytes, the transport reporting failure after
     /// taking them when failed. A write cut short carries what got out.
+    /// A failed prefix records both the standard call accepting those bytes
+    /// and the following write or flush reporting its error as one event.
     Write { bytes: Vec<u8>, failed: bool },
     /// The flush after a write fails.
     FlushFailed,
+    /// A write exhausts its operation budget after accepting these bytes.
+    /// Acceptance and its following error are recorded as one logical event.
+    WriteTimedOut { bytes: Vec<u8> },
+    /// The flush exhausts the write operation's remaining budget.
+    FlushTimedOut,
 }
 
 /// How a read comes up empty.
@@ -71,6 +78,8 @@ pub enum ReadError {
     Failed,
     /// The read was interrupted, to be retried.
     Interrupted,
+    /// One idle read poll expired; the transport keeps waiting for input.
+    TimedOut,
 }
 
 impl ReadError {
@@ -80,6 +89,7 @@ impl ReadError {
             ReadError::Eof => "eof",
             ReadError::Failed => "failed",
             ReadError::Interrupted => "interrupted",
+            ReadError::TimedOut => "timed_out",
         }
     }
 
@@ -89,6 +99,7 @@ impl ReadError {
             "eof" => ReadError::Eof,
             "failed" => ReadError::Failed,
             "interrupted" => ReadError::Interrupted,
+            "timed_out" => ReadError::TimedOut,
             other => panic!("unknown read error {other}"),
         }
     }
@@ -264,6 +275,10 @@ impl Event {
                 failed: true,
             } => format!("\"event\": \"write\", {}, \"failed\": true", payload(bytes)),
             Event::FlushFailed => "\"event\": \"flush_failed\"".to_string(),
+            Event::WriteTimedOut { bytes } => {
+                format!("\"event\": \"write_timed_out\", {}", payload(bytes))
+            }
+            Event::FlushTimedOut => "\"event\": \"flush_timed_out\"".to_string(),
         };
         format!("{{{fields}}}")
     }

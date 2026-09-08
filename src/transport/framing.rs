@@ -18,11 +18,13 @@
 //! that leftover. A failed flush counts as a failed send, as some transports
 //! only report a lost transfer there.
 
+use crate::transport::io::check_deadline;
 use crate::transport::stream::{ReadHalf, WriteHalf};
-use crate::transport::{Closer, Error, MAX_FRAME_SIZE};
+use crate::transport::{Closer, Error, MAX_FRAME_SIZE, Read, Write};
 use darkbio_cobs as cobs;
-use std::io::{self, Read, Write};
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 /// Reading half of the framer, the frames coming in and the buffers receiving
 /// and decoding them. It stands on its own, so a session can read on one
@@ -62,10 +64,12 @@ impl<R: Read> FrameReader<R> {
     /// view. Complete buffered frames remain available after stream closure;
     /// needing another read observes EOF. An oversized frame returns
     /// [`Error::FrameTooLarge`] once, with later calls discarding its remainder.
+    /// Setting the optional reconnect flag cancels further reads for that attempt;
+    /// ordinary idle adapter timeouts are retried without losing buffered input.
     #[inline]
-    pub fn next_packet(&mut self) -> Result<Option<&[u8]>, Error> {
+    pub fn next_packet(&mut self, canceled: Option<&AtomicBool>) -> Result<Option<&[u8]>, Error> {
         // Retrieve the next 0-bounded frame and pull out the data
-        let frame = self.next_frame()?;
+        let frame = self.next_frame(canceled)?;
 
         // Empty frame is a session reset signal, it's not valid COBS
         if frame.start == frame.end {
@@ -85,7 +89,7 @@ impl<R: Read> FrameReader<R> {
     /// same frame again or treating that delimiter as a reset. Read failures
     /// preserve the discard state; interrupted reads are retried.
     #[inline]
-    fn next_frame(&mut self) -> Result<Range<usize>, Error> {
+    fn next_frame(&mut self, canceled: Option<&AtomicBool>) -> Result<Range<usize>, Error> {
         'outer: loop {
             // Search for the frame delimiter, starting from where we left off
             if let Some(found) = memchr::memchr(0, &self.buffer[self.search..self.filled]) {
@@ -134,9 +138,8 @@ impl<R: Read> FrameReader<R> {
                 return Err(Error::FrameTooLarge(MAX_FRAME_SIZE + 1));
             }
             // Read more data to try and find the next frame marker
-            match self.reader.read(&mut self.buffer[self.filled..]) {
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue, // Signal cut the read short, retry
-                Err(err) => return Err(Error::RecvFailed(err)), // Transport failed internally, cannot recover
+            match self.reader.read(&mut self.buffer[self.filled..], canceled) {
+                Err(err) => return Err(Error::RecvFailed(err)), // Surface the adapter or configuration failure
                 Ok(0) => return Err(Error::Terminated), // Transport was terminated, tear down
                 Ok(n) => self.filled += n,              // Read some bytes, ingest them
             }
@@ -149,7 +152,7 @@ impl<R: Read> FrameReader<R> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn next_frame_blob(&mut self) -> Result<&[u8], Error> {
-        let frame = self.next_frame()?;
+        let frame = self.next_frame(None)?;
         Ok(&self.buffer[frame])
     }
 }
@@ -157,11 +160,15 @@ impl<R: Read> FrameReader<R> {
 /// Writing half of the framer, the frames going out and the buffer encoding
 /// them. It stands on its own, so a session can write on one thread while
 /// reading on another.
+///
+/// Every send takes an absolute deadline and optional cancellation flag.
+/// Observing a set flag refuses further adapter calls; admitted calls may
+/// finish normally. Deadline expiry also fails a frame whose flush returns late.
 pub(crate) struct FrameWriter<W: Write> {
     writer: WriteHalf<W>, // Byte stream frames are written to, guarded by its close handle
 
     resync: bool, // Whether the last send failed, possibly leaving a frame unterminated
-    frame: Vec<u8>, // Frame being sent, with a spare slot for the delimiter
+    frame: Vec<u8>, // Leading recovery zero, encoded frame, trailing delimiter
 }
 
 impl<W: Write> FrameWriter<W> {
@@ -173,63 +180,88 @@ impl<W: Write> FrameWriter<W> {
                 closer: close,
             },
             resync: false,
-            frame: vec![0u8; MAX_FRAME_SIZE + 1], // one extra slot for the frame delimiter
+            frame: vec![0u8; MAX_FRAME_SIZE + 2], // recovery prefix and frame delimiter
         }
     }
 
     /// Signals a session reset by writing two frame delimiters, the first one
     /// terminating any interrupted frame, the second forming the empty reset
     /// frame. The first covers a frame a previous client may have left behind,
-    /// so a reset resyncs the stream by itself.
-    pub fn send_reset(&mut self) -> Result<(), Error> {
+    /// so a reset resyncs the stream by itself. Both bytes and flush share the
+    /// supplied absolute deadline.
+    pub fn send_reset(
+        &mut self,
+        deadline: Instant,
+        canceled: Option<&AtomicBool>,
+    ) -> Result<(), Error> {
         self.resync = false;
 
         // Piggyback on the frame sender which turn this into 2 zero-frames
-        self.frame[0] = 0;
-        self.send_frame(1)
+        self.frame[1] = 0;
+        self.send_frame(1, deadline, canceled)
     }
 
     /// Signals a dropped session by writing a single frame delimiter, forming
     /// an empty frame. After a failed send it goes out behind the delimiter
     /// terminating what that send left behind, so it is not swallowed as one.
-    pub fn send_dropped(&mut self) -> Result<(), Error> {
+    /// The resynchronization delimiter also uses the supplied absolute deadline.
+    pub fn send_dropped(
+        &mut self,
+        deadline: Instant,
+        canceled: Option<&AtomicBool>,
+    ) -> Result<(), Error> {
         // Piggyback on the frame sender which turn this into 1 zero-frame
-        self.send_frame(0)
+        self.send_frame(0, deadline, canceled)
     }
 
     /// COBS encodes a packet and sends it as a delimited frame. Packets whose
-    /// encoding would exceed MAX_FRAME_SIZE are rejected.
+    /// encoding would exceed MAX_FRAME_SIZE are rejected. Encoding, any resync
+    /// delimiter, all partial writes and flush share the supplied absolute deadline.
     #[inline]
-    pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+    pub fn send_packet(
+        &mut self,
+        packet: &[u8],
+        deadline: Instant,
+        canceled: Option<&AtomicBool>,
+    ) -> Result<(), Error> {
         // Encode the packet with COBS and send it as a frame
         let len = cobs::encode_buffer(packet.len());
         if len > MAX_FRAME_SIZE {
             return Err(Error::FrameTooLarge(len));
         }
-        let size = cobs::encode(packet, &mut self.frame)
+        let size = cobs::encode(packet, &mut self.frame[1..=MAX_FRAME_SIZE])
             .expect("frame buffer holds any packet passing the size check");
 
         // Send the frame into the 0-bounded stream
-        self.send_frame(size)
+        self.send_frame(size, deadline, canceled)
     }
 
-    /// Writes and flushes the first `size` bytes of the frame buffer with a
-    /// trailing delimiter, preceded by another delimiter if the last send failed.
+    /// Writes and flushes `size` bytes starting at buffer index one, followed
+    /// by a delimiter. After a failed send, the slice also includes the reserved
+    /// leading zero to terminate the previous partial frame.
     /// The resync flag is raised while writing, so a panic leaves the next send
     /// responsible for terminating any partial frame.
     #[inline]
-    fn send_frame(&mut self, size: usize) -> Result<(), Error> {
-        // Append the frame end marker
-        self.frame[size] = 0;
+    fn send_frame(
+        &mut self,
+        size: usize,
+        deadline: Instant,
+        canceled: Option<&AtomicBool>,
+    ) -> Result<(), Error> {
+        // Index zero stays reserved for recovery; the frame begins at one.
+        self.frame[size + 1] = 0;
+        let start = if std::mem::replace(&mut self.resync, true) {
+            0
+        } else {
+            1
+        };
+        let result = self
+            .writer
+            .write(&self.frame[start..size + 2], deadline, canceled);
 
-        // Send the frame, potentially including an initial resync marker
-        let result = (|| {
-            if std::mem::replace(&mut self.resync, true) {
-                self.writer.write_all(&[0x00])?;
-            }
-            self.writer.write_all(&self.frame[..size + 1])?;
-            self.writer.flush()
-        })();
+        // Apply late completion at the whole-frame boundary. Standard writes
+        // must report any accepted bytes, including when a call finishes late.
+        let result = check_deadline(deadline).and(result);
 
         // If anything went wrong, set the resync marker back
         self.resync = result.is_err();
@@ -241,10 +273,15 @@ impl<W: Write> FrameWriter<W> {
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn send_frame_blob(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let len = self.frame.len().min(bytes.len());
-        self.frame[..len].copy_from_slice(&bytes[..len]);
-        self.send_frame(bytes.len())
+    pub fn send_frame_blob(
+        &mut self,
+        bytes: &[u8],
+        deadline: Instant,
+        canceled: Option<&AtomicBool>,
+    ) -> Result<(), Error> {
+        assert!(bytes.len() <= MAX_FRAME_SIZE, "frame fits the send buffer");
+        self.frame[1..bytes.len() + 1].copy_from_slice(bytes);
+        self.send_frame(bytes.len(), deadline, canceled)
     }
 }
 
@@ -253,19 +290,23 @@ impl<W: Write> FrameWriter<W> {
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::transport::DEFAULT_WRITE_TIMEOUT;
+    use crate::transport::testing::Memory;
     use std::collections::VecDeque;
     use std::io::{self, Cursor};
     use std::panic::{self, AssertUnwindSafe};
+    use std::time::{Duration, Instant};
 
     // Closing leaves complete buffered frames readable, then reports EOF.
     #[test]
     fn test_close_drains_buffered_frames() {
         let closer = Closer::new(|| {});
-        let mut reader = FrameReader::new(&[0x02, 1, 0, 0x02, 2, 0][..], closer.clone());
-        assert_eq!(reader.next_packet().unwrap(), Some(&[1][..]));
+        let mut reader =
+            FrameReader::new(Memory::new(&[0x02, 1, 0, 0x02, 2, 0][..]), closer.clone());
+        assert_eq!(reader.next_packet(None).unwrap(), Some(&[1][..]));
         closer.close();
-        assert_eq!(reader.next_packet().unwrap(), Some(&[2][..]));
-        assert!(matches!(reader.next_packet(), Err(Error::Terminated)));
+        assert_eq!(reader.next_packet(None).unwrap(), Some(&[2][..]));
+        assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
     }
 
     // Tests corner-cases when consuming a packet from the framed transport.
@@ -273,6 +314,7 @@ mod tests {
     fn test_next_packet() {
         testing::init_tracing();
 
+        /// Input and expected result for one framing boundary case.
         struct TestCase {
             input: Vec<u8>,
             expected: Option<Vec<u8>>, // Decoded packet, none if the frame fails to decode
@@ -321,17 +363,17 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
-            let mut framing = FrameReader::new(&mut host_to_wire, Closer::new(|| {}));
+            let mut framing = FrameReader::new(Memory::new(&mut host_to_wire), Closer::new(|| {}));
             match tt.expected {
                 Some(expected) => {
                     let packet = framing
-                        .next_packet()
+                        .next_packet(None)
                         .unwrap()
                         .expect("expected a COBS packet");
                     assert_eq!(packet, expected, "test {i}");
                 }
                 None => {
-                    let result = framing.next_packet();
+                    let result = framing.next_packet(None);
                     assert!(
                         matches!(result, Err(Error::FrameDecodingFailed(_))),
                         "test {i}: {result:?}"
@@ -346,6 +388,7 @@ mod tests {
     fn test_send_packet() {
         testing::init_tracing();
 
+        /// Input and expected result for one framing boundary case.
         struct TestCase {
             input: Vec<u8>,
             expected: Option<Vec<u8>>, // Bytes on the wire, none if the packet is refused
@@ -398,16 +441,22 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut wire_to_host = Cursor::new(Vec::<u8>::new());
 
-            let mut framing = FrameWriter::new(&mut wire_to_host, Closer::new(|| {}));
+            let mut framing = FrameWriter::new(Memory::new(&mut wire_to_host), Closer::new(|| {}));
             match tt.expected {
                 Some(expected) => {
-                    framing.send_packet(&tt.input).unwrap();
+                    framing
+                        .send_packet(&tt.input, Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+                        .unwrap();
 
                     let written = &wire_to_host.get_ref()[..];
                     assert_eq!(written, expected, "test {i}");
                 }
                 None => {
-                    let result = framing.send_packet(&tt.input);
+                    let result = framing.send_packet(
+                        &tt.input,
+                        Instant::now() + DEFAULT_WRITE_TIMEOUT,
+                        None,
+                    );
                     assert!(
                         matches!(result, Err(Error::FrameTooLarge(_))),
                         "test {i}: {result:?}"
@@ -451,7 +500,7 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
-            let mut framing = FrameReader::new(&mut host_to_wire, Closer::new(|| {}));
+            let mut framing = FrameReader::new(Memory::new(&mut host_to_wire), Closer::new(|| {}));
             let frame = framing.next_frame_blob().unwrap();
             assert_eq!(frame, tt.expected, "test {i}");
         }
@@ -467,7 +516,7 @@ mod tests {
             input.extend(std::iter::repeat_n(b'a', size));
             input.extend_from_slice(b"\0after\0\0");
         }
-        let mut framing = FrameReader::new(Cursor::new(input), Closer::new(|| {}));
+        let mut framing = FrameReader::new(Memory::new(Cursor::new(input)), Closer::new(|| {}));
         assert_eq!(framing.next_frame_blob().unwrap(), b"before");
         for _ in 0..2 {
             assert!(matches!(
@@ -475,7 +524,7 @@ mod tests {
                 Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
             ));
             assert_eq!(framing.next_frame_blob().unwrap(), b"after");
-            assert!(framing.next_packet().unwrap().is_none());
+            assert!(framing.next_packet(None).unwrap().is_none());
         }
         assert!(matches!(framing.next_frame_blob(), Err(Error::Terminated)));
     }
@@ -490,7 +539,7 @@ mod tests {
         /// Reader handing out one mock result per read.
         struct Mock(VecDeque<io::Result<Vec<u8>>>);
 
-        impl Read for Mock {
+        impl io::Read for Mock {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 match self.0.pop_front() {
                     Some(Ok(bytes)) => {
@@ -534,7 +583,8 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
-            let mut framing = FrameReader::new(Mock(tt.reads.into()), Closer::new(|| {}));
+            let mut framing =
+                FrameReader::new(Memory::new(Mock(tt.reads.into())), Closer::new(|| {}));
             assert!(matches!(
                 framing.next_frame_blob(),
                 Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
@@ -557,7 +607,7 @@ mod tests {
             Ok(Vec::new()),
             Ok(b"tail\0foo\0".to_vec()),
         ];
-        let mut framing = FrameReader::new(Mock(reads.into()), Closer::new(|| {}));
+        let mut framing = FrameReader::new(Memory::new(Mock(reads.into())), Closer::new(|| {}));
         assert!(matches!(
             framing.next_frame_blob(),
             Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
@@ -566,11 +616,13 @@ mod tests {
         assert_eq!(framing.next_frame_blob().unwrap(), b"foo");
     }
 
-    // Tests corner-cases when injecting a frame into the raw transport.
+    // Tests raw frame boundaries with and without the reserved recovery prefix,
+    // including a maximum-sized frame that fills the entire combined buffer.
     #[test]
     fn test_send_frame() {
         testing::init_tracing();
 
+        /// Input and expected result for one framing boundary case.
         struct TestCase {
             input: &'static [u8],
             expected: Vec<u8>,
@@ -596,14 +648,77 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
-            let mut wire_to_host = Cursor::new(Vec::<u8>::with_capacity(tt.input.len() + 1));
+            for resync in [false, true] {
+                let mut wire_to_host = Vec::new();
+                let mut framing =
+                    FrameWriter::new(Memory::new(&mut wire_to_host), Closer::new(|| {}));
+                framing.resync = resync;
+                framing
+                    .send_frame_blob(tt.input, Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+                    .unwrap();
 
-            let mut framing = FrameWriter::new(&mut wire_to_host, Closer::new(|| {}));
-            framing.send_frame_blob(tt.input).unwrap();
-
-            let written = &wire_to_host.get_ref()[..];
-            assert_eq!(written, tt.expected, "test {i}");
+                let mut expected = Vec::new();
+                if resync {
+                    expected.push(0);
+                }
+                expected.extend_from_slice(&tt.expected);
+                assert_eq!(wire_to_host, expected, "test {i}, resync {resync}");
+            }
         }
+    }
+
+    // A successful flush that returns after the deadline still fails the frame.
+    // The next send must use a fresh budget and resynchronize the same adapter.
+    #[test]
+    fn test_late_flush_resynchronizes() {
+        /// Collects bytes and delays one flush until its deadline has elapsed,
+        /// modeling a successful adapter call whose return was scheduled late.
+        struct LateFlush {
+            bytes: Vec<u8>,
+            deadline: Option<Instant>,
+            delay: bool,
+        }
+
+        impl Write for LateFlush {
+            fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+                self.deadline = Some(deadline);
+                Ok(())
+            }
+        }
+
+        impl io::Write for LateFlush {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if std::mem::take(&mut self.delay) {
+                    let deadline = self.deadline.expect("deadline installed");
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut framing = FrameWriter::new(
+            LateFlush {
+                bytes: Vec::new(),
+                deadline: None,
+                delay: true,
+            },
+            Closer::new(|| {}),
+        );
+        let result =
+            framing.send_frame_blob(b"old", Instant::now() + Duration::from_millis(100), None);
+        assert!(
+            matches!(result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut)
+        );
+        assert_eq!(framing.writer.inner.bytes, b"old\0");
+
+        framing
+            .send_frame_blob(b"new", Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+            .unwrap();
+        assert_eq!(framing.writer.inner.bytes, b"old\0\0new\0");
     }
 
     // Tests that a writer panicking midway leaves the framer usable, the frame
@@ -619,7 +734,7 @@ mod tests {
             written: Vec<u8>,
         }
 
-        impl Write for Panicky {
+        impl io::Write for Panicky {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 if std::mem::take(&mut self.armed) {
                     panic!("injected panic");
@@ -633,16 +748,23 @@ mod tests {
             }
         }
         let mut framing = FrameWriter::new(
-            Panicky {
+            Memory::new(Panicky {
                 armed: true,
                 written: Vec::new(),
-            },
+            }),
             Closer::new(|| {}),
         );
-        let result = panic::catch_unwind(AssertUnwindSafe(|| framing.send_packet(&[1, 2, 3])));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            framing.send_packet(&[1, 2, 3], Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+        }));
         assert!(result.is_err());
 
-        framing.send_packet(&[1, 2, 3]).unwrap();
-        assert_eq!(framing.writer.inner.written, [0x00, 0x04, 1, 2, 3, 0x00]);
+        framing
+            .send_packet(&[1, 2, 3], Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+            .unwrap();
+        assert_eq!(
+            framing.writer.inner.inner.written,
+            [0x00, 0x04, 1, 2, 3, 0x00]
+        );
     }
 }

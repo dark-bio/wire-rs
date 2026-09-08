@@ -16,6 +16,7 @@ use super::{
     CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, TIMESTAMP, frame, self_attestation, unframe,
     would_block,
 };
+use crate::transport::Read;
 use crate::transport::handshake;
 use crate::transport::mock::payload;
 use crate::transport::sealing;
@@ -24,11 +25,11 @@ use crate::transport::{
     CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, Event, MAX_FRAME_SIZE, Sender,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Read};
-use std::rc::Rc;
+use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Message id of the probes the driver sends on the server's behalf.
 const PROBE_ID: u64 = u64::MAX;
@@ -125,6 +126,11 @@ pub enum Step {
     /// Ends the server's session locally and signals the client. No local
     /// disconnection event is expected; the stream can establish another session.
     Disconnect,
+    /// The next matching output operation expires after the selected prefix,
+    /// leaving no budget for a failure notification on that operation.
+    Timeout(CutPoint),
+    /// An idle read poll expires; the server keeps waiting without a transition.
+    ReadTimeout,
 }
 
 impl Step {
@@ -153,6 +159,8 @@ impl Step {
                     | Step::Cut { .. }
                     | Step::Chunk(_)
                     | Step::Batch(_)
+                    | Step::Timeout(_)
+                    | Step::ReadTimeout
             )
     }
 }
@@ -220,7 +228,7 @@ enum Emit {
     /// The handshake reply, sealed to the hello with the keys.
     ArkHello(Box<Keys>),
     /// A sealed ArkToHost with the id, opening with the receiver.
-    Reply(u64, Rc<RefCell<xhpke::Receiver>>),
+    Reply(u64, Arc<Mutex<xhpke::Receiver>>),
 }
 
 impl fmt::Debug for Emit {
@@ -268,6 +276,8 @@ enum Outcome {
     Opened,
     /// `Error::RecvFailed` carrying `WouldBlock`.
     Yield,
+    /// `Error::SendFailed`, an ArkHello whose write or flush failed.
+    SendFailed,
     /// `Error::Terminated`, the script having run out.
     Terminated,
 }
@@ -402,12 +412,14 @@ pub struct Client {
     action: Option<Step>,      // Driver action that interrupted a receive call
     identity: xdsa::PublicKey, // The server's identity, verifying its hellos
     outbox: Outbox,            // Frames the server wrote
-    bytes: Vec<u8>,            // Bytes of executed steps not yet read by the server
+    bytes: Vec<u8>,            // Current input batch, retained until fully delivered
+    offset: usize,             // Bytes already delivered, avoiding a copy per small read
     chunk: usize,              // Most bytes a read hands over, zero for all
     batch: usize,              // Steps left to put in front of the server in one read
     broken: bool,              // Whether the server's writes fail
     cut: Option<CutPoint>,     // Cut armed for the next write of the server it applies to
-    flush_fails: bool,         // Whether the flush of the send in progress fails
+    timeout: bool,             // Whether the armed cut expires the operation budget
+    timed_out: bool,           // Whether the last modeled send exhausted that budget
 
     state: State,       // State the server should be in
     partial: Partial,   // Unterminated frame in front of the server
@@ -419,7 +431,7 @@ pub struct Client {
 
     pending: Option<Pending>, // ArkHello received, awaiting the client's ack
     sender: Option<xhpke::Sender>, // Outbound context of the live session, sealing the requests
-    receiver: Option<Rc<RefCell<xhpke::Receiver>>>, // Inbound context of the live session, shared with the replies opening in it
+    receiver: Option<Arc<Mutex<xhpke::Receiver>>>, // Inbound context of the live session, shared with the replies opening in it
 
     last_hello: Option<(Vec<u8>, Keys)>, // Last HostHello sent, framed
     last_ack: Option<Vec<u8>>,           // Last HostAck sent, framed
@@ -437,11 +449,13 @@ impl Client {
             identity,
             outbox,
             bytes: Vec::new(),
+            offset: 0,
             chunk: 0,
             batch: 0,
             broken: false,
             cut: None,
-            flush_fails: false,
+            timeout: false,
+            timed_out: false,
             state: State::Idle,
             partial: Partial::None,
             resync: false,
@@ -512,7 +526,7 @@ impl Client {
                     self.record(&framed);
                     self.last_ack = Some(framed.clone());
                     self.sender = Some(sender);
-                    self.receiver = Some(Rc::new(RefCell::new(receiver)));
+                    self.receiver = Some(Arc::new(Mutex::new(receiver)));
                     self.deliver(Frame::Ack);
                     self.bytes.extend(framed);
                 }
@@ -610,6 +624,7 @@ impl Client {
             }
             Step::Yield
             | Step::Interrupt
+            | Step::ReadTimeout
             | Step::Retain
             | Step::Send(_)
             | Step::SendRetained(_)
@@ -621,10 +636,16 @@ impl Client {
             Step::Heal => self.set_broken(false),
             Step::Cut { point, then_broken } => {
                 self.cut = Some(point);
+                self.timeout = false;
                 self.outbox.set_cut(point);
                 if then_broken {
                     self.set_broken(true);
                 }
+            }
+            Step::Timeout(point) => {
+                self.cut = Some(point);
+                self.timeout = true;
+                self.outbox.set_timeout(point);
             }
             Step::Chunk(n) => self.chunk = n as usize,
             Step::Batch(n) => self.batch = n as usize,
@@ -691,7 +712,10 @@ impl Client {
                 } else {
                     self.forget();
                     self.state = State::Idle;
-                    self.send(Payload::Signal);
+                    if !self.timed_out {
+                        self.send(Payload::Signal);
+                    }
+                    self.outcome = Outcome::SendFailed;
                 }
             }
             // The handshake concluded, the session it opened reported so a
@@ -721,64 +745,50 @@ impl Client {
         }
     }
 
-    /// Applies the model's transition for a send of the server, returning whether
-    /// it goes through. It mirrors the framing, a send after a failed one
-    /// starting with a delimiter that terminates the tail the failure left
-    /// behind, and its flush failing the send after every byte went out.
+    /// Predicts one server send, including its recovery delimiter in the same
+    /// write as the frame. An applicable cut fires before a broken stream;
+    /// a middle cut at zero can accept only recovery, leaving no new fragment.
     fn send(&mut self, payload: Payload) -> bool {
-        let mut sent = !self.resync || self.write_zero();
-        if sent {
-            sent = match payload {
-                Payload::Frame(emit) => self.write_frame(emit),
-                Payload::Signal => self.write_zero(),
-            };
-        }
-        if sent {
-            sent = !std::mem::take(&mut self.flush_fails);
-        }
+        let frame = matches!(&payload, Payload::Frame(_));
+        let cut = match self.cut {
+            Some(CutPoint::Start) => self.cut.take(),
+            Some(CutPoint::Middle(_)) if frame => self.cut.take(),
+            Some(CutPoint::Delimiter | CutPoint::Flush) if frame || self.resync => self.cut.take(),
+            _ => None,
+        };
+        self.timed_out = cut.is_some() && std::mem::take(&mut self.timeout);
+        let sent = match cut {
+            Some(CutPoint::Start) => false,
+            None if self.broken => false,
+            _ => {
+                if self.resync {
+                    self.zero_out();
+                }
+                match (payload, cut) {
+                    (Payload::Frame(_), Some(CutPoint::Middle(n))) => {
+                        if !self.resync || n != 0 {
+                            self.tail = Some(Tail::Fragment);
+                        }
+                        false
+                    }
+                    (Payload::Frame(emit), Some(CutPoint::Delimiter)) => {
+                        self.tail = Some(Tail::Body(emit));
+                        false
+                    }
+                    (Payload::Frame(emit), _) => {
+                        self.emits.push(emit);
+                        cut != Some(CutPoint::Flush)
+                    }
+                    (Payload::Signal, Some(CutPoint::Delimiter)) => false,
+                    (Payload::Signal, _) => {
+                        self.zero_out();
+                        cut != Some(CutPoint::Flush)
+                    }
+                }
+            }
+        };
         self.resync = !sent;
         sent
-    }
-
-    /// A lone delimiter written, the resync ahead of a send or the signal,
-    /// returning whether it got out. Only a cut at the start applies to it,
-    /// the other points waiting for a write with a body.
-    fn write_zero(&mut self) -> bool {
-        if self.cut == Some(CutPoint::Start) {
-            self.cut = None;
-            return false;
-        }
-        if self.broken {
-            return false;
-        }
-        self.zero_out();
-        true
-    }
-
-    /// A frame written, returning whether it got out whole. An armed cut
-    /// fires on it, ahead of a broken transport.
-    fn write_frame(&mut self, emit: Emit) -> bool {
-        match self.cut.take() {
-            Some(CutPoint::Start) => false,
-            Some(CutPoint::Middle(_)) => {
-                self.tail = Some(Tail::Fragment);
-                false
-            }
-            Some(CutPoint::Delimiter) => {
-                self.tail = Some(Tail::Body(emit));
-                false
-            }
-            Some(CutPoint::Flush) => {
-                self.flush_fails = true;
-                self.emits.push(emit);
-                true
-            }
-            None if self.broken => false,
-            None => {
-                self.emits.push(emit);
-                true
-            }
-        }
     }
 
     /// A lone delimiter reaching the stream, terminating the tail into the
@@ -854,7 +864,7 @@ impl Client {
                     self.summary.handshakes += 1;
                 }
                 Emit::Reply(id, receiver) => {
-                    let opened = sealing::open(&mut receiver.borrow_mut(), &unframe(frame))
+                    let opened = sealing::open(&mut receiver.lock().unwrap(), &unframe(frame))
                         .expect("reply failed to open");
                     assert_eq!(opened, payload(id));
                     self.summary.replies += 1;
@@ -894,11 +904,18 @@ impl Client {
 }
 
 /// Read half handed to the server, pulling the script forward as the server reads.
-struct Feed(Rc<RefCell<Client>>);
+struct Feed(Arc<Mutex<Client>>);
 
 impl Read for Feed {
+    fn set_read_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
+        // Every read completes immediately according to the script.
+        Ok(())
+    }
+}
+
+impl io::Read for Feed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut client = self.0.borrow_mut();
+        let mut client = self.0.lock().unwrap();
         if client.bytes.is_empty() {
             // Everything handed over was consumed, check the reactions to it
             // before moving the script forward
@@ -915,6 +932,7 @@ impl Read for Feed {
                         return Err(would_block());
                     }
                     Some(Step::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
+                    Some(Step::ReadTimeout) => return Err(io::ErrorKind::TimedOut.into()),
                     Some(step) if step.is_action() => {
                         client.action = Some(step);
                         client.interrupt(Outcome::Yield);
@@ -939,12 +957,16 @@ impl Read for Feed {
                 client.batch -= 1;
             }
         }
-        let mut n = buf.len().min(client.bytes.len());
+        let mut n = buf.len().min(client.bytes.len() - client.offset);
         if client.chunk > 0 {
             n = n.min(client.chunk);
         }
-        buf[..n].copy_from_slice(&client.bytes[..n]);
-        client.bytes.drain(..n);
+        buf[..n].copy_from_slice(&client.bytes[client.offset..client.offset + n]);
+        client.offset += n;
+        if client.offset == client.bytes.len() {
+            client.bytes.clear();
+            client.offset = 0;
+        }
         client.summary.reads += 1;
         Ok(n)
     }
@@ -987,7 +1009,9 @@ fn send(sender: Option<&Sender<Outbox>>, client: &mut Client, id: u64) {
         if !sent {
             client.forget();
             client.state = State::Idle;
-            client.send(Payload::Signal);
+            if !client.timed_out {
+                client.send(Payload::Signal);
+            }
         }
         sent
     });
@@ -1009,7 +1033,7 @@ pub fn run(steps: &[Step]) -> Summary {
     let signer = xdsa::SecretKey::generate();
     let attestation = self_attestation(&signer);
     let outbox = Outbox::default();
-    let client = Rc::new(RefCell::new(Client::new(
+    let client = Arc::new(Mutex::new(Client::new(
         steps,
         signer.public_key(),
         outbox.clone(),
@@ -1026,9 +1050,9 @@ pub fn run(steps: &[Step]) -> Summary {
     let mut generation = 0u64;
     let mut retained_generation = None;
     loop {
-        let action = client.borrow_mut().next_action();
+        let action = client.lock().unwrap().next_action();
         if let Some(action) = action {
-            let mut client = client.borrow_mut();
+            let mut client = client.lock().unwrap();
             match action {
                 Step::Retain => {
                     retained = sender.clone();
@@ -1070,7 +1094,7 @@ pub fn run(steps: &[Step]) -> Summary {
             // predicted the delivery, so the payload says which it was, and
             // garbage is nothing to answer.
             Ok(Event::Message(message)) => {
-                let mut client = client.borrow_mut();
+                let mut client = client.lock().unwrap();
                 match client.outcome {
                     Outcome::Message(id) if message == payload(id) => {
                         client.surfaced(Outcome::Message(id));
@@ -1086,7 +1110,7 @@ pub fn run(steps: &[Step]) -> Summary {
             // A session the server held ended, the client having reset or
             // broken it
             Ok(Event::Disconnected) => {
-                let mut client = client.borrow_mut();
+                let mut client = client.lock().unwrap();
                 client.surfaced(Outcome::Ended);
                 check_session(sender.as_ref(), &client);
             }
@@ -1094,14 +1118,14 @@ pub fn run(steps: &[Step]) -> Summary {
             // before the client says anything more
             Ok(Event::Connected(opened)) => {
                 sender = Some(opened);
-                let mut client = client.borrow_mut();
+                let mut client = client.lock().unwrap();
                 client.surfaced(Outcome::Opened);
                 generation += 1;
                 check_session(sender.as_ref(), &client);
             }
             // Probe the send path whenever the script hands control back
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                let mut client = client.borrow_mut();
+                let mut client = client.lock().unwrap();
                 client.surfaced(Outcome::Yield);
                 check_session(sender.as_ref(), &client);
                 if client.action.is_none() {
@@ -1109,13 +1133,16 @@ pub fn run(steps: &[Step]) -> Summary {
                 }
             }
             Err(Error::Terminated) => {
-                client.borrow_mut().surfaced(Outcome::Terminated);
+                client.lock().unwrap().surfaced(Outcome::Terminated);
                 break;
+            }
+            Err(Error::SendFailed(_)) => {
+                client.lock().unwrap().surfaced(Outcome::SendFailed);
             }
             Err(err) => panic!("unexpected error from the server: {err}"),
         }
     }
-    let mut client = client.borrow_mut();
+    let mut client = client.lock().unwrap();
     client.sync();
     check_session(sender.as_ref(), &client);
     client.summary.state = client.state;

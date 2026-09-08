@@ -6,7 +6,7 @@
 //! its script into the corpus of the target reading such scripts, when the
 //! WIRE_SEEDS environment variable names the directory to write into.
 
-use super::{CutPoint, client, server};
+use super::{CutPoint, client, duplex, server};
 use arbitrary::{Arbitrary, Unstructured};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -26,6 +26,10 @@ pub const TRANSPORT_SERVER: &str = "transport-server";
 /// there gets seeds.
 pub const TRANSPORT_CLIENT: &str = "transport-client";
 
+/// Fuzz target running real peers over bounded duplex pipes, with concurrent
+/// reconnects and operation deadlines. Each scenario seeds one complete run.
+pub const TRANSPORT_DUPLEX: &str = "transport-duplex";
+
 /// Encoder for the byte stream the fuzzers' `Arbitrary` decoding reads a
 /// script from. It mirrors arbitrary 1.4, integers little endian, a keep-going
 /// byte ahead of every vector element and an enum variant picked as the high
@@ -39,18 +43,23 @@ impl Seed {
         self.0.extend_from_slice(&pick.to_le_bytes());
     }
 
+    /// Appends an eight-bit integer in the form `Arbitrary` reads it.
     pub fn byte(&mut self, byte: u8) {
         self.0.push(byte);
     }
 
+    /// Appends a sixteen-bit integer in little-endian order.
     pub fn word(&mut self, word: u16) {
         self.0.extend_from_slice(&word.to_le_bytes());
     }
 
+    /// Appends a boolean as zero or one, also used for vector continuation.
     pub fn flag(&mut self, flag: bool) {
         self.0.push(flag as u8);
     }
 
+    /// Encodes a byte vector with a continuation flag before each element and
+    /// a final false flag terminating the vector.
     pub fn bytes(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.flag(true);
@@ -62,6 +71,7 @@ impl Seed {
 
 /// A step able to write itself as the fuzzers read it.
 pub trait Seedable: for<'a> Arbitrary<'a> + PartialEq + std::fmt::Debug {
+    /// Appends this value's encoding so `Arbitrary` reconstructs the same step.
     fn seed(&self, seed: &mut Seed);
 }
 
@@ -108,11 +118,47 @@ impl Seedable for CutPoint {
     }
 }
 
+impl Seedable for duplex::Scenario {
+    fn seed(&self, seed: &mut Seed) {
+        use duplex::Scenario;
+
+        const COUNT: u32 = 7;
+        match self {
+            Scenario::Reconnect { both_directions } => {
+                seed.variant(0, COUNT);
+                seed.flag(*both_directions);
+            }
+            Scenario::Backlog(count) => {
+                seed.variant(1, COUNT);
+                seed.byte(*count);
+            }
+            Scenario::ServerTimeout { flush } => {
+                seed.variant(2, COUNT);
+                seed.flag(*flush);
+            }
+            Scenario::HandshakeTimeout { ack, flush } => {
+                seed.variant(3, COUNT);
+                seed.flag(*ack);
+                seed.flag(*flush);
+            }
+            Scenario::FailedPrelude { read } => {
+                seed.variant(4, COUNT);
+                seed.flag(*read);
+            }
+            Scenario::RepeatedAttempts(count) => {
+                seed.variant(5, COUNT);
+                seed.byte(*count);
+            }
+            Scenario::AbandonedHello => seed.variant(6, COUNT),
+        }
+    }
+}
+
 impl Seedable for client::Step {
     fn seed(&self, seed: &mut Seed) {
         use client::Step;
 
-        const COUNT: u32 = 32;
+        const COUNT: u32 = 34;
         match self {
             Step::Reset => seed.variant(0, COUNT),
             Step::ResetPair => seed.variant(1, COUNT),
@@ -171,6 +217,11 @@ impl Seedable for client::Step {
             }
             Step::SendOversized => seed.variant(30, COUNT),
             Step::Disconnect => seed.variant(31, COUNT),
+            Step::Timeout(point) => {
+                seed.variant(32, COUNT);
+                point.seed(seed);
+            }
+            Step::ReadTimeout => seed.variant(33, COUNT),
         }
     }
 }
@@ -179,7 +230,7 @@ impl Seedable for server::Step {
     fn seed(&self, seed: &mut Seed) {
         use server::Step;
 
-        const COUNT: u32 = 32;
+        const COUNT: u32 = 34;
         match self {
             Step::Handshake => seed.variant(0, COUNT),
             Step::Send(tag) => {
@@ -238,6 +289,11 @@ impl Seedable for server::Step {
                 seed.byte(*tag);
             }
             Step::SendOversized => seed.variant(31, COUNT),
+            Step::Timeout(point) => {
+                seed.variant(32, COUNT);
+                point.seed(seed);
+            }
+            Step::ReadTimeout => seed.variant(33, COUNT),
         }
     }
 }

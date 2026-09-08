@@ -171,7 +171,8 @@ pub(super) trait Source: Send + 'static {
 
     /// Reads the next message of the session, or the session ending and the
     /// next one opening, see the transport server's. A client's session is
-    /// its connection, so it only ever reads messages.
+    /// its connection, so it only ever reads messages. A server retries failed
+    /// handshake output on its reusable stream; errors returned here end the mux.
     fn recv(&mut self) -> Result<Event<Writer>, transport::Error>;
 
     /// Ends the live session and tells the peer through
@@ -195,7 +196,17 @@ impl<A: Attester + Send + 'static> Source for transport::Server<Reader, Writer, 
         transport::Server::closer(self)
     }
     fn recv(&mut self) -> Result<Event<Writer>, transport::Error> {
-        transport::Server::recv(self)
+        loop {
+            match transport::Server::recv(self) {
+                // The transport retired the preceding session before the
+                // handshake, and failed output installed no replacement.
+                // Keep consuming the persistent server stream for a new reset.
+                Err(transport::Error::SendFailed(err)) => {
+                    warn!("wire handshake output failed: {}", err);
+                }
+                result => return result,
+            }
+        }
     }
 
     fn disconnect(&mut self) {
@@ -710,4 +721,156 @@ fn work<Out: Envelope, In: Envelope>(switchboard: Arc<Switchboard<Out, In>>) {
 /// panic is caught.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use crate::testing::{self, PipeReader, PipeWriter};
+    use crate::transport::mock::{payload, self_attestation};
+    use crate::transport::{Read, Stream, Write};
+    use darkbio_crypto::xdsa;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// Fails the client's first read once the server's output fault has fired,
+    /// allowing the client to abandon that attempt and reconnect on the same pipe.
+    struct FaultReader {
+        reader: PipeReader,
+        failure: Option<mpsc::Receiver<()>>,
+        deadline: Option<Instant>,
+    }
+
+    impl io::Read for FaultReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(failure) = &self.failure {
+                let failed = match self.deadline {
+                    Some(deadline) => failure.recv_timeout(testing::remaining(deadline)?),
+                    None => failure
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                failed.map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                    mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+                })?;
+                self.failure = None;
+                return Err(io::Error::other("abandoned failed handshake"));
+            }
+            self.reader.read(buf)
+        }
+    }
+
+    impl Read for FaultReader {
+        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.reader.set_read_deadline(deadline)?;
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    /// Rejects the first server hello, reports that rejection to the client
+    /// reader, and accepts all later output, including a failure notification.
+    struct FaultWriter {
+        writer: PipeWriter,
+        failure: Option<mpsc::Sender<()>>,
+        kind: io::ErrorKind,
+        deadline: Option<Instant>,
+    }
+
+    impl io::Write for FaultWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(deadline) = self.deadline {
+                testing::remaining(deadline)?;
+            }
+            if let Some(failure) = self.failure.take() {
+                failure.send(()).unwrap();
+                return Err(self.kind.into());
+            }
+            self.writer.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.writer.flush()
+        }
+    }
+
+    impl Write for FaultWriter {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.writer.set_write_deadline(deadline)?;
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    // Tests the real server Source after a failed hello write and after a hello
+    // timeout. Its receive call must keep consuming input until a new handshake
+    // connects, allowing a message round trip without closing the original stream.
+    // Protocol scenarios bypass the transport handshake, so cannot exercise this.
+    #[test]
+    fn test_server_source_retries_handshake_output_failure() {
+        testing::init_tracing();
+
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::TimedOut] {
+            let (ark_reader, host_writer) = testing::pipe();
+            let (host_reader, ark_writer) = testing::pipe();
+            let (failure, failed) = mpsc::channel();
+            let signer = xdsa::SecretKey::generate();
+            let identity = signer.public_key();
+            let attestation = self_attestation(&signer);
+            let closed = Arc::new(AtomicBool::new(false));
+            let server = transport::Server::new(
+                Stream::new(
+                    Box::new(ark_reader) as Reader,
+                    Box::new(FaultWriter {
+                        writer: ark_writer,
+                        failure: Some(failure),
+                        kind,
+                        deadline: None,
+                    }) as Writer,
+                    {
+                        let closed = closed.clone();
+                        move || closed.store(true, Ordering::Release)
+                    },
+                ),
+                signer,
+                attestation,
+            );
+            let peer = thread::spawn(move || {
+                let mut server = server;
+                let sender = match Source::recv(&mut server).unwrap() {
+                    Event::Connected(sender) => sender,
+                    _ => panic!("failed handshake escaped instead of being retried"),
+                };
+                let message = match Source::recv(&mut server).unwrap() {
+                    Event::Message(message) => message,
+                    _ => panic!("fresh session did not deliver its message"),
+                };
+                sender.send(&message).unwrap();
+                server
+            });
+
+            let mut client = transport::Client::new(Stream::new(
+                FaultReader {
+                    reader: host_reader,
+                    failure: Some(failed),
+                    deadline: None,
+                },
+                host_writer,
+                || {},
+            ));
+            assert!(matches!(
+                client.connect(&identity),
+                Err(transport::Error::RecvFailed(_))
+            ));
+            let (sender, _) = client.connect(&identity).unwrap();
+            sender.send(&payload(1)).unwrap();
+            assert_eq!(client.recv().unwrap(), payload(1));
+            let _server = peer.join().unwrap();
+            assert!(!closed.load(Ordering::Acquire));
+        }
+    }
 }

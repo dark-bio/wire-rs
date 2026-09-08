@@ -8,11 +8,10 @@ use crate::transport::sealing;
 use crate::transport::sender::Sender;
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
-    Error, Stream,
+    Error, Read, Stream, Write,
 };
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
-use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use tracing::{info, trace, warn};
 
@@ -91,8 +90,10 @@ pub enum Event<W: Write> {
 /// another; [`Server::close`] permanently closes the stream.
 ///
 /// On a local disconnect, a session failure, a failed handshake or data received
-/// outside a session, the server sends an empty frame. A client still holding a
-/// session thus learns it is gone instead of having to time out.
+/// outside a session, the server attempts an empty frame notification. A client
+/// receiving it drops its old session. Notifications are best effort and bounded
+/// by an output deadline; timed-out writes cannot spend another budget notifying
+/// the peer. See [`Server::recv`] for the failure and recovery contract.
 ///
 /// The device attestation is not interpreted by the wire, it is provided by an
 /// [`Attester`] and forwarded to the client verbatim.
@@ -116,11 +117,11 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// Creates a server owning the byte stream and its shutdown operation. The signer is
     /// the server's identity key, which signs the handshake. The client verifies that
     /// signature against the key it extracts from the attestation, so the two
-    /// must match. I/O deadlines and cancellation bounds are supplied by the
-    /// stream adapter.
+    /// must match. Output uses the stream's configured write timeout; its
+    /// adapter must enforce deadlines and the shutdown cancellation contract.
     pub fn new(stream: Stream<R, W>, signer: xdsa::SecretKey, attester: A) -> Self {
-        let (reader, writer, close) = stream.into_parts();
-        let outbound = Arc::new(Outbound::new(writer, Side::Server, close.clone()));
+        let (reader, writer, close, timeout) = stream.into_parts();
+        let outbound = Arc::new(Outbound::new(writer, Side::Server, close.clone(), timeout));
         Self {
             reader: FrameReader::new(reader, close),
             outbound,
@@ -181,7 +182,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// caller after the other thread ends the session.
     ///
     /// Junk outside a session and failed handshakes are logged, answered with
-    /// an empty frame and skipped. Transport receive failures surface as errors.
+    /// an empty frame and skipped. Receive failures and handshake write failures
+    /// surface as errors. Idle read polls do not time out the session. Outgoing
+    /// frames and standalone empty notifications use the stream's configured
+    /// write timeout; failure notifications share the failed frame's remaining
+    /// budget and are skipped after timeout. Every such failure leaves the byte
+    /// stream available for the next reset.
     pub fn recv(&mut self) -> Result<Event<W>, Error> {
         // Loop until we can deliver a valid decrypted message. Empty frames
         // are consumed and call for a handshake, run on the pass after them.
@@ -192,6 +198,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // Transport errors propagate immediately
                     Err(Error::Terminated) => return Err(Error::Terminated),
                     Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
+                    // Outbound already attempted notification within the failed
+                    // frame's budget; a fresh attempt here could block again.
+                    Err(Error::SendFailed(err)) => return Err(Error::SendFailed(err)),
 
                     // Decode or protocol errors are logged and ignored, the
                     // client learning that no session came out of it
@@ -211,7 +220,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 continue;
             }
             // Retrieve the next COBS encoded packet
-            let packet = match self.reader.next_packet() {
+            let packet = match self.reader.next_packet(None) {
                 // Transport errors propagate immediately
                 Err(Error::Terminated) => return Err(Error::Terminated),
                 Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
@@ -302,8 +311,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// No encryption lock is taken and extra crypto work is not waited for.
     ///
     /// The stream stays open and no notification is sent. The caller decides
-    /// whether to send a reset or empty frame. A stuck write can delay ending;
-    /// an independently held Closer can cancel it without taking the writer lock.
+    /// whether to send a reset or empty frame. An active write may delay ending
+    /// until its frame deadline. An independently held Closer can cancel it
+    /// earlier without taking the writer lock.
     ///
     /// Returns true when a receive context was removed, including one whose
     /// binding already ended through a send failure. The receive loop uses that
@@ -330,7 +340,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// failures are logged. This local action does not produce an
     /// [`Event::Disconnected`], since the caller already knows the session ended.
     /// Waits for the writer and its flush before retiring the binding and
-    /// sending the notification. An independent Closer can cancel stuck output.
+    /// sending the notification with its own finite frame budget. An independent
+    /// Closer can cancel output earlier.
     pub fn disconnect(&mut self) {
         self.end_session();
         self.send_dropped();
@@ -347,7 +358,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         loop {
             // Message 1: Read the HostHello (skip any trailing empty reset frames)
             let packet = loop {
-                if let Some(packet) = self.reader.next_packet()? {
+                if let Some(packet) = self.reader.next_packet(None)? {
                     break packet;
                 }
             };
@@ -409,7 +420,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 
             // Message 3: Read and open the HostAck. An empty frame probably
             // means the client is restarting the session, start over.
-            let Some(packet) = self.reader.next_packet()? else {
+            let Some(packet) = self.reader.next_packet(None)? else {
                 warn!("session reset during handshake");
                 continue;
             };
@@ -459,8 +470,10 @@ impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::testing::Socket;
     use crate::transport::mock::payload;
-    use crate::transport::{Client, Verifier};
+    use crate::transport::testing::Memory;
+    use crate::transport::{Client, MAX_FRAME_SIZE, Verifier};
     use darkbio_cobs as cobs;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -497,6 +510,33 @@ mod tests {
         buf
     }
 
+    // Tests that an oversized server hello produces one failure notification.
+    // It never reaches adapter I/O, so the handshake owns that notification;
+    // the writer must not emit another one with its own budget. Dummy attestation
+    // bytes isolate the framing limit: the server forwards them without parsing.
+    #[test]
+    fn test_oversized_hello_notifies_once() {
+        testing::init_tracing();
+
+        let hello = cbor::encode(&handshake::HostHello {
+            host_signer: xdsa::SecretKey::generate().public_key(),
+            host_crypto: xhpke::SecretKey::generate().public_key(),
+        })
+        .unwrap();
+        let mut input = vec![0, 0];
+        input.extend_from_slice(&cobs_frame(&hello));
+        let mut output = Vec::new();
+        let mut server = Server::new(
+            Stream::new(Memory::new(&input[..]), Memory::new(&mut output), || {}),
+            xdsa::SecretKey::generate(),
+            Attestation(vec![0; MAX_FRAME_SIZE]),
+        );
+
+        assert!(matches!(server.recv(), Err(Error::Terminated)));
+        drop(server);
+        assert_eq!(output, [0]);
+    }
+
     // Tests the two real sides against each other. The handshake hands the
     // attestation to the client's verifier unchanged and a request gets its
     // response. The server's signal for a dropped session then surfaces on the
@@ -511,8 +551,8 @@ mod tests {
         let presented = attestation.clone();
 
         let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
+        let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
+        let ark_writer = Socket::new(ark_sock);
 
         // Server side: receive two messages (across two sessions), echo each back.
         let ark_thread = std::thread::spawn(move || {
@@ -536,8 +576,8 @@ mod tests {
 
         // Session 1: handshake, checking the attestation, exchange one message.
         let mut client = Client::new(Stream::new(
-            host_sock.try_clone().unwrap(),
-            host_sock,
+            Socket::new(host_sock.try_clone().unwrap()),
+            Socket::new(host_sock),
             || {},
         ));
         let (sender, attest) = client.connect(&signer_pub).unwrap();
@@ -587,8 +627,8 @@ mod tests {
         let signer_key = xdsa::SecretKey::generate();
 
         let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
+        let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
+        let ark_writer = Socket::new(ark_sock);
 
         // Server side: serve handshakes until the transport drops. The client aborts
         // mid-handshake, so the server never delivers a message.
@@ -605,8 +645,8 @@ mod tests {
 
         // Client side: refuse the attestation in the verifier.
         let mut client = Client::new(Stream::new(
-            host_sock.try_clone().unwrap(),
-            host_sock,
+            Socket::new(host_sock.try_clone().unwrap()),
+            Socket::new(host_sock),
             || {},
         ));
         let result = client.connect(&Untrusting);
@@ -645,8 +685,8 @@ mod tests {
             emulator: &[xdsa::PublicKey],
         ) -> Result<darkbio_trust::device::Device, Error> {
             let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-            let ark_reader = ark_sock.try_clone().unwrap();
-            let ark_writer = ark_sock;
+            let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
+            let ark_writer = Socket::new(ark_sock);
 
             let ark_thread = std::thread::spawn(move || {
                 let mut server = Server::new(
@@ -658,8 +698,8 @@ mod tests {
                 testing::served(&mut server, &mut sender)
             });
             let mut client = Client::new(Stream::new(
-                host_sock.try_clone().unwrap(),
-                host_sock,
+                Socket::new(host_sock.try_clone().unwrap()),
+                Socket::new(host_sock),
                 || {},
             ));
             let result = client
@@ -807,8 +847,8 @@ mod tests {
         let attestation = self_attestation(&signer_key);
 
         let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
+        let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
+        let ark_writer = Socket::new(ark_sock);
 
         // Server side: on the first request, push messages from a few threads
         // while waiting for the second request.
@@ -840,8 +880,8 @@ mod tests {
 
         // Client side: request the push, receive it all, then request the stop.
         let mut client = Client::new(Stream::new(
-            host_sock.try_clone().unwrap(),
-            host_sock,
+            Socket::new(host_sock.try_clone().unwrap()),
+            Socket::new(host_sock),
             || {},
         ));
         let (sender, _) = client.connect(&signer_pub).unwrap();

@@ -18,18 +18,17 @@ use crate::protocol::envelope::{Envelope, Side};
 use crate::protocol::switchboard::Source;
 use crate::protocol::switchboard::{Release, ReplySender, Session, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
-use crate::transport::{self, Attester, MAX_MESSAGE_SIZE, Sender};
-use std::io::{Read, Write};
+use crate::transport::{self, Attester, MAX_MESSAGE_SIZE, Read, Sender, Write};
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tracing::warn;
 
-/// Reading half of the transport, the type erased.
+/// Type-erased standard I/O reader with transport deadline configuration.
 pub type Reader = Box<dyn Read + Send>;
 
-/// Writing half of the transport, the type erased.
+/// Type-erased standard I/O writer with transport deadline configuration.
 pub type Writer = Box<dyn Write + Send>;
 
 /// Bytes of unanswered requests a mux keeps in flight before its callers
@@ -101,8 +100,9 @@ pub type Server = Mux<ArkToHost, HostToArk>;
 impl Server {
     /// Starts multiplexing over a transport server, serving the clients it
     /// handshakes one session at a time, a session ending failing whatever it
-    /// left pending. Closing or failing the multiplexer closes the server's
-    /// byte stream.
+    /// left pending. Failed handshake output leaves the byte stream available
+    /// for another handshake. Closing or failing the multiplexer closes the
+    /// server's byte stream.
     pub fn new<A: Attester + Send + 'static>(server: transport::Server<Reader, Writer, A>) -> Self {
         Self {
             switchboard: Switchboard::start(Side::Server, server, None),
@@ -305,6 +305,7 @@ mod tests {
     use super::*;
     use crate::protocol::{ark_to_host, host_to_ark};
     use crate::testing;
+    use crate::testing::Socket;
     use crate::transport::Attestation;
     use crate::transport::mock::self_attestation;
     use darkbio_crypto::xdsa;
@@ -331,9 +332,9 @@ mod tests {
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
 
-        let ark_reader: Reader = Box::new(ark_sock.try_clone().unwrap());
+        let ark_reader: Reader = Box::new(Socket::new(ark_sock.try_clone().unwrap()));
         let ark_closing = ark_sock.try_clone().unwrap();
-        let ark_writer: Writer = Box::new(ark_sock);
+        let ark_writer: Writer = Box::new(Socket::new(ark_sock));
         let peer = thread::spawn(move || {
             let stream = transport::Stream::new(ark_reader, ark_writer, move || {
                 let _ = ark_closing.shutdown(Shutdown::Both);
@@ -349,8 +350,8 @@ mod tests {
         });
 
         let closing = host_sock.try_clone().unwrap();
-        let host_reader: Reader = Box::new(host_sock.try_clone().unwrap());
-        let host_writer: Writer = Box::new(host_sock);
+        let host_reader: Reader = Box::new(Socket::new(host_sock.try_clone().unwrap()));
+        let host_writer: Writer = Box::new(Socket::new(host_sock));
         let stream = transport::Stream::new(host_reader, host_writer, move || {
             let _ = closing.shutdown(Shutdown::Both);
         });
@@ -416,9 +417,9 @@ mod tests {
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
 
-        let host_reader: Reader = Box::new(host_sock.try_clone().unwrap());
+        let host_reader: Reader = Box::new(Socket::new(host_sock.try_clone().unwrap()));
         let host_closing = host_sock.try_clone().unwrap();
-        let host_writer: Writer = Box::new(host_sock);
+        let host_writer: Writer = Box::new(Socket::new(host_sock));
         let peer = thread::spawn(move || {
             let stream = transport::Stream::new(host_reader, host_writer, move || {
                 let _ = host_closing.shutdown(Shutdown::Both);
@@ -429,8 +430,8 @@ mod tests {
         });
 
         let closing = ark_sock.try_clone().unwrap();
-        let ark_reader: Reader = Box::new(ark_sock.try_clone().unwrap());
-        let ark_writer: Writer = Box::new(ark_sock);
+        let ark_reader: Reader = Box::new(Socket::new(ark_sock.try_clone().unwrap()));
+        let ark_writer: Writer = Box::new(Socket::new(ark_sock));
         let stream = transport::Stream::new(ark_reader, ark_writer, move || {
             let _ = closing.shutdown(Shutdown::Both);
         });
