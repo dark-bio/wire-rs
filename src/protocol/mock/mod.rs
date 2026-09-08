@@ -9,7 +9,7 @@
 //! scenario tests and the message level fuzzers share this, so a fuzzer
 //! finding replays as a test.
 //!
-//! The transport underneath is the mock's own, the real funnel over a sink
+//! The transport underneath is the mock's own, the real outbound side over a sink
 //! that can be made to fail. The messages the multiplexer sends are sealed and
 //! framed as on the wire, while the peer decides what comes back and when. The
 //! driver waits for everything the reader and the worker threads do, so a run
@@ -22,7 +22,7 @@ pub mod seed;
 use crate::protocol::envelope::Side;
 use crate::protocol::mux::Writer;
 use crate::protocol::switchboard::Source;
-use crate::transport::{self, Closer, Emitter, Event, Funnel, Stream};
+use crate::transport::{self, Closer, Event, Outbound, Sender, Stream};
 use darkbio_crypto::xhpke;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +47,7 @@ pub const CRYPTO_DOMAIN_MOCK: &[u8] = b"wire-mock";
 /// padded to the size with zeros. Only the tag tells the messages apart, the
 /// padding standing in for bulk.
 pub fn payload(tag: u8, size: usize) -> Vec<u8> {
-    let mut payload = crate::transport::mock::payload(tag as u64);
+    let mut payload = transport::mock::payload(tag as u64);
     payload.resize(payload_len(size), 0);
     payload
 }
@@ -92,7 +92,7 @@ pub(crate) struct Sink {
 
 impl Sink {
     /// Creates the sink along with the channel telling that a write attempt
-    /// finished, one per send of the funnel whether it got out or not.
+    /// finished, one per send of the outbound side whether it got out or not.
     pub(crate) fn new() -> (Self, mpsc::Receiver<()>) {
         let (writes, attempts) = mpsc::channel();
         let sink = Self {
@@ -150,13 +150,12 @@ impl Write for Sink {
     }
 }
 
-/// Sending half of the mock transport, the funnel the multiplexer's messages
+/// Sending half of the mock transport, the outbound side the multiplexer's messages
 /// go through and the handle of the session they go into. The peer opens the
 /// sessions, the reader thread hands the handle out.
 pub(crate) struct Link {
-    funnel: Arc<Funnel<Writer>>,
-    emitter: Mutex<Emitter<Writer>>, // Handle of the live session, as a transport caches it
-    held: AtomicBool,                // Whether the read side holds a session, its end reported
+    outbound: Arc<Outbound<Writer>>,
+    held: AtomicBool, // Whether the read side holds a session, its end reported
 }
 
 impl Link {
@@ -168,11 +167,9 @@ impl Link {
             Side::Client => transport::Side::Client,
             Side::Server => transport::Side::Server,
         };
-        let funnel = Arc::new(Funnel::new(writer, side, close));
-        let emitter = Mutex::new(funnel.emitter());
+        let outbound = Arc::new(Outbound::new(writer, side, close));
         Arc::new(Self {
-            funnel,
-            emitter,
+            outbound,
             held: AtomicBool::new(false),
         })
     }
@@ -189,15 +186,14 @@ impl Link {
             .new_receiver(&encap, CRYPTO_DOMAIN_MOCK)
             .expect("mock session opening context");
 
-        self.funnel.establish_session(sender);
-        *self.emitter.lock().expect("link not poisoned") = self.funnel.emitter();
+        self.outbound.establish_session(sender);
         self.held.store(true, Ordering::Release);
         receiver
     }
 
     /// Number of the live session, or zero without one.
-    pub(crate) fn session(&self) -> u64 {
-        self.funnel.session()
+    pub(crate) fn session_id(&self) -> u64 {
+        self.outbound.session_id()
     }
 
     /// Whether the read side holds a session, one whose end a transport
@@ -210,7 +206,7 @@ impl Link {
     /// server does on the peer's reset.
     pub(crate) fn drop_session(&self) {
         self.held.store(false, Ordering::Release);
-        self.funnel.drop_session();
+        self.outbound.drop_session();
     }
 }
 
@@ -261,9 +257,9 @@ impl Feed {
 
 impl Source for Feed {
     fn closer(&self) -> Closer {
-        self.link.funnel.closer()
+        self.link.outbound.closer()
     }
-    fn next_event(&mut self) -> Result<Event, transport::Error> {
+    fn recv(&mut self) -> Result<Event, transport::Error> {
         // Tell the driver that the reader is back for more, which on the first
         // read means it started and took down the session it starts from, and
         // on every later one that the message before it is routed
@@ -277,23 +273,23 @@ impl Source for Feed {
         }
     }
 
-    fn session(&self) -> u64 {
-        self.link.session()
+    fn session_id(&self) -> u64 {
+        self.link.session_id()
     }
 
-    fn emitter(&self) -> Emitter<Writer> {
-        self.link.emitter.lock().expect("link not poisoned").clone()
+    fn sender(&self) -> Sender<Writer> {
+        self.link.outbound.sender()
     }
 
     fn reset_session(&mut self) {
         self.link.drop_session();
-        let _ = self.link.funnel.send_dropped();
+        let _ = self.link.outbound.send_dropped();
     }
 }
 
 impl Drop for Feed {
     fn drop(&mut self) {
-        self.link.funnel.close();
+        self.link.outbound.close();
         let _ = self.finished.send(());
     }
 }

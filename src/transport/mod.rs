@@ -4,13 +4,13 @@
 //! Transport of the wire, sessions over a byte stream. The framing delimits
 //! packets with COBS, the handshake establishes a session's contexts, the
 //! sealing encrypts the messages within it, and the client and the server
-//! drive it from either end, with emitters for other threads to send through.
+//! drive it from either end, with senders for sending messages from any thread.
 
 mod client;
-mod emitter;
 mod framing;
 mod handshake;
 mod sealing;
+mod sender;
 mod server;
 mod stream;
 
@@ -20,15 +20,15 @@ mod stream;
 pub mod mock;
 
 pub use client::{Client, Roots, Verifier};
-pub use emitter::Emitter;
+pub use sender::Sender;
 pub use server::{Attestation, Attester, Event, Server};
 pub use stream::{Closer, Stream};
 
-/// The funnel behind the emitters, for the protocol's mock to have a real
+/// The outbound side behind the senders, for the protocol's mock to have a real
 /// sending side, sessions, sealing and the resets, without a transport under
 /// it.
 #[cfg(any(test, feature = "fuzz"))]
-pub(crate) use emitter::{Funnel, Side};
+pub(crate) use sender::{Outbound, Side};
 
 use std::io;
 

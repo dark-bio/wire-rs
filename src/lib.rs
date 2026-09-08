@@ -15,7 +15,7 @@ pub use transport::mock;
 
 pub use protocol::{ArkToHost, HostToArk};
 pub use transport::{
-    Attestation, Attester, Client, Closer, Emitter, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Roots,
+    Attestation, Attester, Client, Closer, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Roots, Sender,
     Server, Stream, Verifier,
 };
 
@@ -48,7 +48,7 @@ pub(crate) mod testing {
         server: &mut Server<R, W, A>,
     ) -> Result<Vec<u8>, Error> {
         loop {
-            if let Event::Message(message) = server.next_event()? {
+            if let Event::Message(message) = server.recv()? {
                 return Ok(message);
             }
         }

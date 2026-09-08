@@ -35,9 +35,9 @@ pub struct Vector {
 pub enum Event {
     /// The driver calls `handshake` with the client keys, as seeds.
     Handshake { xdsa: Vec<u8>, xhpke: Vec<u8> },
-    /// The driver calls `send_message` with the protobuf encoded message.
+    /// The driver calls `send` with the protobuf encoded message.
     Send { message: Vec<u8> },
-    /// The driver calls `next_message`.
+    /// The driver calls `recv`.
     Recv,
     /// The call in progress returns, a read with the protobuf encoded message.
     Ok { message: Option<Vec<u8>> },

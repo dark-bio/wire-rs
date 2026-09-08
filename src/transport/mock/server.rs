@@ -944,7 +944,7 @@ pub(super) fn check_session<R: Read, W: Write>(
     client: &mut crate::transport::Client<R, W>,
     established: bool,
 ) {
-    let refused = client.send_message(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
+    let refused = client.sender().send(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "client has a session the model does not")
@@ -1089,7 +1089,7 @@ pub fn run(steps: &[Step]) -> Summary {
                 trace(&recorder, || Event::Send {
                     message: request.clone(),
                 });
-                let result = client.send_message(&request);
+                let result = client.sender().send(&request);
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
                     Err(err) => Event::Err {
@@ -1103,7 +1103,7 @@ pub fn run(steps: &[Step]) -> Summary {
             Step::Recv => {
                 server.borrow_mut().call = Call::Recv;
                 trace(&recorder, || Event::Recv);
-                let result = client.next_message();
+                let result = client.recv();
                 trace(&recorder, || match &result {
                     Ok(message) => Event::Ok {
                         message: Some(message.clone()),

@@ -376,7 +376,7 @@ struct Peer<Out: Tagged, In: Tagged> {
     closed: bool, // Whether the closer ended the transport for good
     resync: bool, // Whether the last write failed, the next starting with a delimiter
 
-    live: u64,   // Session the funnel carries, zero without one
+    live: u64,   // Session the outbound side carries, zero without one
     handle: u64, // Session the multiplexer's handle sends into
 
     ids: u64,  // Next id the multiplexer hands out
@@ -884,7 +884,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             self.deliver(Delivery::SessionClosed);
         }
         self.receiver = Some(self.link.open_session());
-        self.live = self.link.session();
+        self.live = self.link.session_id();
         self.summary.sessions += 1;
         self.deliver(Delivery::SessionOpened);
     }
@@ -1044,7 +1044,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     }
 
     /// Applies a send of the multiplexer through the handle of a session,
-    /// handing back what it fails with, if it does. It mirrors the funnel, a
+    /// handing back what it fails with, if it does. It mirrors the outbound side, a
     /// send into any but the live session refused before the transport is
     /// touched, a message too large refused before sealing, and a failed write
     /// ending the session and, on a server, telling the peer.
@@ -1159,16 +1159,16 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
                 .recv_timeout(PATIENCE)
                 .expect("write attempt the model expected");
         }
-        // A failed write reports back from inside the write, and the funnel
+        // A failed write reports back from inside the write, and the outbound side
         // ends its session only after that, on the thread that wrote, so wait
-        // for the funnel to catch up with the model before the next step
+        // for the outbound side to catch up with the model before the next step
         // reads the session off it
         let deadline = Instant::now() + PATIENCE;
-        while self.link.session() != self.live {
+        while self.link.session_id() != self.live {
             assert!(
                 Instant::now() < deadline,
-                "funnel in session {} where the model has {}",
-                self.link.session(),
+                "outbound side in session {} where the model has {}",
+                self.link.session_id(),
                 self.live
             );
             thread::sleep(Duration::from_millis(1));
@@ -1237,7 +1237,7 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
     // A client's transport hands over the session its handshake opened, a
     // server's waits for a peer to open the first one
     let receiver = (side == Side::Client).then(|| link.open_session());
-    let session = link.session();
+    let session = link.session_id();
 
     let mux = Arc::new(Mux::<Out, In>::mocked(side, feed));
 

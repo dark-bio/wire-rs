@@ -320,8 +320,7 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
-            let mut framing =
-                FrameReader::new(&mut host_to_wire, crate::transport::Closer::new(|| {}));
+            let mut framing = FrameReader::new(&mut host_to_wire, Closer::new(|| {}));
             match tt.expected {
                 Some(expected) => {
                     let packet = framing
@@ -398,8 +397,7 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut wire_to_host = Cursor::new(Vec::<u8>::new());
 
-            let mut framing =
-                FrameWriter::new(&mut wire_to_host, crate::transport::Closer::new(|| {}));
+            let mut framing = FrameWriter::new(&mut wire_to_host, Closer::new(|| {}));
             match tt.expected {
                 Some(expected) => {
                     framing.send_packet(&tt.input).unwrap();
@@ -466,8 +464,7 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
-            let mut framing =
-                FrameReader::new(&mut host_to_wire, crate::transport::Closer::new(|| {}));
+            let mut framing = FrameReader::new(&mut host_to_wire, Closer::new(|| {}));
             let frame = framing.next_frame_blob().unwrap();
             assert_eq!(frame, tt.expected, "test {i}");
         }
@@ -524,8 +521,7 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
-            let mut framing =
-                FrameReader::new(Mock(tt.reads.into()), crate::transport::Closer::new(|| {}));
+            let mut framing = FrameReader::new(Mock(tt.reads.into()), Closer::new(|| {}));
             for (j, expected) in tt.expected.into_iter().enumerate() {
                 let result = framing.next_frame_blob().map(<[u8]>::to_vec);
                 match expected {
@@ -571,8 +567,7 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut wire_to_host = Cursor::new(Vec::<u8>::with_capacity(tt.input.len() + 1));
 
-            let mut framing =
-                FrameWriter::new(&mut wire_to_host, crate::transport::Closer::new(|| {}));
+            let mut framing = FrameWriter::new(&mut wire_to_host, Closer::new(|| {}));
             framing.send_frame_blob(tt.input).unwrap();
 
             let written = &wire_to_host.get_ref()[..];
@@ -611,7 +606,7 @@ mod tests {
                 armed: true,
                 written: Vec::new(),
             },
-            crate::transport::Closer::new(|| {}),
+            Closer::new(|| {}),
         );
         let result = panic::catch_unwind(AssertUnwindSafe(|| framing.send_packet(&[1, 2, 3])));
         assert!(result.is_err());

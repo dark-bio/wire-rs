@@ -3,12 +3,12 @@
 
 //! Mock client driving a real `Server`. A script is a sequence of steps,
 //! each putting the bytes of some frames in front of the server or handing
-//! control back to the driver. The driver calls `next_message` in a loop and
+//! control back to the driver. The driver calls `recv` in a loop and
 //! replies to whatever it delivers. The read half hands over the bytes of one
 //! step at a time, moving the script forward once they are consumed.
 //!
 //! The model tracks the state the server should be in, the frames it should emit
-//! and what `next_message` should surface for the last step. Whenever the server
+//! and what `recv` should surface for the last step. Whenever the server
 //! asks for more input, the frames it wrote are checked against the emissions
 //! expected. Any divergence panics.
 
@@ -223,7 +223,7 @@ enum Payload {
     Signal,
 }
 
-/// What the model expects `next_message` to surface for the last step.
+/// What the model expects `recv` to surface for the last step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     /// The server keeps reading.
@@ -385,7 +385,7 @@ pub struct Client {
     resync: bool,       // Whether the server's last send failed, the next starting with a delimiter
     tail: Option<Tail>, // Unterminated frame the server left behind
     emits: Vec<Emit>,   // Frames the server should have emitted since the last sync
-    outcome: Outcome,   // What next_message should surface for the last step
+    outcome: Outcome,   // What recv should surface for the last step
     held: bool,         // Whether the server's read side holds a session, its end reported
 
     pending: Option<Pending>, // ArkHello received, awaiting the client's ack
@@ -756,7 +756,7 @@ impl Client {
         self.outcome = outcome;
     }
 
-    /// Checks that `next_message` surfaced what the model expected and arms
+    /// Checks that `recv` surfaced what the model expected and arms
     /// the model for the next step.
     fn surfaced(&mut self, outcome: Outcome) {
         assert_eq!(self.outcome, outcome, "model vs server");
@@ -900,7 +900,7 @@ type Server = crate::transport::Server<Feed, Outbox, Attestation>;
 /// without any frame going out.
 fn check_session(server: &mut Server, client: &Client) {
     let established = client.state == State::Established;
-    let refused = server.send_message(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
+    let refused = server.sender().send(&vec![0x42; MAX_MESSAGE_SIZE + 1]);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "server has a session the model does not")
@@ -914,8 +914,8 @@ fn check_session(server: &mut Server, client: &Client) {
 
 /// Sends a message on the server's behalf, checking that the send path works
 /// exactly in a session and fails exactly when the transport does. A failed
-/// send takes the session down with it, the server signaling so, and takes
-/// the read side down with it too, so nothing is left for a read to report.
+/// send ends the sending session and signals the client. The server's receive
+/// side still holds its context until the next read reports the session ending.
 fn send(server: &mut Server, client: &mut Client, id: u64) {
     // Predict the send, a reply going out in a session unless the transport
     // fails it, in which case the server drops the session and signals
@@ -929,12 +929,11 @@ fn send(server: &mut Server, client: &mut Client, id: u64) {
         if !sent {
             client.forget();
             client.state = State::Idle;
-            client.held = false;
             client.send(Payload::Signal);
         }
         sent
     });
-    let sent = server.send_message(&payload(id));
+    let sent = server.sender().send(&payload(id));
     match (expected, sent) {
         (Some(true), Ok(())) => {}
         (Some(false), Err(Error::SendFailed(_))) => {}
@@ -965,7 +964,7 @@ pub fn run(steps: &[Step]) -> Summary {
     );
 
     loop {
-        match server.next_event() {
+        match server.recv() {
             // Reply to every request delivered, as a server would. The model
             // predicted the delivery, so the payload says which it was, and
             // garbage is nothing to answer.

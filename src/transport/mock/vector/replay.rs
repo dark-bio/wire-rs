@@ -130,11 +130,11 @@ pub fn run(vector: &Vector) {
                 settle(&tape, &mut peer, None, result);
             }
             Event::Send { message } => {
-                let result = client.send_message(&message).map(|_| None);
+                let result = client.sender().send(&message).map(|_| None);
                 settle(&tape, &mut peer, Some(&message), result);
             }
             Event::Recv => {
-                let result = client.next_message().map(Some);
+                let result = client.recv().map(Some);
                 settle(&tape, &mut peer, None, result);
             }
             Event::Session { established } => check_session(&mut client, established),

@@ -5,7 +5,7 @@
 //! of the wire. A reader thread owns the transport and routes what arrives,
 //! answers to the callers waiting for them, requests to a worker thread
 //! running the handler, so the reader blocks on nothing but its read. Callers
-//! send through the session's emitter from any thread, a request coming back
+//! send through the session's sender from any thread, a request coming back
 //! as a pending answer to wait on, several outstanding at once pipelining
 //! them within a window of bytes in flight, so a peer following the same
 //! rules never overflows, and a peer that does not follow them has its
@@ -16,9 +16,9 @@
 use crate::protocol::envelope::{Envelope, Side};
 #[cfg(any(test, feature = "fuzz"))]
 use crate::protocol::switchboard::Source;
-use crate::protocol::switchboard::{Release, Sender, Switchboard};
+use crate::protocol::switchboard::{Release, ReplySender, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
-use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE};
+use crate::transport::{self, Attester, MAX_MESSAGE_SIZE, Sender};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -156,20 +156,20 @@ impl<T> Drop for Pending<T> {
 /// that panics, forgets or gives up does not leave the peer waiting. It is
 /// bound to the session the request arrived in and refused once that ended.
 pub struct Responder<Out: Envelope> {
-    switchboard: Weak<dyn Sender>, // Answers through it, a failed write tearing the session down
-    emitter: Emitter<Writer>,      // Handle of the session the request arrived in
-    pub(super) id: u64,            // Id of the request, echoed by the answer
-    answered: bool,                // Whether an answer went out
+    switchboard: Weak<dyn ReplySender>, // Answers through it, a failed write tearing the session down
+    sender: Sender<Writer>,             // Handle of the session the request arrived in
+    pub(super) id: u64,                 // Id of the request, echoed by the answer
+    answered: bool,                     // Whether an answer went out
     envelope: PhantomData<fn() -> Out>, // Envelope the answer travels in
 }
 
 impl<Out: Envelope> Responder<Out> {
     /// Creates the responder of a request, answering through the switchboard
     /// into the session the request arrived in.
-    pub(super) fn new(switchboard: Weak<dyn Sender>, emitter: Emitter<Writer>, id: u64) -> Self {
+    pub(super) fn new(switchboard: Weak<dyn ReplySender>, sender: Sender<Writer>, id: u64) -> Self {
         Self {
             switchboard,
-            emitter,
+            sender,
             id,
             answered: false,
             envelope: PhantomData,
@@ -201,7 +201,7 @@ impl<Out: Envelope> Responder<Out> {
         }
         let message = answer.encode_to_vec();
         let result = match self.switchboard.upgrade() {
-            Some(switchboard) => switchboard.send(&self.emitter, &message),
+            Some(switchboard) => switchboard.send(&self.sender, &message),
             None => Err(Error::Closed),
         };
         self.answered = !matches!(result, Err(Error::TooLarge(_)));
@@ -379,7 +379,7 @@ mod tests {
 
     /// Sends an answer of the peer's.
     fn answer(server: &mut PeerServer, envelope: ArkToHost) {
-        server.send_message(&envelope.encode_to_vec()).unwrap();
+        server.sender().send(&envelope.encode_to_vec()).unwrap();
     }
 
     /// A peer echoing every request's payload back as its response.
@@ -438,14 +438,14 @@ mod tests {
 
     /// Sends a message of the client's.
     fn say(client: &mut PeerClient, envelope: HostToArk) {
-        client.send_message(&envelope.encode_to_vec()).unwrap();
+        client.sender().send(&envelope.encode_to_vec()).unwrap();
     }
 
     /// Reads the next message of the server's, taken apart.
     fn hear(
         client: &mut PeerClient,
     ) -> (u64, Option<protocol::Error>, Option<ark_to_host::Content>) {
-        let message = client.next_message().unwrap();
+        let message = client.recv().unwrap();
         ArkToHost::decode(&message[..]).unwrap().into_parts()
     }
 
@@ -576,14 +576,14 @@ mod tests {
     fn test_window() {
         testing::init_tracing();
 
-        // A peer holding every request, handing its emitter out so the test
+        // A peer holding every request, handing its sender out so the test
         // answers them when it pleases
         let (held_tx, held) = mpsc::channel();
-        let (emitter_tx, emitter_rx) = mpsc::channel();
-        let mut emitter_tx = Some(emitter_tx);
+        let (sender_tx, sender_rx) = mpsc::channel();
+        let mut sender_tx = Some(sender_tx);
         let (mux, peer) = connect(Box::new(move |server, message| {
-            if let Some(tx) = emitter_tx.take() {
-                tx.send(server.emitter()).unwrap();
+            if let Some(tx) = sender_tx.take() {
+                tx.send(server.sender()).unwrap();
             }
             held_tx.send(pinged(message).0).unwrap();
             true
@@ -611,7 +611,7 @@ mod tests {
                 }
             })
         };
-        let emitter = emitter_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sender = sender_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut ids: Vec<u64> = (0..15)
             .map(|_| held.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect();
@@ -620,7 +620,7 @@ mod tests {
 
         // Answering one makes room for the sixteenth
         let reply = |id: u64| ArkToHost::response(id, Some(pong(b"ok")), None).encode_to_vec();
-        emitter.send_message(&reply(ids.remove(0))).unwrap();
+        sender.send(&reply(ids.remove(0))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while issued.load(Ordering::SeqCst) < 16 {
             assert!(Instant::now() < deadline, "sixteenth request never issued");
@@ -628,7 +628,7 @@ mod tests {
         }
         ids.push(held.recv_timeout(Duration::from_secs(5)).unwrap());
         for id in ids {
-            emitter.send_message(&reply(id)).unwrap();
+            sender.send(&reply(id)).unwrap();
         }
         requester.join().unwrap();
 
@@ -642,14 +642,14 @@ mod tests {
     fn test_forgotten() {
         testing::init_tracing();
 
-        // A peer holding every request, handing its emitter out so the test
+        // A peer holding every request, handing its sender out so the test
         // answers them when it pleases
         let (held_tx, held) = mpsc::channel();
-        let (emitter_tx, emitter_rx) = mpsc::channel();
-        let mut emitter_tx = Some(emitter_tx);
+        let (sender_tx, sender_rx) = mpsc::channel();
+        let mut sender_tx = Some(sender_tx);
         let (mux, peer) = connect(Box::new(move |server, message| {
-            if let Some(tx) = emitter_tx.take() {
-                tx.send(server.emitter()).unwrap();
+            if let Some(tx) = sender_tx.take() {
+                tx.send(server.sender()).unwrap();
             }
             held_tx.send(pinged(message).0).unwrap();
             true
@@ -675,7 +675,7 @@ mod tests {
                 wait(pending).unwrap();
             })
         };
-        let emitter = emitter_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sender = sender_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut ids: Vec<u64> = (0..15)
             .map(|_| held.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect();
@@ -684,7 +684,7 @@ mod tests {
 
         // Answering a forgotten one makes room for the sixteenth
         let reply = |id: u64| ArkToHost::response(id, Some(pong(b"ok")), None).encode_to_vec();
-        emitter.send_message(&reply(ids.remove(0))).unwrap();
+        sender.send(&reply(ids.remove(0))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while issued.load(Ordering::SeqCst) < 16 {
             assert!(Instant::now() < deadline, "sixteenth request never issued");
@@ -692,7 +692,7 @@ mod tests {
         }
         ids.push(held.recv_timeout(Duration::from_secs(5)).unwrap());
         for id in ids {
-            emitter.send_message(&reply(id)).unwrap();
+            sender.send(&reply(id)).unwrap();
         }
         requester.join().unwrap();
 
@@ -718,8 +718,8 @@ mod tests {
             say(client, HostToArk::request(1, ping(b"first")));
             hear(client);
             assert_eq!(hear(client), (2, None, Some(pong(b"question"))));
-            client.send_message(&[0x07]).unwrap();
-            let result = client.next_message();
+            client.sender().send(&[0x07]).unwrap();
+            let result = client.recv();
             assert!(
                 matches!(result, Err(transport::Error::SessionReset)),
                 "{result:?}"
@@ -825,7 +825,8 @@ mod tests {
                 // Ask the server something, its handler echoing it back
                 let mine = 2 * round + 1;
                 if client
-                    .send_message(&HostToArk::request(mine, ping(b"host")).encode_to_vec())
+                    .sender()
+                    .send(&HostToArk::request(mine, ping(b"host")).encode_to_vec())
                     .is_err()
                 {
                     let _ = client.handshake(identity);
@@ -835,7 +836,7 @@ mod tests {
                 // asks of us on the way, a dead session sending us back to a
                 // handshake
                 loop {
-                    let Ok(message) = client.next_message() else {
+                    let Ok(message) = client.recv() else {
                         let _ = client.handshake(identity);
                         break;
                     };
@@ -844,7 +845,7 @@ mod tests {
                         break;
                     }
                     let answer = HostToArk::response(id, Some(ping(b"answered")), None);
-                    if client.send_message(&answer.encode_to_vec()).is_err() {
+                    if client.sender().send(&answer.encode_to_vec()).is_err() {
                         let _ = client.handshake(identity);
                         break;
                     }
