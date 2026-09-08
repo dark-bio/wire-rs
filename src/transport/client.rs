@@ -292,11 +292,13 @@ impl<R: Read, W: Write> Client<R, W> {
         // otherwise both peers can block writing into each other's full pipe.
         self.receiver = None;
         self.sealer = None;
+
         // Each attempt owns a fresh stop flag. It publishes no other state;
         // joining the helper synchronizes its result before this attempt ends.
         let canceled = AtomicBool::new(false);
         let outbound = &self.outbound;
         let reader = &mut self.reader;
+
         thread::scope(|scope| {
             let cancellation = &canceled;
             let writer = scope.spawn(|| {
