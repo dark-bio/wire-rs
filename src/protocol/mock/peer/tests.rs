@@ -839,6 +839,91 @@ fn test_scripted_flooded() {
     );
 }
 
+// Tests a maximal answer taken by its caller, its charge of the answers
+// budget freed so a peer staying under it forever keeps the session.
+#[test]
+fn test_scripted_blast_round_trip() {
+    let mut steps = Vec::new();
+    for tag in 0..20u8 {
+        steps.extend_from_slice(&[Step::Request(tag), Step::Blast(tag), Step::Wait(tag)]);
+    }
+
+    let summary = client(&steps);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 20,
+            answered: 20,
+            ..Summary::default()
+        }
+    );
+
+    let summary = server(&steps);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 20,
+            answered: 20,
+            sessions: 1,
+            ..Summary::default()
+        }
+    );
+}
+
+// Tests a peer stockpiling maximal answers against a driver not taking them,
+// the answers the multiplexer holds bounded like everything else a peer can
+// pile up, the session ended once they overrun the budget.
+#[test]
+fn test_scripted_answer_flooded() {
+    // Thirty two tiny requests out, then a maximal answer to each, the
+    // seventeenth overrunning the budget
+    let mut steps = Vec::new();
+    for tag in 0..32u8 {
+        steps.push(Step::Request(tag));
+    }
+    for tag in 0..32u8 {
+        steps.push(Step::Blast(tag));
+    }
+
+    let summary = client(&steps);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 32,
+            disconnects: 1,
+            closed: true,
+            ..Summary::default()
+        }
+    );
+
+    // Twenty four a side here, leaving room for the recovery within the
+    // step limit
+    let mut steps = Vec::new();
+    for tag in 0..24u8 {
+        steps.push(Step::Request(tag));
+    }
+    for tag in 0..24u8 {
+        steps.push(Step::Blast(tag));
+    }
+    steps.extend_from_slice(&[
+        Step::Reset,
+        Step::Request(32),
+        Step::Answer(32),
+        Step::Wait(32),
+    ]);
+    let summary = server(&steps);
+    assert_eq!(
+        summary,
+        Summary {
+            sent: 25,
+            answered: 1,
+            disconnects: 1,
+            sessions: 2,
+            ..Summary::default()
+        }
+    );
+}
+
 // Tests that a request the handler holds across a reset is answered into the
 // session it arrived in, which is gone, so the answer never reaches anyone.
 #[test]

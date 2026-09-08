@@ -28,7 +28,7 @@ pub fn seed(target: &str, steps: &[Step]) {
 
 impl Seedable for Step {
     fn seed(&self, seed: &mut Seed) {
-        const COUNT: u32 = 22;
+        const COUNT: u32 = 23;
         match self {
             Step::Request(tag) => {
                 seed.variant(0, COUNT);
@@ -73,6 +73,10 @@ impl Seedable for Step {
             Step::Unplug => seed.variant(19, COUNT),
             Step::Break => seed.variant(20, COUNT),
             Step::Heal => seed.variant(21, COUNT),
+            Step::Blast(tag) => {
+                seed.variant(22, COUNT);
+                seed.byte(*tag);
+            }
         }
     }
 }

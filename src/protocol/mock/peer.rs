@@ -19,7 +19,7 @@
 //! refusal of a request nobody serves to the tests of the multiplexer.
 
 use super::{Delivery, Feed, Link, MAX_STEPS, PATIENCE, Sink, payload, payload_len, tag as tagged};
-use crate::protocol::mux::{CHARGE, Error, INBOX, Mux, Pending, Responder, WINDOW};
+use crate::protocol::mux::{ANSWERS, CHARGE, Error, INBOX, Mux, Pending, Responder, WINDOW};
 use crate::protocol::{self, ArkToHost, Envelope, HostToArk, ark_to_host, host_to_ark};
 use crate::transport::mock::unframe;
 use crate::transport::{self, MAX_MESSAGE_SIZE, Side};
@@ -127,6 +127,10 @@ pub enum Step {
     Break,
     /// The multiplexer's writes work again.
     Heal,
+    /// The peer answers the request tagged by the byte with a payload nearly
+    /// filling a frame, however small the request was. Nothing if no such
+    /// request is outstanding.
+    Blast(u8),
 }
 
 /// Error kinds the model distinguishes in the multiplexer's results.
@@ -271,12 +275,29 @@ struct Queued {
 /// Answer the driver is due for a request of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
-    /// The peer answered, echoing the tag.
-    Payload(u8),
+    /// The peer answered, echoing the tag in a payload of the size.
+    Payload(usize),
     /// The peer failed the request.
     Rejected,
     /// The session ended under it, with the reason.
     Fault(Kind),
+}
+
+/// What the peer answers a request of the driver's with.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// A payload echoing the tag, of the size.
+    Echo(usize),
+    /// A failure.
+    Reject,
+}
+
+/// An answer of the peer's arrived, the outcome the driver should see and
+/// the bytes it holds of the answers budget until taken or dropped.
+#[derive(Clone, Copy)]
+struct Settled {
+    outcome: Outcome,
+    bytes: usize,
 }
 
 /// What a wait hands back, the model's prediction and the multiplexer's
@@ -363,7 +384,8 @@ struct Peer<Out: Tagged, In: Tagged> {
     pending: HashMap<u64, Track>, // Requests of the driver's still registered
     inflight: usize,              // Bytes they hold of the window
     waiting: HashMap<u8, Pending<In::Content>>, // Answers the driver has yet to take
-    settled: HashMap<u8, Outcome>, // What those answers should be
+    settled: HashMap<u8, Settled>, // What those answers should be, with their charges
+    buffered: usize,              // Bytes the answers arrived hold of the answers budget
     blocked: Option<Blocked<In>>, // Request waiting for room in the window
 
     inbox: VecDeque<Queued>, // Requests of the peer's ahead of the worker
@@ -389,8 +411,9 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             Step::Wait(tag) => self.wait(tag),
             Step::Forget(tag) => self.forget(tag),
             Step::Close => self.close(),
-            Step::Answer(tag) => self.answer(tag, false),
-            Step::Fail(tag) => self.answer(tag, true),
+            Step::Answer(tag) => self.answer(tag),
+            Step::Blast(tag) => self.blast(tag),
+            Step::Fail(tag) => self.reject(tag),
             Step::Stray => self.stray(true),
             Step::Void => self.stray(false),
             Step::Junk => self.junk(),
@@ -548,9 +571,24 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             return;
         };
         let expected = match self.settled.remove(&tag) {
-            Some(Outcome::Payload(answer)) => Expect::Payload(payload(answer, 0)),
-            Some(Outcome::Rejected) => Expect::Rejected(REJECTION.0, REJECTION.1.into()),
-            Some(Outcome::Fault(kind)) => Expect::Failed(kind),
+            Some(Settled {
+                outcome: Outcome::Payload(size),
+                bytes,
+            }) => {
+                self.buffered -= bytes;
+                Expect::Payload(payload(tag, size))
+            }
+            Some(Settled {
+                outcome: Outcome::Rejected,
+                bytes,
+            }) => {
+                self.buffered -= bytes;
+                Expect::Rejected(REJECTION.0, REJECTION.1.into())
+            }
+            Some(Settled {
+                outcome: Outcome::Fault(kind),
+                ..
+            }) => Expect::Failed(kind),
             None => Expect::Failed(Kind::Timeout),
         };
         let result = match pending.wait(Duration::ZERO) {
@@ -569,12 +607,15 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
     }
 
     /// Drops the answer of a request, which stays registered and holds its
-    /// bytes of the window until the peer answers it.
+    /// bytes of the window until the peer answers it. One already arrived is
+    /// dropped with it, its charge of the answers budget freed.
     fn forget(&mut self, tag: u8) {
         if self.waiting.remove(&tag).is_none() {
             return;
         }
-        self.settled.remove(&tag);
+        if let Some(settled) = self.settled.remove(&tag) {
+            self.buffered -= settled.bytes;
+        }
         self.give_up(tag);
     }
 
@@ -606,43 +647,71 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         self.mux.close();
     }
 
-    /// Answers a request of the driver's, with its payload echoed or with a
-    /// failure.
-    fn answer(&mut self, tag: u8, failed: bool) {
+    /// Answers a request of the driver's with its payload echoed.
+    fn answer(&mut self, tag: u8) {
+        self.deliver_answer(tag, Answer::Echo(0))
+    }
+
+    /// Answers a request of the driver's with a payload nearly filling a
+    /// frame, however small the request was.
+    fn blast(&mut self, tag: u8) {
+        self.deliver_answer(tag, Answer::Echo(BULK))
+    }
+
+    /// Fails a request of the driver's.
+    fn reject(&mut self, tag: u8) {
+        self.deliver_answer(tag, Answer::Reject)
+    }
+
+    /// Delivers the answer to a request of the driver's, charging its bytes
+    /// of the answers budget while the driver holds it untaken. A peer
+    /// stockpiling more than the budget overran it, its session ended.
+    fn deliver_answer(&mut self, tag: u8, answer: Answer) {
         if !self.open() {
             return;
         }
         let Some(id) = self.outstanding(tag) else {
             return;
         };
-        let message = match failed {
-            false => In::response(id, Some(In::develop(payload(tag, 0))), None),
-            true => In::response(
-                id,
-                None,
-                Some(protocol::Error {
-                    code: REJECTION.0,
-                    msg: REJECTION.1.into(),
-                }),
+        let (message, outcome) = match answer {
+            Answer::Echo(size) => (
+                In::response(id, Some(In::develop(payload(tag, size))), None),
+                Outcome::Payload(size),
+            ),
+            Answer::Reject => (
+                In::response(
+                    id,
+                    None,
+                    Some(protocol::Error {
+                        code: REJECTION.0,
+                        msg: REJECTION.1.into(),
+                    }),
+                ),
+                Outcome::Rejected,
             ),
         };
-        if !self.deliver(Delivery::Message(message.encode_to_vec())) {
+        let message = message.encode_to_vec();
+        let bytes = message.len().max(CHARGE);
+        if !self.deliver(Delivery::Message(message)) {
             return;
         }
 
         // A reset ahead of the answer already drained the request, leaving
-        // the answer to no request at all
+        // the answer to no request at all. A forgotten one is delivered to
+        // nobody, its charge freed with it.
         let Some(track) = self.pending.remove(&id) else {
             return;
         };
         self.inflight -= track.bytes;
-        if !track.forgotten {
-            let outcome = match failed {
-                false => Outcome::Payload(tag),
-                true => Outcome::Rejected,
-            };
-            self.settled.insert(tag, outcome);
+        if track.forgotten {
+            return;
         }
+        if self.buffered + bytes > ANSWERS {
+            self.fault(Kind::Flooded);
+            return;
+        }
+        self.buffered += bytes;
+        self.settled.insert(tag, Settled { outcome, bytes });
     }
 
     /// Answers an id nobody asked under, either carrying a payload, which is
@@ -926,14 +995,22 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         true
     }
 
-    /// Fails every pending request with the reason, freeing the window.
+    /// Fails every pending request with the reason, freeing the window. The
+    /// answers already delivered are the driver's to take or drop, their
+    /// charges untouched by the session's end.
     fn drain(&mut self, reason: Kind) {
         self.inflight = 0;
         for track in std::mem::take(&mut self.pending).into_values() {
             if let Some(tag) = track.tag
                 && !track.forgotten
             {
-                self.settled.insert(tag, Outcome::Fault(reason));
+                self.settled.insert(
+                    tag,
+                    Settled {
+                        outcome: Outcome::Fault(reason),
+                        bytes: 0,
+                    },
+                );
             }
         }
     }
@@ -1244,6 +1321,7 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
         inflight: 0,
         waiting: HashMap::new(),
         settled: HashMap::new(),
+        buffered: 0,
         blocked: None,
         inbox: VecDeque::new(),
         queued: 0,

@@ -9,7 +9,9 @@
 
 use crate::protocol;
 use crate::protocol::envelope::{Envelope, Ids, Kind, Parity};
-use crate::protocol::mux::{CHARGE, Closer, Error, INBOX, Reader, Responder, WINDOW, Writer};
+use crate::protocol::mux::{
+    ANSWERS, CHARGE, Closer, Error, INBOX, Reader, Responder, WINDOW, Writer,
+};
 use crate::transport::{self, Attester, Emitter, Event, MAX_MESSAGE_SIZE, Side};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -24,8 +26,40 @@ pub(super) type Handler<Out, In> = Box<dyn FnMut(<In as Envelope>::Content, Resp
 /// Handler of a session ending without a close, with the reason.
 pub(super) type Disconnect = Box<dyn FnMut(Error) + Send>;
 
-/// Delivery of an answer to the caller waiting for it.
-pub(super) type Answer<In> = SyncSender<Result<<In as Envelope>::Content, Error>>;
+/// Delivery of an answer to the caller waiting for it, the charge of its
+/// bytes of the answers budget going with it, freed when the caller takes or
+/// drops the answer.
+pub(super) type Answer<In> =
+    SyncSender<(Result<<In as Envelope>::Content, Error>, Option<Release>)>;
+
+/// Charge of an answer of the answers budget, freed on drop, which is when
+/// the caller takes the answer out or lets it go.
+pub(crate) struct Release(Option<Box<dyn FnOnce() + Send>>);
+
+impl Release {
+    /// Creates the charge of the bytes on the switchboard, its drop paying
+    /// them back however far the multiplexer moved on meanwhile.
+    fn new<Out: Envelope, In: Envelope>(
+        switchboard: &Arc<Switchboard<Out, In>>,
+        bytes: usize,
+    ) -> Self {
+        let switchboard = Arc::downgrade(switchboard);
+        Self(Some(Box::new(move || {
+            if let Some(switchboard) = switchboard.upgrade() {
+                let mut registry = lock(&switchboard.registry);
+                registry.buffered = registry.buffered.saturating_sub(bytes);
+            }
+        })))
+    }
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
 
 /// Whether the multiplexer still takes calls, and if not, why.
 enum State {
@@ -44,6 +78,8 @@ struct Registry<In: Envelope> {
     waiting: usize,  // Callers parked on the window
     session: u64,    // Session the switchboard is bound to, zero for none
 
+    buffered: usize, // Bytes of answers delivered but not taken, bounded by the budget
+
     ended: Option<Error>, // Reason the session before it ended for, none before the first
 }
 
@@ -60,7 +96,7 @@ impl<In: Envelope> Registry<In> {
     fn drain(&mut self, reason: &Error) {
         self.inflight = 0;
         for (_, (tx, _)) in std::mem::take(&mut self.pending) {
-            let _ = tx.send(Err(reason.clone()));
+            let _ = tx.send((Err(reason.clone()), None));
         }
     }
 
@@ -187,6 +223,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
                 inflight: 0,
                 waiting: 0,
                 session: source.session(),
+                buffered: 0,
                 ended: None,
             }),
             room: Condvar::new(),
@@ -266,10 +303,12 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             // Sanity check whether the registry is accepting messages
             registry.accepting()?;
 
-            // Sanity chek that no new session was established since
+            // Sanity check that no new session was established since, the
+            // reason it ended for standing in for one bound before any did
             if registry.session != session {
-                let ended = registry.ended.clone();
-                return Err(ended.expect("a session that ended left its reason"));
+                let reset = transport::Error::SessionReset;
+                let ended = Error::Disconnected(Arc::new(reset));
+                return Err(registry.ended.clone().unwrap_or(ended));
             }
         }
         // Message admitted into the registry, insert it
@@ -358,19 +397,31 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
                     }
                 };
                 // Deliver to the caller, unless it gave up on the request. The
-                // entry leaves the registry and frees its bytes under one
-                // hold, or a drain in between zeroes the bytes first
+                // entry leaves the registry and frees its bytes of the window
+                // under one hold, or a drain in between zeroes the bytes
+                // first. The answer is charged of the answers budget until
+                // the caller takes or drops it, a peer piling more of them on
+                // its callers than the budget having its session ended like
+                // one overrunning its window.
                 let delivery = {
                     let mut registry = lock(&self.registry);
-                    registry.pending.remove(&id).map(|(tx, bytes)| {
-                        registry.inflight -= bytes;
-                        tx
-                    })
+                    match registry.pending.remove(&id) {
+                        Some((tx, request)) => {
+                            registry.inflight -= request;
+                            if registry.buffered + bytes > ANSWERS {
+                                error!("ending session, peer stockpiled answers: {}", id);
+                                return Err(Error::Flooded);
+                            }
+                            registry.buffered += bytes;
+                            Some((tx, Release::new(self, bytes)))
+                        }
+                        None => None,
+                    }
                 };
                 match delivery {
-                    Some(tx) => {
+                    Some((tx, release)) => {
                         self.room.notify_all();
-                        let _ = tx.send(answer);
+                        let _ = tx.send((answer, Some(release)));
                     }
                     None => warn!("dropping answer to no request: {}", id),
                 }
@@ -432,10 +483,20 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// blocked in it wakes up, and telling the disconnect handler. A closed
     /// multiplexer needs none of it.
     fn fail(&self, reason: Error) {
-        if self.end(State::Failed(reason.clone()))
-            && let Some(handler) = lock(&self.disconnect).as_mut()
+        if self.end(State::Failed(reason.clone())) {
+            self.tell(reason);
+        }
+    }
+
+    /// Tells the disconnect handler that a session ended, a panic in it being
+    /// its own bug, the multiplexer carrying on. It runs on whichever thread
+    /// saw the session die, the reader among them, which would stop reading
+    /// for good if a panic took it.
+    fn tell(&self, reason: Error) {
+        if let Some(handler) = lock(&self.disconnect).as_mut()
+            && panic::catch_unwind(AssertUnwindSafe(|| handler(reason))).is_err()
         {
-            handler(reason);
+            error!("disconnect handler panicked");
         }
     }
 
@@ -465,9 +526,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             lock(&self.inbox).clear();
         }
         self.room.notify_all();
-        if let Some(handler) = lock(&self.disconnect).as_mut() {
-            handler(reason);
-        }
+        self.tell(reason);
     }
 
     /// Ends the multiplexer in the state, failing every pending request
@@ -485,6 +544,10 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             registry.state = state;
             let refusal = registry.refusal();
             registry.drain(&refusal);
+
+            // Bound to no session any more, so one ending afterwards has
+            // nothing left to end and tells nobody, a close being silent
+            registry.session = 0;
 
             let mut inbox = lock(&self.inbox);
             inbox.clear();

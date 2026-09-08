@@ -9,12 +9,14 @@
 //! as a pending answer to wait on, several outstanding at once pipelining
 //! them within a window of bytes in flight, so a peer following the same
 //! rules never overflows, and a peer that does not follow them has its
-//! session ended.
+//! session ended. Answers arriving faster than their callers take them are
+//! held under a budget of their own, a peer stockpiling more than it having
+//! its session ended the same way.
 
 use crate::protocol::envelope::Envelope;
 #[cfg(any(test, feature = "fuzz"))]
 use crate::protocol::switchboard::Source;
-use crate::protocol::switchboard::{Sender, Switchboard};
+use crate::protocol::switchboard::{Release, Sender, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
 use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
 use std::io::{Read, Write};
@@ -43,6 +45,13 @@ pub const WINDOW: usize = 16 * 1024 * 1024;
 /// is ended on the peer. Four windows, which a peer respecting its window
 /// never reaches, so only one ignoring the rules does.
 pub const INBOX: usize = 64 * 1024 * 1024;
+
+/// Bytes of answers the multiplexer holds for callers that have not taken
+/// them before the session is ended on the peer. Two windows, which a peer
+/// answering only what was asked and a caller taking its answers never
+/// reaches, so only one stockpiling answers against a caller not reading
+/// does.
+pub const ANSWERS: usize = 32 * 1024 * 1024;
 
 /// Bytes a request is charged of either budget at the least, whatever it
 /// encodes to. Holding one costs this much in queues and maps however
@@ -110,9 +119,10 @@ impl Server {
 /// Answer to a request still on its way, waited for once. Dropped, the
 /// request is forgotten and its answer discarded on arrival, the request
 /// keeping its place in the window until then, the peer still holding the
-/// work.
+/// work. An answer that arrived holds its place of the answers budget until
+/// it is taken or dropped.
 pub struct Pending<T> {
-    answer: mpsc::Receiver<Result<T, Error>>, // Answer, or the reason there is none
+    answer: mpsc::Receiver<(Result<T, Error>, Option<Release>)>, // Answer, or the reason there is none
     forget: Option<Box<dyn FnOnce() -> bool + Send>>, // Forgets the request, telling if it was still pending
 }
 
@@ -123,12 +133,15 @@ impl<T> Pending<T> {
     pub fn wait(mut self, timeout: Duration) -> Result<T, Error> {
         let forget = self.forget.take().expect("answer waited for once");
         match self.answer.recv_timeout(timeout) {
-            Ok(result) => result,
+            Ok((result, _charge)) => result,
             Err(RecvTimeoutError::Timeout) => {
                 if forget() {
                     return Err(Error::Timeout);
                 }
-                self.answer.recv().unwrap_or(Err(Error::Closed))
+                self.answer
+                    .recv()
+                    .map(|(result, _charge)| result)
+                    .unwrap_or(Err(Error::Closed))
             }
             Err(RecvTimeoutError::Disconnected) => Err(Error::Closed),
         }
@@ -796,5 +809,158 @@ mod tests {
 
         drop(mux);
         peer.join().unwrap();
+    }
+
+    // Adversarial: a client that reconnects under load while the server's own
+    // callers keep asking, its requests failing and resuming across sessions,
+    // with nothing hanging and the multiplexer usable at the end.
+    #[test]
+    fn test_stress_server_reconnects() {
+        testing::init_tracing();
+
+        let rounds = 40;
+        let (mux, peer) = serve(Box::new(move |client, identity| {
+            for round in 0..rounds {
+                // Ask the server something, its handler echoing it back
+                let mine = 2 * round + 1;
+                if client
+                    .send_message(&HostToArk::request(mine, ping(b"host")).encode_to_vec())
+                    .is_err()
+                {
+                    let _ = client.handshake(identity);
+                    continue;
+                }
+                // Read until the answer comes, answering whatever the server
+                // asks of us on the way, a dead session sending us back to a
+                // handshake
+                loop {
+                    let Ok(message) = client.next_message() else {
+                        let _ = client.handshake(identity);
+                        break;
+                    };
+                    let (id, _, content) = ArkToHost::decode(&message[..]).unwrap().into_parts();
+                    if id == mine {
+                        break;
+                    }
+                    let answer = HostToArk::response(id, Some(ping(b"answered")), None);
+                    if client.send_message(&answer.encode_to_vec()).is_err() {
+                        let _ = client.handshake(identity);
+                        break;
+                    }
+                    let _ = content;
+                }
+                // Reconnect now and then, under whatever is in flight
+                if round % 4 == 3 {
+                    let _ = client.handshake(identity);
+                }
+            }
+        }));
+        let mux = Arc::new(mux);
+        let (served_tx, _served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+
+        // Callers of the server's own, asking through whatever session is
+        // live and taking any failure in stride
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let mux = mux.clone();
+                thread::spawn(move || {
+                    for _ in 0..rounds {
+                        if let Ok(pending) = mux.request(pong(b"ark")) {
+                            let _ = pending.wait(Duration::from_millis(500));
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for caller in callers {
+            caller.join().expect("caller thread");
+            assert!(Instant::now() < deadline, "callers hung");
+        }
+        peer.join().expect("peer thread");
+        drop(mux);
+    }
+
+    // Adversarial: a disconnect handler that panics, which must not take the
+    // reader thread with it, the server serving the client that reconnects
+    // after the session its panic fired on.
+    #[test]
+    fn test_server_disconnect_handler_panics() {
+        testing::init_tracing();
+
+        let (mux, peer) = serve(Box::new(move |client, identity| {
+            say(client, HostToArk::request(1, ping(b"first")));
+            hear(client);
+            // Reconnect, which ends the session and fires the handler
+            client.handshake(identity).unwrap();
+            say(client, HostToArk::request(1, ping(b"second")));
+            hear(client);
+        }));
+        mux.on_disconnect(|_| panic!("injected panic"));
+        let (served_tx, served) = mpsc::channel();
+        mux.on_request(echoing(served_tx));
+
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            served.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"second",
+            "the reader stopped after the disconnect handler panicked"
+        );
+
+        drop(mux);
+        peer.join().unwrap();
+    }
+
+    // Measures how much memory a message of the wire's maximum size occupies
+    // once decoded, which is what the inbox holds while the charge it counts
+    // is the serialized size.
+    #[test]
+    fn test_measure_decode_expansion() {
+        use crate::protocol::{SlotUploadPeekRequest, SlotUploadProcessResponse};
+
+        // Toward the Ark, a packed enum list, four bytes held per byte sent
+        let kinds = vec![1i32; MAX_MESSAGE_SIZE - 64];
+        let request = HostToArk::request(
+            1,
+            host_to_ark::Content::SlotUploadPeek(SlotUploadPeekRequest {
+                kinds,
+                ..Default::default()
+            }),
+        );
+        let wire = request.encode_to_vec().len();
+        let host_to_ark::Content::SlotUploadPeek(peek) = request.into_parts().2.unwrap() else {
+            panic!("content");
+        };
+        let held = peek.kinds.capacity() * size_of::<i32>();
+        println!(
+            "host to ark: {wire} bytes on the wire, {held} bytes held, {:.1}x",
+            held as f64 / wire as f64
+        );
+
+        // Toward the host, a list of empty strings, a pointer triple each
+        let names = vec![String::new(); (MAX_MESSAGE_SIZE - 64) / 2];
+        let response = ArkToHost::request(
+            2,
+            ark_to_host::Content::SlotUploadProcess(SlotUploadProcessResponse {
+                phase_names: names,
+                ..Default::default()
+            }),
+        );
+        let wire = response.encode_to_vec().len();
+        let ark_to_host::Content::SlotUploadProcess(process) = response.into_parts().2.unwrap()
+        else {
+            panic!("content");
+        };
+        let held = process.phase_names.capacity() * size_of::<String>();
+        println!(
+            "ark to host: {wire} bytes on the wire, {held} bytes held, {:.1}x",
+            held as f64 / wire as f64
+        );
     }
 }
