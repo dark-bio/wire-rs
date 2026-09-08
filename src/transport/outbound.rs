@@ -1,13 +1,14 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Serialized output of one byte stream. Session objects own encryption; the
-//! writer orders their frames with handshake traffic and reset notifications.
+//! Serialized output of one byte stream. The client/server owns encryption;
+//! the writer orders its frames with handshake traffic and reset notifications.
 
 use super::framing::FrameWriter;
-use super::session::{Session, SessionState};
 use super::{Closer, Error, Sender};
+use darkbio_crypto::xhpke;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tracing::{trace, warn};
 
@@ -31,7 +32,7 @@ impl Side {
 
 /// Output and permanent closure of a byte stream, owned by its client or server.
 /// Senders hold weak references and active sends temporarily retain it. The
-/// encryption contexts belong to individual sessions, which share this writer.
+/// encryption contexts belong to the client/server and share this writer.
 pub(crate) struct Outbound<W: Write> {
     writer: Mutex<Writer<W>>, // Frames and session boundaries serialized together
     closer: Closer,           // Shutdown independent of the writer lock
@@ -44,19 +45,31 @@ impl<W: Write> Outbound<W> {
             writer: Mutex::new(Writer {
                 framer: FrameWriter::new(writer, closer.clone()),
                 binding: Weak::new(),
+                ended: Weak::new(),
                 side,
             }),
             closer,
         }
     }
 
-    /// Binds a session and issues its sender under the same lock used to write
-    /// frames. Previous senders are invalidated before the new session can write.
-    pub(crate) fn bind(self: &Arc<Self>, session: &Session) -> Sender<W> {
+    /// Binds a sending context and its fresh termination flag, issuing a sender
+    /// under the same lock used to write frames. The caller retains both; the
+    /// writer and idle senders hold weak references. Previous senders are
+    /// invalidated before the new session can write.
+    pub(crate) fn bind(
+        self: &Arc<Self>,
+        sealer: &Arc<Mutex<xhpke::Sender>>,
+        ended: &Arc<AtomicBool>,
+    ) -> Sender<W> {
         let mut writer = self.lock();
         writer.unbind();
-        writer.binding = Arc::downgrade(&session.state);
-        Sender::new(Arc::downgrade(self), Arc::downgrade(&session.state))
+        writer.binding = Arc::downgrade(sealer);
+        writer.ended = Arc::downgrade(ended);
+        Sender::new(
+            Arc::downgrade(self),
+            Arc::downgrade(sealer),
+            Arc::downgrade(ended),
+        )
     }
 
     /// Retires the writer's binding before a server starts another handshake.
@@ -112,8 +125,8 @@ impl<W: Write> Outbound<W> {
     /// replacement is skipped, so it cannot interrupt a later handshake or
     /// session. The client side signals its reset when starting another handshake.
     /// Notification failures are logged, preserving the original send error.
-    pub(super) fn notify_session_ended(&self, session: &Arc<SessionState>) {
-        self.lock().notify_session_ended(session);
+    pub(super) fn notify_session_ended(&self, sealer: &Arc<Mutex<xhpke::Sender>>) {
+        self.lock().notify_session_ended(sealer);
     }
 
     /// Locks the writer, ending its bound session if a previous write panicked.
@@ -121,8 +134,8 @@ impl<W: Write> Outbound<W> {
     pub(super) fn lock(&self) -> MutexGuard<'_, Writer<W>> {
         self.writer.lock().unwrap_or_else(|poisoned| {
             let writer = poisoned.into_inner();
-            if let Some(session) = writer.binding.upgrade() {
-                session.end();
+            if let Some(ended) = writer.ended.upgrade() {
+                ended.store(true, Ordering::Release);
             }
             self.writer.clear_poison();
             writer
@@ -134,35 +147,47 @@ impl<W: Write> Outbound<W> {
 /// binding and writing a frame or failure notification form one operation.
 pub(super) struct Writer<W: Write> {
     framer: FrameWriter<W>, // Reused across handshakes, retaining framing recovery state
-    binding: Weak<SessionState>, // Session whose frames and failure notifications may be written
+    binding: Weak<Mutex<xhpke::Sender>>, // Encryption allocation whose frames may be written
+    ended: Weak<AtomicBool>, // Termination flag of the bound encryption context
     side: Side,             // Whether failed sends need an empty frame notification
 }
 
 impl<W: Write> Writer<W> {
     /// Whether this allocation owns the wire, checked only under the writer lock.
-    fn bound_to(&self, session: &Arc<SessionState>) -> bool {
-        Weak::ptr_eq(&Arc::downgrade(session), &self.binding)
+    fn bound_to(&self, sealer: &Arc<Mutex<xhpke::Sender>>) -> bool {
+        Weak::ptr_eq(&Arc::downgrade(sealer), &self.binding)
     }
 
     /// Ends and removes the current binding while holding the writer lock.
     fn unbind(&mut self) {
-        if let Some(session) = self.binding.upgrade() {
-            session.end();
+        if let Some(ended) = self.ended.upgrade() {
+            ended.store(true, Ordering::Release);
         }
         self.binding = Weak::new();
+        self.ended = Weak::new();
     }
 
     /// Checks the session after its send acquires the writer lock, then writes
     /// its sealed frame. A write failure ends that session and notifies the client
     /// before any handshake or other message can acquire the writer.
-    pub(super) fn send(&mut self, session: &Arc<SessionState>, packet: &[u8]) -> Result<(), Error> {
-        session.check()?;
-        if !self.bound_to(session) {
+    pub(super) fn send(
+        &mut self,
+        sealer: &Arc<Mutex<xhpke::Sender>>,
+        packet: &[u8],
+    ) -> Result<(), Error> {
+        if !self.bound_to(sealer) {
+            return Err(Error::EncryptionFailed("session ended".into()));
+        }
+        let ended = self
+            .ended
+            .upgrade()
+            .ok_or_else(|| Error::EncryptionFailed("session ended".into()))?;
+        if ended.load(Ordering::Acquire) {
             return Err(Error::EncryptionFailed("session ended".into()));
         }
         if let Err(err) = self.framer.send_packet(packet) {
-            session.end();
-            self.notify_session_ended(session);
+            ended.store(true, Ordering::Release);
+            self.notify_session_ended(sealer);
             return Err(err);
         }
         trace!(
@@ -179,9 +204,9 @@ impl<W: Write> Writer<W> {
     /// ordered with handshakes and other sends. Client-side and obsolete-session
     /// calls do nothing; write failures are logged instead of replacing the
     /// original send error. The binding itself is left in place.
-    fn notify_session_ended(&mut self, session: &Arc<SessionState>) {
+    fn notify_session_ended(&mut self, sealer: &Arc<Mutex<xhpke::Sender>>) {
         if self.side == Side::Server
-            && self.bound_to(session)
+            && self.bound_to(sealer)
             && let Err(err) = self.framer.send_dropped()
         {
             warn!("failed to notify client of ended session: {}", err);
@@ -196,19 +221,7 @@ mod tests {
     use crate::testing;
     use crate::transport::framing::FrameReader;
     use crate::transport::{mock::payload, sealing};
-    use darkbio_crypto::xhpke;
     use std::io;
-
-    /// Creates a session and binds its sender to the test writer.
-    fn connect<W: Write>(
-        outbound: &Arc<Outbound<W>>,
-        sender: xhpke::Sender,
-        receiver: xhpke::Receiver,
-    ) -> (Session, Sender<W>) {
-        let session = Session::new(sender, receiver);
-        let sender = outbound.bind(&session);
-        (session, sender)
-    }
 
     /// Writer exposing its bytes for assertions about frame and notification order.
     #[derive(Clone, Default)]
@@ -245,10 +258,11 @@ mod tests {
             Side::Server,
             Closer::new(|| {}),
         ));
-        let (crypto, receiver) = contexts();
-        let (old, _) = connect(&outbound, crypto, receiver);
+        let old = Arc::new(Mutex::new(contexts().0));
+        let old_ended = Arc::new(AtomicBool::new(false));
+        outbound.bind(&old, &old_ended);
         let delayed = outbound.lock().binding.upgrade().unwrap();
-        old.end();
+        old_ended.store(true, Ordering::Release);
         outbound.notify_session_ended(&delayed);
 
         // The old session can notify until the writer starts the new handshake.
@@ -258,7 +272,9 @@ mod tests {
         outbound.notify_session_ended(&delayed);
 
         let (crypto, mut peer) = contexts();
-        let (_replacement, sender) = connect(&outbound, crypto, contexts().1);
+        let replacement = Arc::new(Mutex::new(crypto));
+        let ended = Arc::new(AtomicBool::new(false));
+        let sender = outbound.bind(&replacement, &ended);
         outbound.notify_session_ended(&delayed);
         drop(old);
         sender.send(&payload(1)).unwrap();

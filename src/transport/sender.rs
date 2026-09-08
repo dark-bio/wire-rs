@@ -5,10 +5,11 @@
 //! any of its clones keeps the session or the byte stream alive.
 
 use super::outbound::Outbound;
-use super::session::SessionState;
 use super::{Error, sealing};
+use darkbio_crypto::xhpke;
 use std::io::Write;
-use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Weak};
 
 /// Cloneable handle for sending messages into a session from any thread.
 /// Delivered by [`Client::connect`](super::Client::connect) or a server's
@@ -28,14 +29,23 @@ use std::sync::Weak;
 #[derive(Debug)]
 pub struct Sender<W: Write> {
     outbound: Weak<Outbound<W>>, // Writer retained by the client/server and active sends
-    session: Weak<SessionState>, // The particular session that issued this handle
+    sealer: Weak<Mutex<xhpke::Sender>>, // Encryption context whose allocation identifies the session
+    ended: Weak<AtomicBool>,            // Termination shared with the client/server and writer
 }
 
 impl<W: Write> Sender<W> {
-    /// Stores weak references to the writer and the session bound to it. Each
-    /// send upgrades them for its duration; this handle alone retains neither.
-    pub(super) fn new(outbound: Weak<Outbound<W>>, session: Weak<SessionState>) -> Self {
-        Self { outbound, session }
+    /// Stores weak references to the writer, encryption context and termination
+    /// flag. Each send retains them for its duration; an idle handle owns none.
+    pub(super) fn new(
+        outbound: Weak<Outbound<W>>,
+        sealer: Weak<Mutex<xhpke::Sender>>,
+        ended: Weak<AtomicBool>,
+    ) -> Self {
+        Self {
+            outbound,
+            sealer,
+            ended,
+        }
     }
 
     /// Seals the message and writes and flushes its complete frame. Concurrent
@@ -52,29 +62,43 @@ impl<W: Write> Sender<W> {
     /// Stream closure is observed through I/O failure; an overlapping write may
     /// still succeed.
     pub fn send(&self, message: &[u8]) -> Result<(), Error> {
-        // Retain the writer and session state for this operation. Ending the
-        // session still marks this state ended even while we hold a reference.
+        // Retain the writer, encryption context and termination flag for this
+        // operation. The owner can still end it while these references exist.
         let outbound = self.outbound.upgrade().ok_or(Error::Terminated)?;
-        let session = self
-            .session
+        let context = self
+            .sealer
+            .upgrade()
+            .ok_or_else(|| Error::EncryptionFailed("session ended".into()))?;
+        let ended = self
+            .ended
             .upgrade()
             .ok_or_else(|| Error::EncryptionFailed("session ended".into()))?;
 
         // A panic can leave encryption or wire order uncertain, so unwinding
         // must invalidate both directions before another operation uses them.
-        let _end_on_panic = session.end_on_panic();
+        let _end_on_panic = EndOnPanic(&ended);
 
         // Attempt to seal the message
-        let mut sealer = session.lock()?;
+        if ended.load(Ordering::Acquire) {
+            return Err(Error::EncryptionFailed("session ended".into()));
+        }
+        let mut sealer = context.lock().unwrap_or_else(|poisoned| {
+            ended.store(true, Ordering::Release);
+            context.clear_poison();
+            poisoned.into_inner()
+        });
+        if ended.load(Ordering::Acquire) {
+            return Err(Error::EncryptionFailed("session ended".into()));
+        }
 
         let packet = match sealing::seal(&mut sealer, message) {
             Err(err @ Error::EncryptionFailed(_)) => {
                 // Encryption failed, no recovery here, nuke the session
-                session.end();
+                ended.store(true, Ordering::Release);
                 drop(sealer);
 
                 // If we're a server, notify the client that they're gone
-                outbound.notify_session_ended(&session);
+                outbound.notify_session_ended(&context);
                 return Err(err);
             }
             Err(err) => return Err(err),
@@ -84,13 +108,31 @@ impl<W: Write> Sender<W> {
         // wire order equal to sealing order while the next send seals during I/O.
         let mut writer = outbound.lock();
         drop(sealer);
-        writer.send(&session, &packet)
+        writer.send(&context, &packet)
     }
 }
 
 impl<W: Write> Clone for Sender<W> {
     fn clone(&self) -> Self {
-        Self::new(self.outbound.clone(), self.session.clone())
+        Self::new(
+            self.outbound.clone(),
+            self.sealer.clone(),
+            self.ended.clone(),
+        )
+    }
+}
+
+/// Marks the transport session ended if encryption, writing, or owner shutdown
+/// unwinds. Ordinary errors are handled by the operation, including size
+/// refusals that preserve the session. This guard takes no lock and performs
+/// no I/O; it does not wait for other operations to finish.
+pub(super) struct EndOnPanic<'a>(pub(super) &'a AtomicBool);
+
+impl Drop for EndOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -99,26 +141,39 @@ impl<W: Write> Clone for Sender<W> {
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::transport::Closer;
     use crate::transport::framing::FrameReader;
     use crate::transport::mock::payload;
     use crate::transport::outbound::Side;
-    use crate::transport::{Closer, session::Session};
-    use darkbio_crypto::xhpke;
     use std::io;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, TryLockError, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    /// Creates a session and binds its sender to the test writer.
+    /// Retains a sending context and termination flag as a client/server would,
+    /// and binds a sender to them. No receive context is needed to exercise sends.
     fn connect<W: Write>(
         outbound: &Arc<Outbound<W>>,
         sender: xhpke::Sender,
-        receiver: xhpke::Receiver,
-    ) -> (Session, Sender<W>) {
-        let session = Session::new(sender, receiver);
-        let sender = outbound.bind(&session);
-        (session, sender)
+    ) -> (Arc<Mutex<xhpke::Sender>>, Arc<AtomicBool>, Sender<W>) {
+        let sealer = Arc::new(Mutex::new(sender));
+        let ended = Arc::new(AtomicBool::new(false));
+        let sender = outbound.bind(&sealer, &ended);
+        (sealer, ended, sender)
+    }
+
+    /// Waits until a sender holds the encryption context while queued behind
+    /// a writer held by the test. No sleep determines the ordering.
+    fn wait_sealing(sealer: &Mutex<xhpke::Sender>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(sealer.try_lock(), Err(TryLockError::WouldBlock)) {
+            assert!(
+                Instant::now() < deadline,
+                "sender did not acquire encryption context"
+            );
+            thread::yield_now();
+        }
     }
 
     /// A pair of contexts standing in for an established session.
@@ -235,7 +290,7 @@ mod tests {
             Side::Client,
             Closer::new(|| {}),
         ));
-        let (_session, sender) = connect(&outbound, sender, contexts().1);
+        let (_sealer, _ended, sender) = connect(&outbound, sender);
 
         let threads: Vec<_> = (0..8)
             .map(|thread| {
@@ -270,9 +325,9 @@ mod tests {
         assert_eq!(messages, expected);
     }
 
-    // Tests that ending a session takes no writer or encryption lock. A send is
-    // held after sealing while the owner ends, then races a replacement session
-    // for the writer. Only the replacement's frame may reach the byte stream.
+    // Tests that a send held after sealing observes termination when it acquires
+    // the writer lock. The old send races a replacement for that lock; only the
+    // replacement's frame may reach the byte stream.
     #[test]
     fn test_end_with_queued_send() {
         testing::init_tracing();
@@ -284,22 +339,17 @@ mod tests {
             Closer::new(|| {}),
         ));
         let (crypto, _) = contexts();
-        let (session, sender) = connect(&outbound, crypto, contexts().1);
+        let (sealer, ended, sender) = connect(&outbound, crypto);
         let writer = outbound.lock();
         let sending = thread::spawn(move || sender.send(&payload(1)));
 
-        session.state.wait_sealing();
-        let (ended_tx, ended) = mpsc::channel();
-        let ending = thread::spawn(move || {
-            session.end();
-            ended_tx.send(()).unwrap();
-        });
-        ended.recv_timeout(Duration::from_secs(5)).unwrap();
-        ending.join().unwrap();
+        wait_sealing(&sealer);
+        ended.store(true, Ordering::Release);
+        drop(sealer);
         drop(writer);
 
         let (crypto, mut peer) = contexts();
-        let (_replacement, fresh) = connect(&outbound, crypto, contexts().1);
+        let (_replacement, _ended, fresh) = connect(&outbound, crypto);
         fresh.send(&payload(2)).unwrap();
         assert!(matches!(
             sending.join().unwrap(),
@@ -323,7 +373,7 @@ mod tests {
         let (gate, entered, release, _) = Gate::new();
         let (sender, _) = contexts();
         let outbound = Arc::new(Outbound::new(gate, Side::Client, Closer::new(|| {})));
-        let (session, sender) = connect(&outbound, sender, contexts().1);
+        let (sealer, ended, sender) = connect(&outbound, sender);
 
         // The first sender blocks inside its write, the second seals behind it
         // and waits for the write lock while retaining the encryption lock.
@@ -336,7 +386,7 @@ mod tests {
             let sender = sender.clone();
             thread::spawn(move || sender.send(&payload(2)))
         };
-        session.state.wait_sealing();
+        wait_sealing(&sealer);
 
         // The write fails, taking the session with it
         release.send(()).unwrap();
@@ -352,7 +402,7 @@ mod tests {
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
         );
-        assert!(session.ended());
+        assert!(ended.load(Ordering::Acquire));
     }
 
     // Tests that senders stay bound to the session that issued them, that ending
@@ -364,22 +414,23 @@ mod tests {
 
         let outbound = Arc::new(Outbound::new(Vec::new(), Side::Client, Closer::new(|| {})));
         let (crypto, _) = contexts();
-        let (first_session, first) = connect(&outbound, crypto, contexts().1);
+        let (first_sealer, first_ended, first) = connect(&outbound, crypto);
         first.send(&payload(1)).unwrap();
 
-        first_session.end();
+        first_ended.store(true, Ordering::Release);
         assert!(matches!(
             first.send(&payload(2)),
             Err(Error::EncryptionFailed(_))
         ));
 
         let (crypto, _) = contexts();
-        let (second_session, second) = connect(&outbound, crypto, contexts().1);
+        let (_second_sealer, second_ended, second) = connect(&outbound, crypto);
         assert!(matches!(
             first.send(&payload(3)),
             Err(Error::EncryptionFailed(_))
         ));
-        drop(first_session);
+        drop(first_sealer);
+        drop(first_ended);
         assert!(matches!(
             first.send(&payload(4)),
             Err(Error::EncryptionFailed(_))
@@ -388,13 +439,13 @@ mod tests {
 
         // Closure leaves logical termination to the operation's I/O result.
         outbound.close();
-        assert!(!second_session.ended());
+        assert!(!second_ended.load(Ordering::Acquire));
         let result = second.send(&payload(6));
         assert!(
             matches!(&result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::NotConnected),
             "{result:?}"
         );
-        assert!(second_session.ended());
+        assert!(second_ended.load(Ordering::Acquire));
         drop(outbound);
         assert!(matches!(second.send(&payload(7)), Err(Error::Terminated)));
     }
@@ -412,7 +463,7 @@ mod tests {
             let _ = release.send(());
         });
         let outbound = Arc::new(Outbound::new(gate, Side::Client, closer));
-        let (session, sender) = connect(&outbound, sender, contexts().1);
+        let (sealer, ended, sender) = connect(&outbound, sender);
 
         let first = {
             let sender = sender.clone();
@@ -423,7 +474,7 @@ mod tests {
             let sender = sender.clone();
             thread::spawn(move || sender.send(&payload(2)))
         };
-        session.state.wait_sealing();
+        wait_sealing(&sealer);
 
         let (closed_tx, closed) = mpsc::channel();
         let owner = {
@@ -440,7 +491,7 @@ mod tests {
             second.join().unwrap(),
             Err(Error::EncryptionFailed(_))
         ));
-        assert!(session.ended());
+        assert!(ended.load(Ordering::Acquire));
         assert!(matches!(
             sender.send(&payload(3)),
             Err(Error::EncryptionFailed(_))
@@ -463,7 +514,7 @@ mod tests {
             let _ = release.send(());
         });
         let outbound = Arc::new(Outbound::new(gate, Side::Client, closer));
-        let (_session, sender) = connect(&outbound, sender, contexts().1);
+        let (_sealer, _ended, sender) = connect(&outbound, sender);
 
         let sending = thread::spawn(move || {
             panic::catch_unwind(AssertUnwindSafe(|| sender.send(&payload(1))))
@@ -492,25 +543,25 @@ mod tests {
             Side::Client,
             Closer::new(|| {}),
         ));
-        let (session, sender) = connect(&outbound, sender, contexts().1);
+        let (_sealer, ended, sender) = connect(&outbound, sender);
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| sender.send(&payload(1))));
         assert!(result.is_err());
 
         // Unwinding ends the session immediately, before any operation retries.
-        assert!(session.ended());
+        assert!(ended.load(Ordering::Acquire));
         let result = sender.send(&payload(2));
         assert!(
             matches!(result, Err(Error::EncryptionFailed(_))),
             "{result:?}"
         );
-        assert!(session.ended());
+        assert!(ended.load(Ordering::Acquire));
         assert!(written.lock().unwrap().is_empty());
 
         // The next session sends, the framer having kept its buffer and first
         // terminating whatever the panic left behind
         let (sender, mut receiver) = contexts();
-        let (_session, sender) = connect(&outbound, sender, contexts().1);
+        let (_replacement, _ended, sender) = connect(&outbound, sender);
         sender.send(&payload(3)).unwrap();
 
         let written = written.lock().unwrap().clone();

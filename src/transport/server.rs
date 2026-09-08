@@ -4,8 +4,8 @@
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
 use crate::transport::outbound::{Outbound, Side};
-use crate::transport::sender::Sender;
-use crate::transport::session::Session;
+use crate::transport::sealing;
+use crate::transport::sender::{EndOnPanic, Sender};
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
     Error, Stream,
@@ -13,7 +13,8 @@ use crate::transport::{
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{info, trace, warn};
 
 /// Device attestation a server presents in the handshake, a CWT in one of the
@@ -103,7 +104,9 @@ pub struct Server<R: Read, W: Write, A: Attester> {
     signer: xdsa::SecretKey, // Server's identity key, signing the ArkHello
     attester: A,             // Source of the device attestation for handshakes
 
-    session: Option<Session>, // Encryption contexts and lifetime of the current session
+    receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this server
+    sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
+    ended: Arc<AtomicBool>,            // Termination flag shared with the sender and writer
 
     handshaking: bool, // Whether a reset arrived, the handshake it calls for still to run
 
@@ -125,7 +128,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             outbound,
             signer,
             attester,
-            session: None,
+            receiver: None,
+            sealer: None,
+            ended: Arc::new(AtomicBool::new(true)),
             handshaking: false,
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
@@ -196,9 +201,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // can send into it before the client says anything
                     Ok((sender, receiver)) => {
                         info!("new wire session established");
-                        let session = Session::new(sender, receiver);
-                        let sender = self.outbound.bind(&session);
-                        self.session = Some(session);
+                        let sender = self.new_session(sender, receiver);
                         return Ok(Event::Connected(sender));
                     }
                 }
@@ -240,17 +243,24 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // Valid COBS packet
                 Ok(Some(packet)) => packet,
             };
-            let session = match self.session.as_mut() {
+            let receiver = match self.receiver.as_mut() {
                 None => {
                     warn!("dropping data outside session");
                     self.send_dropped();
                     continue;
                 }
-                Some(session) => session,
+                Some(receiver) => receiver,
             };
-            // The session either opens the packet or reports that receiving or
-            // sending ended it. The owner is removed when delivering its end.
-            let message = match session.open(packet) {
+            // Sending can end the session before receiving observes it. The
+            // contexts are released when receiving reports that end.
+            let opened = if self.ended.load(Ordering::Acquire) {
+                Err(Error::EncryptionFailed("session ended".into()))
+            } else {
+                let _end_on_panic = EndOnPanic(&self.ended);
+                sealing::open(receiver, packet)
+                    .inspect_err(|_| self.ended.store(true, Ordering::Release))
+            };
+            let message = match opened {
                 Err(err) => {
                     warn!("session receive failed, resetting session: {}", err);
                     self.end_session();
@@ -267,14 +277,34 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
-    /// Removes the current session. Dropping [`Session`] marks its shared
-    /// sending state ended and releases its receive context, so existing senders
-    /// are refused even if an active send still holds the shared state alive.
+    /// Retains the contexts negotiated by a completed handshake and returns a
+    /// sender bound to the sending context's allocation. The server uses the
+    /// receive context directly and shares the sending context with active sends.
+    /// Idle senders hold weak references and keep neither context nor stream alive.
+    /// Each handshake gets a fresh termination flag, so ending an old session
+    /// cannot invalidate its replacement.
+    ///
+    /// Binding takes the writer lock, ordering replacement with in-flight writes
+    /// and invalidating previous senders. After binding, old senders cannot write
+    /// into the new session. This method performs no handshake or stream I/O.
+    fn new_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) -> Sender<W> {
+        let sealer = Arc::new(Mutex::new(sender));
+        let ended = Arc::new(AtomicBool::new(false));
+        let sender = self.outbound.bind(&sealer, &ended);
+        self.receiver = Some(receiver);
+        self.sealer = Some(sealer);
+        self.ended = ended;
+        sender
+    }
+
+    /// Marks the current termination flag ended, releases the receive context,
+    /// and releases the server's reference to the sending context. Active sends
+    /// may still retain that context, but observe the same termination flag.
     /// Takes no encryption or writer lock; a write already admitted may finish.
     ///
     /// Returns true when a session was removed, including one already ended by
-    /// a send failure. That failure leaves `self.session` present until receiving
-    /// observes it. The receive loop uses this result to emit one
+    /// a send failure. That failure leaves the receive context present until
+    /// receiving observes it. The receive loop uses this result to emit one
     /// [`Event::Disconnected`]; later calls return false until another handshake
     /// establishes a session. Local [`Server::disconnect`] ignores the result
     /// because its caller already knows the session ended.
@@ -282,7 +312,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// Leaves the stream open and sends no notification. The calling operation
     /// decides whether to send an empty frame to the client.
     fn end_session(&mut self) -> bool {
-        self.session.take().is_some()
+        self.ended.store(true, Ordering::Release);
+        self.sealer = None;
+        self.receiver.take().is_some()
     }
 
     /// Tells the client that the server has no session with it by sending an empty
@@ -411,10 +443,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 }
 
 impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
-    /// Permanently closes the stream and waits for adapter shutdown. Idle senders
-    /// hold only weak references, so they cannot keep the outbound side alive.
+    /// Permanently closes the stream, waits for adapter shutdown, and marks the
+    /// session ended before releasing its contexts. Idle senders hold only weak
+    /// references, so they cannot keep the outbound side alive.
     fn drop(&mut self) {
+        let _end_on_panic = EndOnPanic(&self.ended);
         self.outbound.close();
+        self.ended.store(true, Ordering::Release);
     }
 }
 

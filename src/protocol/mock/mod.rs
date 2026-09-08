@@ -22,7 +22,7 @@ pub mod seed;
 use crate::protocol::envelope::Side;
 use crate::protocol::mux::Writer;
 use crate::protocol::switchboard::Source;
-use crate::transport::{self, Closer, Event, Outbound, Sender, Session, Stream};
+use crate::transport::{self, Closer, Event, Outbound, Sender, Stream};
 use darkbio_crypto::xhpke;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,8 +161,9 @@ pub(crate) struct Link {
 /// Session retained by the mock receive side, with an ordinal for model assertions.
 /// The counter belongs to the mock; production transport uses object identity.
 struct LinkSession {
-    current: Option<Session>, // Retained until receiving observes its end
-    generation: u64,          // Number of sessions the mock has created
+    current: Option<Arc<Mutex<xhpke::Sender>>>, // Retained until receiving observes its end
+    ended: Arc<AtomicBool>, // Termination observed by model assertions and real sends
+    generation: u64,        // Number of sessions the mock has created
 }
 
 impl Link {
@@ -179,6 +180,7 @@ impl Link {
             outbound,
             session: Mutex::new(LinkSession {
                 current: None,
+                ended: Arc::new(AtomicBool::new(true)),
                 generation: 0,
             }),
         })
@@ -196,15 +198,14 @@ impl Link {
             .new_receiver(&encap, CRYPTO_DOMAIN_MOCK)
             .expect("mock session opening context");
 
-        // The mock never decrypts inbound frames, but owns a complete session
-        // just as a real transport does. Both receivers start at the same sequence.
-        let inbound = secret
-            .new_receiver(&encap, CRYPTO_DOMAIN_MOCK)
-            .expect("mock receive context");
-        let current = Session::new(sender, inbound);
-        let sender = self.outbound.bind(&current);
+        // Only sending runs through the real transport; the model handles
+        // inbound messages directly and needs no receive crypto context.
+        let current = Arc::new(Mutex::new(sender));
+        let ended = Arc::new(AtomicBool::new(false));
+        let sender = self.outbound.bind(&current, &ended);
         let mut session = self.session.lock().expect("link not poisoned");
         session.current = Some(current);
+        session.ended = ended;
         session.generation += 1;
         (sender, receiver)
     }
@@ -213,7 +214,7 @@ impl Link {
     pub(crate) fn generation(&self) -> u64 {
         let session = self.session.lock().expect("link not poisoned");
         match &session.current {
-            Some(current) if !current.ended() => session.generation,
+            Some(_) if !session.ended.load(Ordering::Acquire) => session.generation,
             _ => 0,
         }
     }
@@ -231,7 +232,21 @@ impl Link {
     /// Drops the session, the read side letting go of it too, as a transport
     /// server does on the peer's reset.
     pub(crate) fn end_session(&self) {
-        self.session.lock().expect("link not poisoned").current = None;
+        let mut session = self.session.lock().expect("link not poisoned");
+        session.ended.store(true, Ordering::Release);
+        session.current = None;
+    }
+}
+
+impl Drop for Link {
+    /// Ends the mock's current session before releasing its context, including
+    /// when an active send temporarily keeps that context and the writer alive.
+    fn drop(&mut self) {
+        let session = self
+            .session
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.ended.store(true, Ordering::Release);
     }
 }
 
