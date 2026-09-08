@@ -19,10 +19,11 @@
 //! refusal of a request nobody serves to the tests of the multiplexer.
 
 use super::{Delivery, Feed, Link, MAX_STEPS, PATIENCE, Sink, payload, payload_len, tag as tagged};
+use crate::protocol::envelope::Side;
 use crate::protocol::mux::{ANSWERS, CHARGE, Error, INBOX, Mux, Pending, Responder, WINDOW};
 use crate::protocol::{self, ArkToHost, Envelope, HostToArk, ark_to_host, host_to_ark};
 use crate::transport::mock::unframe;
-use crate::transport::{self, MAX_MESSAGE_SIZE, Side};
+use crate::transport::{self, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -1230,26 +1231,15 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
 /// divergence from the model, and reports what the run observed.
 fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
     let (sink, attempts) = Sink::new();
-    let link = Link::new(side, sink.clone());
-    let (feed, deliveries, routes, ends) = Feed::new(link.clone());
-
-    // The closer of the multiplexer ends the transport, so a reader blocked in
-    // it wakes up and nothing else goes out, as shutting a socket down does
-    let closer = {
-        let sink = sink.clone();
-        let deliveries = deliveries.clone();
-        Box::new(move || {
-            sink.close();
-            let _ = deliveries.send(Delivery::Failed(transport::Error::Terminated));
-        })
-    };
+    let (feed, deliveries, routes, ends) = Feed::new(side, sink.clone());
+    let link = feed.link.clone();
 
     // A client's transport hands over the session its handshake opened, a
     // server's waits for a peer to open the first one
     let receiver = (side == Side::Client).then(|| link.open_session());
     let session = link.session();
 
-    let mux = Arc::new(Mux::<Out, In>::mocked(side, feed, closer));
+    let mux = Arc::new(Mux::<Out, In>::mocked(side, feed));
 
     // Wait for the reader to reach its first read, which is where it takes
     // down the session it starts from, so no step can move that under it

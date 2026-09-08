@@ -957,7 +957,12 @@ pub fn run(steps: &[Step]) -> Summary {
         signer.public_key(),
         outbox.clone(),
     )));
-    let mut server = Server::new_at(Feed(client.clone()), outbox, signer, attestation, TIMESTAMP);
+    let mut server = Server::new_at(
+        crate::transport::Stream::new(Feed(client.clone()), outbox, || {}),
+        signer,
+        attestation,
+        TIMESTAMP,
+    );
 
     loop {
         match server.next_event() {

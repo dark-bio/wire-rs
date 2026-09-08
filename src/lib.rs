@@ -15,8 +15,8 @@ pub use transport::mock;
 
 pub use protocol::{ArkToHost, HostToArk};
 pub use transport::{
-    Attestation, Attester, Client, Emitter, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Roots, Server,
-    Verifier,
+    Attestation, Attester, Client, Closer, Emitter, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Roots,
+    Server, Stream, Verifier,
 };
 
 #[cfg(test)]

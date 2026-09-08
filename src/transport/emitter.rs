@@ -9,9 +9,9 @@
 //! from the sealing order. An emitter is bound to the session it was made in
 //! and holds the funnel only as long as the owner does.
 
-use crate::transport::Error;
 use crate::transport::framing::FrameWriter;
 use crate::transport::sealing;
+use crate::transport::{Closer, Error};
 use darkbio_crypto::xhpke;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,9 +21,6 @@ use tracing::{trace, warn};
 /// Session number of a funnel without a session, none established yet or the
 /// last one ended.
 const NONE: u64 = 0;
-
-/// Session number of a funnel whose owner is gone, never to have one again.
-const CLOSED: u64 = u64::MAX;
 
 /// Side of the wire a funnel sends for. The server lives across sessions,
 /// clients come and go on it, so after a failed send it tells the client with
@@ -70,9 +67,10 @@ struct Sealer {
 /// server's side, which serves clients across sessions, the empty frame
 /// telling the client its session is gone follows, so the client handshakes
 /// again. The client's side recovers by starting that handshake and sends
-/// nothing. Ending a session or closing the funnel never waits for a send
-/// stuck in the transport, and the funnel goes with its owner and the sends
-/// in progress, the transport with it.
+/// nothing. Ending a session takes no send lock. Closing the funnel cancels
+/// adapter I/O and waits for it to return, also without taking a send lock.
+/// The funnel goes with its owner and the sends in progress, the transport
+/// with it.
 ///
 /// Sealing and writing run under two locks taken hand over hand, the write
 /// lock before the seal lock is released, which keeps the wire order equal to
@@ -80,7 +78,8 @@ struct Sealer {
 pub(crate) struct Funnel<W: Write> {
     sealer: Mutex<Sealer>,         // Sealing phase, taken first
     framer: Mutex<FrameWriter<W>>, // Writing phase, taken second
-    session: AtomicU64,            // Number of the live session, NONE or CLOSED without
+    session: AtomicU64,            // Number of the live session, NONE without
+    closer: Closer,                // Permanent closure of the underlying stream
 
     side: Side, // Side of the wire the funnel sends for, deciding what follows a failed send
 }
@@ -88,8 +87,8 @@ pub(crate) struct Funnel<W: Write> {
 impl<W: Write> Funnel<W> {
     /// Creates the funnel around a low level writer, without a session until a
     /// handshake establishes one.
-    pub fn new(writer: W, side: Side) -> Self {
-        let framer = FrameWriter::new(writer);
+    pub fn new(writer: W, side: Side, close: Closer) -> Self {
+        let framer = FrameWriter::new(writer, close.clone());
         Self {
             sealer: Mutex::new(Sealer {
                 sender: None,
@@ -97,6 +96,7 @@ impl<W: Write> Funnel<W> {
             }),
             framer: Mutex::new(framer),
             session: AtomicU64::new(NONE),
+            closer: close,
             side,
         }
     }
@@ -131,27 +131,30 @@ impl<W: Write> Funnel<W> {
         }
     }
 
-    /// Whether a session is live for the sends, as opposed to none established
-    /// yet, the last one ended or the funnel closed.
+    /// Whether a session is installed for sends. Stream closure is observed
+    /// through I/O; this does not report whether the stream is open.
     pub fn has_session(&self) -> bool {
         self.session() != NONE
     }
 
-    /// Number of the live session, counting the ones established so far, or
-    /// zero without one.
+    /// Number of the installed session, counting the ones established so far,
+    /// or zero without one. Closing the stream alone does not clear the session.
     pub fn session(&self) -> u64 {
-        match self.session.load(Ordering::Acquire) {
-            CLOSED => NONE,
-            session => session,
-        }
+        self.session.load(Ordering::Acquire)
     }
 
-    /// Ends the sessions for good, every send refused from here on. The funnel
-    /// itself goes with the owner's reference and the sends in progress, the
+    /// Handle ending the underlying stream without taking either send lock.
+    pub fn closer(&self) -> Closer {
+        self.closer.clone()
+    }
+
+    /// Permanently closes the byte stream and waits for adapter shutdown.
+    /// Sends observe closure through their write results. The funnel itself
+    /// goes with the owner's reference and the sends in progress, the
     /// framer and the transport with it, so an emitter outliving its owner
     /// holds nothing, its weak reference failing to upgrade.
     pub fn close(&self) {
-        self.session.store(CLOSED, Ordering::Release);
+        self.closer.close();
     }
 
     /// Seals a message with the session and sends it. Fails unless the session
@@ -250,19 +253,15 @@ impl<W: Write> Funnel<W> {
     /// as the peer would not follow its sequence.
     fn check(&self, session: u64) -> Result<(), Error> {
         match self.session.load(Ordering::Acquire) {
-            NONE | CLOSED => Err(Error::EncryptionFailed("no active session".into())),
+            NONE => Err(Error::EncryptionFailed("no active session".into())),
             live if live == session => Ok(()),
             _ => Err(Error::EncryptionFailed("session ended".into())),
         }
     }
 
-    /// Ends the live session if there is one, a closed funnel staying closed.
+    /// Ends the live session. Permanent closure belongs to the byte stream.
     fn end_session(&self) {
-        let _ = self
-            .session
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |session| {
-                (session != CLOSED).then_some(NONE)
-            });
+        self.session.store(NONE, Ordering::Release);
     }
 
     /// Tells the client the session is gone if this is the server's side,
@@ -317,9 +316,10 @@ pub struct Emitter<W: Write> {
 }
 
 impl<W: Write> Emitter<W> {
-    /// Number of the session the handle sends into, for a caller telling
-    /// the session a send belonged to from whichever is live.
-    pub(crate) fn session(&self) -> u64 {
+    /// Number of the session the handle was created for, even after it ends.
+    /// Zero identifies a handle obtained before the first handshake.
+    /// Numbers are local to one transport owner, not globally unique.
+    pub fn session_id(&self) -> u64 {
         self.session
     }
 
@@ -328,13 +328,14 @@ impl<W: Write> Emitter<W> {
         Self { funnel, session }
     }
 
-    /// Seals a message with the session and sends it, see `Funnel::send`.
-    /// Fails once the owner is gone.
+    /// Seals the message and writes and flushes its complete frame. Concurrent
+    /// sends take turns in encryption order, each waiting for its own write.
+    /// An oversized message is refused without ending the session; encryption
+    /// or write failure ends it. Stream closure is observed through write
+    /// failure; an overlapping send may succeed. Returns [`Error::Terminated`]
+    /// if the owner is gone, and refuses a handle from an ended session.
     pub fn send_message(&self, message: &[u8]) -> Result<(), Error> {
-        let funnel = self
-            .funnel
-            .upgrade()
-            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
+        let funnel = self.funnel.upgrade().ok_or(Error::Terminated)?;
         funnel.send(self.session, message)
     }
 }
@@ -467,7 +468,11 @@ mod tests {
 
         let (sender, mut receiver) = contexts();
         let collector = Collector::default();
-        let funnel = Arc::new(Funnel::new(collector.clone(), Side::Client));
+        let funnel = Arc::new(Funnel::new(
+            collector.clone(),
+            Side::Client,
+            crate::transport::Closer::new(|| {}),
+        ));
         funnel.establish_session(sender);
 
         let threads: Vec<_> = (0..8)
@@ -486,7 +491,7 @@ mod tests {
 
         // Every frame must open in the order written, or the sequence is off
         let written = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(&written[..]);
+        let mut reader = FrameReader::new(&written[..], crate::transport::Closer::new(|| {}));
         let mut messages = Vec::new();
         loop {
             let packet = match reader.next_packet() {
@@ -512,7 +517,11 @@ mod tests {
 
         let (gate, entered, release, _) = Gate::new();
         let (sender, _) = contexts();
-        let funnel = Arc::new(Funnel::new(gate, Side::Client));
+        let funnel = Arc::new(Funnel::new(
+            gate,
+            Side::Client,
+            crate::transport::Closer::new(|| {}),
+        ));
         funnel.establish_session(sender);
         let emitter: Emitter<Gate> = funnel.emitter();
 
@@ -555,7 +564,11 @@ mod tests {
     fn test_send_refusals() {
         testing::init_tracing();
 
-        let funnel = Arc::new(Funnel::new(Vec::new(), Side::Client));
+        let funnel = Arc::new(Funnel::new(
+            Vec::new(),
+            Side::Client,
+            crate::transport::Closer::new(|| {}),
+        ));
         let detached: Emitter<Vec<u8>> = funnel.emitter();
         let result = detached.send_message(&payload(1));
         assert!(
@@ -595,43 +608,41 @@ mod tests {
         let second: Emitter<Vec<u8>> = funnel.emitter();
         second.send_message(&payload(6)).unwrap();
 
-        // The owner closed the funnel and went, nothing sends ever again
+        // Closure is observed by the next write, which ends the session.
         funnel.close();
-        assert!(!funnel.has_session());
+        assert_eq!(funnel.session(), second.session_id());
         let result = second.send_message(&payload(7));
         assert!(
-            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
+            matches!(&result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::NotConnected),
             "{result:?}"
         );
+        assert!(!funnel.has_session());
         drop(funnel);
         let result = second.send_message(&payload(8));
-        assert!(
-            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
-            "{result:?}"
-        );
+        assert!(matches!(&result, Err(Error::Terminated)), "{result:?}");
     }
 
-    // Tests that ending the session and closing the funnel never wait for a
-    // send stuck in the transport, the one sealed behind it refused, and that
-    // the funnel goes with its owner once both returned, the transport with
-    // it, the surviving emitters holding nothing.
+    // Tests that closing cancels a blocked write without taking the send locks,
+    // including when a second sender holds the sealer while waiting for the
+    // writer. Both senders finish and a surviving emitter refuses new sends.
     #[test]
     fn test_close_with_stuck_sends() {
         testing::init_tracing();
 
         let (gate, entered, release, dropped) = Gate::new();
         let (sender, _) = contexts();
-        let funnel = Arc::new(Funnel::new(gate, Side::Client));
+        let closer = Closer::new(move || {
+            let _ = release.send(());
+        });
+        let funnel = Arc::new(Funnel::new(gate, Side::Client, closer));
         funnel.establish_session(sender);
-        let emitter: Emitter<Gate> = funnel.emitter();
+        let emitter = funnel.emitter();
 
-        // The first send is stuck in its write holding the framer, the second
-        // seals behind it and waits for the framer holding the sealer
         let first = {
             let emitter = emitter.clone();
             thread::spawn(move || emitter.send_message(&payload(1)))
         };
-        entered.recv().unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
         let second = {
             let emitter = emitter.clone();
             thread::spawn(move || emitter.send_message(&payload(2)))
@@ -642,56 +653,36 @@ mod tests {
             thread::yield_now();
         }
 
-        // The owner ends the session and closes the funnel, waiting for neither
         let (closed_tx, closed) = mpsc::channel();
         let owner = {
             let funnel = funnel.clone();
             thread::spawn(move || {
-                funnel.drop_session();
-                assert!(!funnel.has_session());
                 funnel.close();
                 closed_tx.send(()).unwrap();
             })
         };
         closed.recv_timeout(Duration::from_secs(5)).unwrap();
         owner.join().unwrap();
-
-        // A send after the close is refused at once rather than queued behind
-        // the stuck ones, which still hold the funnel alive
-        let (refused_tx, refused) = mpsc::channel();
-        {
-            let emitter = emitter.clone();
-            thread::spawn(move || refused_tx.send(emitter.send_message(&payload(3))).unwrap());
-        }
-        let result = refused.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(
-            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
-            "{result:?}"
-        );
-
-        // The stuck write fails once released, the one behind it is refused,
-        // and the funnel goes with the last reference to it
-        release.send(()).unwrap();
-        let result = first.join().unwrap();
-        assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
-        let result = second.join().unwrap();
-        assert!(
-            matches!(result, Err(Error::EncryptionFailed(_))),
-            "{result:?}"
-        );
+        assert!(matches!(first.join().unwrap(), Err(Error::SendFailed(_))));
+        assert!(matches!(
+            second.join().unwrap(),
+            Err(Error::EncryptionFailed(_))
+        ));
+        assert!(!funnel.has_session());
+        assert!(matches!(
+            emitter.send_message(&payload(3)),
+            Err(Error::EncryptionFailed(_))
+        ));
         drop(funnel);
         dropped.recv_timeout(Duration::from_secs(5)).unwrap();
-        let result = emitter.send_message(&payload(4));
-        assert!(
-            matches!(&result, Err(Error::EncryptionFailed(msg)) if msg == "no active session"),
-            "{result:?}"
-        );
+        assert!(matches!(
+            emitter.send_message(&payload(4)),
+            Err(Error::Terminated)
+        ));
     }
 
-    // Tests that a funnel closed while a send is stuck in its write goes with
-    // its owner once that write panics, the transport with it, the send
-    // letting go of the funnel on the way out of the panic as it would on a
-    // return.
+    // Tests that an I/O panic releases its admission charge, allowing shutdown
+    // to complete and the last active send to release the transport writer.
     #[test]
     fn test_close_with_panicking_send() {
         testing::init_tracing();
@@ -699,20 +690,18 @@ mod tests {
         let (mut gate, entered, release, dropped) = Gate::new();
         gate.panics = true;
         let (sender, _) = contexts();
-        let funnel = Arc::new(Funnel::new(gate, Side::Client));
+        let closer = Closer::new(move || {
+            let _ = release.send(());
+        });
+        let funnel = Arc::new(Funnel::new(gate, Side::Client, closer));
         funnel.establish_session(sender);
-        let emitter: Emitter<Gate> = funnel.emitter();
+        let emitter = funnel.emitter();
 
-        // The send is stuck in its write when the owner closes the funnel
         let sending = thread::spawn(move || {
             panic::catch_unwind(AssertUnwindSafe(|| emitter.send_message(&payload(1))))
         });
-        entered.recv().unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
         funnel.close();
-
-        // The write panics, the funnel and the transport going with the last
-        // reference to it
-        release.send(()).unwrap();
         assert!(sending.join().unwrap().is_err());
         drop(funnel);
         dropped.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -733,6 +722,7 @@ mod tests {
                 written: written.clone(),
             },
             Side::Client,
+            crate::transport::Closer::new(|| {}),
         ));
         funnel.establish_session(sender);
         let emitter: Emitter<Panicky> = funnel.emitter();
@@ -757,7 +747,7 @@ mod tests {
         emitter.send_message(&payload(3)).unwrap();
 
         let written = written.lock().unwrap().clone();
-        let mut reader = FrameReader::new(&written[..]);
+        let mut reader = FrameReader::new(&written[..], crate::transport::Closer::new(|| {}));
         assert!(reader.next_packet().unwrap().is_none());
         let packet = reader.next_packet().unwrap().unwrap();
         let opened = sealing::open(&mut receiver, packet).unwrap();

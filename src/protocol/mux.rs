@@ -13,12 +13,12 @@
 //! held under a budget of their own, a peer stockpiling more than it having
 //! its session ended the same way.
 
-use crate::protocol::envelope::Envelope;
+use crate::protocol::envelope::{Envelope, Side};
 #[cfg(any(test, feature = "fuzz"))]
 use crate::protocol::switchboard::Source;
 use crate::protocol::switchboard::{Release, Sender, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
-use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE, Side};
+use crate::transport::{self, Attester, Emitter, MAX_MESSAGE_SIZE};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -31,9 +31,6 @@ pub type Reader = Box<dyn Read + Send>;
 
 /// Writing half of the transport, the type erased.
 pub type Writer = Box<dyn Write + Send>;
-
-/// Hook ending the transport underneath, so a reader blocked in it wakes up.
-pub type Closer = Box<dyn FnOnce() + Send>;
 
 /// Bytes of unanswered requests a mux keeps in flight before its callers
 /// wait. Eight maximal messages, enough for three uploads pipelining a few
@@ -88,12 +85,11 @@ pub enum Error {
 pub type Client = Mux<HostToArk, ArkToHost>;
 
 impl Client {
-    /// Starts multiplexing over a transport client with its handshake done,
-    /// the closer ending the transport when the multiplexer closes or the
-    /// session fails.
-    pub fn new(client: transport::Client<Reader, Writer>, closer: Closer) -> Self {
+    /// Starts multiplexing over a transport client with its handshake done.
+    /// Closing or failing the multiplexer closes the client's byte stream.
+    pub fn new(client: transport::Client<Reader, Writer>) -> Self {
         Self {
-            switchboard: Switchboard::start(Side::Client, client, closer),
+            switchboard: Switchboard::start(Side::Client, client),
         }
     }
 }
@@ -104,14 +100,11 @@ pub type Server = Mux<ArkToHost, HostToArk>;
 impl Server {
     /// Starts multiplexing over a transport server, serving the clients it
     /// handshakes one session at a time, a session ending failing whatever it
-    /// left pending. The closer ends the transport when the multiplexer
-    /// closes or the transport fails.
-    pub fn new<A: Attester + Send + 'static>(
-        server: transport::Server<Reader, Writer, A>,
-        closer: Closer,
-    ) -> Self {
+    /// left pending. Closing or failing the multiplexer closes the server's
+    /// byte stream.
+    pub fn new<A: Attester + Send + 'static>(server: transport::Server<Reader, Writer, A>) -> Self {
         Self {
-            switchboard: Switchboard::start(Side::Server, server, closer),
+            switchboard: Switchboard::start(Side::Server, server),
         }
     }
 }
@@ -242,9 +235,9 @@ impl<Out: Envelope, In: Envelope> Mux<Out, In> {
     /// the API.
     #[cfg(any(test, feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(super) fn mocked(side: Side, source: impl Source, closer: Closer) -> Self {
+    pub(super) fn mocked(side: Side, source: impl Source) -> Self {
         Self {
-            switchboard: Switchboard::start(side, source, closer),
+            switchboard: Switchboard::start(side, source),
         }
     }
 
@@ -338,9 +331,13 @@ mod tests {
         let attestation = self_attestation(&signer);
 
         let ark_reader: Reader = Box::new(ark_sock.try_clone().unwrap());
+        let ark_closing = ark_sock.try_clone().unwrap();
         let ark_writer: Writer = Box::new(ark_sock);
         let peer = thread::spawn(move || {
-            let mut server = PeerServer::new(ark_reader, ark_writer, signer, attestation);
+            let stream = transport::Stream::new(ark_reader, ark_writer, move || {
+                let _ = ark_closing.shutdown(Shutdown::Both);
+            });
+            let mut server = PeerServer::new(stream, signer, attestation);
             while let Ok(message) = testing::served(&mut server) {
                 let message = HostToArk::decode(&message[..]).unwrap();
                 if !script(&mut server, message) {
@@ -352,12 +349,12 @@ mod tests {
         let closing = host_sock.try_clone().unwrap();
         let host_reader: Reader = Box::new(host_sock.try_clone().unwrap());
         let host_writer: Writer = Box::new(host_sock);
-        let mut client = transport::Client::new(host_reader, host_writer);
-        client.handshake(&identity).unwrap();
-        let closer = Box::new(move || {
+        let stream = transport::Stream::new(host_reader, host_writer, move || {
             let _ = closing.shutdown(Shutdown::Both);
         });
-        (Client::new(client, closer), peer)
+        let mut client = transport::Client::new(stream);
+        client.handshake(&identity).unwrap();
+        (Client::new(client), peer)
     }
 
     /// A request payload.
@@ -418,9 +415,13 @@ mod tests {
         let attestation = self_attestation(&signer);
 
         let host_reader: Reader = Box::new(host_sock.try_clone().unwrap());
+        let host_closing = host_sock.try_clone().unwrap();
         let host_writer: Writer = Box::new(host_sock);
         let peer = thread::spawn(move || {
-            let mut client = PeerClient::new(host_reader, host_writer);
+            let stream = transport::Stream::new(host_reader, host_writer, move || {
+                let _ = host_closing.shutdown(Shutdown::Both);
+            });
+            let mut client = PeerClient::new(stream);
             client.handshake(&identity).unwrap();
             script(&mut client, &identity);
         });
@@ -428,11 +429,11 @@ mod tests {
         let closing = ark_sock.try_clone().unwrap();
         let ark_reader: Reader = Box::new(ark_sock.try_clone().unwrap());
         let ark_writer: Writer = Box::new(ark_sock);
-        let server = transport::Server::new(ark_reader, ark_writer, signer, attestation);
-        let closer = Box::new(move || {
+        let stream = transport::Stream::new(ark_reader, ark_writer, move || {
             let _ = closing.shutdown(Shutdown::Both);
         });
-        (Server::new(server, closer), peer)
+        let server = transport::Server::new(stream, signer, attestation);
+        (Server::new(server), peer)
     }
 
     /// Sends a message of the client's.

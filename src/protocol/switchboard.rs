@@ -8,11 +8,9 @@
 //! worker. The threads start with it and wind down when it ends.
 
 use crate::protocol;
-use crate::protocol::envelope::{Envelope, Ids, Kind, Parity};
-use crate::protocol::mux::{
-    ANSWERS, CHARGE, Closer, Error, INBOX, Reader, Responder, WINDOW, Writer,
-};
-use crate::transport::{self, Attester, Emitter, Event, MAX_MESSAGE_SIZE, Side};
+use crate::protocol::envelope::{Envelope, Ids, Kind, Parity, Side};
+use crate::protocol::mux::{ANSWERS, CHARGE, Error, INBOX, Reader, Responder, WINDOW, Writer};
+use crate::transport::{self, Attester, Closer, Emitter, Event, MAX_MESSAGE_SIZE};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::SyncSender;
@@ -147,6 +145,9 @@ pub(super) trait Sender: Send + Sync {
 /// Source of the messages a reader thread routes, a transport client or
 /// server with its emitter.
 pub(super) trait Source: Send + 'static {
+    /// Public transport handle ending the underlying byte stream.
+    fn closer(&self) -> Closer;
+
     /// Reads the next message of the session, or the session ending and the
     /// next one opening, see the transport server's. A client's session is
     /// its connection, so it only ever reads messages.
@@ -165,6 +166,9 @@ pub(super) trait Source: Send + 'static {
 }
 
 impl Source for transport::Client<Reader, Writer> {
+    fn closer(&self) -> Closer {
+        transport::Client::closer(self)
+    }
     fn next_event(&mut self) -> Result<Event, transport::Error> {
         transport::Client::next_message(self).map(Event::Message)
     }
@@ -177,6 +181,9 @@ impl Source for transport::Client<Reader, Writer> {
 }
 
 impl<A: Attester + Send + 'static> Source for transport::Server<Reader, Writer, A> {
+    fn closer(&self) -> Closer {
+        transport::Server::closer(self)
+    }
     fn next_event(&mut self) -> Result<Event, transport::Error> {
         transport::Server::next_event(self)
     }
@@ -204,14 +211,14 @@ pub(super) struct Switchboard<Out: Envelope, In: Envelope> {
     arrived: Condvar, // Wakes the worker
     handler: Mutex<Option<Handler<Out, In>>>, // Server of the peer's requests
     disconnect: Mutex<Option<Disconnect>>, // Handler of the session ending without a close
-    closer: Mutex<Option<Closer>>, // Hook ending the transport, run once
+    closer: Closer, // Public handle ending the transport
 }
 
 impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// Starts the switchboard of a side over a source, its ids of the side's
-    /// parity, the reader and the worker threads with it, the closer ending
+    /// parity, the reader and the worker threads with it, the close handle ending
     /// the transport when the multiplexer closes or the session fails.
-    pub(super) fn start(side: Side, source: impl Source, closer: Closer) -> Arc<Self> {
+    pub(super) fn start(side: Side, source: impl Source) -> Arc<Self> {
         let parity = Parity::from(side);
         let switchboard = Arc::new(Self {
             side,
@@ -236,7 +243,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
             arrived: Condvar::new(),
             handler: Mutex::new(None),
             disconnect: Mutex::new(None),
-            closer: Mutex::new(Some(closer)),
+            closer: source.closer(),
         });
         let reading = switchboard.clone();
         thread::Builder::new()
@@ -449,7 +456,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         // out of a session could land in the inbox after that session ended
         // and be served to whoever comes next
         let registry = lock(&self.registry);
-        if registry.session != request.emitter.session() {
+        if registry.session != request.emitter.session_id() {
             warn!("dropping request of a session that ended: {}", request.id);
             return Ok(());
         }
@@ -555,9 +562,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
         }
         self.room.notify_all();
         self.arrived.notify_one();
-        if let Some(closer) = lock(&self.closer).take() {
-            closer();
-        }
+        self.closer.close();
         true
     }
 }
@@ -584,7 +589,7 @@ impl<Out: Envelope, In: Envelope> Sender for Switchboard<Out, In> {
                         Err(lock(&self.registry).refusal())
                     }
                     Side::Server => {
-                        self.reset(emitter.session(), reason.clone(), emitter.clone());
+                        self.reset(emitter.session_id(), reason.clone(), emitter.clone());
                         Err(reason)
                     }
                 }

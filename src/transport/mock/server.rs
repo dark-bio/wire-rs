@@ -982,7 +982,11 @@ pub fn run(steps: &[Step]) -> Summary {
         recorder.clone(),
     )));
     let identity = server.borrow().identity.public_key();
-    let mut client = Client::new(Feed(server.clone()), outbox);
+    let mut client = Client::new(crate::transport::Stream::new(
+        Feed(server.clone()),
+        outbox,
+        || {},
+    ));
 
     // Transcribe the run for other implementations of the client to replay,
     // flagging the writes failing on purpose for the ones unable to

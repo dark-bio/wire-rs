@@ -7,7 +7,8 @@ use crate::transport::handshake;
 use crate::transport::sealing;
 use crate::transport::server::Attestation;
 use crate::transport::{
-    CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
+    CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
+    Error, Stream,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
@@ -94,23 +95,38 @@ pub struct Client<R: Read, W: Write> {
 }
 
 impl<R: Read, W: Write> Client<R, W> {
-    /// Creates a new client side around a low level reader and writer. Reads block
-    /// per the transport's semantics, so a timeout for an unresponsive server must
-    /// be configured on the reader passed in.
-    pub fn new(reader: R, writer: W) -> Self {
-        let funnel = Arc::new(Funnel::new(writer, Side::Client));
+    /// Creates a client owning the byte stream and its shutdown operation.
+    /// I/O deadlines and cancellation bounds are supplied by the stream adapter.
+    pub fn new(stream: Stream<R, W>) -> Self {
+        let (reader, writer, close) = stream.into_parts();
+
+        let funnel = Arc::new(Funnel::new(writer, Side::Client, close.clone()));
         let emitter = funnel.emitter();
+
         Self {
-            reader: FrameReader::new(reader),
+            reader: FrameReader::new(reader, close),
             receiver: None,
             funnel,
             emitter,
         }
     }
 
-    /// Number of the live session, counting the handshakes so far, or zero
+    /// A handle that permanently closes the stream from another thread.
+    pub fn closer(&self) -> Closer {
+        self.funnel.closer()
+    }
+
+    /// Permanently closes the stream and waits for adapter shutdown. Emitters
+    /// observe closure through write failure; buffered messages remain readable.
+    /// See [`Closer::close`].
+    pub fn close(&self) {
+        self.funnel.close();
+    }
+
+    /// Number of the installed session, counting the handshakes so far, or zero
     /// without one. A fresh handshake moves it, which is how anything bound
-    /// to the session above the wire tells.
+    /// to the session above the wire tells. This records local session state;
+    /// closing the stream alone does not clear it.
     pub fn session(&self) -> u64 {
         self.funnel.session()
     }
@@ -448,13 +464,21 @@ mod tests {
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
         let ark = thread::spawn(move || {
-            let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer,
+                attestation,
+            );
             for _ in 0..100 {
                 let req = testing::served(&mut server).unwrap();
                 server.send_message(&req).unwrap();
             }
         });
-        let mut client = Client::new(host_reader, host_writer);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_reader,
+            host_writer,
+            || {},
+        ));
         client.handshake(&identity).unwrap();
 
         // Send from a few threads at once while reading the echoes on this one
@@ -496,11 +520,19 @@ mod tests {
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
         let ark = thread::spawn(move || {
-            let mut server = Server::new(ark_reader, ark_writer, signer, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer,
+                attestation,
+            );
             let req = testing::served(&mut server).unwrap();
             server.send_message(&req).unwrap();
         });
-        let mut client = Client::new(host_reader, host_writer);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_reader,
+            host_writer,
+            || {},
+        ));
         client.handshake(&identity).unwrap();
         let stale = client.emitter();
         client.handshake(&identity).unwrap();
@@ -524,7 +556,11 @@ mod tests {
 
         // The reader ending the wire refuses the sends
         let (sender, receiver) = contexts();
-        let mut client = Client::new(io::empty(), Vec::new());
+        let mut client = Client::new(crate::transport::Stream::new(
+            io::empty(),
+            Vec::new(),
+            || {},
+        ));
         client.establish_session(sender, receiver);
         let emitter = client.emitter();
 
@@ -554,7 +590,7 @@ mod tests {
             }
         }
         let (sender, receiver) = contexts();
-        let mut client = Client::new(io::empty(), Broken);
+        let mut client = Client::new(crate::transport::Stream::new(io::empty(), Broken, || {}));
         client.establish_session(sender, receiver);
 
         let result = client.send_message(&payload(1));
@@ -564,7 +600,11 @@ mod tests {
         // An emitter failing to deliver refuses the reads once the client
         // gets to them, a frame waiting notwithstanding
         let (sender, receiver) = contexts();
-        let mut client = Client::new(&[0x02, 0x05, 0x00][..], Broken);
+        let mut client = Client::new(crate::transport::Stream::new(
+            &[0x02, 0x05, 0x00][..],
+            Broken,
+            || {},
+        ));
         client.establish_session(sender, receiver);
         let emitter = client.emitter();
 
@@ -586,17 +626,14 @@ mod tests {
 
         let (mut reader, writer) = io::pipe().unwrap();
         let (sender, receiver) = contexts();
-        let mut client = Client::new(io::empty(), writer);
+        let mut client = Client::new(crate::transport::Stream::new(io::empty(), writer, || {}));
         client.establish_session(sender, receiver);
         let emitter = client.emitter();
         emitter.send_message(&payload(1)).unwrap();
         drop(client);
 
         let result = emitter.send_message(&payload(2));
-        assert!(
-            matches!(result, Err(Error::EncryptionFailed(_))),
-            "{result:?}"
-        );
+        assert!(matches!(result, Err(Error::Terminated)), "{result:?}");
         // The read only returns once the writer is gone
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();

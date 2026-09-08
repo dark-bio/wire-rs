@@ -12,6 +12,7 @@ mod framing;
 mod handshake;
 mod sealing;
 mod server;
+mod stream;
 
 #[cfg(any(test, feature = "fuzz"))]
 #[doc(hidden)]
@@ -20,14 +21,14 @@ pub mod mock;
 
 pub use client::{Client, Roots, Verifier};
 pub use emitter::Emitter;
-pub(crate) use emitter::Side;
 pub use server::{Attestation, Attester, Event, Server};
+pub use stream::{Closer, Stream};
 
 /// The funnel behind the emitters, for the protocol's mock to have a real
 /// sending side, sessions, sealing and the resets, without a transport under
 /// it.
 #[cfg(any(test, feature = "fuzz"))]
-pub(crate) use emitter::Funnel;
+pub(crate) use emitter::{Funnel, Side};
 
 use std::io;
 

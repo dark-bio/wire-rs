@@ -9,9 +9,18 @@
 //! the peer's.
 
 use crate::protocol::{ArkToHost, Error, HostToArk, ark_to_host, host_to_ark};
-use crate::transport::Side;
 use prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Role in the protocol, deciding request parity and whether the mux serves
+/// successive sessions. Independent of the transport's implementation roles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Side {
+    /// Host requests have odd IDs and its mux serves one session.
+    Client,
+    /// Ark requests have even IDs and its mux accepts successive sessions.
+    Server,
+}
 
 /// Parity of the ids a side allocates, telling its own requests from the
 /// peer's.

@@ -107,7 +107,11 @@ fn event(value: &Value) -> Event {
 /// from it.
 pub fn run(vector: &Vector) {
     let tape = Rc::new(RefCell::new(Tape::new(vector.trace.clone())));
-    let mut client = Client::new(Reader(tape.clone()), Writer(tape.clone()));
+    let mut client = Client::new(crate::transport::Stream::new(
+        Reader(tape.clone()),
+        Writer(tape.clone()),
+        || {},
+    ));
     let mut peer = Peer::new(vector);
 
     while !tape.borrow().done() {

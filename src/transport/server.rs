@@ -6,7 +6,8 @@ use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
 use crate::transport::sealing;
 use crate::transport::{
-    CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error,
+    CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
+    Error, Stream,
 };
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
@@ -104,16 +105,17 @@ pub struct Server<R: Read, W: Write, A: Attester> {
 }
 
 impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
-    /// Creates a new server side around a low level reader and writer. The signer is
+    /// Creates a server owning the byte stream and its shutdown operation. The signer is
     /// the server's identity key, which signs the handshake. The client verifies that
     /// signature against the key it extracts from the attestation, so the two
-    /// must match. Reads block per the transport's semantics, so any timeout
-    /// must be configured on the reader passed in.
-    pub fn new(reader: R, writer: W, signer: xdsa::SecretKey, attester: A) -> Self {
-        let funnel = Arc::new(Funnel::new(writer, Side::Server));
+    /// must match. I/O deadlines and cancellation bounds are supplied by the
+    /// stream adapter.
+    pub fn new(stream: Stream<R, W>, signer: xdsa::SecretKey, attester: A) -> Self {
+        let (reader, writer, close) = stream.into_parts();
+        let funnel = Arc::new(Funnel::new(writer, Side::Server, close.clone()));
         let emitter = funnel.emitter();
         Self {
-            reader: FrameReader::new(reader),
+            reader: FrameReader::new(reader, close),
             funnel,
             signer,
             attester,
@@ -125,6 +127,18 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
+    /// A handle that permanently closes the stream from another thread.
+    pub fn closer(&self) -> Closer {
+        self.funnel.closer()
+    }
+
+    /// Permanently closes the stream and waits for adapter shutdown. Emitters
+    /// observe closure through write failure; buffered messages remain readable.
+    /// See [`Closer::close`].
+    pub fn close(&self) {
+        self.funnel.close();
+    }
+
     /// Test helper creating a server side signing its ArkHellos at the given
     /// time instead of the clock, so a run of it is the same every time. Not
     /// part of the API.
@@ -133,20 +147,20 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn new_at(
-        reader: R,
-        writer: W,
+        stream: Stream<R, W>,
         signer: xdsa::SecretKey,
         attester: A,
         timestamp: i64,
     ) -> Self {
-        let mut server = Self::new(reader, writer, signer, attester);
+        let mut server = Self::new(stream, signer, attester);
         server.timestamp = Some(timestamp);
         server
     }
 
-    /// Number of the live session, counting the handshakes served so far, or
+    /// Number of the installed session, counting the handshakes served so far, or
     /// zero without one. A client reconnecting on the same transport moves it,
-    /// which is how anything bound to the session above the wire tells.
+    /// which is how anything bound to the session above the wire tells. This
+    /// records local session state; closing the stream alone does not clear it.
     pub fn session(&self) -> u64 {
         self.funnel.session()
     }
@@ -491,7 +505,11 @@ mod tests {
 
         // Server side: receive two messages (across two sessions), echo each back.
         let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer_key,
+                attestation,
+            );
             let mut requests = Vec::new();
             for _ in 0..2 {
                 let req = testing::served(&mut server).unwrap();
@@ -505,7 +523,11 @@ mod tests {
         let mut raw_sock = host_sock.try_clone().unwrap();
 
         // Session 1: handshake, checking the attestation, exchange one message.
-        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_sock.try_clone().unwrap(),
+            host_sock,
+            || {},
+        ));
         let attest = client.handshake(&signer_pub).unwrap();
         assert_eq!(attest.as_bytes(), presented.as_bytes());
         client.send_message(&payload(1)).unwrap();
@@ -560,12 +582,20 @@ mod tests {
         // mid-handshake, so the server never delivers a message.
         let ark_thread = std::thread::spawn(move || {
             let attestation = self_attestation(&signer_key);
-            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer_key,
+                attestation,
+            );
             testing::served(&mut server)
         });
 
         // Client side: refuse the attestation in the verifier.
-        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_sock.try_clone().unwrap(),
+            host_sock,
+            || {},
+        ));
         let result = client.handshake(&Untrusting);
         assert!(result.is_err());
 
@@ -606,10 +636,18 @@ mod tests {
             let ark_writer = ark_sock;
 
             let ark_thread = std::thread::spawn(move || {
-                let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+                let mut server = Server::new(
+                    crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                    signer_key,
+                    attestation,
+                );
                 testing::served(&mut server)
             });
-            let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+            let mut client = Client::new(crate::transport::Stream::new(
+                host_sock.try_clone().unwrap(),
+                host_sock,
+                || {},
+            ));
             let result = client.handshake(&Roots { hardware, emulator });
 
             // Dropping the client tears down the transport, unblocking the server
@@ -758,7 +796,11 @@ mod tests {
         // Server side: note the number before any session and after each of
         // the two requests, the second one arriving in a second session.
         let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer_key,
+                attestation,
+            );
             let mut numbers = vec![server.session()];
             for _ in 0..2 {
                 testing::served(&mut server).unwrap();
@@ -768,7 +810,11 @@ mod tests {
         });
 
         // Client side: one request per session, over two sessions.
-        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_sock.try_clone().unwrap(),
+            host_sock,
+            || {},
+        ));
         assert_eq!(client.session(), 0);
         client.handshake(&signer_pub).unwrap();
         assert_eq!(client.session(), 1);
@@ -797,7 +843,11 @@ mod tests {
         // Server side: serve one request, reset the session, then serve the
         // request of the next session.
         let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer_key,
+                attestation,
+            );
             testing::served(&mut server).unwrap();
             server.reset_session();
             testing::served(&mut server).unwrap();
@@ -806,7 +856,11 @@ mod tests {
 
         // Client side: one request, the reset read back, then a new session
         // with a request of its own.
-        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_sock.try_clone().unwrap(),
+            host_sock,
+            || {},
+        ));
         client.handshake(&signer_pub).unwrap();
         client.send_message(&payload(1)).unwrap();
         let result = client.next_message();
@@ -835,7 +889,11 @@ mod tests {
         // Server side: on the first request, push messages from a few threads
         // while waiting for the second request.
         let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(ark_reader, ark_writer, signer_key, attestation);
+            let mut server = Server::new(
+                crate::transport::Stream::new(ark_reader, ark_writer, || {}),
+                signer_key,
+                attestation,
+            );
             testing::served(&mut server).unwrap();
 
             let pushers: Vec<_> = (0..4)
@@ -856,7 +914,11 @@ mod tests {
         });
 
         // Client side: request the push, receive it all, then request the stop.
-        let mut client = Client::new(host_sock.try_clone().unwrap(), host_sock);
+        let mut client = Client::new(crate::transport::Stream::new(
+            host_sock.try_clone().unwrap(),
+            host_sock,
+            || {},
+        ));
         client.handshake(&signer_pub).unwrap();
         client.send_message(&payload(1)).unwrap();
 

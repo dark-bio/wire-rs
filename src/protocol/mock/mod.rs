@@ -19,9 +19,10 @@ pub mod peer;
 #[cfg(feature = "fuzz")]
 pub mod seed;
 
+use crate::protocol::envelope::Side;
 use crate::protocol::mux::Writer;
 use crate::protocol::switchboard::Source;
-use crate::transport::{self, Emitter, Event, Funnel, Side};
+use crate::transport::{self, Closer, Emitter, Event, Funnel, Stream};
 use darkbio_crypto::xhpke;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,8 +162,13 @@ pub(crate) struct Link {
 impl Link {
     /// Creates the link of a side over the sink, without a session until the
     /// peer opens one.
-    pub(crate) fn new(side: Side, sink: Sink) -> Arc<Self> {
-        let funnel = Arc::new(Funnel::new(Box::new(sink) as Writer, side));
+    pub(super) fn new(side: Side, stream: Stream<io::Empty, Writer>) -> Arc<Self> {
+        let (_, writer, close) = stream.into_parts();
+        let side = match side {
+            Side::Client => transport::Side::Client,
+            Side::Server => transport::Side::Server,
+        };
+        let funnel = Arc::new(Funnel::new(writer, side, close));
         let emitter = Mutex::new(funnel.emitter());
         Arc::new(Self {
             funnel,
@@ -223,8 +229,9 @@ impl Feed {
     /// Creates the source of a link along with the channel delivering into it,
     /// the one telling that a delivery is routed and the one telling that the
     /// reader thread wound down.
-    pub(crate) fn new(
-        link: Arc<Link>,
+    pub(super) fn new(
+        side: Side,
+        sink: Sink,
     ) -> (
         Self,
         mpsc::Sender<Delivery>,
@@ -234,6 +241,14 @@ impl Feed {
         let (deliveries, inbound) = mpsc::channel();
         let (routed, routes) = mpsc::sync_channel(0);
         let (finished, ends) = mpsc::channel();
+        let stream = Stream::new(io::empty(), Box::new(sink.clone()) as Writer, {
+            let deliveries = deliveries.clone();
+            move || {
+                sink.close();
+                let _ = deliveries.send(Delivery::Failed(transport::Error::Terminated));
+            }
+        });
+        let link = Link::new(side, stream);
         let feed = Self {
             link,
             deliveries: inbound,
@@ -245,6 +260,9 @@ impl Feed {
 }
 
 impl Source for Feed {
+    fn closer(&self) -> Closer {
+        self.link.funnel.closer()
+    }
     fn next_event(&mut self) -> Result<Event, transport::Error> {
         // Tell the driver that the reader is back for more, which on the first
         // read means it started and took down the session it starts from, and
@@ -275,6 +293,7 @@ impl Source for Feed {
 
 impl Drop for Feed {
     fn drop(&mut self) {
+        self.link.funnel.close();
         let _ = self.finished.send(());
     }
 }
