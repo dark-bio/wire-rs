@@ -162,8 +162,7 @@ pub(crate) struct Link {
 /// The counter belongs to the mock; production transport uses object identity.
 struct LinkSession {
     current: Option<Arc<Mutex<xhpke::Sender>>>, // Retained until receiving observes its end
-    ended: Arc<AtomicBool>, // Termination observed by model assertions and real sends
-    generation: u64,        // Number of sessions the mock has created
+    generation: u64,                            // Number of sessions the mock has created
 }
 
 impl Link {
@@ -180,7 +179,6 @@ impl Link {
             outbound,
             session: Mutex::new(LinkSession {
                 current: None,
-                ended: Arc::new(AtomicBool::new(true)),
                 generation: 0,
             }),
         })
@@ -201,11 +199,9 @@ impl Link {
         // Only sending runs through the real transport; the model handles
         // inbound messages directly and needs no receive crypto context.
         let current = Arc::new(Mutex::new(sender));
-        let ended = Arc::new(AtomicBool::new(false));
-        let sender = self.outbound.bind(&current, &ended);
+        let sender = self.outbound.bind(&current);
         let mut session = self.session.lock().expect("link not poisoned");
         session.current = Some(current);
-        session.ended = ended;
         session.generation += 1;
         (sender, receiver)
     }
@@ -214,7 +210,11 @@ impl Link {
     pub(crate) fn generation(&self) -> u64 {
         let session = self.session.lock().expect("link not poisoned");
         match &session.current {
-            Some(_) if !session.ended.load(Ordering::Acquire) => session.generation,
+            Some(current) => self
+                .outbound
+                .finish_receive(current, Ok(Vec::new()))
+                .map(|_| session.generation)
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -233,7 +233,9 @@ impl Link {
     /// server does on the peer's reset.
     pub(crate) fn end_session(&self) {
         let mut session = self.session.lock().expect("link not poisoned");
-        session.ended.store(true, Ordering::Release);
+        if let Some(current) = session.current.as_ref() {
+            self.outbound.end(current);
+        }
         session.current = None;
     }
 }
@@ -242,11 +244,10 @@ impl Drop for Link {
     /// Ends the mock's current session before releasing its context, including
     /// when an active send temporarily keeps that context and the writer alive.
     fn drop(&mut self) {
-        let session = self
-            .session
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        session.ended.store(true, Ordering::Release);
+        let session = self.session.get_mut().expect("link not poisoned");
+        if let Some(current) = session.current.as_ref() {
+            self.outbound.end(current);
+        }
     }
 }
 

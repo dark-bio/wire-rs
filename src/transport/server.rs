@@ -5,7 +5,7 @@ use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
 use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
-use crate::transport::sender::{EndOnPanic, Sender};
+use crate::transport::sender::Sender;
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
     Error, Stream,
@@ -13,7 +13,6 @@ use crate::transport::{
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, trace, warn};
 
@@ -106,7 +105,6 @@ pub struct Server<R: Read, W: Write, A: Attester> {
 
     receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this server
     sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
-    ended: Arc<AtomicBool>,            // Termination flag shared with the sender and writer
 
     handshaking: bool, // Whether a reset arrived, the handshake it calls for still to run
 
@@ -130,7 +128,6 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             attester,
             receiver: None,
             sealer: None,
-            ended: Arc::new(AtomicBool::new(true)),
             handshaking: false,
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
@@ -176,6 +173,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// the next call runs the handshake. A send failure does not wake a blocked
     /// read; it is observed when receiving progresses. A session ended locally
     /// by [`Server::disconnect`] is not reported again.
+    ///
+    /// Successful message acceptance is ordered with session ending after
+    /// decryption, without waiting for the writer. Reporting a session ended
+    /// waits for outgoing writes first. A concurrent send failure can discard
+    /// a decrypted message before acceptance; an accepted message may reach the
+    /// caller after the other thread ends the session.
     ///
     /// Junk outside a session and failed handshakes are logged, answered with
     /// an empty frame and skipped. Transport receive failures surface as errors.
@@ -251,16 +254,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 }
                 Some(receiver) => receiver,
             };
-            // Sending can end the session before receiving observes it. The
-            // contexts are released when receiving reports that end.
-            let opened = if self.ended.load(Ordering::Acquire) {
-                Err(Error::EncryptionFailed("session ended".into()))
-            } else {
-                let _end_on_panic = EndOnPanic(&self.ended);
-                sealing::open(receiver, packet)
-                    .inspect_err(|_| self.ended.store(true, Ordering::Release))
-            };
-            let message = match opened {
+            // Finish after decrypting, ordering message acceptance with a send
+            // failure without ever waiting for the writer on a successful receive.
+            let sealer = self
+                .sealer
+                .as_ref()
+                .expect("receiver has a sending context");
+            let opened = sealing::open(receiver, packet);
+            let message = match self.outbound.finish_receive(sealer, opened) {
                 Err(err) => {
                     warn!("session receive failed, resetting session: {}", err);
                     self.end_session();
@@ -277,42 +278,41 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
-    /// Retains the contexts negotiated by a completed handshake and returns a
-    /// sender bound to the sending context's allocation. The server uses the
-    /// receive context directly and shares the sending context with active sends.
-    /// Idle senders hold weak references and keep neither context nor stream alive.
-    /// Each handshake gets a fresh termination flag, so ending an old session
-    /// cannot invalidate its replacement.
+    /// Retains freshly negotiated crypto contexts and returns a sender bound
+    /// to the sending context's allocation. The server uses the receive context
+    /// directly and shares the sending context with active sends. Idle senders
+    /// hold weak references and keep neither the contexts nor the stream alive.
     ///
-    /// Binding takes the writer lock, ordering replacement with in-flight writes
-    /// and invalidating previous senders. After binding, old senders cannot write
-    /// into the new session. This method performs no handshake or stream I/O.
+    /// Binding takes the writer lock, then the binding lock. Once replaced,
+    /// old sends cannot write and old received messages cannot be accepted.
+    /// A write already owning the writer may finish before replacement. This
+    /// method performs no handshake, crypto or stream I/O itself.
     fn new_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) -> Sender<W> {
         let sealer = Arc::new(Mutex::new(sender));
-        let ended = Arc::new(AtomicBool::new(false));
-        let sender = self.outbound.bind(&sealer, &ended);
+        let sender = self.outbound.bind(&sealer);
         self.receiver = Some(receiver);
         self.sealer = Some(sealer);
-        self.ended = ended;
         sender
     }
 
-    /// Marks the current termination flag ended, releases the receive context,
-    /// and releases the server's reference to the sending context. Active sends
-    /// may still retain that context, but observe the same termination flag.
-    /// Takes no encryption or writer lock; a write already admitted may finish.
+    /// Ends the current binding before releasing the server's crypto contexts.
+    /// Waits for the writer, so no write or flush for the session remains in
+    /// progress or can start after this returns. A send that acquires the writer
+    /// first may finish; one still sealing after removal cannot write its packet.
+    /// No encryption lock is taken and extra crypto work is not waited for.
     ///
-    /// Returns true when a session was removed, including one already ended by
-    /// a send failure. That failure leaves the receive context present until
-    /// receiving observes it. The receive loop uses this result to emit one
-    /// [`Event::Disconnected`]; later calls return false until another handshake
-    /// establishes a session. Local [`Server::disconnect`] ignores the result
-    /// because its caller already knows the session ended.
+    /// The stream stays open and no notification is sent. The caller decides
+    /// whether to send a reset or empty frame. A stuck write can delay ending;
+    /// an independently held Closer can cancel it without taking the writer lock.
     ///
-    /// Leaves the stream open and sends no notification. The calling operation
-    /// decides whether to send an empty frame to the client.
+    /// Returns true when a receive context was removed, including one whose
+    /// binding already ended through a send failure. The receive loop uses that
+    /// completed removal to emit Disconnected once; local disconnect ignores
+    /// the result because its caller already knows the session ended.
     fn end_session(&mut self) -> bool {
-        self.ended.store(true, Ordering::Release);
+        if let Some(sealer) = self.sealer.as_ref() {
+            self.outbound.end(sealer);
+        }
         self.sealer = None;
         self.receiver.take().is_some()
     }
@@ -329,6 +329,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// The stream remains available for the client to connect again. Notification
     /// failures are logged. This local action does not produce an
     /// [`Event::Disconnected`], since the caller already knows the session ended.
+    /// Waits for the writer and its flush before retiring the binding and
+    /// sending the notification. An independent Closer can cancel stuck output.
     pub fn disconnect(&mut self) {
         self.end_session();
         self.send_dropped();
@@ -443,13 +445,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 }
 
 impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
-    /// Permanently closes the stream, waits for adapter shutdown, and marks the
-    /// session ended before releasing its contexts. Idle senders hold only weak
-    /// references, so they cannot keep the outbound side alive.
+    /// Closes the stream to cancel blocked I/O, then ends the binding before
+    /// releasing the contexts. Shutdown must precede waiting for the writer.
+    /// Idle senders hold weak references and cannot extend the stream's lifetime.
     fn drop(&mut self) {
-        let _end_on_panic = EndOnPanic(&self.ended);
         self.outbound.close();
-        self.ended.store(true, Ordering::Release);
+        self.end_session();
     }
 }
 

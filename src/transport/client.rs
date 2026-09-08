@@ -5,7 +5,7 @@ use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
 use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
-use crate::transport::sender::{EndOnPanic, Sender};
+use crate::transport::sender::Sender;
 use crate::transport::server::Attestation;
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
@@ -14,7 +14,6 @@ use crate::transport::{
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
@@ -93,7 +92,6 @@ pub struct Client<R: Read, W: Write> {
     reader: FrameReader<R>,            // COBS framed transport for ingress data
     receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this client
     sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
-    ended: Arc<AtomicBool>,            // Termination flag shared with the sender and writer
     outbound: Arc<Outbound<W>>,        // Outgoing transport, shared with the senders
 }
 
@@ -110,7 +108,6 @@ impl<R: Read, W: Write> Client<R, W> {
             reader: FrameReader::new(reader, close),
             receiver: None,
             sealer: None,
-            ended: Arc::new(AtomicBool::new(true)),
             outbound,
         }
     }
@@ -289,6 +286,12 @@ impl<R: Read, W: Write> Client<R, W> {
     /// the server's HPKE sequence can no longer be followed. So does an empty
     /// frame, the server signaling it dropped the session on its end. Call
     /// [`Client::connect`] to establish a new session after either failure.
+    ///
+    /// Message acceptance is ordered with session ending after decryption and
+    /// never waits for the writer. Ending through a receive error does wait for
+    /// outgoing writes before returning. A concurrent send failure can discard
+    /// a decrypted message that has not yet been accepted; an accepted message
+    /// may reach the caller after the other thread ends the session.
     pub fn recv(&mut self) -> Result<Vec<u8>, Error> {
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
@@ -309,14 +312,12 @@ impl<R: Read, W: Write> Client<R, W> {
             .as_mut()
             .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
 
-        let opened = if self.ended.load(Ordering::Acquire) {
-            Err(Error::EncryptionFailed("session ended".into()))
-        } else {
-            let _end_on_panic = EndOnPanic(&self.ended);
-            sealing::open(receiver, packet)
-                .inspect_err(|_| self.ended.store(true, Ordering::Release))
-        };
-        let message = match opened {
+        let sealer = self
+            .sealer
+            .as_ref()
+            .expect("receiver has a sending context");
+        let opened = sealing::open(receiver, packet);
+        let message = match self.outbound.finish_receive(sealer, opened) {
             Err(err) => {
                 self.end_session();
                 return Err(err);
@@ -330,41 +331,38 @@ impl<R: Read, W: Write> Client<R, W> {
         Ok(message)
     }
 
-    /// Retains the contexts negotiated by a completed handshake and returns a
-    /// sender bound to the sending context's allocation. The client uses the
-    /// receive context directly and shares the sending context with active sends.
-    /// The returned handle holds weak references and cannot keep either context
-    /// or the stream alive on its own. Each handshake gets a fresh termination
-    /// flag, so ending an old session cannot invalidate its replacement.
+    /// Retains freshly negotiated crypto contexts and returns a sender bound
+    /// to the sending context's allocation. The client uses the receive context
+    /// directly and shares the sending context with active sends. Idle senders
+    /// hold weak references and keep neither the contexts nor the stream alive.
     ///
-    /// Binding takes the writer lock to order the replacement with in-flight
-    /// writes and invalidate previous senders. A write already holding the lock
-    /// may finish first; after binding, old senders cannot write into the new
-    /// session. This method performs no handshake or stream I/O itself.
+    /// Binding takes the writer lock, then the binding lock. Once replaced,
+    /// old sends cannot write and old received messages cannot be accepted.
+    /// A write already owning the writer may finish before replacement. This
+    /// method performs no handshake, crypto or stream I/O itself.
     fn new_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) -> Sender<W> {
         let sealer = Arc::new(Mutex::new(sender));
-        let ended = Arc::new(AtomicBool::new(false));
-        let sender = self.outbound.bind(&sealer, &ended);
+        let sender = self.outbound.bind(&sealer);
 
         self.receiver = Some(receiver);
         self.sealer = Some(sealer);
-        self.ended = ended;
 
         sender
     }
 
-    /// Marks the current termination flag ended, releases the receive context,
-    /// and releases the client's reference to the sending context. Active sends
-    /// may still retain that context, but observe the same termination flag.
-    /// Another completed handshake creates fresh contexts and a new sender.
-    /// Calling this without a session has no effect.
+    /// Ends the current binding before releasing the client's crypto contexts.
+    /// Waits for the writer, so no write or flush for the session remains in
+    /// progress or can start after this returns. A send that acquires the writer
+    /// first may finish; one still sealing after removal cannot write its packet.
+    /// No encryption lock is taken and extra crypto work is not waited for.
     ///
-    /// Takes no encryption or writer lock and does not wait for active sends.
-    /// A write already admitted may finish, while queued sends are refused when
-    /// they next check the session. The stream stays open and no reset is sent;
-    /// the caller handles any notification required by the operation ending it.
+    /// The stream stays open and no notification is sent. The caller decides
+    /// whether to send a reset or empty frame. A stuck write can delay ending;
+    /// an independently held Closer can cancel it without taking the writer lock.
     fn end_session(&mut self) {
-        self.ended.store(true, Ordering::Release);
+        if let Some(sealer) = self.sealer.as_ref() {
+            self.outbound.end(sealer);
+        }
         self.receiver = None;
         self.sealer = None;
     }
@@ -428,13 +426,12 @@ impl<R: Read, W: Write> Client<R, W> {
 }
 
 impl<R: Read, W: Write> Drop for Client<R, W> {
-    /// Permanently closes the stream, waits for adapter shutdown, and marks the
-    /// session ended before releasing its contexts. Idle senders hold only weak
-    /// references, so they cannot keep the outbound side alive.
+    /// Closes the stream to cancel blocked I/O, then ends the binding before
+    /// releasing the contexts. Shutdown must precede waiting for the writer.
+    /// Idle senders hold weak references and cannot extend the stream's lifetime.
     fn drop(&mut self) {
-        let _end_on_panic = EndOnPanic(&self.ended);
         self.outbound.close();
-        self.ended.store(true, Ordering::Release);
+        self.end_session();
     }
 }
 
@@ -447,7 +444,9 @@ mod tests {
     use crate::transport::mock::{payload, self_attestation};
     use crate::transport::server::Server;
     use std::io;
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     /// A pair of contexts standing in for an established session.
     fn contexts() -> (xhpke::Sender, xhpke::Receiver) {
@@ -455,6 +454,121 @@ mod tests {
         let (sender, encap) = secret.public_key().new_sender(b"test").unwrap();
         let receiver = secret.new_receiver(&encap, b"test").unwrap();
         (sender, receiver)
+    }
+
+    /// Writer accepting bytes immediately but holding its first flush until
+    /// the test releases it. This distinguishes finished writes from a fully
+    /// completed send, which must also wait for its flush.
+    struct BlockedFlush {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockedFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    // Tests that ending waits through an active flush. After it returns the
+    // old sender is refused, and fresh contexts can use the still-open stream.
+    #[test]
+    fn test_end_waits_for_flush() {
+        testing::init_tracing();
+
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let mut client = Client::new(Stream::new(
+            io::empty(),
+            BlockedFlush {
+                entered: Some(entered_tx),
+                release: release_rx,
+            },
+            || {},
+        ));
+        let (crypto, receiver) = contexts();
+        let sender = client.new_session(crypto, receiver);
+        let sending = {
+            let sender = sender.clone();
+            thread::spawn(move || sender.send(&payload(1)))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (started_tx, started) = mpsc::channel();
+        let (ended_tx, ended) = mpsc::channel();
+        let ending = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            client.end_session();
+            ended_tx.send(()).unwrap();
+            client
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = ended.recv_timeout(Duration::from_millis(50));
+        release.send(()).unwrap();
+        sending.join().unwrap().unwrap();
+        let mut client = ending.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        ended.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            sender.send(&payload(2)),
+            Err(Error::EncryptionFailed(_))
+        ));
+
+        let (crypto, receiver) = contexts();
+        let fresh = client.new_session(crypto, receiver);
+        fresh.send(&payload(3)).unwrap();
+        assert!(matches!(
+            sender.send(&payload(4)),
+            Err(Error::EncryptionFailed(_))
+        ));
+    }
+
+    // Tests that a real receive reads, decrypts and returns a message while an
+    // outgoing flush is blocked. Waiting for the writer on the success path
+    // would time out before the test releases that flush.
+    #[test]
+    fn test_recv_during_blocked_flush() {
+        testing::init_tracing();
+
+        let (mut peer, receiver) = contexts();
+        let packet = sealing::seal(&mut peer, &payload(1)).unwrap();
+        let mut bytes = Vec::new();
+        FrameWriter::new(&mut bytes, Closer::new(|| {}))
+            .send_packet(&packet)
+            .unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let mut client = Client::new(Stream::new(
+            io::Cursor::new(bytes),
+            BlockedFlush {
+                entered: Some(entered_tx),
+                release: release_rx,
+            },
+            || {},
+        ));
+        let sender = client.new_session(contexts().0, receiver);
+        let sending = thread::spawn(move || sender.send(&payload(2)));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (received_tx, received) = mpsc::channel();
+        let receiving = thread::spawn(move || {
+            received_tx.send(client.recv()).unwrap();
+            client
+        });
+        let result = received.recv_timeout(Duration::from_secs(5));
+        // Release the writer even on a timeout, so a failing test can unwind.
+        release.send(()).unwrap();
+        sending.join().unwrap().unwrap();
+        let _client = receiving.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), payload(1));
     }
 
     // Tests that releasing an old session's contexts cannot invalidate its
@@ -475,12 +589,10 @@ mod tests {
         let (crypto, old_receiver) = contexts();
         let stale = client.new_session(crypto, old_receiver);
         let old_sealer = client.sealer.as_ref().unwrap().clone();
-        let old_ended = client.ended.clone();
 
         let fresh = client.new_session(contexts().0, receiver);
-        old_ended.store(true, Ordering::Release);
+        client.outbound.end(&old_sealer);
         drop(old_sealer);
-        drop(old_ended);
         assert!(matches!(
             stale.send(&payload(1)),
             Err(Error::EncryptionFailed(_))
@@ -488,11 +600,10 @@ mod tests {
         assert_eq!(client.recv().unwrap(), payload(2));
         fresh.send(&payload(3)).unwrap();
 
-        let _outbound = client.outbound.clone();
-        let _sealer = client.sealer.as_ref().unwrap().clone();
-        let ended = client.ended.clone();
+        let outbound = client.outbound.clone();
+        let sealer = client.sealer.as_ref().unwrap().clone();
         drop(client);
-        assert!(ended.load(Ordering::Acquire));
+        assert!(outbound.finish_receive(&sealer, Ok(Vec::new())).is_err());
         assert!(matches!(
             fresh.send(&payload(4)),
             Err(Error::EncryptionFailed(_))

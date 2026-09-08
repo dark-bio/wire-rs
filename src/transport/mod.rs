@@ -37,8 +37,13 @@ use std::io;
 /// wire protocol.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
-/// Largest message the wire carries, being what still fits a frame after the
-/// session's sealing and the COBS framing overheads are added.
+/// Conservative soft limit for message sizes, guaranteed to fit a frame after
+/// sealing and worst-case COBS overhead.
+///
+/// The wire's hard limit is [`MAX_FRAME_SIZE`]; received messages may exceed
+/// this value if their encoded frames fit. [`Sender::send`] currently uses
+/// this conservative bound to reject oversized messages before sealing, without
+/// advancing the encryption sequence.
 pub const MAX_MESSAGE_SIZE: usize = {
     let mut size = MAX_FRAME_SIZE;
     while darkbio_cobs::encode_buffer(size + sealing::OVERHEAD) > MAX_FRAME_SIZE {
