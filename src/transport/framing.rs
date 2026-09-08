@@ -23,7 +23,6 @@ use crate::transport::{Closer, Error, MAX_FRAME_SIZE};
 use darkbio_cobs as cobs;
 use std::io::{self, Read, Write};
 use std::ops::Range;
-use tracing::warn;
 
 /// Reading half of the framer, the frames coming in and the buffers receiving
 /// and decoding them. It stands on its own, so a session can read on one
@@ -35,7 +34,7 @@ pub(crate) struct FrameReader<R: Read> {
     filled: usize,   // Number of received bytes in buffer
     offset: usize,   // Start of the unconsumed data, i.e. of the next frame
     search: usize,   // End of the unconsumed data already scanned for a delimiter
-    discard: usize,  // Bytes of an oversized frame thrown away so far, its delimiter still to come
+    discard: bool,   // An oversized frame was reported; discard its remainder through the delimiter
 
     packet: Vec<u8>, // Last decoded packet, handed out as a view until the next read
 }
@@ -52,7 +51,7 @@ impl<R: Read> FrameReader<R> {
             filled: 0,
             offset: 0,
             search: 0,
-            discard: 0,
+            discard: false,
             packet: vec![0u8; MAX_FRAME_SIZE],
         }
     }
@@ -61,7 +60,8 @@ impl<R: Read> FrameReader<R> {
     /// valid until the next read. An empty frame is not COBS but a session reset
     /// signal and yields `None`; a genuinely empty packet decodes to an empty
     /// view. Complete buffered frames remain available after stream closure;
-    /// needing another read observes EOF.
+    /// needing another read observes EOF. An oversized frame returns
+    /// [`Error::FrameTooLarge`] once, with later calls discarding its remainder.
     #[inline]
     pub fn next_packet(&mut self) -> Result<Option<&[u8]>, Error> {
         // Retrieve the next 0-bounded frame and pull out the data
@@ -79,10 +79,11 @@ impl<R: Read> FrameReader<R> {
     }
 
     /// Reads the next zero delimited frame, returning its range within `buffer`
-    /// so callers can parse it without copying. Frames exceeding MAX_FRAME_SIZE
-    /// are discarded with a warning, resynchronizing on the next delimiter, a
-    /// read failing midway through one leaving the discard to resume on the
-    /// next call. A read interrupted by a signal is retried.
+    /// so callers can parse it without copying. Crossing MAX_FRAME_SIZE reports
+    /// an error immediately, before the frame's full length is known. Later
+    /// calls discard the remainder through its delimiter without reporting the
+    /// same frame again or treating that delimiter as a reset. Read failures
+    /// preserve the discard state; interrupted reads are retried.
     #[inline]
     fn next_frame(&mut self) -> Result<Range<usize>, Error> {
         'outer: loop {
@@ -95,10 +96,10 @@ impl<R: Read> FrameReader<R> {
                 self.offset = end + 1; // skip the zero marker
                 self.search = end + 1; // skip the zero marker
 
-                // If we were in discard mode, report, throw away and start over
-                if self.discard > 0 {
-                    warn!("discarded frame of {} bytes", self.discard + end - start);
-                    self.discard = 0;
+                // The oversized frame was already reported. Its delimiter only
+                // finishes the discard; any following zero remains a reset.
+                if self.discard {
+                    self.discard = false;
                     continue 'outer;
                 }
                 // We were in normal operation, return the consumed frame
@@ -108,7 +109,7 @@ impl<R: Read> FrameReader<R> {
             self.search = self.filled;
 
             // Frame delimiter not found, we only have fragments
-            if self.discard == 0 {
+            if !self.discard {
                 if self.offset > 0 {
                     // We're in waiting mode, compact the buffer to maximise free space
                     let used = self.filled - self.offset;
@@ -119,18 +120,18 @@ impl<R: Read> FrameReader<R> {
                 }
             } else {
                 // We're in discard mode, throw everything away
-                self.discard += self.filled;
                 self.filled = 0;
                 self.offset = 0;
                 self.search = 0
             }
-            // We've done everything we could, we need more data. If the buffer
-            // is already full, we've exceeded our frame size, drop all.
+            // A full delimiter-free buffer proves overflow. Report it before
+            // reading any more, retaining only the need to drain its remainder.
             if self.filled == MAX_FRAME_SIZE + 1 {
-                self.discard += MAX_FRAME_SIZE + 1;
+                self.discard = true;
                 self.filled = 0;
                 self.offset = 0;
-                self.search = 0
+                self.search = 0;
+                return Err(Error::FrameTooLarge(MAX_FRAME_SIZE + 1));
             }
             // Read more data to try and find the next frame marker
             match self.reader.read(&mut self.buffer[self.filled..]) {
@@ -422,6 +423,7 @@ mod tests {
     fn test_next_frame() {
         testing::init_tracing();
 
+        /// Raw input and the frame it must deliver, including the size boundary.
         struct TestCase {
             input: Vec<u8>,
             expected: Vec<u8>,
@@ -444,21 +446,6 @@ mod tests {
                     .collect(),
                 expected: vec![b'a'; MAX_FRAME_SIZE],
             },
-            // Overflown packet should be silently discarded and the next packet
-            // read and returned.
-            TestCase {
-                input: std::iter::repeat_n(b'a', MAX_FRAME_SIZE + 1)
-                    .chain(b"\0foo\0".iter().copied())
-                    .collect(),
-                expected: b"foo".to_vec(),
-            },
-            // Multi-frame overflow should not cause issues.
-            TestCase {
-                input: std::iter::repeat_n(b'a', 2 * MAX_FRAME_SIZE + 15)
-                    .chain(b"\0foo\0".iter().copied())
-                    .collect(),
-                expected: b"foo".to_vec(),
-            },
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
@@ -470,8 +457,32 @@ mod tests {
         }
     }
 
+    // Tests that each oversized frame reports one error, including when it spans
+    // several buffers. Its terminator is consumed, while following frames and a
+    // separate reset survive. A preceding frame also exercises buffer compaction.
+    #[test]
+    fn test_next_frame_oversized() {
+        let mut input = b"before\0".to_vec();
+        for size in [MAX_FRAME_SIZE + 1, 2 * MAX_FRAME_SIZE + 15] {
+            input.extend(std::iter::repeat_n(b'a', size));
+            input.extend_from_slice(b"\0after\0\0");
+        }
+        let mut framing = FrameReader::new(Cursor::new(input), Closer::new(|| {}));
+        assert_eq!(framing.next_frame_blob().unwrap(), b"before");
+        for _ in 0..2 {
+            assert!(matches!(
+                framing.next_frame_blob(),
+                Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
+            ));
+            assert_eq!(framing.next_frame_blob().unwrap(), b"after");
+            assert!(framing.next_packet().unwrap().is_none());
+        }
+        assert!(matches!(framing.next_frame_blob(), Err(Error::Terminated)));
+    }
+
     // Tests reads failing midway through an oversized frame, which leave the
-    // discard to resume on the next call, the frame's tail never served.
+    // discard to resume on the next call, the frame's tail never served. Overflow
+    // is reported before another adapter read, even if no delimiter ever arrives.
     #[test]
     fn test_next_frame_discard_resumes() {
         testing::init_tracing();
@@ -495,6 +506,8 @@ mod tests {
         let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
         let timeout = || io::Error::from(io::ErrorKind::WouldBlock);
 
+        /// Adapter results after the oversized prefix and the frames or read
+        /// failures expected after the initial size error.
         struct TestCase {
             reads: Vec<io::Result<Vec<u8>>>,
             expected: Vec<Option<Vec<u8>>>, // Frame served per call, none for a failure
@@ -522,6 +535,10 @@ mod tests {
 
         for (i, tt) in tests.into_iter().enumerate() {
             let mut framing = FrameReader::new(Mock(tt.reads.into()), Closer::new(|| {}));
+            assert!(matches!(
+                framing.next_frame_blob(),
+                Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
+            ));
             for (j, expected) in tt.expected.into_iter().enumerate() {
                 let result = framing.next_frame_blob().map(<[u8]>::to_vec);
                 match expected {
@@ -533,6 +550,20 @@ mod tests {
                 }
             }
         }
+
+        // EOF while discarding does not make a later tail into a fresh frame.
+        let reads = vec![
+            Ok(vec![b'a'; MAX_FRAME_SIZE + 1]),
+            Ok(Vec::new()),
+            Ok(b"tail\0foo\0".to_vec()),
+        ];
+        let mut framing = FrameReader::new(Mock(reads.into()), Closer::new(|| {}));
+        assert!(matches!(
+            framing.next_frame_blob(),
+            Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
+        ));
+        assert!(matches!(framing.next_frame_blob(), Err(Error::Terminated)));
+        assert_eq!(framing.next_frame_blob().unwrap(), b"foo");
     }
 
     // Tests corner-cases when injecting a frame into the raw transport.

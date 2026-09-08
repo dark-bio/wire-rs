@@ -709,26 +709,80 @@ fn test_scripted_interrupted_reads() {
     assert_eq!(summary.failures, 0);
 }
 
-// Tests that frames past the size limit vanish in the framing, in a
-// handshake and in a session alike, a partial ArkHello in front of one
-// vanishing with it.
+// Tests that an oversized receive ends the session and invalidates retained
+// senders before accepting a queued reply. Draining the failed frame does not
+// restore the session; only a new handshake supplies a working sender.
 #[test]
 fn test_scripted_oversized_frames() {
     let summary = run_logged(&[
         Step::Handshake,
         Step::Oversized,
         Step::Hello,
+        Step::Retain,
         Step::Send(1),
         Step::Oversized,
         Step::Reply(1),
         Step::Recv,
+        Step::SendRetained(2),
+        Step::Recv,
+        Step::Handshake,
+        Step::Hello,
+        Step::SendRetained(3),
+        Step::Send(4),
+        Step::Reply(4),
+        Step::Recv,
     ]);
     assert!(summary.established);
+    assert_eq!(summary.handshakes, 2);
     assert_eq!(summary.messages, 1);
-    assert_eq!(summary.failures, 0);
+    assert_eq!(summary.failures, 2);
+}
 
-    let summary = run_logged(&[Step::Handshake, Step::Partial, Step::Oversized, Step::Hello]);
-    assert!(summary.established);
+// Tests oversized stale frames after a partial hello, with reads batched or
+// split into chunks. The overflow is skipped once and the remainder through its
+// delimiter is drained before accepting the fresh hello or the next reset.
+#[test]
+fn test_scripted_oversized_fragments() {
+    for chunk in [0, 255] {
+        let summary = run_logged(&[
+            Step::Chunk(chunk),
+            Step::Handshake,
+            Step::Batch(3),
+            Step::Partial,
+            Step::Oversized,
+            Step::Hello,
+            Step::Retain,
+            Step::Partial,
+            Step::Oversized,
+            Step::Recv,
+            Step::SendRetained(1),
+            Step::Recv,
+            Step::Dropped,
+        ]);
+        assert!(!summary.established, "chunk {chunk}");
+        assert_eq!(summary.handshakes, 1, "chunk {chunk}");
+        assert_eq!(summary.failures, 1, "chunk {chunk}");
+        assert_eq!(summary.resets, 1, "chunk {chunk}");
+    }
+}
+
+// Tests that a skipped oversized frame consumes exactly one stale-frame slot
+// during a handshake. Filling the remaining slots still permits the hello;
+// exceeding the budget fails that handshake and a new attempt can recover.
+#[test]
+fn test_scripted_oversized_stale_budget() {
+    for stale in [MAX_STALE_FRAMES - 1, MAX_STALE_FRAMES] {
+        let mut steps = vec![Step::Handshake, Step::Batch(255), Step::Oversized];
+        steps.extend(std::iter::repeat_n(Step::Dropped, stale));
+        steps.push(Step::Hello);
+        if stale == MAX_STALE_FRAMES {
+            steps.extend([Step::Handshake, Step::Hello]);
+        }
+        let summary = run_logged(&steps);
+        assert!(summary.established, "stale {stale}");
+        assert_eq!(summary.handshakes, 1, "stale {stale}");
+        assert_eq!(summary.failures, usize::from(stale == MAX_STALE_FRAMES));
+    }
 }
 
 // Tests that server frames, yields and interrupts outside a read queue up or

@@ -33,8 +33,9 @@ pub(crate) use outbound::{Outbound, Side};
 
 use std::io;
 
-/// Maximum limit for a frame size, above which it will be discarded from the
-/// wire protocol.
+/// Maximum encoded frame size, excluding its trailing delimiter. An oversized
+/// incoming frame is a framing error that ends any active session. Its remainder
+/// is discarded through its delimiter so the stream can carry a fresh handshake.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
 /// Conservative soft limit for message sizes, guaranteed to fit a frame after
@@ -77,6 +78,9 @@ pub enum Error {
     #[error("wire packet too large: {0} bytes, max {MAX_MESSAGE_SIZE} bytes")]
     PacketTooLarge(usize),
 
+    /// The frame size check exceeded [`MAX_FRAME_SIZE`]. On receive, the size
+    /// is the bytes observed when the limit was crossed, a lower bound on the
+    /// full frame length. On send, it is the required COBS encoding buffer size.
     #[error("wire frame too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
     FrameTooLarge(usize),
 

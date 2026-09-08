@@ -977,46 +977,90 @@ fn test_scripted_interrupted_reads() {
     assert_eq!(summary.dropped, 0);
 }
 
-// Tests that frames past the size limit vanish in the framing in every
-// state, a partial hello in front of one vanishing with it, whole or in
-// pieces.
+// Tests that oversized input is refused outside a session and ends an active
+// session, invalidating retained senders. Its delimiter does not act as a reset;
+// a fresh reset and handshake are needed before another request can succeed.
 #[test]
 fn test_scripted_oversized_frames() {
     let summary = run_logged(&[
         Step::Oversized,
         Step::Reset,
-        Step::Oversized,
         Step::Hello,
-        Step::Oversized,
         Step::Ack,
-        Step::Oversized,
+        Step::Retain,
         Step::Request(1),
-    ]);
-    assert_eq!(summary.state, State::Established);
-    assert_eq!(summary.handshakes, 1);
-    assert_eq!(summary.delivered, 1);
-    assert_eq!(summary.dropped, 0);
-
-    let summary = run_logged(&[
-        Step::Reset,
-        Step::Partial,
         Step::Oversized,
+        Step::SendRetained(2),
+        Step::Request(3),
+        Step::ResetPair,
         Step::Hello,
         Step::Ack,
+        Step::SendRetained(4),
+        Step::Request(5),
     ]);
     assert_eq!(summary.state, State::Established);
-    assert_eq!(summary.handshakes, 1);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.delivered, 2);
+    assert_eq!(summary.replies, 2);
+    assert_eq!(summary.dropped, 3);
+}
 
-    let summary = run_logged(&[
-        Step::Chunk(255),
-        Step::Reset,
-        Step::Oversized,
-        Step::Hello,
-        Step::Ack,
-        Step::Request(1),
-    ]);
-    assert_eq!(summary.state, State::Established);
-    assert_eq!(summary.delivered, 1);
+// Tests that oversized input aborts both waiting for HostHello and waiting for
+// HostAck. Further handshake packets are refused until a fresh reset arrives.
+#[test]
+fn test_scripted_oversized_handshakes() {
+    for awaiting_ack in [false, true] {
+        let mut steps = vec![Step::Reset];
+        if awaiting_ack {
+            steps.push(Step::Hello);
+        }
+        steps.extend([
+            Step::Oversized,
+            Step::Hello,
+            Step::Ack,
+            Step::ResetPair,
+            Step::Hello,
+            Step::Ack,
+            Step::Request(1),
+        ]);
+        let summary = run_logged(&steps);
+        assert_eq!(summary.state, State::Established);
+        assert_eq!(summary.handshakes, 1 + usize::from(awaiting_ack));
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(summary.replies, 1);
+        assert_eq!(summary.dropped, 3);
+    }
+}
+
+// Tests early rejection when a partial hello precedes an oversized frame,
+// including chunked input and batches containing its tail and a later reset.
+// The discarded frame's delimiter is consumed once, and the real reset survives.
+#[test]
+fn test_scripted_oversized_partial_and_batches() {
+    for chunk in [0, 255] {
+        for established in [false, true] {
+            let mut steps = vec![Step::Chunk(chunk), Step::Reset];
+            if established {
+                steps.extend([Step::Hello, Step::Ack, Step::Retain]);
+            }
+            steps.extend([
+                Step::Batch(3),
+                Step::Partial,
+                Step::Oversized,
+                Step::ResetPair,
+                Step::Hello,
+                Step::Ack,
+                Step::SendRetained(1),
+                Step::Request(2),
+            ]);
+            let summary = run_logged(&steps);
+            assert_eq!(summary.state, State::Established);
+            assert_eq!(summary.handshakes, 1 + usize::from(established));
+            assert_eq!(summary.delivered, 1);
+            assert_eq!(summary.replies, 1);
+            assert_eq!(summary.dropped, 1);
+        }
+    }
 }
 
 // Tests that steps with nothing to replay or truncate yet are no-ops.

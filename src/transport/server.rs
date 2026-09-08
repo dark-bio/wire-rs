@@ -168,11 +168,11 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// starts a handshake, whose completion returns [`Event::Connected`] with
     /// a sender before any messages from that session are delivered.
     ///
-    /// A client reset, invalid incoming data or an observed send failure ends
-    /// the current session and returns [`Event::Disconnected`]. After a reset,
-    /// the next call runs the handshake. A send failure does not wake a blocked
-    /// read; it is observed when receiving progresses. A session ended locally
-    /// by [`Server::disconnect`] is not reported again.
+    /// A client reset, invalid incoming data (including oversized frames), or an
+    /// observed send failure ends the session and returns [`Event::Disconnected`].
+    /// After a reset, the next call runs the handshake. A send failure does not
+    /// wake a blocked read; it is observed when receiving progresses. A session
+    /// ended locally by [`Server::disconnect`] is not reported again.
     ///
     /// Successful message acceptance is ordered with session ending after
     /// decryption, without waiting for the writer. Reporting a session ended
@@ -216,16 +216,16 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Err(Error::Terminated) => return Err(Error::Terminated),
                 Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
 
-                // Decode errors may be due to session resets, log and ignore.
+                // Framing errors may be due to session resets, log and ignore.
                 // Within a session the skipped frame may have carried a sealed
                 // message though, leaving the HPKE sequence behind the client's,
                 // so the session cannot continue either way.
                 Err(err) => {
                     let ended = self.end_session();
                     if ended {
-                        warn!("failed to decode cobs packet, resetting session: {}", err);
+                        warn!("invalid frame, resetting session: {}", err);
                     } else {
-                        warn!("failed to decode cobs packet: {}", err);
+                        warn!("invalid frame: {}", err);
                     }
                     self.send_dropped();
                     if ended {

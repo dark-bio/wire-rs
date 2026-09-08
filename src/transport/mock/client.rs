@@ -88,8 +88,9 @@ pub enum Step {
     /// A valid HostHello without its delimiter. The next frame's bytes merge
     /// into it, a lone delimiter completing it into the valid hello it is.
     Partial,
-    /// A frame past the size limit, delimiter included. The framing throws it
-    /// away before the server sees it, a partial hello in front going with it.
+    /// A frame past the size limit, delimiter included. The server rejects it
+    /// as soon as the limit is exceeded, ending any session or handshake. Its
+    /// remaining bytes and any partial hello in front are discarded together.
     Oversized,
     /// The read fails with `WouldBlock`, handing control back to the driver.
     Yield,
@@ -600,6 +601,10 @@ impl Client {
             }
             Step::Oversized => {
                 self.partial = Partial::None;
+                // Rejection precedes draining the tail and delimiter. An ended
+                // session stops batching here, so the driver sees its event
+                // before any later step changes the model again.
+                self.deliver(Frame::Junk);
                 self.bytes.resize(self.bytes.len() + MAX_FRAME_SIZE + 1, 1);
                 self.bytes.push(0x00);
             }

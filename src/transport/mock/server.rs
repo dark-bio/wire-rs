@@ -90,9 +90,9 @@ pub enum Step {
     /// A valid ArkHello without its delimiter. The next frame's bytes merge
     /// into it, a lone delimiter completing it into the valid hello it is.
     Partial,
-    /// A frame past the size limit, delimiter included. The framing throws it
-    /// away before the client sees it, a partial ArkHello in front going with
-    /// it.
+    /// A frame past the size limit, delimiter included. Receiving it ends a
+    /// session; a handshake counts it once as stale and skips its remainder.
+    /// A partial ArkHello in front belongs to the same oversized frame.
     Oversized,
     /// The read fails with `WouldBlock`.
     Yield,
@@ -162,6 +162,8 @@ impl Step {
 /// Error kinds the model distinguishes in the client's results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// `Error::FrameTooLarge`, a frame exceeding the receive limit.
+    FrameTooLarge,
     /// `Error::FrameDecodingFailed`, a frame failing COBS decoding.
     FrameDecoding,
     /// `Error::SendFailed`, the transport refusing a write.
@@ -220,6 +222,8 @@ enum Flaw {
 /// A frame put in front of the client, as the model sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Frame {
+    /// The first byte exceeding the frame limit, reported before its delimiter.
+    Oversized,
     /// An ArkHello answering the hello of the generation, flawed or not.
     ArkHello { generation: u64, flaw: Flaw },
     /// A packet sealed in the server's session with the sequence number.
@@ -247,6 +251,9 @@ enum Partial {
     Hello(u64, Vec<u8>),
     /// Bytes no delimiter can complete into anything valid.
     Junk(Vec<u8>),
+    /// The size failure was already reported; remaining bytes are discarded
+    /// through the next delimiter without reporting another frame.
+    Discarding,
 }
 
 /// Call in progress on the client, consuming the frames read.
@@ -293,7 +300,7 @@ pub struct Server {
     attestation: Attestation,
     outbox: Outbox,                            // Frames the client wrote
     recorder: Recorder,                        // Transcript of the run, if recorded
-    queue: VecDeque<(Vec<u8>, Option<Frame>)>, // Bytes produced, not yet read by the client, unterminated ones without a frame
+    queue: VecDeque<(Vec<u8>, Option<Frame>)>, // Bytes and their frame result, including an overflow before its delimiter
     bytes: Vec<u8>,                            // Bytes of the frame being handed over
     chunk: usize,                              // Most bytes a read hands over, zero for all
     batch: usize,                              // Frames left to hand to the client in one read
@@ -389,6 +396,7 @@ impl Server {
             Step::Partial => {
                 let (mut bytes, frame) = self.ark_hello(Flaw::None);
                 bytes.pop();
+                let mut overflow = None;
                 self.partial = match std::mem::replace(&mut self.partial, Partial::None) {
                     Partial::None => match frame {
                         Frame::ArkHello { generation, .. } => {
@@ -398,18 +406,22 @@ impl Server {
                     },
                     Partial::Hello(_, mut prior) | Partial::Junk(mut prior) => {
                         prior.extend_from_slice(&bytes);
-                        Partial::Junk(prior)
+                        if prior.len() > MAX_FRAME_SIZE {
+                            overflow = Some(Frame::Oversized);
+                            Partial::Discarding
+                        } else {
+                            Partial::Junk(prior)
+                        }
                     }
+                    Partial::Discarding => Partial::Discarding,
                 };
-                self.queue.push_back((bytes, None));
+                self.queue.push_back((bytes, overflow));
                 return;
             }
             Step::Oversized => {
-                self.partial = Partial::None;
                 let mut bytes = vec![1u8; MAX_FRAME_SIZE + 1];
                 bytes.push(0x00);
-                self.queue.push_back((bytes, None));
-                return;
+                (bytes, Frame::Oversized)
             }
             Step::Break => {
                 self.set_broken(true);
@@ -453,18 +465,23 @@ impl Server {
         // one and anything else merging into junk, decodable or not
         let (bytes, frame) = produced;
         let frame = match std::mem::replace(&mut self.partial, Partial::None) {
-            Partial::None => frame,
-            Partial::Hello(generation, _) if frame == Frame::Dropped => Frame::ArkHello {
+            Partial::None => Some(if bytes.len() - 1 > MAX_FRAME_SIZE {
+                Frame::Oversized
+            } else {
+                frame
+            }),
+            Partial::Hello(generation, _) if frame == Frame::Dropped => Some(Frame::ArkHello {
                 generation,
                 flaw: Flaw::None,
-            },
+            }),
             Partial::Hello(_, prior) | Partial::Junk(prior) => {
                 let mut merged = prior;
                 merged.extend_from_slice(&bytes[..bytes.len() - 1]);
-                classify(&merged)
+                Some(classify(&merged))
             }
+            Partial::Discarding => None,
         };
-        self.queue.push_back((bytes, Some(frame)));
+        self.queue.push_back((bytes, frame));
     }
 
     /// An ArkHello answering the latest HostHello, flawed as requested.
@@ -742,6 +759,10 @@ impl Server {
             }
             Call::Recv => {
                 let result = match (self.client_session, frame) {
+                    (_, Frame::Oversized) => {
+                        self.client_session = None;
+                        Expect::Err(Kind::FrameTooLarge)
+                    }
                     (_, Frame::Dropped) => {
                         self.client_session = None;
                         Expect::Err(Kind::SessionReset)
@@ -859,8 +880,10 @@ impl Read for Feed {
                 server.summary.reads += 1;
                 return Ok(n);
             }
-            // Start on the next frame queued, the model consuming it whole,
-            // unterminated bytes carrying no frame to consume yet. A batch
+            // Start on the next frame queued, predicting its result. An
+            // oversized frame settles receiving before all its bytes drain;
+            // the remainder stays here for a later call. Other unterminated
+            // bytes carry no result until completed or oversized. A batch
             // appends the frames after it, the script moved forward for them
             // while it yields frames, until one settles the call
             if let Some((bytes, frame)) = server.queue.pop_front() {
@@ -941,6 +964,9 @@ type Client = crate::transport::Client<Feed, Outbox>;
 /// junk if they still decode and undecodable if not, neither meaning
 /// anything to the client.
 fn classify(bytes: &[u8]) -> Frame {
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Frame::Oversized;
+    }
     let mut buf = vec![0u8; cobs::decode_buffer(bytes.len())];
     match cobs::decode(bytes, &mut buf) {
         Ok(_) => Frame::Junk,
@@ -951,6 +977,7 @@ fn classify(bytes: &[u8]) -> Frame {
 /// Maps a client error onto the kind the model predicts.
 fn kind(err: Error) -> Kind {
     match err {
+        Error::FrameTooLarge(_) => Kind::FrameTooLarge,
         Error::FrameDecodingFailed(_) => Kind::FrameDecoding,
         Error::SendFailed(_) => Kind::Send,
         Error::RecvFailed(_) => Kind::Recv,

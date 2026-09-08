@@ -180,11 +180,12 @@ impl<R: Read, W: Write> Client<R, W> {
         let mut stale = 0;
         let packet = loop {
             // Empty frames are the server signaling an earlier session dropped,
-            // stale junk too by now. So are frames failing to decode, the
-            // leftovers of a transfer that was cut short.
+            // stale junk too by now. So are oversized or undecodable frames,
+            // the leftovers of a transfer that was cut short. The framer reports
+            // an oversized frame once and drains its remainder on the next call.
             let packet: &[u8] = match self.reader.next_packet() {
                 Ok(Some(packet)) => packet,
-                Ok(None) | Err(Error::FrameDecodingFailed(_)) => &[],
+                Ok(None) | Err(Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) => &[],
                 Err(err) => return Err(err),
             };
             if cose::recipient(packet).is_ok_and(|fp| fp == host_xhpke_fp) {
@@ -281,11 +282,11 @@ impl<R: Read, W: Write> Client<R, W> {
         Ok((sender, info))
     }
 
-    /// Reads the next ark-to-host message, decrypting it. A frame that cannot
-    /// be decoded or a packet that cannot be decrypted drops the session, as
+    /// Reads the next ark-to-host message, decrypting it. An oversized or
+    /// undecodable frame, or a packet that cannot be decrypted, drops the session:
     /// the server's HPKE sequence can no longer be followed. So does an empty
     /// frame, the server signaling it dropped the session on its end. Call
-    /// [`Client::connect`] to establish a new session after either failure.
+    /// [`Client::connect`] to establish a new session after such a failure.
     ///
     /// Message acceptance is ordered with session ending after decryption and
     /// never waits for the writer. Ending through a receive error does wait for
