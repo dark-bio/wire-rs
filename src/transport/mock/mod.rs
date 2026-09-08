@@ -15,7 +15,7 @@ pub mod seed;
 pub mod server;
 pub mod vector;
 
-use crate::transport::{Attestation, Error, Sender};
+use crate::transport::{Attestation, Error, MAX_MESSAGE_SIZE, Sender};
 use darkbio_cobs as cobs;
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
@@ -32,6 +32,10 @@ pub const MAX_STEPS: usize = 64;
 /// Signing time stamped into everything the mocks and the drivers seal. The
 /// wire never checks it, so a fixed one keeps the transcripts off the clock.
 pub const TIMESTAMP: i64 = 0;
+
+/// Message one byte past the send limit, used to assert refusal without advancing
+/// encryption or touching the writer. Shared so fuzz steps need no large allocation.
+pub(super) const OVERSIZED_MESSAGE: &[u8] = &[0x42; MAX_MESSAGE_SIZE + 1];
 
 /// Payload of a message the mocks exchange, the tag as eight big endian
 /// bytes. It only tells the messages apart, the transport never reads it.

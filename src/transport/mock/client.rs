@@ -13,14 +13,15 @@
 //! expected. Any divergence panics.
 
 use super::{
-    CutPoint, MAX_STEPS, Outbox, TIMESTAMP, frame, self_attestation, unframe, would_block,
+    CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, TIMESTAMP, frame, self_attestation, unframe,
+    would_block,
 };
 use crate::transport::handshake;
 use crate::transport::mock::payload;
 use crate::transport::sealing;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, Event, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Sender,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, Event, MAX_FRAME_SIZE, Sender,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use std::cell::RefCell;
@@ -110,22 +111,48 @@ pub enum Step {
     /// early, the driver acting on it before the server reads on, as does any
     /// step not queuing frames.
     Batch(u8),
+    /// Retains the server's current sender separately, replacing any previously
+    /// retained handle. Without a current sender, clears the retained slot.
+    Retain,
+    /// Sends a message through the server's current sender, without a request.
+    Send(u8),
+    /// Sends through the retained sender, including after its session ends.
+    /// Without a retained handle, checks the same refusal as a missing sender.
+    SendRetained(u8),
+    /// Sends a message one byte over the limit through the current sender.
+    SendOversized,
+    /// Ends the server's session locally and signals the client. No local
+    /// disconnection event is expected; the stream can establish another session.
+    Disconnect,
 }
 
 impl Step {
+    /// Whether the driver must act on the server or one of its sender handles.
+    fn is_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Retain
+                | Self::Send(_)
+                | Self::SendRetained(_)
+                | Self::SendOversized
+                | Self::Disconnect
+        )
+    }
+
     /// Whether the step only puts frames in front of the server, as opposed to
     /// handing control back or changing the transport.
     fn queues_frames(&self) -> bool {
-        !matches!(
-            self,
-            Step::Yield
-                | Step::Interrupt
-                | Step::Break
-                | Step::Heal
-                | Step::Cut { .. }
-                | Step::Chunk(_)
-                | Step::Batch(_)
-        )
+        !self.is_action()
+            && !matches!(
+                self,
+                Step::Yield
+                    | Step::Interrupt
+                    | Step::Break
+                    | Step::Heal
+                    | Step::Cut { .. }
+                    | Step::Chunk(_)
+                    | Step::Batch(_)
+            )
     }
 }
 
@@ -371,6 +398,7 @@ impl Pending {
 /// Mock client along with the model of the server it drives.
 pub struct Client {
     steps: VecDeque<Step>,
+    action: Option<Step>,      // Driver action that interrupted a receive call
     identity: xdsa::PublicKey, // The server's identity, verifying its hellos
     outbox: Outbox,            // Frames the server wrote
     bytes: Vec<u8>,            // Bytes of executed steps not yet read by the server
@@ -404,6 +432,7 @@ impl Client {
     fn new(steps: &[Step], identity: xdsa::PublicKey, outbox: Outbox) -> Self {
         Self {
             steps: steps.iter().take(MAX_STEPS).cloned().collect(),
+            action: None,
             identity,
             outbox,
             bytes: Vec::new(),
@@ -428,6 +457,19 @@ impl Client {
             last_valid: None,
             summary: Summary::default(),
         }
+    }
+
+    /// Takes an action at the current script position, before another receive
+    /// can consume frames. Actions encountered inside a receive are saved by Feed.
+    fn next_action(&mut self) -> Option<Step> {
+        if self.action.is_some() {
+            return self.action.take();
+        }
+        if self.bytes.is_empty() && self.steps.front().is_some_and(Step::is_action) {
+            self.sync();
+            return self.steps.pop_front();
+        }
+        None
     }
 
     /// Executes one step, queuing its bytes for the server and applying the
@@ -561,8 +603,14 @@ impl Client {
                 self.bytes.resize(self.bytes.len() + MAX_FRAME_SIZE + 1, 1);
                 self.bytes.push(0x00);
             }
-            Step::Yield | Step::Interrupt => {
-                unreachable!("yields and interrupts are handled by the reader")
+            Step::Yield
+            | Step::Interrupt
+            | Step::Retain
+            | Step::Send(_)
+            | Step::SendRetained(_)
+            | Step::SendOversized
+            | Step::Disconnect => {
+                unreachable!("control steps are handled by the reader and driver")
             }
             Step::Break => self.set_broken(true),
             Step::Heal => self.set_broken(false),
@@ -862,6 +910,11 @@ impl Read for Feed {
                         return Err(would_block());
                     }
                     Some(Step::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
+                    Some(step) if step.is_action() => {
+                        client.action = Some(step);
+                        client.interrupt(Outcome::Yield);
+                        return Err(would_block());
+                    }
                     Some(step) => client.execute(step),
                 }
                 if !client.bytes.is_empty() {
@@ -900,7 +953,7 @@ type Server = crate::transport::Server<Feed, Outbox, Attestation>;
 /// without any frame going out.
 fn check_session(sender: Option<&Sender<Outbox>>, client: &Client) {
     let established = client.state == State::Established;
-    let refused = super::send(sender, &vec![0x42; MAX_MESSAGE_SIZE + 1]);
+    let refused = super::send(sender, OVERSIZED_MESSAGE);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "server has a session the model does not")
@@ -964,7 +1017,49 @@ pub fn run(steps: &[Step]) -> Summary {
     );
 
     let mut sender = None;
+    let mut retained = None;
+    let mut generation = 0u64;
+    let mut retained_generation = None;
     loop {
+        let action = client.borrow_mut().next_action();
+        if let Some(action) = action {
+            let mut client = client.borrow_mut();
+            match action {
+                Step::Retain => {
+                    retained = sender.clone();
+                    retained_generation =
+                        (client.state == State::Established).then_some(generation);
+                }
+                Step::Send(tag) => send(sender.as_ref(), &mut client, tag as u64),
+                Step::SendRetained(tag) => {
+                    if client.state == State::Established && retained_generation == Some(generation)
+                    {
+                        send(retained.as_ref(), &mut client, tag as u64);
+                    } else {
+                        assert!(matches!(
+                            super::send(retained.as_ref(), &payload(tag as u64)),
+                            Err(Error::EncryptionFailed(_))
+                        ));
+                    }
+                }
+                Step::SendOversized => check_session(sender.as_ref(), &client),
+                Step::Disconnect => {
+                    client.forget();
+                    // A reset already surfaced leaves the next handshake
+                    // scheduled even if the owner disconnects before receiving.
+                    if client.state != State::AwaitHello {
+                        client.state = State::Idle;
+                    }
+                    client.held = false;
+                    client.send(Payload::Signal);
+                    server.disconnect();
+                }
+                _ => unreachable!("only owner actions reach the driver"),
+            }
+            check_session(sender.as_ref(), &client);
+            client.sync();
+            continue;
+        }
         match server.recv() {
             // Reply to every request delivered, as a server would. The model
             // predicted the delivery, so the payload says which it was, and
@@ -996,6 +1091,7 @@ pub fn run(steps: &[Step]) -> Summary {
                 sender = Some(opened);
                 let mut client = client.borrow_mut();
                 client.surfaced(Outcome::Opened);
+                generation += 1;
                 check_session(sender.as_ref(), &client);
             }
             // Probe the send path whenever the script hands control back
@@ -1003,7 +1099,9 @@ pub fn run(steps: &[Step]) -> Summary {
                 let mut client = client.borrow_mut();
                 client.surfaced(Outcome::Yield);
                 check_session(sender.as_ref(), &client);
-                send(sender.as_ref(), &mut client, PROBE_ID);
+                if client.action.is_none() {
+                    send(sender.as_ref(), &mut client, PROBE_ID);
+                }
             }
             Err(Error::Terminated) => {
                 client.borrow_mut().surfaced(Outcome::Terminated);

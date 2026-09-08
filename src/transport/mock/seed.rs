@@ -112,7 +112,7 @@ impl Seedable for client::Step {
     fn seed(&self, seed: &mut Seed) {
         use client::Step;
 
-        const COUNT: u32 = 27;
+        const COUNT: u32 = 32;
         match self {
             Step::Reset => seed.variant(0, COUNT),
             Step::ResetPair => seed.variant(1, COUNT),
@@ -160,6 +160,17 @@ impl Seedable for client::Step {
                 seed.variant(26, COUNT);
                 seed.byte(*n);
             }
+            Step::Retain => seed.variant(27, COUNT),
+            Step::Send(tag) => {
+                seed.variant(28, COUNT);
+                seed.byte(*tag);
+            }
+            Step::SendRetained(tag) => {
+                seed.variant(29, COUNT);
+                seed.byte(*tag);
+            }
+            Step::SendOversized => seed.variant(30, COUNT),
+            Step::Disconnect => seed.variant(31, COUNT),
         }
     }
 }
@@ -168,7 +179,7 @@ impl Seedable for server::Step {
     fn seed(&self, seed: &mut Seed) {
         use server::Step;
 
-        const COUNT: u32 = 29;
+        const COUNT: u32 = 32;
         match self {
             Step::Handshake => seed.variant(0, COUNT),
             Step::Send(tag) => {
@@ -221,6 +232,12 @@ impl Seedable for server::Step {
                 seed.variant(28, COUNT);
                 seed.byte(*n);
             }
+            Step::Retain => seed.variant(29, COUNT),
+            Step::SendRetained(tag) => {
+                seed.variant(30, COUNT);
+                seed.byte(*tag);
+            }
+            Step::SendOversized => seed.variant(31, COUNT),
         }
     }
 }

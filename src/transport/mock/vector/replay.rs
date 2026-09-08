@@ -54,7 +54,7 @@ fn count(value: &Value) -> usize {
     value.as_u64().expect("expected a count") as usize
 }
 
-/// The bytes of a read or a write, spelled out or as runs.
+/// Read, write or oversized message bytes, spelled out or as runs.
 fn payload(event: &Value) -> Vec<u8> {
     match (&event["bytes"], &event["runs"]) {
         (Value::String(text), _) => BASE64_STANDARD.decode(text).expect("invalid base64"),
@@ -73,6 +73,13 @@ fn event(value: &Value) -> Event {
             xhpke: bytes(&value["xhpke"]),
         },
         "send" => Event::Send {
+            message: value
+                .get("message")
+                .map(bytes)
+                .unwrap_or_else(|| payload(value)),
+        },
+        "retain" => Event::Retain,
+        "send_retained" => Event::SendRetained {
             message: bytes(&value["message"]),
         },
         "recv" => Event::Recv,
@@ -114,6 +121,7 @@ pub fn run(vector: &Vector) {
     ));
     let mut peer = Peer::new(vector);
     let mut sender = None;
+    let mut retained = None;
 
     while !tape.borrow().done() {
         let event = tape.borrow_mut().next();
@@ -134,6 +142,11 @@ pub fn run(vector: &Vector) {
             }
             Event::Send { message } => {
                 let result = super::super::send(sender.as_ref(), &message).map(|_| None);
+                settle(&tape, &mut peer, Some(&message), result);
+            }
+            Event::Retain => retained = sender.clone(),
+            Event::SendRetained { message } => {
+                let result = super::super::send(retained.as_ref(), &message).map(|_| None);
                 settle(&tape, &mut peer, Some(&message), result);
             }
             Event::Recv => {

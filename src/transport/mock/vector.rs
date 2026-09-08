@@ -35,8 +35,13 @@ pub struct Vector {
 pub enum Event {
     /// The driver calls `handshake_with_keys` with the client keys, as seeds.
     Handshake { xdsa: Vec<u8>, xhpke: Vec<u8> },
-    /// The driver calls `send` with the protobuf encoded message.
+    /// The driver calls `send` with the message. Oversized messages use compact
+    /// byte runs in JSON; ordinary messages keep the base64 `message` field.
     Send { message: Vec<u8> },
+    /// The driver retains its current sender for use across later handshakes.
+    Retain,
+    /// The driver sends through the retained sender, without changing the current one.
+    SendRetained { message: Vec<u8> },
     /// The driver calls `recv`.
     Recv,
     /// The call in progress returns, a read with the protobuf encoded message.
@@ -216,8 +221,16 @@ impl Event {
                 BASE64_STANDARD.encode(xdsa),
                 BASE64_STANDARD.encode(xhpke)
             ),
+            Event::Send { message } if message.len() > crate::transport::MAX_MESSAGE_SIZE => {
+                format!("\"event\": \"send\", {}", payload(message))
+            }
             Event::Send { message } => format!(
                 "\"event\": \"send\", \"message\": \"{}\"",
+                BASE64_STANDARD.encode(message)
+            ),
+            Event::Retain => "\"event\": \"retain\"".to_string(),
+            Event::SendRetained { message } => format!(
+                "\"event\": \"send_retained\", \"message\": \"{}\"",
                 BASE64_STANDARD.encode(message)
             ),
             Event::Recv => "\"event\": \"recv\"".to_string(),

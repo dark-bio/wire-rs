@@ -22,7 +22,7 @@ pub mod seed;
 use crate::protocol::envelope::Side;
 use crate::protocol::mux::Writer;
 use crate::protocol::switchboard::Source;
-use crate::transport::{self, Closer, Event, Outbound, Sender, Stream};
+use crate::transport::{self, Closer, Event, Outbound, Sender, Session, Stream};
 use darkbio_crypto::xhpke;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,7 +155,14 @@ impl Write for Sink {
 /// sessions, the reader thread hands the handle out.
 pub(crate) struct Link {
     outbound: Arc<Outbound<Writer>>,
-    held: AtomicBool, // Whether the read side holds a session, its end reported
+    session: Mutex<LinkSession>, // Session owner and the model's own ordinal
+}
+
+/// Session retained by the mock receive side, with an ordinal for model assertions.
+/// The counter belongs to the mock; production transport uses object identity.
+struct LinkSession {
+    current: Option<Session>, // Retained until receiving observes its end
+    generation: u64,          // Number of sessions the mock has created
 }
 
 impl Link {
@@ -170,13 +177,16 @@ impl Link {
         let outbound = Arc::new(Outbound::new(writer, side, close));
         Arc::new(Self {
             outbound,
-            held: AtomicBool::new(false),
+            session: Mutex::new(LinkSession {
+                current: None,
+                generation: 0,
+            }),
         })
     }
 
     /// Opens a session, the one before it dropped, and hands back the context
     /// opening what the multiplexer seals into it.
-    pub(crate) fn open_session(self: &Arc<Self>) -> (Sender<Writer>, xhpke::Receiver) {
+    pub(crate) fn create_session(self: &Arc<Self>) -> (Sender<Writer>, xhpke::Receiver) {
         let secret = xhpke::SecretKey::generate();
         let (sender, encap) = secret
             .public_key()
@@ -186,27 +196,42 @@ impl Link {
             .new_receiver(&encap, CRYPTO_DOMAIN_MOCK)
             .expect("mock session opening context");
 
-        let sender = self.outbound.establish_session(sender);
-        self.held.store(true, Ordering::Release);
+        // The mock never decrypts inbound frames, but owns a complete session
+        // just as a real transport does. Both receivers start at the same sequence.
+        let inbound = secret
+            .new_receiver(&encap, CRYPTO_DOMAIN_MOCK)
+            .expect("mock receive context");
+        let current = Session::new(sender, inbound);
+        let sender = self.outbound.bind(&current);
+        let mut session = self.session.lock().expect("link not poisoned");
+        session.current = Some(current);
+        session.generation += 1;
         (sender, receiver)
     }
 
-    /// Number of the live session, or zero without one.
-    pub(crate) fn session_id(&self) -> u64 {
-        self.outbound.session_id()
+    /// Model ordinal of the live session, or zero once either direction ends.
+    pub(crate) fn generation(&self) -> u64 {
+        let session = self.session.lock().expect("link not poisoned");
+        match &session.current {
+            Some(current) if !current.ended() => session.generation,
+            _ => 0,
+        }
     }
 
     /// Whether the read side holds a session, one whose end a transport
     /// server's read would report.
     pub(crate) fn held(&self) -> bool {
-        self.held.load(Ordering::Acquire)
+        self.session
+            .lock()
+            .expect("link not poisoned")
+            .current
+            .is_some()
     }
 
     /// Drops the session, the read side letting go of it too, as a transport
     /// server does on the peer's reset.
-    pub(crate) fn drop_session(&self) {
-        self.held.store(false, Ordering::Release);
-        self.outbound.drop_session();
+    pub(crate) fn end_session(&self) {
+        self.session.lock().expect("link not poisoned").current = None;
     }
 }
 
@@ -274,7 +299,7 @@ impl Source for Feed {
     }
 
     fn disconnect(&mut self) {
-        self.link.drop_session();
+        self.link.end_session();
         let _ = self.link.outbound.send_dropped();
     }
 }

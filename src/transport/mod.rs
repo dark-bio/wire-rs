@@ -4,14 +4,18 @@
 //! Transport of the wire, sessions over a byte stream. The framing delimits
 //! packets with COBS, the handshake establishes a session's contexts, the
 //! sealing encrypts the messages within it, and the client and the server
-//! drive it from either end, with senders for sending messages from any thread.
+//! drive it from either end. Each handshake creates a private session owning
+//! both encryption contexts and their lifetime. Senders bind that session to
+//! the stream writer for sending messages from any thread.
 
 mod client;
 mod framing;
 mod handshake;
+mod outbound;
 mod sealing;
 mod sender;
 mod server;
+mod session;
 mod stream;
 
 #[cfg(any(test, feature = "fuzz"))]
@@ -24,11 +28,13 @@ pub use sender::Sender;
 pub use server::{Attestation, Attester, Event, Server};
 pub use stream::{Closer, Stream};
 
-/// The outbound side behind the senders, for the protocol's mock to have a real
-/// sending side, sessions, sealing and the resets, without a transport under
-/// it.
+/// Stream writer for the protocol mock's real framing and reset notifications.
 #[cfg(any(test, feature = "fuzz"))]
-pub(crate) use sender::{Outbound, Side};
+pub(crate) use outbound::{Outbound, Side};
+
+/// Session owner for the protocol mock's real sending side.
+#[cfg(any(test, feature = "fuzz"))]
+pub(crate) use session::Session;
 
 use std::io;
 

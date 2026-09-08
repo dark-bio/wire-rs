@@ -13,15 +13,15 @@
 
 use super::vector::{Event, ReadError, Vector};
 use super::{
-    CutPoint, MAX_STEPS, Outbox, Recorder, TIMESTAMP, cloud_attestation, frame, self_attestation,
-    trace, unframe, would_block,
+    CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, Recorder, TIMESTAMP, cloud_attestation, frame,
+    self_attestation, trace, unframe, would_block,
 };
 use crate::transport::client::MAX_STALE_FRAMES;
 use crate::transport::handshake;
 use crate::transport::mock::payload;
 use crate::transport::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Sender,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Error, MAX_FRAME_SIZE, Sender,
 };
 use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
@@ -113,12 +113,28 @@ pub enum Step {
     /// frame settling the call in progress ends the batch early, the client
     /// acting on it before reading on, as does any step not queuing a frame.
     Batch(u8),
+    /// Retains the current sender separately, replacing any previously retained
+    /// handle. With no sender, clears the retained slot.
+    Retain,
+    /// Sends through the retained handle, which may belong to an earlier session.
+    /// Without a retained sender, the driver models refusal before any I/O.
+    SendRetained(u8),
+    /// Sends a message one byte over the size limit through the current sender.
+    SendOversized,
 }
 
 impl Step {
     /// Whether the step is a call into the client rather than a server frame.
     fn is_call(&self) -> bool {
-        matches!(self, Step::Handshake | Step::Send(_) | Step::Recv)
+        matches!(
+            self,
+            Step::Handshake
+                | Step::Send(_)
+                | Step::Recv
+                | Step::Retain
+                | Step::SendRetained(_)
+                | Step::SendOversized
+        )
     }
 
     /// Whether the step only puts a frame in front of the client, as opposed to
@@ -129,6 +145,9 @@ impl Step {
             Step::Handshake
                 | Step::Send(_)
                 | Step::Recv
+                | Step::Retain
+                | Step::SendRetained(_)
+                | Step::SendOversized
                 | Step::Yield
                 | Step::Interrupt
                 | Step::Break
@@ -416,7 +435,14 @@ impl Server {
                 self.batch = n as usize;
                 return;
             }
-            Step::Handshake | Step::Send(_) | Step::Recv | Step::Yield | Step::Interrupt => {
+            Step::Handshake
+            | Step::Send(_)
+            | Step::Recv
+            | Step::Yield
+            | Step::Interrupt
+            | Step::Retain
+            | Step::SendRetained(_)
+            | Step::SendOversized => {
                 unreachable!(
                     "calls, yields and interrupts are handled by the driver and the reader"
                 )
@@ -941,7 +967,7 @@ fn kind(err: Error) -> Kind {
 /// oversized message is refused before sealing, so it probes the session
 /// without any frame going out.
 pub(super) fn check_session<W: Write>(sender: Option<&Sender<W>>, established: bool) {
-    let refused = super::send(sender, &vec![0x42; MAX_MESSAGE_SIZE + 1]);
+    let refused = super::send(sender, OVERSIZED_MESSAGE);
     match refused {
         Err(Error::PacketTooLarge(_)) => {
             assert!(established, "client has a session the model does not")
@@ -1000,6 +1026,8 @@ pub fn run(steps: &[Step]) -> Summary {
     );
 
     let mut sender = None;
+    let mut retained = None;
+    let mut retained_session = None; // Model identity captured with the retained handle
     loop {
         let call = server.borrow_mut().next_call();
         let Some(call) = call else { break };
@@ -1070,16 +1098,49 @@ pub fn run(steps: &[Step]) -> Summary {
                 }
                 server.finish(result);
             }
-            Step::Send(tag) => {
+            Step::Retain => {
+                retained = sender.clone();
+                retained_session = server.borrow().client_session;
+                trace(&recorder, || Event::Retain);
+            }
+            Step::SendOversized => {
+                let established = server.borrow().client_session.is_some();
+                trace(&recorder, || Event::Send {
+                    message: OVERSIZED_MESSAGE.to_vec(),
+                });
+                let result = super::send(sender.as_ref(), OVERSIZED_MESSAGE);
+                trace(&recorder, || Event::Err {
+                    kind: <&str>::from(result.as_ref().unwrap_err()).into(),
+                });
+                match result {
+                    Err(Error::PacketTooLarge(size)) if established => {
+                        assert_eq!(size, OVERSIZED_MESSAGE.len())
+                    }
+                    Err(Error::EncryptionFailed(_)) if !established => {}
+                    other => panic!("unexpected oversized send result: {other:?}"),
+                }
+                check_session(sender.as_ref(), established);
+                server.borrow_mut().ingest();
+            }
+            Step::Send(tag) | Step::SendRetained(tag) => {
                 let established = server.borrow().client_session.is_some();
                 trace(&recorder, || Event::Session { established });
                 check_session(sender.as_ref(), established);
+
+                let use_retained = matches!(call, Step::SendRetained(_));
+                let admitted = established
+                    && (!use_retained || retained_session == server.borrow().client_session);
+                let sending = if use_retained {
+                    retained.as_ref()
+                } else {
+                    sender.as_ref()
+                };
 
                 // A failed send takes the session down with it, a cut firing
                 // ahead of a broken transport
                 let expected: Result<Option<u64>, Kind> = {
                     let mut server = server.borrow_mut();
-                    match (established, server.broken || server.cut.is_some()) {
+                    match (admitted, server.broken || server.cut.is_some()) {
                         (true, false) => Ok(None),
                         (true, true) => {
                             server.client_session = None;
@@ -1090,10 +1151,18 @@ pub fn run(steps: &[Step]) -> Summary {
                     }
                 };
                 let request = payload(tag as u64);
-                trace(&recorder, || Event::Send {
-                    message: request.clone(),
+                trace(&recorder, || {
+                    if use_retained {
+                        Event::SendRetained {
+                            message: request.clone(),
+                        }
+                    } else {
+                        Event::Send {
+                            message: request.clone(),
+                        }
+                    }
                 });
-                let result = super::send(sender.as_ref(), &request);
+                let result = super::send(sending, &request);
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
                     Err(err) => Event::Err {

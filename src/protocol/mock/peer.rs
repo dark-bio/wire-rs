@@ -426,7 +426,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
             Step::Refuse => self.serve(Order::Refuse),
             Step::Ignore => self.serve(Order::Ignore),
             Step::Bloat => self.serve(Order::Bloat),
-            Step::Reset => self.reset_session(),
+            Step::Reset => self.reconnect(),
             Step::Unplug => self.unplug(),
             Step::Break => self.set_broken(true),
             Step::Heal => self.set_broken(false),
@@ -872,7 +872,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
 
     /// Opens a session, the one before it dropped. A client's transport is
     /// its session, so it never sees another.
-    fn reset_session(&mut self) {
+    fn reconnect(&mut self) {
         if self.side == Side::Client || !self.open() {
             return;
         }
@@ -880,13 +880,13 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         // of the handshake that follows, and that handshake opening the next
         // one, so the multiplexer follows without a message of the peer's
         if self.link.held() {
-            self.link.drop_session();
+            self.link.end_session();
             self.live = 0;
             self.deliver(Delivery::Disconnected);
         }
-        let (sender, receiver) = self.link.open_session();
+        let (sender, receiver) = self.link.create_session();
         self.receiver = Some(receiver);
-        self.live = self.link.session_id();
+        self.live = self.link.generation();
         self.summary.sessions += 1;
         self.deliver(Delivery::Connected(sender));
     }
@@ -1171,11 +1171,11 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         // for the outbound side to catch up with the model before the next step
         // reads the session off it
         let deadline = Instant::now() + PATIENCE;
-        while self.link.session_id() != self.live {
+        while self.link.generation() != self.live {
             assert!(
                 Instant::now() < deadline,
                 "outbound side in session {} where the model has {}",
-                self.link.session_id(),
+                self.link.generation(),
                 self.live
             );
             thread::sleep(Duration::from_millis(1));
@@ -1245,12 +1245,12 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
     // server's waits for a peer to open the first one
     let (sender, receiver) = match side {
         Side::Client => {
-            let (sender, receiver) = link.open_session();
+            let (sender, receiver) = link.create_session();
             (Some(sender), Some(receiver))
         }
         Side::Server => (None, None),
     };
-    let session = link.session_id();
+    let session = link.generation();
 
     let mux = Arc::new(Mux::<Out, In>::mocked(side, feed, sender));
 

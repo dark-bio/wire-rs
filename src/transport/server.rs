@@ -3,8 +3,9 @@
 
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
-use crate::transport::sealing;
-use crate::transport::sender::{Outbound, Sender, Side};
+use crate::transport::outbound::{Outbound, Side};
+use crate::transport::sender::Sender;
+use crate::transport::session::Session;
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
     Error, Stream,
@@ -102,7 +103,7 @@ pub struct Server<R: Read, W: Write, A: Attester> {
     signer: xdsa::SecretKey, // Server's identity key, signing the ArkHello
     attester: A,             // Source of the device attestation for handshakes
 
-    receiver: Option<xhpke::Receiver>, // Inbound context of the session (if handshake completed)
+    session: Option<Session>, // Encryption contexts and lifetime of the current session
 
     handshaking: bool, // Whether a reset arrived, the handshake it calls for still to run
 
@@ -124,7 +125,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             outbound,
             signer,
             attester,
-            receiver: None,
+            session: None,
             handshaking: false,
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
@@ -195,8 +196,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // can send into it before the client says anything
                     Ok((sender, receiver)) => {
                         info!("new wire session established");
-                        self.receiver = Some(receiver);
-                        let sender = self.outbound.establish_session(sender);
+                        let session = Session::new(sender, receiver);
+                        let sender = self.outbound.bind(&session);
+                        self.session = Some(session);
                         return Ok(Event::Connected(sender));
                     }
                 }
@@ -213,7 +215,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // message though, leaving the HPKE sequence behind the client's,
                 // so the session cannot continue either way.
                 Err(err) => {
-                    let ended = self.drop_session();
+                    let ended = self.end_session();
                     if ended {
                         warn!("failed to decode cobs packet, resetting session: {}", err);
                     } else {
@@ -230,7 +232,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // for the next pass of the loop.
                 Ok(None) => {
                     self.handshaking = true;
-                    if self.drop_session() {
+                    if self.end_session() {
                         return Ok(Event::Disconnected);
                     }
                     continue;
@@ -238,30 +240,20 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // Valid COBS packet
                 Ok(Some(packet)) => packet,
             };
-            // A sender may have ended the session on its own thread, in which
-            // case the receiver side goes down with it here, the end reported.
-            // A non-empty packet without a session is junk either way, the
-            // client may still think it has a session though, tell it otherwise.
-            if !self.outbound.has_session() && self.receiver.is_some() {
-                warn!("dropping data of a session a sender ended");
-                self.drop_session();
-                self.send_dropped();
-                return Ok(Event::Disconnected);
-            }
-            let receiver = match self.receiver.as_mut() {
+            let session = match self.session.as_mut() {
                 None => {
                     warn!("dropping data outside session");
                     self.send_dropped();
                     continue;
                 }
-                Some(receiver) => receiver,
+                Some(session) => session,
             };
-            // Decrypt the message. If that fails, the HPKE context is most
-            // probably broken, no point continuing with it.
-            let message = match sealing::open(receiver, packet) {
+            // The session either opens the packet or reports that receiving or
+            // sending ended it. The owner is removed when delivering its end.
+            let message = match session.open(packet) {
                 Err(err) => {
-                    warn!("decryption failed, resetting session: {}", err);
-                    self.drop_session();
+                    warn!("session receive failed, resetting session: {}", err);
+                    self.end_session();
                     self.send_dropped();
                     return Ok(Event::Disconnected);
                 }
@@ -275,13 +267,22 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
-    /// Drops the session, both of its contexts going together, and reports
-    /// whether the read side held one, a sender possibly having ended the
-    /// outbound session already.
-    fn drop_session(&mut self) -> bool {
-        let held = self.receiver.take().is_some();
-        self.outbound.drop_session();
-        held
+    /// Removes the current session. Dropping [`Session`] marks its shared
+    /// sending state ended and releases its receive context, so existing senders
+    /// are refused even if an active send still holds the shared state alive.
+    /// Takes no encryption or writer lock; a write already admitted may finish.
+    ///
+    /// Returns true when a session was removed, including one already ended by
+    /// a send failure. That failure leaves `self.session` present until receiving
+    /// observes it. The receive loop uses this result to emit one
+    /// [`Event::Disconnected`]; later calls return false until another handshake
+    /// establishes a session. Local [`Server::disconnect`] ignores the result
+    /// because its caller already knows the session ended.
+    ///
+    /// Leaves the stream open and sends no notification. The calling operation
+    /// decides whether to send an empty frame to the client.
+    fn end_session(&mut self) -> bool {
+        self.session.take().is_some()
     }
 
     /// Tells the client that the server has no session with it by sending an empty
@@ -297,7 +298,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// failures are logged. This local action does not produce an
     /// [`Event::Disconnected`], since the caller already knows the session ended.
     pub fn disconnect(&mut self) {
-        self.drop_session();
+        self.end_session();
         self.send_dropped();
     }
 
@@ -308,6 +309,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     ///   2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
     ///   3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
     fn handshake(&mut self) -> Result<(xhpke::Sender, xhpke::Receiver), Error> {
+        self.outbound.unbind();
         loop {
             // Message 1: Read the HostHello (skip any trailing empty reset frames)
             let packet = loop {
@@ -755,110 +757,6 @@ mod tests {
             matches!(result, Err(Error::InvalidAttestation)),
             "{result:?}"
         );
-    }
-
-    // Tests the ordered lifecycle across two handshakes: each opening delivers
-    // a sender before any client message, and closing precedes the next opening.
-    // The old sender cannot send into the new session, whose sender still works.
-    #[test]
-    fn test_session_events() {
-        testing::init_tracing();
-
-        let signer = xdsa::SecretKey::generate();
-        let identity = signer.public_key();
-        let attestation = self_attestation(&signer);
-        let (host, ark) = UnixStream::pair().unwrap();
-        let peer = std::thread::spawn(move || {
-            let mut server = Server::new(
-                Stream::new(ark.try_clone().unwrap(), ark, || {}),
-                signer,
-                attestation,
-            );
-            let Event::Connected(first) = server.recv().unwrap() else {
-                panic!("first handshake did not open a session");
-            };
-            first.send(&payload(0)).unwrap();
-            assert!(
-                matches!(server.recv().unwrap(), Event::Message(message) if message == payload(1))
-            );
-            assert!(matches!(server.recv().unwrap(), Event::Disconnected));
-            let Event::Connected(second) = server.recv().unwrap() else {
-                panic!("second handshake did not open a session");
-            };
-            assert!(matches!(
-                first.send(&payload(3)),
-                Err(Error::EncryptionFailed(_))
-            ));
-            second.send(&payload(2)).unwrap();
-            assert!(
-                matches!(server.recv().unwrap(), Event::Message(message) if message == payload(4))
-            );
-        });
-        let mut client = Client::new(Stream::new(host.try_clone().unwrap(), host, || {}));
-        let (first, _) = client.connect(&identity).unwrap();
-        assert_eq!(client.recv().unwrap(), payload(0));
-        first.send(&payload(1)).unwrap();
-        let (second, _) = client.connect(&identity).unwrap();
-        assert_eq!(client.recv().unwrap(), payload(2));
-        second.send(&payload(4)).unwrap();
-        peer.join().unwrap();
-    }
-
-    // Tests that the server resetting a session tells the client, whose next
-    // read fails with the reset, the next handshake starting the next session.
-    // The sender of the previous session cannot send into the new one.
-    #[test]
-    fn test_session_reset() {
-        testing::init_tracing();
-
-        let signer_key = xdsa::SecretKey::generate();
-        let signer_pub = signer_key.public_key();
-        let attestation = self_attestation(&signer_key);
-
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = ark_sock.try_clone().unwrap();
-        let ark_writer = ark_sock;
-
-        // Server side: serve one request, reset the session, then serve the
-        // request of the next session.
-        let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(
-                Stream::new(ark_reader, ark_writer, || {}),
-                signer_key,
-                attestation,
-            );
-            let mut sender = None;
-            testing::served(&mut server, &mut sender).unwrap();
-            let stale = sender.as_ref().unwrap().clone();
-            server.disconnect();
-            assert!(matches!(
-                stale.send(&payload(3)),
-                Err(Error::EncryptionFailed(_))
-            ));
-            testing::served(&mut server, &mut sender).unwrap();
-            assert!(matches!(
-                stale.send(&payload(3)),
-                Err(Error::EncryptionFailed(_))
-            ));
-            sender.as_ref().unwrap().send(&payload(3)).unwrap();
-        });
-
-        // Client side: one request, the reset read back, then a new session
-        // with a request of its own.
-        let mut client = Client::new(Stream::new(
-            host_sock.try_clone().unwrap(),
-            host_sock,
-            || {},
-        ));
-        let (sender, _) = client.connect(&signer_pub).unwrap();
-        sender.send(&payload(1)).unwrap();
-        let result = client.recv();
-        assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
-        let (sender, _) = client.connect(&signer_pub).unwrap();
-        sender.send(&payload(2)).unwrap();
-
-        assert_eq!(client.recv().unwrap(), payload(3));
-        ark_thread.join().unwrap();
     }
 
     // Tests that the server sends through senders from other threads while

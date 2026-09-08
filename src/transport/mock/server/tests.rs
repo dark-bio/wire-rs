@@ -42,6 +42,133 @@ fn test_scripted_round_trip() {
     );
 }
 
+// Tests that a failed send ends receiving even with a valid encrypted reply
+// already queued. Healing the writer does not revive the session; reconnecting
+// creates a fresh session that can send and receive again. EOF also ends the
+// receive side after a send failure when no reply is waiting.
+#[test]
+fn test_scripted_send_failure_ends_receiving() {
+    let summary = run_logged(&[
+        Step::Handshake,
+        Step::Hello,
+        Step::Reply(1),
+        Step::Break,
+        Step::Send(2),
+        Step::Recv,
+        Step::Heal,
+        Step::Send(3),
+        Step::Handshake,
+        Step::Hello,
+        Step::Send(4),
+        Step::Reply(4),
+        Step::Recv,
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.messages, 1);
+    assert_eq!(summary.failures, 1);
+
+    let summary = run_logged(&[
+        Step::Handshake,
+        Step::Hello,
+        Step::Break,
+        Step::Send(1),
+        Step::Recv,
+    ]);
+    assert!(!summary.established);
+    assert_eq!(summary.failures, 1);
+}
+
+// Tests that refusing an oversized send preserves both encryption sequences,
+// while a corrupt reply ends both directions. A fresh handshake restores them.
+#[test]
+fn test_scripted_send_refusal_and_receive_failure() {
+    let summary = run_logged(&[
+        Step::SendOversized,
+        Step::Handshake,
+        Step::Hello,
+        Step::SendOversized,
+        Step::Send(1),
+        Step::Reply(1),
+        Step::Recv,
+        Step::ReplyTampered,
+        Step::Recv,
+        Step::Send(2),
+        Step::Handshake,
+        Step::Hello,
+        Step::Send(3),
+        Step::Reply(3),
+        Step::Recv,
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.messages, 2);
+    assert_eq!(summary.failures, 1);
+}
+
+// Tests that a retained sender works in its original session, is refused after
+// reconnecting, and cannot damage the new session. Replacing the retained slot
+// with the new sender makes it usable again; retaining an absent sender is safe.
+#[test]
+fn test_scripted_retained_sender() {
+    let summary = run_logged(&[
+        Step::Retain,
+        Step::SendRetained(0),
+        Step::Handshake,
+        Step::Hello,
+        Step::Retain,
+        Step::SendRetained(1),
+        Step::Handshake,
+        Step::Hello,
+        Step::SendRetained(2),
+        Step::Send(3),
+        Step::Reply(3),
+        Step::Recv,
+        Step::Retain,
+        Step::SendRetained(4),
+        Step::Reply(4),
+        Step::Recv,
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.messages, 2);
+    assert_eq!(summary.failures, 0);
+}
+
+// Tests that both an unsuccessful reconnect and a failed retained send retire
+// the old handle permanently. Healing the stream and establishing another
+// session cannot revive it or let its refusal break the new sender.
+#[test]
+fn test_scripted_retained_sender_failures() {
+    let summary = run_logged(&[
+        Step::Handshake,
+        Step::Hello,
+        Step::Retain,
+        Step::Handshake,
+        Step::HelloTampered,
+        Step::SendRetained(1),
+        Step::Handshake,
+        Step::Hello,
+        Step::SendRetained(2),
+        Step::Send(3),
+        Step::Retain,
+        Step::Break,
+        Step::SendRetained(4),
+        Step::Heal,
+        Step::SendRetained(5),
+        Step::Handshake,
+        Step::Hello,
+        Step::SendRetained(6),
+        Step::Send(7),
+        Step::Reply(7),
+        Step::Recv,
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.handshakes, 3);
+    assert_eq!(summary.messages, 1);
+    assert_eq!(summary.failures, 1);
+}
+
 // Tests that flawed hellos fail the handshake once found, each with its
 // own error, leaving the client without a session. That is a hello tampered
 // with, bound or signed wrongly, malformed, carrying a bad key or

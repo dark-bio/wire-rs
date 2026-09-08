@@ -38,6 +38,142 @@ fn test_scripted_round_trip() {
     );
 }
 
+// Tests that each connection event supplies a working sender before any request,
+// and that disconnect precedes the next connection. A retained sender is refused
+// after the peer resets; replacing it with the new sender restores sending.
+#[test]
+fn test_scripted_retained_sender() {
+    let summary = run_logged(&[
+        Step::Retain,
+        Step::SendRetained(0),
+        Step::SendOversized,
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::Send(1),
+        Step::Retain,
+        Step::SendRetained(2),
+        Step::Request(3),
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::SendRetained(4),
+        Step::Send(5),
+        Step::Retain,
+        Step::SendRetained(6),
+        Step::Request(7),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.delivered, 2);
+    assert_eq!(summary.replies, 6);
+    assert_eq!(summary.dropped, 0);
+}
+
+// Tests that local disconnection emits an empty frame and invalidates senders
+// immediately, without a local disconnect event. Reconnecting the same stream
+// supplies a working sender while the retained old sender remains unusable.
+#[test]
+fn test_scripted_local_disconnect() {
+    let summary = run_logged(&[
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::Request(1),
+        Step::Retain,
+        Step::Disconnect,
+        Step::SendRetained(2),
+        Step::Send(3),
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::SendRetained(4),
+        Step::Send(5),
+        Step::Request(6),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.delivered, 2);
+    assert_eq!(summary.replies, 3);
+    assert_eq!(summary.dropped, 1);
+}
+
+// Tests that oversize refusal leaves sending and receiving usable, but a failed
+// send through a retained handle ends both. A later handshake creates a fresh
+// sender; neither healing nor reconnecting revives the retained one.
+#[test]
+fn test_scripted_retained_sender_failures() {
+    let summary = run_logged(&[
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::SendOversized,
+        Step::Send(1),
+        Step::Request(2),
+        Step::Retain,
+        Step::Break,
+        Step::SendRetained(3),
+        Step::Heal,
+        Step::SendRetained(4),
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::SendRetained(5),
+        Step::Send(6),
+        Step::Request(7),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.delivered, 2);
+    assert_eq!(summary.replies, 4);
+    assert_eq!(summary.dropped, 1);
+}
+
+// Tests owner actions encountered while a handshake is reading. They yield to
+// the driver, aborting that handshake like other read interruptions. Disconnect
+// and send actions remain valid without a session, including on a broken writer.
+#[test]
+fn test_scripted_actions_during_handshake() {
+    let summary = run_logged(&[
+        Step::Reset,
+        Step::Hello,
+        Step::Retain,
+        Step::Send(1),
+        Step::Disconnect,
+        Step::Break,
+        Step::Disconnect,
+        Step::Heal,
+        Step::Disconnect,
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::Send(2),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.replies, 1);
+    assert_eq!(summary.dropped, 3);
+
+    // Actions between the reset's disconnect event and the next receive do
+    // not cancel the handshake already scheduled by that reset.
+    let summary = run_logged(&[
+        Step::Reset,
+        Step::Hello,
+        Step::Ack,
+        Step::Retain,
+        Step::Reset,
+        Step::Disconnect,
+        Step::SendRetained(1),
+        Step::Hello,
+        Step::Ack,
+        Step::Send(2),
+    ]);
+    assert_eq!(summary.state, State::Established);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.replies, 1);
+    assert_eq!(summary.dropped, 1);
+}
+
 // Tests that a reset in every state restarts the handshake without the
 // Server signaling anything, the client having asked for it. A session does
 // not survive one, a request into it earning a signal.
