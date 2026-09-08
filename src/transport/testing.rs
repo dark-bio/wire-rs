@@ -3,17 +3,17 @@
 
 //! Memory adapters for transport tests, benchmarks and fuzz harnesses.
 //!
-//! These wrappers check deadlines before known nonblocking memory I/O. They
-//! cannot enforce deadlines on a blocking reader or writer and must not be used
-//! to adapt sockets, files, or device endpoints for production transport.
+//! These wrappers check deadlines before nonblocking memory I/O. They cannot
+//! interrupt a blocking call. Use them for memory buffers, not production
+//! sockets, files or device endpoints.
 
 use super::{Read, Write};
 use std::io;
 use std::time::Instant;
 
 /// Adds independent read and write deadlines to nonblocking memory I/O.
-/// No deadline applies until its setter is called. Replacing an expired deadline
-/// permits subsequent operations on the same memory buffer.
+/// Neither direction has a deadline until its setter is called. Replacing an
+/// expired deadline allows further operations on the same buffer.
 #[derive(Debug, Default)]
 pub struct Memory<T> {
     /// In-memory reader or writer retained by this test adapter.
@@ -66,7 +66,7 @@ impl<T: io::Write> Write for Memory<T> {
     }
 }
 
-/// Refuses an expired operation before it mutates the in-memory adapter.
+/// Rejects an expired deadline before accessing the memory buffer.
 fn check_deadline(deadline: Option<Instant>) -> io::Result<()> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         Err(io::ErrorKind::TimedOut.into())

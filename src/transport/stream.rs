@@ -10,14 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Default deadline for writing and flushing one complete transport frame.
+/// Default time budget for writing and flushing one complete transport frame.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time an idle adapter read runs before checking cancellation again.
-/// Polling is needed because we can't wake a system call when a session dies.
+/// Polls observe reconnect cancellation and permanent closure. Ending a session
+/// binding alone does not interrupt its idle receive.
 const READ_POLL: Duration = Duration::from_millis(100);
 
-/// Marks an operation refused by its reconnect scope, without closing the stream.
+/// Reports reconnect cancellation without closing the stream.
 #[derive(Debug, thiserror::Error)]
 #[error("reconnect I/O cancelled")]
 pub(super) struct Cancelled;
@@ -26,11 +27,11 @@ pub(super) struct Cancelled;
 ///
 /// The adapter must make blocked reads, writes and flushes return within its
 /// documented cancellation bound after shutdown. Socket adapters can shut down
-/// the socket; adapters that poll or use I/O timeouts must document those bounds.
+/// the socket. Adapters that poll or use I/O timeouts must document those bounds.
 /// The shutdown operation must return promptly, must not panic, and must not
 /// acquire a lock held by a blocked I/O operation. It runs at most once.
-/// Neither shutdown nor an I/O operation may call this stream's closer: closing
-/// waits for those operations to return.
+/// Neither shutdown nor an I/O operation may call this stream's closer. Closing
+/// would wait for the calling operation itself to return.
 ///
 /// Closing refuses further adapter I/O. Admitted operations return their normal
 /// results and may succeed while shutdown is in progress. A failed frame send
@@ -39,7 +40,7 @@ pub(super) struct Cancelled;
 /// Data already buffered by the transport may still be received after closing.
 ///
 /// Dropping the stream closes it. Passing it to a client or server transfers
-/// that responsibility to the transport owner. Close handles do not keep the
+/// that responsibility to the transport owner. Closer handles do not keep the
 /// reader or writer alive, and dropping a handle does not close the stream.
 pub struct Stream<R: Read, W: Write> {
     io: Option<(R, W)>, // Taken when ownership passes to the transport
@@ -59,7 +60,12 @@ impl<R: Read, W: Write> Stream<R, W> {
 
     /// Sets the budget for writing and flushing one complete frame, including
     /// any delimiter needed after failed output. Progress does not restart it.
-    /// Zero refuses output immediately.
+    /// The budget begins after acquiring the writer and includes frame encoding.
+    /// Waiting for locks, encryption and peer replies is outside this budget.
+    /// Reset, hello and acknowledgement frames each get their own budget.
+    ///
+    /// Zero refuses output immediately. A duration too large to add to an
+    /// [`Instant`] panics when an outgoing frame's deadline is constructed.
     pub fn set_write_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -70,7 +76,8 @@ impl<R: Read, W: Write> Stream<R, W> {
         self.closer.clone()
     }
 
-    /// Permanently closes the stream, see [`Closer::close`].
+    /// Permanently closes the stream and waits for shutdown and admitted adapter
+    /// operations to finish. Concurrent close calls wait for the same completion.
     pub fn close(&self) {
         self.closer.close();
     }
@@ -94,32 +101,32 @@ impl<R: Read, W: Write> Drop for Stream<R, W> {
 #[derive(Clone)]
 pub struct Closer(Arc<Shutdown>);
 
-/// Shared shutdown coordination. The state lock serializes admission and
-/// closure; the condition variable wakes closers when I/O drains or another
-/// closer completes shutdown. Neither adapter I/O nor its callback holds it.
+/// Shared shutdown coordination. The state lock orders I/O admission and closure.
+/// Adapter operations and the shutdown callback run without this lock. The
+/// condition variable wakes waiting closers as those operations finish.
 struct Shutdown {
     state: Mutex<State>,
     changed: Condvar,
 }
 
-/// Lifecycle of a byte stream, advancing once from open through closing to
-/// closed. Closing refuses admission; closed additionally guarantees completion.
+/// Lifecycle of a byte stream. Closing refuses new adapter operations. Closed
+/// additionally guarantees that shutdown and all admitted operations have finished.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Adapter I/O may be admitted and shutdown has not been requested.
     Open,
-    /// One closer owns shutdown; all others wait and new I/O is refused.
+    /// One closer runs shutdown. Other closers wait and new I/O is refused.
     Closing,
     /// The callback and every admitted adapter call have returned.
     Closed,
 }
 
-/// Stream lifecycle and I/O admission under one lock. Only the closer that
-/// changes open to closing takes the action. Closed implies no action remains
-/// and the active I/O count is zero; every admitted call releases one count on drop.
+/// Stream lifecycle and active adapter operations under one lock. The first
+/// closer takes the shutdown action. Each admitted operation increments the
+/// active count and decrements it on completion. Closed requires a zero count.
 struct State {
     phase: Phase,
-    active: usize, // Active IO operations to wait on after close
+    active: usize, // Admitted adapter operations that shutdown must wait for
     action: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -137,16 +144,16 @@ impl Closer {
     }
 
     /// Permanently closes the stream. Every caller waits until the shutdown
-    /// callback and all admitted adapter calls, including deadline setters,
-    /// reads, writes and flushes, have returned.
+    /// callback and all admitted adapter calls have returned. This includes
+    /// deadline setters, reads, writes and flushes.
     /// New I/O is refused as soon as closing begins. This does not join the
     /// threads using the transport or wait for application handlers.
     ///
-    /// The callback runs once, without holding a state or I/O lock. The adapter
-    /// must satisfy the cancellation contract of [`Stream`]. Calling this from
-    /// inside the adapter's I/O or shutdown callback would wait on itself.
+    /// The callback runs once, without holding a state or I/O lock. It must return
+    /// promptly and make blocked I/O return within the adapter's cancellation
+    /// bound. Calling close from adapter I/O or the callback would wait on itself.
     pub fn close(&self) {
-        // Loop until someone closes in front of us, of we get the shutdown
+        // Wait for another closer to finish or take responsibility for shutdown
         let action = {
             let mut state = self.0.state.lock().expect("stream state not poisoned");
             loop {
@@ -154,7 +161,7 @@ impl Closer {
                     // Stream already closed, return early
                     Phase::Closed => return,
 
-                    // Stream currently closing by someone else, idle around
+                    // Another closer is running shutdown. Wait for it to finish.
                     Phase::Closing => {
                         state = self
                             .0
@@ -172,10 +179,10 @@ impl Closer {
             }
         };
 
-        // We're the first to call close, were granted the shutdown invocation
+        // The first closer runs shutdown without holding the state lock.
         action();
 
-        // Keep idling until all active IO operations settle
+        // Wait until all admitted adapter operations return
         let mut state = self.0.state.lock().expect("stream state not poisoned");
         while state.active != 0 {
             state = self
@@ -201,7 +208,8 @@ impl Closer {
     }
 }
 
-/// An admitted call, released on return or unwind without holding an I/O lock.
+/// Tracks one admitted adapter operation until return or unwind. Dropping it
+/// decrements the active count without acquiring an I/O lock.
 struct Activity<'a>(&'a Closer);
 
 impl Drop for Activity<'_> {
@@ -221,10 +229,11 @@ pub(super) struct ReadHalf<R> {
 }
 
 impl<R: Read> ReadHalf<R> {
-    /// Reads with bounded idle polls, admitting each independently against
-    /// closure and the optional cancellation flag. A read admitted before the
-    /// flag is set may still finish normally. Idle timeouts and interrupted
-    /// reads are retried; deadline configuration errors surface without retrying.
+    /// Reads with bounded idle polls. Each poll checks reconnect cancellation
+    /// and enters shutdown accounting before configuring the deadline and reading.
+    /// A read may finish normally if the flag is set after its cancellation check.
+    /// Idle timeouts and interrupted reads are retried. Deadline setter errors
+    /// return immediately. Closure refuses another poll and returns EOF.
     pub(super) fn read(
         &mut self,
         buf: &mut [u8],
@@ -235,7 +244,7 @@ impl<R: Read> ReadHalf<R> {
             if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 return Err(io::Error::other(Cancelled));
             }
-            // Attempt the read (tracked for teardown)
+            // Keep the setter and read accounted for until both have returned.
             let result = {
                 let Some(_active) = self.closer.enter() else {
                     return Ok(0);
@@ -243,8 +252,7 @@ impl<R: Read> ReadHalf<R> {
                 self.inner.set_read_deadline(Instant::now() + READ_POLL)?;
                 self.inner.read(buf)
             };
-            // Timeouts (caused by our poller) or an OS interruption gets to try
-            // again, any other error bubbles up as a failure
+            // Retry an idle timeout or interrupted read. Other errors return.
             match result {
                 Err(err)
                     if matches!(
@@ -267,12 +275,15 @@ pub(super) struct WriteHalf<W> {
 }
 
 impl<W: Write> WriteHalf<W> {
-    /// Writes all bytes and flushes them under one absolute deadline, installing
-    /// it once before I/O. Each partial write and flush is admitted independently
-    /// against cancellation and closure. Interrupted writes are retried; zero
-    /// progress fails with WriteZero. Setter and flush errors are not retried.
+    /// Writes all bytes and flushes them under one absolute deadline. Installs
+    /// the deadline once before I/O. Each partial write and flush checks
+    /// cancellation, expiration and closure before calling the adapter.
+    /// Interrupted writes are retried. Zero progress fails with `WriteZero`.
+    /// Setter and flush errors are not retried.
+    ///
     /// An admitted call may finish after cancellation or closure begins. Failure
-    /// can leave a written prefix; framing applies the final deadline check.
+    /// can leave a written prefix. The framer checks the deadline again after
+    /// this operation returns, so a late flush fails the complete frame.
     pub(super) fn write(
         &mut self,
         mut bytes: &[u8],
@@ -285,7 +296,7 @@ impl<W: Write> WriteHalf<W> {
         }
         check_deadline(deadline)?;
 
-        // Set the deadline for the next write, taking care of racy shutdowns
+        // Account for the deadline setter so shutdown waits for it too.
         {
             let _active = self
                 .closer
@@ -293,9 +304,9 @@ impl<W: Write> WriteHalf<W> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))?;
             self.inner.set_write_deadline(deadline)?;
         }
-        // Keep flushing the data while we have any bytes left
+        // Keep writing while bytes remain; flush only after the complete write
         while !bytes.is_empty() {
-            // Ensure that a loop iteration didn't hit a cancellation or timeout
+            // Recheck cancellation and the deadline before each partial write.
             if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 return Err(io::Error::other(Cancelled));
             }
@@ -501,9 +512,9 @@ mod tests {
         );
     }
 
-    // Tests that concurrent close calls and owner drop all wait for shutdown
-    // completion, holding the callback until every caller has started and
-    // checking that none returns before the callback is released.
+    // Tests that concurrent close calls and owner drop all wait for shutdown.
+    // Hold the callback until every caller has started, then check that none
+    // returns before the callback is released.
     #[test]
     fn test_every_closer_waits_for_the_shutdown_callback() {
         let (entered, callback) = mpsc::channel();
@@ -556,19 +567,19 @@ mod tests {
         owner.join().unwrap();
     }
 
-    /// Adapter operation held in flight while the test requests shutdown.
+    /// Adapter operation held in flight while the test requests cancellation.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum BlockAt {
-        /// Hold a raw read until the driver completes cancellation.
+        /// Hold a raw read until the test releases it.
         Read,
-        /// Hold a raw write until the driver completes cancellation.
+        /// Hold a raw write until the test releases it.
         Write,
-        /// Hold a flush until the driver completes cancellation.
+        /// Hold a flush until the test releases it.
         Flush,
     }
 
-    /// An adapter whose cancellation takes time after the shutdown request. The
-    /// driver controls completion to test the interval with I/O still in flight.
+    /// Holds one adapter operation until the test releases it. This keeps I/O in
+    /// progress long enough to observe shutdown or reconnect cancellation.
     struct Gate {
         at: BlockAt,
         entered: mpsc::Sender<()>,
@@ -598,14 +609,14 @@ mod tests {
             Ok(())
         }
 
-        /// Allows the admitted operation to finish after shutdown was requested.
+        /// Allows the admitted operation to finish.
         fn release(&self) {
             *self.released.lock().unwrap() = true;
             self.changed.notify_all();
         }
     }
 
-    /// Two byte-stream halves sharing the driver's cancellation gate.
+    /// Adapter half sharing a gate with the test driver.
     struct GatedAdapter {
         gate: Arc<Gate>,
         deadline: Option<Instant>,
@@ -901,7 +912,7 @@ mod tests {
     }
 
     // Tests that a failed deadline setter prevents byte I/O and preserves its
-    // error, including Interrupted and TimedOut: only retryable errors from an
+    // error, including Interrupted and TimedOut. Only retryable errors from an
     // actual read may start another attempt.
     #[test]
     fn test_deadline_setter_failure_prevents_io() {
@@ -1057,8 +1068,8 @@ mod tests {
         }
     }
 
-    // Tests that idle polls observe scope cancellation without closing the
-    // stream, and a fresh scope can immediately receive on the same adapter.
+    // Tests that idle polls observe reconnect cancellation without closing the
+    // stream. A fresh cancellation flag allows reads on the same adapter.
     #[test]
     fn test_cancel_idle_read_and_reuse() {
         let ready = Arc::new(AtomicBool::new(false));

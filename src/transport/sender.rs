@@ -11,20 +11,19 @@ use darkbio_crypto::xhpke;
 use std::sync::{Mutex, Weak};
 
 /// Cloneable handle for sending messages into a session from any thread.
-/// Delivered by [`Client::connect`](super::Client::connect) or a server's
-/// [`Event::Connected`](super::Event::Connected) event.
+/// Returned by [`Client::connect`](super::Client::connect) or delivered in a
+/// server's [`Connected`](super::Event::Connected) event.
 ///
-/// Sends share one encryption sequence and are written in that order, each
-/// waiting for its own frame and getting its own result. Each handle belongs
-/// permanently to the session that issued it. Ending that session through a
-/// failure, disconnect, reconnect, or dropping the client/server invalidates
-/// every handle for it. Another session supplies a new sender; old handles
-/// cannot send messages to its peer.
+/// Sends share one encryption sequence and are written in that order. Each send
+/// waits for its own frame and receives its own result. A handle belongs
+/// permanently to the session that issued it. Session failure, disconnect,
+/// reconnect or dropping the client/server invalidates all that session's handles.
+/// A new session supplies a new sender. Old handles cannot send into it.
 ///
-/// The client/server retains the session and stream. Senders hold only weak
-/// references, so keeping a handle or cloning it does not extend either lifetime.
-/// A send temporarily retains both while it runs, but still observes session
-/// termination. Dropping a sender does not end the session.
+/// The client/server retains the session and stream. Idle senders hold only weak
+/// references and do not extend either lifetime. An active send temporarily
+/// retains both, but can write only while its session remains current.
+/// Dropping a sender does not end the session.
 #[derive(Debug)]
 pub struct Sender<W: Write> {
     outbound: Weak<Outbound<W>>, // Writer retained by the client/server and active sends
@@ -33,32 +32,35 @@ pub struct Sender<W: Write> {
 
 impl<W: Write> Sender<W> {
     /// Stores weak references to the writer and encryption allocation. Each
-    /// send retains them for its duration; an idle handle owns neither.
+    /// active send temporarily retains both. An idle handle owns neither.
     pub(super) fn new(outbound: Weak<Outbound<W>>, sealer: Weak<Mutex<xhpke::Sender>>) -> Self {
         Self { outbound, sealer }
     }
 
-    /// Seals a message and writes and flushes its complete frame. Concurrent
-    /// sends retain encryption order on the wire while the next message can
-    /// seal during the preceding write. An oversized message is refused without
-    /// advancing encryption or ending the session. Once the writer is acquired,
-    /// all partial writes, resynchronization and flush share the stream's write
-    /// timeout. Encryption and waiting for the writer are outside that budget.
+    /// Encrypts a message, writes its complete frame and flushes the output.
+    /// Concurrent sends preserve encryption order on the wire. The next message
+    /// can be encrypted while the previous one is being written. An oversized
+    /// message is refused without advancing encryption or ending the session.
     ///
-    /// A write failure ends the binding before returning: subsequent sends and
+    /// The write timeout starts after acquiring the writer. Frame encoding,
+    /// recovery delimiters, partial writes and flush all share that budget.
+    /// Encryption and waiting for the writer are outside the budget.
+    ///
+    /// An output failure ends the session before returning. Subsequent sends and
     /// receive completions are refused. A timeout returns [`Error::SendFailed`]
-    /// containing [`std::io::ErrorKind::TimedOut`] and leaves the byte stream
-    /// reusable. Server failure notification uses only the failed frame's
-    /// remaining budget and is skipped after timeout. This does not wake a
-    /// blocked receive.
-    /// Ending elsewhere waits for a write already holding the writer lock;
-    /// queued sends can still seal but must match the binding before writing.
+    /// containing an I/O `TimedOut` error and leaves the byte stream reusable.
+    /// Server failure notification uses the frame's remaining budget and is
+    /// skipped after timeout. Ending this way does not wake a blocked receive.
     ///
-    /// Returns [`Error::Terminated`] if the outgoing transport was released, or
-    /// [`Error::EncryptionFailed`] if the context was released or its binding
-    /// ended. Stream closure is observed through I/O; an overlapping write may
-    /// succeed. Unexpected encryption failures and poisoned locks panic, and
-    /// transport reuse after a panic is unsupported.
+    /// Ending from another thread waits for a send holding the writer lock.
+    /// Queued sends can still encrypt, but must belong to the current session
+    /// when they acquire the writer.
+    ///
+    /// Returns [`Error::Terminated`] if the outgoing transport was released.
+    /// Returns [`Error::EncryptionFailed`] if the context was released or its
+    /// session ended. Permanent stream closure is observed through I/O, so an
+    /// overlapping send may succeed. Unexpected encryption failures and poisoned
+    /// locks panic. Transport reuse after a panic is unsupported.
     pub fn send(&self, message: &[u8]) -> Result<(), Error> {
         let outbound = self.outbound.upgrade().ok_or(Error::Terminated)?;
         let context = self
@@ -156,8 +158,8 @@ mod tests {
         }
     }
 
-    /// Writer holding its first write until released, then failing it or
-    /// panicking inside it, the ones after passing, and reporting its drop.
+    /// Holds its first write until released, then fails or panics as configured.
+    /// Later writes succeed. Dropping the writer notifies the test driver.
     struct Gate {
         entered: mpsc::Sender<()>,
         release: Option<mpsc::Receiver<()>>,
@@ -167,9 +169,8 @@ mod tests {
     }
 
     impl Gate {
-        /// Creates the gate along with the channel telling that a write is
-        /// held, the one releasing it and the one telling that the gate was
-        /// dropped.
+        /// Creates the gate and channels to observe a blocked write, release it
+        /// and observe the writer's drop.
         fn new() -> (
             Self,
             mpsc::Receiver<()>,
@@ -228,8 +229,8 @@ mod tests {
         }
     }
 
-    // Tests that messages sent from many threads at once go out in the order
-    // they were sealed, every one opening in sequence on the receiving side.
+    // Tests that concurrent messages go out in encryption order. The receiver
+    // must decrypt every frame in sequence and recover every submitted message.
     #[test]
     fn test_send_order() {
         testing::init_tracing();
@@ -316,9 +317,9 @@ mod tests {
         assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
     }
 
-    // Tests that a failed write is reported to the sender it failed, that a
-    // message sealed behind it is refused rather than written, and that every
-    // later one is refused too, even if it performs extra sealing.
+    // Tests that a send receives its own write failure. The message encrypted
+    // behind it must be refused before writing. Later sends must also fail,
+    // even if they perform extra encryption before finding the ended session.
     #[test]
     fn test_send_failure_attribution() {
         testing::init_tracing();
@@ -365,9 +366,9 @@ mod tests {
         assert!(outbound.finish_receive(&sealer, Ok(Vec::new())).is_err());
     }
 
-    // Tests that senders stay bound to the session that issued them, that ending
-    // or dropping it refuses further sends, and that stream closure is observed
-    // through I/O while dropping the stream owner yields Terminated.
+    // Tests that senders stay bound to their original session after replacement
+    // or ending. Closing the stream is observed through I/O. Dropping its owner
+    // makes later sends return Terminated.
     #[test]
     fn test_send_refusals() {
         testing::init_tracing();
@@ -420,10 +421,10 @@ mod tests {
         assert!(matches!(second.send(&payload(7)), Err(Error::Terminated)));
     }
 
-    // Tests that closing cancels a blocked write without taking the send locks,
-    // including when a second sender holds the sealer while waiting for the
-    // writer and session ending waits for it too. Closing lets both senders and
-    // ending finish, and a surviving sender refuses new sends.
+    // Tests close while a send blocks in I/O, another waits with encryption
+    // locked, and session ending also waits for the writer. Close must release
+    // the blocked I/O without taking those locks. Both sends and ending then
+    // finish, and a surviving sender refuses new messages.
     #[test]
     fn test_close_with_stuck_sends() {
         testing::init_tracing();
@@ -489,8 +490,8 @@ mod tests {
         assert!(matches!(sender.send(&payload(4)), Err(Error::Terminated)));
     }
 
-    // Tests that an I/O panic releases its admission charge, allowing shutdown
-    // to complete and the last active send to release the transport writer.
+    // Tests that an I/O panic releases its active-operation count. Shutdown can
+    // then complete, and the last active send releases the transport writer.
     #[test]
     fn test_close_with_panicking_send() {
         testing::init_tracing();

@@ -1,11 +1,10 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Replay of a transcript against a fresh client, the way another
-//! implementation of it would consume the vectors. The reads are handed over
-//! as recorded and the client's writes are checked against the transcript,
-//! the deterministic ones for equality and the sealed ones by opening them
-//! with the server's keys.
+//! Replays recorded scenarios against a fresh client.
+//! Reads follow the transcript. Deterministic writes must match the recorded
+//! bytes. Complete encrypted frames can differ, so the replay opens them with
+//! the server's keys to check their contents.
 
 use super::{Event, ReadError, Vector};
 use crate::transport::mock::server::check_session;
@@ -37,25 +36,29 @@ pub fn parse(json: &str) -> Vector {
     }
 }
 
+/// Reads a JSON string, panicking if the value has another type.
 fn text(value: &Value) -> String {
     value.as_str().expect("expected a string").to_string()
 }
 
+/// Decodes a base64 JSON string, panicking if its type or encoding is invalid.
 fn bytes(value: &Value) -> Vec<u8> {
     BASE64_STANDARD
         .decode(value.as_str().expect("expected base64"))
         .expect("invalid base64")
 }
 
+/// Reads a JSON array, panicking if the value has another type.
 fn list(value: &Value) -> &[Value] {
     value.as_array().expect("expected a list")
 }
 
+/// Reads a nonnegative JSON integer as a count.
 fn count(value: &Value) -> usize {
     value.as_u64().expect("expected a count") as usize
 }
 
-/// Read, write or oversized message bytes, spelled out or as runs.
+/// Decodes event bytes from base64 or runs of repeated values.
 fn payload(event: &Value) -> Vec<u8> {
     match (&event["bytes"], &event["runs"]) {
         (Value::String(text), _) => BASE64_STANDARD.decode(text).expect("invalid base64"),
@@ -67,6 +70,7 @@ fn payload(event: &Value) -> Vec<u8> {
     }
 }
 
+/// Parses one event, panicking if its kind or required fields are invalid.
 fn event(value: &Value) -> Event {
     match value["event"].as_str().expect("event without a kind") {
         "handshake" => Event::Handshake {
@@ -115,8 +119,7 @@ fn event(value: &Value) -> Event {
     }
 }
 
-/// Replays the transcript, panicking at the first divergence of the client
-/// from it.
+/// Runs a transcript against a fresh client and checks its calls and output.
 pub fn run(vector: &Vector) {
     let tape = Arc::new(Playback::new(vector.trace.clone()));
     let mut client = Client::new(crate::transport::Stream::new(
@@ -174,8 +177,8 @@ pub fn run(vector: &Vector) {
     }
 }
 
-/// Checks the result of a call and the writes made during it against the
-/// transcript, a request being the message the call was asked to send.
+/// Checks one call's result and output against the transcript.
+/// `request` is the plaintext message supplied to a send call, if any.
 fn settle(
     tape: &Arc<Playback>,
     peer: &mut Peer,
@@ -194,13 +197,12 @@ fn settle(
             panic!("client returned {result:?} where the transcript has {expected:?}")
         }
     }
-    for (recorded, actual) in writes {
-        peer.check(&recorded, &actual, request);
+    for (recorded, actual, failed) in writes {
+        peer.check(&recorded, &actual, failed, request);
     }
 }
 
-/// Transport of a replay, playing the transcript's reads to the client and
-/// taking its writes, failing them where the transcript says so.
+/// Shared replay state for delivering recorded input and checking client output.
 struct Playback {
     tape: Mutex<Tape>,
     advanced: Condvar,
@@ -219,15 +221,16 @@ impl Playback {
 /// Recorded events and partially delivered reads under the playback lock.
 struct Tape {
     trace: Vec<Event>,
-    next: usize,                     // Next event to play
-    pending: Vec<u8>,                // Read event bytes, retained until fully delivered
-    offset: usize,                   // Bytes already delivered, avoiding a copy per small read
-    chunk: usize,                    // Most bytes a read hands over, zero for all
-    writes: Vec<(Vec<u8>, Vec<u8>)>, // Writes since the last check, recorded and actual
+    next: usize,                           // Next event to play
+    pending: Vec<u8>,                      // Read event bytes, retained until fully delivered
+    offset: usize, // Read cursor; keeps small reads from shifting the buffer
+    chunk: usize,  // Maximum read size; zero means no limit
+    writes: Vec<(Vec<u8>, Vec<u8>, bool)>, // Recorded bytes, actual bytes and recorded failure
     output_failed: bool, // A concurrent helper failed, so reads wait for its cancellation
 }
 
 impl Tape {
+    /// Starts playback at the first event with no buffered I/O.
     fn new(trace: Vec<Event>) -> Self {
         Self {
             trace,
@@ -240,12 +243,12 @@ impl Tape {
         }
     }
 
-    /// Whether the transcript has been played to its end.
+    /// Reports whether every transcript event has been consumed.
     fn done(&self) -> bool {
         self.next == self.trace.len()
     }
 
-    /// The next event of the transcript, which must have one.
+    /// Consumes the next event. Panics if the transcript has ended.
     fn next(&mut self) -> Event {
         let event = self.trace.get(self.next).cloned();
         self.next += 1;
@@ -253,7 +256,7 @@ impl Tape {
     }
 }
 
-/// Read half of the transport.
+/// Delivers transcript input to the real client.
 struct Reader {
     playback: Arc<Playback>,
     deadline: Instant, // Configured deadline for waiting on concurrent output
@@ -273,9 +276,9 @@ impl io::Read for Reader {
         let deadline = self.deadline.min(Instant::now() + Duration::from_millis(1));
         let mut tape = self.playback.tape.lock().unwrap();
         while tape.pending.is_empty() {
-            // The handshake writer may not have consumed its prefix events
-            // yet. A failed prefix leaves the call's error next; let the read
-            // poll expire so the transport observes companion cancellation.
+            // Wait for the handshake writer to consume its output events.
+            // After output failure, the next event can be the call's result.
+            // A short read poll lets the client observe the writer's cancellation.
             if matches!(
                 tape.trace.get(tape.next),
                 Some(
@@ -332,7 +335,7 @@ impl io::Read for Reader {
     }
 }
 
-/// Write half of the transport.
+/// Captures client output and injects the transcript's write and flush failures.
 struct Writer {
     playback: Arc<Playback>,
     pending_error: Option<ErrorKind>, // Failure after a recorded prefix returned Ok(n)
@@ -341,7 +344,7 @@ struct Writer {
 impl Write for Writer {
     fn set_write_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
         // Recorded outcomes determine expiry without wall-clock delays.
-        // An unobserved error belongs to output abandoned before another call.
+        // Starting new output discards any error left by an abandoned write.
         self.pending_error = None;
         Ok(())
     }
@@ -358,8 +361,8 @@ impl io::Write for Writer {
             Event::WriteTimedOut { bytes } => (bytes, Some(ErrorKind::TimedOut)),
             event => panic!("client wrote where the transcript has {event:?}"),
         };
-        // A sealed frame varies in length with its COBS overhead, so a
-        // failing transport takes as much of it as it did of the recorded one
+        // Fresh encryption can change COBS overhead and therefore frame length.
+        // On failure, accept up to the recorded byte count from the actual frame.
         let n = match error.is_some() {
             true => recorded.len().min(buf.len()),
             // Older vectors recorded recovery separately. Accepting only its
@@ -367,7 +370,8 @@ impl io::Write for Writer {
             false if recorded == [0] && buf.first() == Some(&0) => 1,
             false => buf.len(),
         };
-        tape.writes.push((recorded, buf[..n].to_vec()));
+        tape.writes
+            .push((recorded, buf[..n].to_vec(), error.is_some()));
         tape.output_failed |= error.is_some();
         self.playback.advanced.notify_all();
         match error {
@@ -381,8 +385,8 @@ impl io::Write for Writer {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // A recorded failed prefix can fill the replay's complete, differently
-        // encoded frame. Flush must then surface the failure without a retry.
+        // A recorded partial write can cover the whole frame if its encoding
+        // is shorter on replay. Return the deferred error from flush in that case.
         if let Some(error) = self.pending_error.take() {
             return Err(error.into());
         }
@@ -403,8 +407,7 @@ impl io::Write for Writer {
     }
 }
 
-/// The server's side of a replay, holding the keys of the transcript to open
-/// what the client seals.
+/// Opens client output using the server keys saved in the transcript.
 struct Peer {
     identity: xdsa::PublicKey,       // Server identity key, the pinned verifier
     xhpke: Vec<xhpke::SecretKey>,    // Server crypto keys, one per ArkHello
@@ -413,6 +416,7 @@ struct Peer {
 }
 
 impl Peer {
+    /// Loads the recorded server keys with no client session established yet.
     fn new(vector: &Vector) -> Self {
         Self {
             identity: xdsa::PublicKey::from_bytes(vector.identity[..].try_into().unwrap()).unwrap(),
@@ -426,26 +430,47 @@ impl Peer {
         }
     }
 
-    /// Checks a write of the client against the recorded one. A reset or a
-    /// hello must match it. A sealed frame differs in content and, with the
-    /// COBS overhead, in length. An ack must open with the server key it is
-    /// sealed to, setting up the context the requests after it must open in.
-    /// A write cut short leaves no frame to open.
-    fn check(&mut self, recorded: &[u8], actual: &[u8], request: Option<&[u8]>) {
+    /// Checks client output against the recording.
+    /// Unfinished output requires a recorded failure or an exact recorded prefix.
+    /// Signals and HostHello must match exactly. Every complete encrypted frame
+    /// is opened, even when its bytes match: HostAck installs the receiving
+    /// context, and requests advance it while checking the plaintext.
+    fn check(&mut self, recorded: &[u8], actual: &[u8], failed: bool, request: Option<&[u8]>) {
+        if actual.last() != Some(&0) {
+            assert!(
+                failed || recorded == actual,
+                "client left successful output unfinished: {actual:?} for {recorded:?}"
+            );
+            return;
+        }
+        // Check signals before stripping recovery prefixes. Otherwise a reset
+        // missing its second delimiter could look like an unfinished frame.
+        if actual.iter().all(|byte| *byte == 0) {
+            assert_eq!(
+                actual, recorded,
+                "client signal differs from the recorded one"
+            );
+            return;
+        }
         // A combined write includes the recovery delimiter before its encoded
         // frame. Both representations identify the same packet for verification.
+        assert_eq!(
+            actual.first() == Some(&0),
+            recorded.first() == Some(&0),
+            "client recovery delimiter differs from the recorded one"
+        );
         let (recorded, actual) = match (recorded.strip_prefix(&[0]), actual.strip_prefix(&[0])) {
             (Some(recorded), Some(actual)) => (recorded, actual),
             _ => (recorded, actual),
         };
-        if recorded == actual || actual.last() != Some(&0) {
+        let packet = unframe(&actual[..actual.len() - 1]);
+        if cbor::decode::<handshake::HostHello>(&packet).is_ok() {
+            assert_eq!(
+                actual, recorded,
+                "client hello differs from the recorded one"
+            );
             return;
         }
-        let packet = unframe(&actual[..actual.len() - 1]);
-        assert!(
-            cbor::decode::<handshake::HostHello>(&packet).is_err(),
-            "client hello differs from the recorded one"
-        );
         match cose::recipient(&packet) {
             Ok(fingerprint) => {
                 let crypto = self
@@ -528,8 +553,8 @@ fn test_full_prefix_failure_surfaces_on_flush() {
     }
 }
 
-// Tests that every vector on disk decodes, re-encodes to the same file and
-// replays against the client, the way another implementation consumes it.
+// Tests that every saved vector decodes, re-encodes unchanged and replays
+// against the client. This checks the format consumed by other implementations.
 #[test]
 fn test_vectors_replay() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/client");
@@ -541,7 +566,7 @@ fn test_vectors_replay() {
     assert!(!paths.is_empty(), "no vectors to replay");
 
     for path in paths {
-        // A checkout may have converted the line endings
+        // A checkout may have converted the line endings.
         let json = std::fs::read_to_string(&path)
             .unwrap()
             .replace("\r\n", "\n");
@@ -553,4 +578,134 @@ fn test_vectors_replay() {
         );
         run(&vector);
     }
+}
+
+/// Builds a replay peer, a sealed HostAck and its client sending context.
+/// The peer has not processed the acknowledgement yet.
+fn checker_session() -> (Peer, Vec<u8>, xhpke::Sender) {
+    use crate::transport::mock::frame;
+
+    let identity = xdsa::SecretKey::from_bytes(&[1; xdsa::SECRET_KEY_SIZE]).public_key();
+    let crypto = xhpke::SecretKey::from_bytes(&[2; xhpke::SECRET_KEY_SIZE]);
+    let signer = xdsa::SecretKey::from_bytes(&[3; xdsa::SECRET_KEY_SIZE]);
+    let (sender, encap) = crypto
+        .public_key()
+        .new_sender(CRYPTO_DOMAIN_WIRE_HOST_TO_ARK)
+        .unwrap();
+    let ack = cose::seal_at(
+        &handshake::HostAck {
+            h2a_encap: encap.to_vec(),
+        },
+        &handshake::HostAckAuth {
+            ark_signer: identity.clone(),
+            ark_crypto: crypto.public_key(),
+        },
+        &signer,
+        &crypto.public_key(),
+        CRYPTO_DOMAIN_WIRE,
+        TIMESTAMP,
+    )
+    .unwrap();
+    let peer = Peer {
+        identity,
+        xhpke: vec![crypto],
+        signer: Some(signer.public_key()),
+        receiver: None,
+    };
+    (peer, frame(&ack), sender)
+}
+
+// Tests that a recorded successful frame cannot replay as unfinished output.
+// Includes a combined recovery prefix and a reset missing its second delimiter.
+#[test]
+fn test_checker_rejects_incomplete_successful_output() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    for (recorded, actual) in [
+        (&[2, 42, 0][..], &[2, 42][..]),
+        (&[0, 2, 42, 0][..], &[0, 2, 42][..]),
+        (&[0, 0][..], &[0][..]),
+    ] {
+        let (mut peer, _, _) = checker_session();
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || peer.check(recorded, actual, false, None)
+            ))
+            .is_err(),
+            "accepted incomplete successful output: {actual:?} for {recorded:?}"
+        );
+    }
+}
+
+// Tests that a complete encrypted frame cannot omit a recorded recovery zero,
+// even if the write ultimately failed. Without that zero the peer would merge
+// the packet with the preceding unfinished frame instead of decrypting it.
+#[test]
+fn test_checker_requires_recovery_delimiter() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    for failed in [false, true] {
+        let (mut peer, ack, _) = checker_session();
+        let mut recorded = vec![0];
+        recorded.extend_from_slice(&ack);
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || peer.check(&recorded, &ack, failed, None)
+            ))
+            .is_err(),
+            "accepted output without its recovery delimiter"
+        );
+    }
+}
+
+// Tests that exact HostAck bytes still install the replay's receiving context.
+// The next request uses different valid ciphertext in the recording, forcing
+// the checker to open the actual request with that installed context.
+#[test]
+fn test_checker_exact_ack_installs_receiver() {
+    use crate::transport::mock::frame;
+
+    let (mut peer, ack, mut sender) = checker_session();
+    let (_, _, mut recorded_sender) = checker_session();
+    peer.check(&ack, &ack, false, None);
+
+    let message = b"first request";
+    let actual = frame(&sender.seal(message, &[]).unwrap());
+    let recorded = frame(&recorded_sender.seal(message, &[]).unwrap());
+    assert_ne!(actual, recorded);
+    peer.check(&recorded, &actual, false, Some(message));
+}
+
+// Tests that exact request bytes still advance the replay's receiving context.
+// The following request differs from its recording and must decrypt at the next
+// sequence number. The different ACK ensures this test isolates request handling.
+#[test]
+fn test_checker_exact_request_advances_receiver() {
+    use crate::transport::mock::frame;
+
+    let (mut peer, ack, mut sender) = checker_session();
+    let (_, recorded_ack, mut recorded_sender) = checker_session();
+    assert_ne!(ack, recorded_ack);
+    peer.check(&recorded_ack, &ack, false, None);
+
+    let first = b"first request";
+    let actual = frame(&sender.seal(first, &[]).unwrap());
+    peer.check(&actual, &actual, false, Some(first));
+    recorded_sender.seal(first, &[]).unwrap();
+
+    let second = b"second request";
+    let actual = frame(&sender.seal(second, &[]).unwrap());
+    let recorded = frame(&recorded_sender.seal(second, &[]).unwrap());
+    assert_ne!(actual, recorded);
+    peer.check(&recorded, &actual, false, Some(second));
+}
+
+// Tests the partial writes that remain valid: a failed write may stop mid-frame,
+// while a successful write may match an explicitly recorded unfinished prefix.
+#[test]
+fn test_checker_accepts_recorded_partial_output() {
+    let (mut peer, _, _) = checker_session();
+    peer.check(&[2, 42, 0], &[2, 42], true, None);
+    peer.check(&[2, 42], &[2, 42], false, None);
+    peer.check(&[0], &[0], false, None);
 }

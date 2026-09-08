@@ -1,9 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Messages of the session handshake. The structs are CBOR arrays, so their
-//! field order is part of the protocol and must never change without a wire
-//! version bump.
+//! Messages of the session handshake. Each struct encodes as a CBOR array.
+//! Field order is part of the protocol; changing it requires a wire version bump.
 
 use darkbio_crypto::cbor::Cbor;
 use darkbio_crypto::{xdsa, xhpke};
@@ -16,19 +15,18 @@ pub(crate) struct HostHello {
     pub host_crypto: xhpke::PublicKey, // Host's ephemeral xHPKE encryption key
 }
 
-/// Session initiation acknowledgement from the Ark, containing its ephemeral
-/// encryption key, the encapsulated key for the ark-to-host context and the
-/// Ark's genuinity attestation.
+/// Ark's response with its device attestation, ephemeral encryption key and
+/// encapsulated key for ark-to-host encryption.
 #[derive(Cbor)]
 #[cbor(array)]
 pub(crate) struct ArkHello {
-    pub ark_attest: Vec<u8>, // Ark's genuinity attestation (embeds the xDSA signer key)
+    pub ark_attest: Vec<u8>, // Device attestation containing the Ark's identity key
     pub ark_crypto: xhpke::PublicKey, // Ark's ephemeral xHPKE encryption key
     pub a2h_encap: Vec<u8>,  // Encapsulated key for the ark-to-host HPKE context
 }
 
-/// Authenticated data sealed with ArkHello, binding the Ark's response to the
-/// host's ephemeral keys so a hello substituted by a MitM is detected.
+/// Authenticated data for ArkHello. Binds the response to the host's ephemeral
+/// keys so an intermediary cannot substitute its own hello.
 #[derive(Cbor)]
 #[cbor(array)]
 pub(crate) struct ArkHelloAuth {
@@ -44,8 +42,8 @@ pub(crate) struct HostAck {
     pub h2a_encap: Vec<u8>, // Encapsulated key for the host-to-ark HPKE context
 }
 
-/// Authenticated data sealed with HostAck, binding the host's ack to the Ark's
-/// identity and ephemeral key so a hello substituted by a MitM is detected.
+/// Authenticated data for HostAck. Binds the acknowledgement to the Ark's identity
+/// and ephemeral key so an intermediary cannot substitute its own hello.
 #[derive(Cbor)]
 #[cbor(array)]
 pub(crate) struct HostAckAuth {
@@ -79,6 +77,7 @@ mod tests {
             (0..len).map(|i| i as u8).collect()
         }
 
+        /// Encoded handshake message paired with its checked-in CBOR vector.
         struct TestCase {
             encoded: Vec<u8>,
             vector: &'static [u8],

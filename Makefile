@@ -59,8 +59,8 @@ fuzz-minimize:
 fuzz-loop:
 	while true; do $(MAKE) --no-print-directory fuzz || exit 1; done
 
-# vectors transcribes the client scenario tests for other implementations of
-# the client to replay, the format documented in vectors/README.md. The build
+# vectors transcribes the client scenario tests for other client implementations
+# to replay. src/transport/mock/vector.rs defines the recorded events. The build
 # routes all randomness through getrandom's custom backend, which the recorder
 # seeds per scenario, so the transcripts regenerate unchanged for a given
 # version of the crypto. The flag rebuilds every crate, hence its own target

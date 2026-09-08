@@ -1,7 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Scenario tests of the client, scripts run against it by the mock server.
+//! Client scenario tests driven by mock server scripts.
 
 use super::*;
 use crate::testing;
@@ -12,8 +12,8 @@ fn run_logged(steps: &[Step]) -> Summary {
     run(steps)
 }
 
-// Tests the happy path of the state machine, a handshake followed by
-// requests and replies through the session, one at a time and pipelined.
+// Tests a successful handshake and request/reply exchanges, including several
+// requests sent before their replies are read.
 #[test]
 fn test_scripted_round_trip() {
     let summary = run_logged(&[
@@ -169,10 +169,9 @@ fn test_scripted_retained_sender_failures() {
     assert_eq!(summary.failures, 1);
 }
 
-// Tests that flawed hellos fail the handshake once found, each with its
-// own error, leaving the client without a session. That is a hello tampered
-// with, bound or signed wrongly, malformed, carrying a bad key or
-// encapsulation, or an attestation of the wrong shape.
+// Tests handshake rejection for each invalid authentication field, signature,
+// payload, key, encapsulation, and attestation. Each matching response must fail
+// with the expected error and leave the client without a session.
 #[test]
 fn test_scripted_flawed_hellos() {
     for flaw in [
@@ -188,7 +187,7 @@ fn test_scripted_flawed_hellos() {
         assert!(!summary.established, "{flaw:?}");
         assert_eq!(summary.failures, 1, "{flaw:?}");
 
-        // Without a hello to answer the frame is plain junk
+        // Without a HostHello to answer, the mock sends junk instead.
         let summary = run_logged(&[flaw.clone(), Step::Recv]);
         assert!(!summary.established, "{flaw:?}");
         assert_eq!(summary.failures, 1, "{flaw:?}");
@@ -211,7 +210,7 @@ fn test_scripted_stale_skipping() {
     assert!(summary.established);
     assert_eq!(summary.failures, 0);
 
-    // A reply left unread from the previous session is stale too
+    // Reconnect drains replies left unread from the previous session.
     let summary = run_logged(&[
         Step::Handshake,
         Step::Hello,
@@ -227,7 +226,7 @@ fn test_scripted_stale_skipping() {
     assert_eq!(summary.messages, 1);
     assert_eq!(summary.failures, 0);
 
-    // An old ArkHello left over from a completed handshake is stale too
+    // Reconnect also drains ArkHellos left from an earlier handshake.
     let summary = run_logged(&[
         Step::Handshake,
         Step::Hello,
@@ -248,15 +247,13 @@ fn test_scripted_stale_skipping() {
         assert_eq!(summary.failures, 0);
     }
 
-    // A frame failing to decode, the leftover of a transfer cut short, is
-    // stale like any other
+    // An undecodable frame left by an interrupted transfer is also drained.
     let summary = run_logged(&[Step::Handshake, Step::Undecodable, Step::Hello]);
     assert!(summary.established);
     assert_eq!(summary.failures, 0);
 }
 
-// Tests that a read failing and the transport ending both abort a
-// handshake with their own errors.
+// Tests that a read error and EOF each abort the handshake with their own error.
 #[test]
 fn test_scripted_handshake_interrupted() {
     let summary = run_logged(&[Step::Handshake, Step::Yield, Step::Send(1)]);
@@ -268,8 +265,8 @@ fn test_scripted_handshake_interrupted() {
     assert_eq!(summary.failures, 1);
 }
 
-// Tests that a packet decrypting into something that is not a message is
-// delivered as bytes like any other and leaves the session usable.
+// Tests that transport delivers decrypted bytes without checking protobuf validity
+// and leaves the session usable for the next reply.
 #[test]
 fn test_scripted_garbage_keeps_session() {
     let summary = run_logged(&[
@@ -285,9 +282,8 @@ fn test_scripted_garbage_keeps_session() {
     assert_eq!(summary.failures, 0);
 }
 
-// Tests that packets the session cannot open drop it. That is a replayed
-// reply, one from an earlier session, a tampered one, junk, a leftover
-// ArkHello and an undecodable frame.
+// Tests that failed framing or decryption ends a session. Covers replayed, stale,
+// and tampered replies, junk, an unexpected ArkHello, and undecodable COBS.
 #[test]
 fn test_scripted_undecryptable_drops_session() {
     let summary = run_logged(&[
@@ -341,9 +337,9 @@ fn test_scripted_undecryptable_drops_session() {
     assert!(!summary.established);
 }
 
-// Tests that the server signaling a dropped session surfaces as a reset and
-// drops the client's session, sends failing until a new handshake. A
-// request sent before the signal is read still goes out.
+// Tests that reading a server's empty-frame signal reports SessionReset and ends
+// the session. Sending remains possible until that signal is read, then requires
+// a new handshake.
 #[test]
 fn test_scripted_dropped_signal() {
     let summary = run_logged(&[
@@ -373,8 +369,8 @@ fn test_scripted_dropped_signal() {
     assert_eq!(summary.resets, 1);
     assert_eq!(summary.failures, 0);
 
-    // Without a session the signal still surfaces as a reset, so a request
-    // the server answered with a signal of its own shows up as a second reset
+    // Every signal reports SessionReset, including when no session exists and
+    // when several signals from the same ended session arrive consecutively.
     let summary = run_logged(&[Step::Dropped, Step::Recv]);
     assert_eq!(summary.resets, 1);
 
@@ -390,8 +386,8 @@ fn test_scripted_dropped_signal() {
     assert_eq!(summary.resets, 2);
 }
 
-// Tests that reads without a session consume a frame and fail with the
-// error matching the frame, the session check coming after the read.
+// Tests that receiving without a session still consumes input. Framing errors
+// and EOF take precedence over the error for a missing session.
 #[test]
 fn test_scripted_recv_without_session() {
     let summary = run_logged(&[Step::Junk(vec![1]), Step::Recv]);
@@ -407,8 +403,8 @@ fn test_scripted_recv_without_session() {
     assert_eq!(summary.failures, 0);
 }
 
-// Tests that a read failing in a session drops the session, the client not
-// knowing what it missed. So does the transport ending.
+// Tests that a read error or EOF ends an established client session and prevents
+// later sends through its old sender.
 #[test]
 fn test_scripted_read_failure_drops_session() {
     let summary = run_logged(&[Step::Handshake, Step::Hello, Step::Recv, Step::Send(1)]);
@@ -420,9 +416,8 @@ fn test_scripted_read_failure_drops_session() {
     assert_eq!(summary.failures, 1);
 }
 
-// Tests a transport failing under the client's writes. A send fails and
-// drops the session, a handshake fails at its reset or at its ack, and a
-// healed transport recovers.
+// Tests persistent client output failure during a send, reset, or HostAck.
+// Once writes recover, a fresh handshake restores the session.
 #[test]
 fn test_scripted_broken_transport() {
     let summary = run_logged(&[
@@ -454,11 +449,9 @@ fn test_scripted_broken_transport() {
     assert_eq!(summary.failures, 1);
 }
 
-// Tests the client's sends cut short. A cut request fails the send and
-// drops the session, the reset of the next handshake terminating what got
-// out, junk or the request itself, ahead of its hello. A cut reset, hello
-// or ack fails the handshake before anything is read, a fresh handshake
-// recovering either way.
+// Tests output cuts during a request, reset, HostHello, and HostAck. Each cut
+// fails the active call. The next handshake's reset terminates any partial output
+// before sending its own hello, allowing the same stream to recover.
 #[test]
 fn test_scripted_cut_sends() {
     for point in [
@@ -502,8 +495,8 @@ fn test_scripted_cut_sends() {
         assert_eq!(summary.failures, 1, "{point:?}");
     }
 
-    // A transport staying broken after the cut heals into a working
-    // handshake, the fragment waiting on the stream until then
+    // A partial frame survives further write failures until a successful reset
+    // can terminate it.
     let summary = run_logged(&[
         Step::Handshake,
         Step::Hello,
@@ -566,8 +559,7 @@ fn test_scripted_consecutive_handshake_failures() {
     }
 }
 
-// Tests that frames arriving in pieces, down to a byte per read, are
-// reassembled and read like whole ones.
+// Tests frame assembly across reads as small as one byte.
 #[test]
 fn test_scripted_chunked_reads() {
     for chunk in [1u8, 7, 254, 255] {
@@ -589,9 +581,8 @@ fn test_scripted_chunked_reads() {
     }
 }
 
-// Tests that frames batched into one read are read like frames arriving
-// one per read, the batch ending at the frame settling the call, so a
-// read never takes in more than its call consumes.
+// Tests several frames arriving in one read. The mock ends each batch at the
+// frame that determines the call's result, then resumes for the next call.
 #[test]
 fn test_scripted_batched_reads() {
     let summary = run_logged(&[
@@ -642,11 +633,9 @@ fn test_scripted_batched_reads() {
     }
 }
 
-// Tests frames cut short and unterminated ones in front of the client. A
-// truncated ArkHello or reply is stale to a handshake and drops a
-// session, whether its prefix still decodes or not. A partial ArkHello
-// swallows the frame after it into junk, a lone delimiter completing it
-// into the valid ArkHello it is instead.
+// Tests truncated and unterminated input. Handshake drains truncated frames;
+// receiving one in a session ends it. A delimiter completes a partial ArkHello,
+// while other following bytes merge into invalid input.
 #[test]
 fn test_scripted_interrupted_frames() {
     for cut in [0u8, 1, 7, 255] {
@@ -732,8 +721,8 @@ fn test_scripted_interrupted_frames() {
     }
 }
 
-// Tests that a read interrupted by a signal is retried by the framing, in
-// a handshake and in a session alike, the client none the wiser.
+// Tests that framing retries Interrupted reads during a handshake or session
+// without ending the call or changing its result.
 #[test]
 fn test_scripted_interrupted_reads() {
     let summary = run_logged(&[
@@ -800,9 +789,9 @@ fn test_scripted_handshake_timeouts() {
     }
 }
 
-// Tests a timed-out established send ending its binding and retained handles.
-// Reconnecting drains any interrupted output and issues a new sender; the old
-// handle remains refused and cannot affect the replacement's exchange.
+// Tests that a send timeout ends its session and invalidates retained senders.
+// Reconnecting completes any interrupted frame and supplies a new sender. The old
+// handle stays unusable and cannot affect the replacement session's exchange.
 #[test]
 fn test_scripted_send_timeouts() {
     for point in [
@@ -861,9 +850,9 @@ fn test_scripted_oversized_frames() {
     assert_eq!(summary.failures, 2);
 }
 
-// Tests oversized stale frames after a partial hello, with reads batched or
-// split into chunks. The overflow is skipped once and the remainder through its
-// delimiter is drained before accepting the fresh hello or the next reset.
+// Tests oversized input after a partial hello, with batched and chunked reads.
+// Its remaining bytes and delimiter are discarded before the fresh ArkHello or
+// later reset signal. Only one size error is reported during session receive.
 #[test]
 fn test_scripted_oversized_fragments() {
     for chunk in [0, 255] {
@@ -924,9 +913,9 @@ fn test_scripted_oversized_stale_frames() {
     }
 }
 
-// Tests that server frames, yields and interrupts outside a read queue up or
-// vanish, and that replies before a session are junk, as is truncating
-// with no valid frame yet.
+// Tests script steps before the first client call. Read faults and unavailable
+// replays or truncations do nothing. Responses without the required hello or
+// session become junk that a later handshake drains.
 #[test]
 fn test_scripted_noops() {
     let summary = run_logged(&[
@@ -943,11 +932,9 @@ fn test_scripted_noops() {
     assert_eq!(summary.handshakes, 1);
 }
 
-// Tests a middle cut armed together with a broken transport, which the reset
-// of a handshake is too short to trigger, so the cut stays armed and fires on
-// the hello of the next handshake once the transport heals. Regression for the
-// model spending the cut on the reset and then mispredicting that later
-// handshake as one that reads a reply.
+// Tests that a failed two-byte reset leaves a middle cut armed: the cut needs
+// at least three bytes. After writes recover, it must fail the next HostHello.
+// This guards against the model spending the cut on the earlier reset.
 #[test]
 fn test_scripted_cut_survives_broken_handshake() {
     let summary = run_logged(&[

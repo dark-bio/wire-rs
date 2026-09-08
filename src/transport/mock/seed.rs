@@ -1,10 +1,9 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Seeds for the fuzzers, the scripts of the scenario tests written out as
-//! the fuzzers' `Arbitrary` decoding reads them. Every scenario run writes
-//! its script into the corpus of the target reading such scripts, when the
-//! WIRE_SEEDS environment variable names the directory to write into.
+//! Encodes scenario scripts as seeds for the fuzzers' `Arbitrary` decoders.
+//! When `WIRE_SEEDS` names a directory, each scenario run writes its script
+//! into the corresponding target's seed corpus.
 
 use super::{CutPoint, client, duplex, server};
 use arbitrary::{Arbitrary, Unstructured};
@@ -14,30 +13,28 @@ use std::path::Path;
 /// Environment variable naming the directory the seeds are written into.
 pub const ENV: &str = "WIRE_SEEDS";
 
-/// Fuzz target driving the transport's real server through the mock client's
-/// scripts, which seed its corpus. Keep it in step with the binary in
-/// fuzz/Cargo.toml, the fuzz-seeds make target checks that every target listed
-/// there gets seeds.
+/// Target that drives the real server with mock client scripts.
+/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
+/// every binary has seeds.
 pub const TRANSPORT_SERVER: &str = "transport-server";
 
-/// Fuzz target driving the transport's real client through the mock server's
-/// scripts, which seed its corpus. Keep it in step with the binary in
-/// fuzz/Cargo.toml, the fuzz-seeds make target checks that every target listed
-/// there gets seeds.
+/// Target that drives the real client with mock server scripts.
+/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
+/// every binary has seeds.
 pub const TRANSPORT_CLIENT: &str = "transport-client";
 
 /// Fuzz target running real peers over bounded duplex pipes, with concurrent
 /// reconnects and operation deadlines. Each scenario seeds one complete run.
 pub const TRANSPORT_DUPLEX: &str = "transport-duplex";
 
-/// Encoder for the byte stream the fuzzers' `Arbitrary` decoding reads a
-/// script from. It mirrors arbitrary 1.4, integers little endian, a keep-going
-/// byte ahead of every vector element and an enum variant picked as the high
-/// half of a u32 scaled by the variant count.
+/// Encodes scripts in the format decoded by arbitrary 1.4.
+/// Integers use little-endian order. Each vector element starts with a
+/// continuation byte. Enum selection scales a u32 by the variant count and
+/// uses the upper 32 bits of the product as the variant index.
 pub struct Seed(Vec<u8>);
 
 impl Seed {
-    /// Picks the variant with the index out of the count.
+    /// Encodes a zero-based variant index from an enum with `count` variants.
     pub fn variant(&mut self, index: u32, count: u32) {
         let pick = (u64::from(index) << 32).div_ceil(u64::from(count)) as u32;
         self.0.extend_from_slice(&pick.to_le_bytes());
@@ -69,17 +66,15 @@ impl Seed {
     }
 }
 
-/// A step able to write itself as the fuzzers read it.
+/// A scenario or step that can encode itself for the fuzzers.
 pub trait Seedable: for<'a> Arbitrary<'a> + PartialEq + std::fmt::Debug {
     /// Appends this value's encoding so `Arbitrary` reconstructs the same step.
     fn seed(&self, seed: &mut Seed);
 }
 
-/// Writes the script into the seed corpus of the target, under the directory
-/// the WIRE_SEEDS environment variable names, checking that the bytes decode
-/// back into the same script. The file is named by the hash of its content,
-/// so regenerating leaves an unchanged script untouched. Without the variable
-/// set nothing happens.
+/// Writes a script under `WIRE_SEEDS/<target>`, if `WIRE_SEEDS` is set.
+/// First checks that the encoded bytes decode back into the same script.
+/// A content hash names the file, so an unchanged script keeps the same path.
 pub fn seed<S: Seedable>(target: &str, steps: &[S]) {
     let Some(root) = std::env::var_os(ENV) else {
         return;

@@ -1,20 +1,19 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Sealing of messages into packets with the xHPKE context of a direction,
-//! and opening them again.
+//! Seals messages into packets and opens them using each direction's xHPKE context.
 
 use crate::transport::{Error, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
 
 /// Bytes the session's AEAD adds to a sealed message (the Poly1305 tag).
 /// Sealing advances the HPKE sequence, so message sizes are bounded with this
-/// before sealing rather than by rejecting the sealed output afterwards.
+/// before sealing. Rejecting a packet after sealing would leave a sequence gap.
 pub(crate) const OVERHEAD: usize = 16;
 
 /// Seals a message for the peer with the outbound context. Messages above
 /// MAX_MESSAGE_SIZE are rejected before sealing, leaving the HPKE sequence
-/// untouched; a failure of the sealing itself leaves the context unusable.
+/// untouched. A crypto failure leaves the context unusable.
 pub(crate) fn seal(sender: &mut xhpke::Sender, message: &[u8]) -> Result<Vec<u8>, Error> {
     if message.len() > MAX_MESSAGE_SIZE {
         return Err(Error::PacketTooLarge(message.len()));
@@ -52,9 +51,9 @@ mod tests {
         }
     }
 
-    // Tests that the message limit is exact against the frame limit. The sealed
-    // and framed size of a maximal message fits a frame, the next byte pushing
-    // it over.
+    // Tests that the conservative message limit fits the worst-case sealing
+    // and COBS overhead. The next byte exceeds that worst-case frame budget;
+    // particular messages may still produce smaller frames.
     #[test]
     fn test_message_limit() {
         let framed = |size: usize| cobs::encode_buffer(size + OVERHEAD);
@@ -63,7 +62,7 @@ mod tests {
         assert!(framed(MAX_MESSAGE_SIZE + 1) > MAX_FRAME_SIZE);
     }
 
-    // Tests that a message at the limit seals into a frame sized packet and
+    // Tests that a message at the limit seals into a packet that fits a frame and
     // that one over the limit is rejected before sealing. The rejection leaves
     // the HPKE sequence untouched, so the session stays in sync.
     #[test]
@@ -80,9 +79,8 @@ mod tests {
             "{result:?}"
         );
 
-        // A maximal message must seal, frame within the limit and, the
-        // sequence not having advanced, open as the first message on the
-        // receiving side
+        // The rejected message did not advance the sequence. A maximal message
+        // must still seal, fit a frame and open as the receiver's first message.
         let message = vec![0x42; MAX_MESSAGE_SIZE];
         let sealed = seal(&mut sender, &message).unwrap();
         assert!(cobs::encode_buffer(sealed.len()) <= MAX_FRAME_SIZE);

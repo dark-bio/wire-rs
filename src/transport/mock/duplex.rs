@@ -2,8 +2,9 @@
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
 //! Concurrent scenarios between a real client and server on bounded byte pipes.
-//! Gates expose actual blocked I/O, while deadline-aware faults exercise recovery
-//! without closing the device stream. A watchdog only closes a failed test run.
+//! Gates let tests wait for I/O to block before injecting faults or reconnecting.
+//! Deadlines exercise recovery without closing the stream. A watchdog closes
+//! both peers if the scenario hangs.
 
 use super::self_attestation;
 use crate::transport::{Client, Closer, Error, Event, Read, Sender, Server, Stream, Write};
@@ -15,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Overall test patience, used to release every operation if a regression hangs.
+/// Maximum wait before a hung scenario fails and releases blocked operations.
 const PATIENCE: Duration = Duration::from_secs(8);
 
 /// Budget for deliberately stalled output, long enough for ordinary handshakes.
@@ -28,20 +29,20 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Scenario {
-    /// Reconnect while server output is blocked, optionally with old client
-    /// output blocked too. The reconnect must start draining before ending it.
+    /// Reconnect while server output is blocked, optionally with client output
+    /// blocked too. Input must drain before reconnect waits for the old send.
     Reconnect { both_directions: bool },
     /// Drain at least 33 legitimate old messages before a new handshake.
     Backlog(u8),
-    /// A server message times out in its body or flush, then the stream recovers.
+    /// A server message times out during its write or flush, then the stream recovers.
     ServerTimeout { flush: bool },
     /// ArkHello or HostAck times out in its write or flush. The ArkHello case
     /// deliberately aborts the client's read because peer replies have no timeout.
     HandshakeTimeout { ack: bool, flush: bool },
-    /// A failed read cancels blocked prelude output, or failed output cancels an
-    /// idle read. A subsequent attempt must use the same open stream successfully.
+    /// Fail a read while reset output is blocked, or fail output during an idle
+    /// read. Cancellation must release the other operation and allow a retry.
     FailedPrelude { read: bool },
-    /// Alternate both companion-failure directions across fresh reconnect scopes.
+    /// Alternate read and write failures across reconnect attempts.
     RepeatedAttempts(u8),
     /// Retry an abandoned handshake while its old ArkHello is still blocked,
     /// draining that reply so the server can consume the replacement hello.
@@ -55,7 +56,7 @@ enum Operation {
     Read,
     /// Append bytes to its bounded output queue.
     Write,
-    /// Flush after a complete frame has been queued.
+    /// Flush after an output buffer has been queued.
     Flush,
 }
 
@@ -79,7 +80,7 @@ enum FaultKind {
     Timeout,
 }
 
-/// A one-shot fault activated after enough complete frames have been flushed.
+/// A one-shot fault activated after a given number of successful flushes.
 #[derive(Clone, Copy, Debug)]
 struct Fault {
     operation: Operation,
@@ -99,8 +100,8 @@ struct State {
     faults: VecDeque<Fault>,
 }
 
-/// A byte pipe whose adapter calls honor deadlines and whose shutdown wakes all
-/// readers and writers without taking a lock they retain while blocked.
+/// Bounded byte pipe with deadline-aware I/O.
+/// Blocked calls release the state lock, so closing can acquire it and wake them.
 #[derive(Debug)]
 struct Pipe {
     capacity: usize,
@@ -155,7 +156,7 @@ impl Pipe {
         }
     }
 
-    /// Waits once while retaining an observation of the blocked operation.
+    /// Waits once and tracks the operation in the blocked-call count.
     fn wait<'a>(
         &self,
         mut state: MutexGuard<'a, State>,
@@ -185,8 +186,8 @@ impl Pipe {
         Some(state.faults.remove(index).unwrap().kind)
     }
 
-    /// Completes an injected failure, allowing permanent shutdown to interrupt
-    /// even a deliberately stalled operation.
+    /// Returns an injected error or waits for its deadline to expire.
+    /// Closing the pipe wakes even an intentionally stalled operation.
     fn fail(
         &self,
         mut state: MutexGuard<'_, State>,
@@ -404,8 +405,8 @@ impl Peers {
         }
     }
 
-    /// Connects and consumes preceding disconnect/message events until the
-    /// server reports the matching new connection.
+    /// Connects and waits for the server's new connection event.
+    /// Discards preceding disconnection and message events from the old session.
     fn connect(&mut self) -> (Sender<Adapter>, Sender<Adapter>) {
         let (client, _) = self.client.connect(&self.identity).unwrap();
         loop {
@@ -416,13 +417,13 @@ impl Peers {
         }
     }
 
-    /// Receives one server event, surfacing unexpected errors at the scenario.
+    /// Receives one server event. Panics on timeout or a transport error.
     fn event(&self) -> Event<Adapter> {
         self.events.recv_timeout(PATIENCE).unwrap().unwrap()
     }
 
-    /// Sends in the background and optionally releases server input only after
-    /// the send finishes, establishing the dependency used by both-way blockage.
+    /// Sends in the background and optionally releases server input afterwards.
+    /// This can make a blocked client send wait for a server send to finish.
     fn send(
         &mut self,
         sender: Sender<Adapter>,
@@ -455,8 +456,8 @@ impl Peers {
         );
     }
 
-    /// Injects one companion failure after both the helper's write and the main
-    /// read have actually blocked. The next scope must be independent of it.
+    /// Waits for the handshake's read and write to block, then fails one of them.
+    /// Checks that cancellation releases the other operation without closing.
     fn fail_prelude(&mut self, read: bool) {
         self.outgoing.pause(Operation::Write, true);
         let client = &mut self.client;
@@ -487,8 +488,8 @@ impl Peers {
 }
 
 impl Drop for Peers {
-    /// Cancels all adapter waits before joining workers, including while a test
-    /// unwinds, so assertion failures do not strand peers or native helpers.
+    /// Closes the adapters before joining workers, even after an assertion fails.
+    /// This keeps blocked peers and helper threads from being left behind.
     fn drop(&mut self) {
         self.closer.close();
         self.server_closer.close();
@@ -507,8 +508,8 @@ impl Drop for Peers {
     }
 }
 
-/// Runs one concurrency scenario, panicking if a real peer violates its expected
-/// progress, error attribution, session isolation or stream reuse.
+/// Runs one concurrency scenario and checks progress, errors and session isolation.
+/// Recovery must leave the same stream usable. Any mismatch panics.
 pub fn run(scenario: Scenario) {
     #[cfg(feature = "fuzz")]
     super::seed::seed(super::seed::TRANSPORT_DUPLEX, &[scenario]);
@@ -627,8 +628,8 @@ pub fn run(scenario: Scenario) {
                         incoming.state.lock().unwrap().delimiters,
                         usize::from(flush)
                     );
-                    // No complete ArkHello is promised, and waiting for a peer
-                    // reply has no deadline. Abort this read explicitly to retry.
+                    // The failed send may leave ArkHello incomplete. Waiting
+                    // for a reply has no deadline, so abort this read to retry.
                     incoming.fault(Operation::Read, 0, FaultKind::Error(io::ErrorKind::Other));
                     incoming.pause(Operation::Read, false);
                     assert!(matches!(
@@ -671,9 +672,8 @@ pub fn run(scenario: Scenario) {
                 ));
             });
 
-            // The server is still sending the earlier ArkHello. Receiving the
-            // new hello requires that old output to drain first, even though
-            // its response belongs to the abandoned client keys.
+            // The server is still sending ArkHello to the abandoned client keys.
+            // That output must drain before the server can read the new hello.
             let (client, server) = peers.connect();
             assert_eq!(peers.incoming.state.lock().unwrap().flushes, 2);
             peers.round_trip(&client, &server);
@@ -694,8 +694,8 @@ mod tests {
         }
     }
 
-    // Tests that arbitrary legitimate stale backlog does not cap reconnect at
-    // the old 32-frame limit, and old senders cannot enter the replacement.
+    // Tests reconnect with more than 32 queued messages from the old session.
+    // All must drain, and old senders must fail after the new session starts.
     #[test]
     fn test_reconnect_drains_stale_backlog() {
         for extra in [0, 63] {
@@ -703,8 +703,8 @@ mod tests {
         }
     }
 
-    // Tests that a blocked server body or flush times out without starting a new
-    // notification budget, and the same open device stream accepts another session.
+    // Tests that a blocked server write or flush times out without another
+    // notification attempt. The same open stream must accept a new session.
     #[test]
     fn test_server_timeout_preserves_stream() {
         for flush in [false, true] {
@@ -712,9 +712,9 @@ mod tests {
         }
     }
 
-    // Tests ArkHello and HostAck timeout recovery, including flush after complete
-    // delivery. ArkHello failure intentionally injects a client read abort because
-    // the transport does not impose an overall deadline on waiting for a peer reply.
+    // Tests ArkHello and HostAck timeout recovery, including failed flush after
+    // complete delivery. After ArkHello fails, the test aborts the client read:
+    // waiting for a peer reply has no overall deadline.
     #[test]
     fn test_handshake_timeout_recovery() {
         for ack in [false, true] {
@@ -724,8 +724,8 @@ mod tests {
         }
     }
 
-    // Tests both cancellation directions of the scoped handshake helper: failed
-    // reads release blocked output, and failed output releases an idle read.
+    // Tests that failed handshake reads cancel blocked output and failed output
+    // cancels an idle read. The stream must remain open for the next attempt.
     #[test]
     fn test_companion_failure_preserves_stream() {
         for read in [false, true] {
@@ -733,8 +733,8 @@ mod tests {
         }
     }
 
-    // Tests that joined failed attempts cannot leak cancellation into later
-    // successful handshakes on the same stream across alternating failure modes.
+    // Tests alternating read and write failures followed by successful retries.
+    // Cancellation from an earlier attempt must not affect a later handshake.
     #[test]
     fn test_repeated_attempts_have_independent_cancellation() {
         run(Scenario::RepeatedAttempts(2));

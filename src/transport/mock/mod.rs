@@ -1,11 +1,12 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Mock peers driving one real side of the wire through arbitrary frame
-//! sequences. A script decides what the side under test reads next. A model
-//! of the protocol's state machine predicts the reaction to each frame, and a
-//! run panics at the first divergence between the two. The scenario tests and
-//! the packet level fuzzers share this, so a fuzzer finding replays as a test.
+//! Scripted mock peers and concurrent scenarios for the transport.
+//!
+//! Each mock drives one real peer through a sequence of frames and failures.
+//! A state machine predicts the peer's reaction and panics on a mismatch.
+//! Duplex scenarios run both real peers over bounded pipes. Tests and fuzzers
+//! share these runners so a fuzz finding can become a regression test.
 
 pub mod client;
 pub mod duplex;
@@ -25,21 +26,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use vector::{Event, Vector};
 
-/// Most steps a script is run for. It bounds the runtime of a fuzz iteration
-/// and keeps the unterminated frames a script can pile up well below the
-/// frame limit.
+/// Maximum steps run from one script, limiting the work in a fuzz iteration.
 pub const MAX_STEPS: usize = 64;
 
-/// Signing time stamped into everything the mocks and the drivers seal. The
-/// wire never checks it, so a fixed one keeps the transcripts off the clock.
+/// Fixed signing timestamp used by mocks and drivers to keep recorded output
+/// independent of the clock.
 pub const TIMESTAMP: i64 = 0;
 
 /// Message one byte past the send limit, used to assert refusal without advancing
 /// encryption or touching the writer. Shared so fuzz steps need no large allocation.
 pub(super) const OVERSIZED_MESSAGE: &[u8] = &[0x42; MAX_MESSAGE_SIZE + 1];
 
-/// Payload of a message the mocks exchange, the tag as eight big endian
-/// bytes. It only tells the messages apart, the transport never reads it.
+/// Encodes a tag as eight big-endian bytes to identify a test message.
+/// The transport treats this payload as opaque bytes.
 pub fn payload(tag: u64) -> Vec<u8> {
     tag.to_be_bytes().to_vec()
 }
@@ -54,8 +53,8 @@ pub(super) fn send<W: Write>(sender: Option<&Sender<W>>, message: &[u8]) -> Resu
     }
 }
 
-/// Self-signed attestation of a never onboarded server, embedding the identity
-/// key that signs the handshake.
+/// Creates a self-signed device attestation for a server without onboarding.
+/// It embeds the server's handshake signing key.
 pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
     let claims = darkbio_trust::device::HardwareClaims {
         sub: claims::Subject { sub: "".into() },
@@ -76,9 +75,9 @@ pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
     Attestation::new(cwt).unwrap()
 }
 
-/// Well formed attestation of the wrong shape, a cloud signer attestation
-/// issued under the device attestation domain. The wire refuses it as a device
-/// attestation before any verifier sees it.
+/// Creates a cloud signer attestation under the device attestation domain.
+/// Its claims have the wrong shape for a device, so the transport rejects it
+/// before calling the verifier.
 pub fn cloud_attestation(signer: &xdsa::SecretKey) -> Vec<u8> {
     let claims = darkbio_trust::cloud::SignerClaims {
         iss: claims::Issuer { iss: "".into() },
@@ -96,7 +95,7 @@ pub fn cloud_attestation(signer: &xdsa::SecretKey) -> Vec<u8> {
     .unwrap()
 }
 
-/// COBS encodes a packet into a frame, delimiter included.
+/// COBS encodes a packet and appends its frame delimiter.
 pub fn frame(packet: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; cobs::encode_buffer(packet.len())];
     let n = cobs::encode(packet, &mut buf).unwrap();
@@ -105,7 +104,8 @@ pub fn frame(packet: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// COBS decodes a frame, its delimiter already stripped, back into a packet.
+/// COBS decodes a frame whose delimiter has already been removed.
+/// Panics if the side under test wrote an invalid frame.
 pub fn unframe(frame: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; cobs::decode_buffer(frame.len())];
     let n = cobs::decode(frame, &mut buf).expect("side under test wrote an undecodable frame");
@@ -113,13 +113,12 @@ pub fn unframe(frame: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// The error a read fails with when a script yields.
+/// Returns the read error used when a script yields control to its driver.
 pub fn would_block() -> io::Error {
     io::ErrorKind::WouldBlock.into()
 }
 
-/// Transcript of the run in progress, shared by everything logging into it,
-/// absent when the run is not recorded.
+/// Shared transcript for the current run. Contains `None` when recording is off.
 pub type Recorder = Arc<Mutex<Option<Vector>>>;
 
 /// Logs an event into the transcript, if the run is recorded.
@@ -129,28 +128,27 @@ pub fn trace(recorder: &Recorder, event: impl FnOnce() -> Event) {
     }
 }
 
-/// Where a write of the side under test is cut, standing in for a transport
-/// dying under it. A recovery delimiter belongs to the same write as its frame.
+/// Point where a scripted output failure occurs.
+/// A recovery delimiter belongs to the same write as its frame.
 /// Only `Start` applies to a lone delimiter; `Middle` needs at least three bytes,
 /// while `Delimiter` and `Flush` also apply to a two-delimiter signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum CutPoint {
-    /// Nothing of the write goes out.
+    /// Fails before accepting any bytes.
     Start,
     /// Accepts `1 + min(n, len - 3)` bytes of a write at least three bytes long.
     /// Zero accepts its first byte, which can be only the recovery delimiter.
     /// Larger offsets clamp before the final body byte and frame delimiter.
     Middle(u16),
-    /// Everything but the delimiter goes out.
+    /// Accepts everything except the final delimiter, then fails.
     Delimiter,
-    /// Everything goes out, the flush after it failing.
+    /// Accepts all bytes, then fails during flush.
     Flush,
 }
 
-/// Frames written by the side under test, drained by the mock peer. Its
-/// writes can be cut short or made to fail, standing in for a transport that
-/// died.
+/// Captures output for the mock peer to consume.
+/// Scripts can inject partial writes, timeouts and persistent write failures.
 #[derive(Clone, Default)]
 pub struct Outbox {
     shared: Arc<Output>,
@@ -164,8 +162,7 @@ struct Output {
     changed: Condvar,
 }
 
-/// Output mutations under one lock, including the flush boundary a scripted
-/// reader waits for before answering the new HostHello.
+/// Captured bytes, injected faults and handshake progress under one lock.
 #[derive(Default)]
 struct OutputState {
     bytes: Vec<u8>,
@@ -179,64 +176,60 @@ struct OutputState {
 }
 
 impl Outbox {
-    /// Takes the frames written so far, delimiters stripped. A trailing
-    /// unterminated frame stays behind, the delimiter of the next write
-    /// completing it.
+    /// Removes and returns all delimited frames, without their delimiters.
+    /// Keeps any unfinished tail until a later write supplies its delimiter.
     pub fn take_frames(&self) -> Vec<Vec<u8>> {
         let mut state = self.shared.state.lock().unwrap();
-        // Splitting at the delimiters leaves the unterminated tail last, empty
-        // if the last write ended on one
+        // The final piece is the unfinished tail, or empty after a delimiter.
         let mut frames: Vec<Vec<u8>> = state.bytes.split(|&b| b == 0).map(<[u8]>::to_vec).collect();
         let tail = frames.pop().expect("split yields at least one piece");
         state.bytes = tail;
         frames
     }
 
-    /// Whether an unterminated frame was left behind.
+    /// Reports whether captured output contains an unfinished frame.
     pub fn has_tail(&self) -> bool {
         !self.shared.state.lock().unwrap().bytes.is_empty()
     }
 
-    /// Makes every write fail from here on, or work again.
+    /// Enables or clears a persistent write failure.
     pub fn set_broken(&self, broken: bool) {
         self.shared.state.lock().unwrap().broken = broken;
     }
 
-    /// Cuts the next write the point applies to, firing ahead of a broken
-    /// transport.
+    /// Arms a failure for the next write to which this cut point applies.
+    /// The cut takes priority over a persistent write failure.
     pub fn set_cut(&self, point: CutPoint) {
         let mut state = self.shared.state.lock().unwrap();
         state.cut = Some(point);
         state.timeout = false;
     }
 
-    /// Expires the next matching write or flush after the same prefix as a cut.
-    /// Returning TimedOut represents an exhausted operation budget without a
-    /// wall-clock sleep, keeping timeout scenarios fast and deterministic.
+    /// Arms a timeout at the selected cut point.
+    /// Returns `TimedOut` without sleeping so scripted timeout tests stay fast.
     pub fn set_timeout(&self, point: CutPoint) {
         let mut state = self.shared.state.lock().unwrap();
         state.cut = Some(point);
         state.timeout = true;
     }
 
-    /// Makes synthetic reads wait until the next reset and HostHello have both
-    /// flushed. The real duplex scenarios exercise reading during those writes;
-    /// this gate keeps model predictions and vector ordering deterministic.
+    /// Delays scripted reads until the next reset and HostHello have both flushed.
+    /// This keeps model predictions and vector ordering deterministic. Duplex
+    /// scenarios cover the real peer reading while those writes are in progress.
     pub fn prepare_handshake(&self) {
         let mut state = self.shared.state.lock().unwrap();
         state.handshake = Some(state.flushes + 2);
     }
 
-    /// Releases the synthetic prefix gate after a handshake returns, including
-    /// one whose failed writer could not flush the prefix.
+    /// Releases the read gate after a handshake returns, even if its output failed.
     pub fn finish_handshake(&self) {
         self.shared.state.lock().unwrap().handshake = None;
         self.shared.changed.notify_all();
     }
 
-    /// Waits for the scripted handshake prefix, releasing the output lock while
-    /// waiting. A failed writer never reaches its goal, so the read poll expires
-    /// and lets the transport observe the writer's cancellation signal.
+    /// Waits for reset and HostHello to flush, releasing the lock while waiting.
+    /// Returns false if this short poll expires. That lets the reader observe
+    /// cancellation when failed output cannot complete the handshake prefix.
     pub fn await_handshake(&self, deadline: Instant) -> bool {
         // A short synthetic poll keeps failed-helper fuzz cases fast. Real
         // adapter deadline behavior is covered by the bounded duplex scenarios.
@@ -262,9 +255,8 @@ impl Outbox {
         }
     }
 
-    /// How much of a write the transport takes and whether it reports failure.
-    /// An armed cut fires ahead of a broken transport, on the first write with
-    /// enough of a body for it.
+    /// Chooses how many bytes to accept and which error to report afterwards.
+    /// An applicable cut takes priority over a persistent write failure.
     fn accept(state: &mut OutputState, buf: &[u8]) -> (usize, Option<io::ErrorKind>) {
         if let Some(point) = state.cut {
             let accepted = match point {
@@ -296,8 +288,8 @@ impl Outbox {
 impl Write for Outbox {
     fn set_write_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
         // Scripted faults determine expiry without wall-clock delays.
-        // A new frame may follow cancellation before a deferred failure was
-        // observed; that failure belongs only to the previous frame's output.
+        // Cancellation can leave an error unobserved. Starting a new frame
+        // discards that error because it belongs to the previous output.
         let mut state = self.shared.state.lock().unwrap();
         state.write_error = None;
         state.flush_error = None;
@@ -322,8 +314,8 @@ impl io::Write for Outbox {
                 failed: error.is_some(),
             },
         });
-        // Keep one logical failed-write event in the transcript, while each
-        // standard call reports progress before surfacing the deferred error.
+        // The transcript records accepted bytes and failure as one event.
+        // Standard I/O reports them separately: Ok(n), then an error.
         match error {
             Some(error) if accepted > 0 => {
                 state.write_error = Some(error);
