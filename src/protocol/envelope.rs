@@ -48,6 +48,7 @@ impl Parity {
 }
 
 impl From<Side> for Parity {
+    /// Maps the host role to odd request IDs and the Ark role to even ones.
     fn from(side: Side) -> Self {
         match side {
             Side::Client => Self::Odd,
@@ -76,6 +77,7 @@ pub trait Envelope: Message + Default + sealed::Sealed + 'static {
 
 /// Supertrait nobody outside the crate can implement, closing the envelopes.
 mod sealed {
+    /// Restricts envelope implementations to the two generated wire messages.
     pub trait Sealed {}
 
     impl Sealed for super::HostToArk {}
@@ -83,8 +85,10 @@ mod sealed {
 }
 
 impl Envelope for HostToArk {
+    /// Payload variants available in the host-to-Ark envelope.
     type Content = host_to_ark::Content;
 
+    /// Builds a host-to-Ark request with content and no application error.
     fn request(id: u64, content: Self::Content) -> Self {
         Self {
             id,
@@ -92,17 +96,21 @@ impl Envelope for HostToArk {
             content: Some(content),
         }
     }
+    /// Builds a host-to-Ark response, preserving the supplied content and error.
     fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self {
         Self { id, err, content }
     }
+    /// Takes the host-to-Ark envelope apart without validating its field combination.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }
 
 impl Envelope for ArkToHost {
+    /// Payload variants available in the Ark-to-host envelope.
     type Content = ark_to_host::Content;
 
+    /// Builds an Ark-to-host request with content and no application error.
     fn request(id: u64, content: Self::Content) -> Self {
         Self {
             id,
@@ -110,9 +118,11 @@ impl Envelope for ArkToHost {
             content: Some(content),
         }
     }
+    /// Builds an Ark-to-host response, preserving the supplied content and error.
     fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self {
         Self { id, err, content }
     }
+    /// Takes the Ark-to-host envelope apart without validating its field combination.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
@@ -142,7 +152,8 @@ impl Kind {
 /// Allocator of the request ids of one side, handing out the ids of its
 /// parity in order, from any thread.
 pub(crate) struct Ids {
-    next: AtomicU64, // Next id to hand out
+    /// Next ID to hand out, incremented atomically by two to preserve parity.
+    next: AtomicU64,
 }
 
 impl Ids {
@@ -154,24 +165,30 @@ impl Ids {
         }
     }
 
-    /// Hands out the next id.
+    /// Hands out the next ID. The counter wraps on overflow; this allocator does
+    /// not detect reuse or enforce a session's request-ID exhaustion policy.
     pub(crate) fn next(&self) -> u64 {
         self.next.fetch_add(2, Ordering::Relaxed)
     }
 }
 
+/// Checks the existing envelope construction and parity conventions.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
-    // Tests the classification of incoming ids on both sides, the parity of
-    // one's own requests meaning a response and the other one a request.
+    /// Tests incoming ID classification: own parity means a response, the other
+    /// parity means a peer request.
     #[test]
     fn test_kinds() {
+        /// One received ID and its expected interpretation for the receiving side.
         struct TestCase {
+            /// Incoming envelope ID, including legacy zero and boundary examples.
             id: u64,
+            /// Parity allocated by the side receiving this envelope.
             parity: Parity,
+            /// Expected request or response classification, retaining the same ID.
             kind: Kind,
         }
         let tests = [
@@ -217,8 +234,7 @@ mod tests {
         }
     }
 
-    // Tests that the allocators of the two sides hand out their parities in
-    // order and never meet.
+    /// Tests the first IDs of both allocators and their interpretation on each side.
     #[test]
     fn test_ids() {
         let client = Ids::new(Parity::from(Side::Client));
@@ -239,8 +255,7 @@ mod tests {
         }
     }
 
-    // Tests that the envelopes of both directions build as the conventions
-    // say and come apart the same after a trip through their encoding.
+    /// Tests that encoding preserves envelope IDs, content and application errors.
     #[test]
     fn test_envelopes() {
         let err = RemoteError {

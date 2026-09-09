@@ -6,6 +6,8 @@
 use super::Error;
 use super::generated::*;
 
+/// Defines the shared body enum and conversions from the schema-derived payload list.
+/// The build script invokes this once with the union of both envelope directions.
 macro_rules! messages {
     ($($variant:ident($payload:ty),)*) => {
         /// A request or successful response body, shared by hosts and servers.
@@ -26,6 +28,7 @@ macro_rules! messages {
         }
 
         impl Message {
+            /// Returns the payload's Rust type name for response mismatch errors.
             fn message_type(&self) -> &'static str {
                 match self {
                     $(Self::$variant(_) => stringify!($payload),)*
@@ -35,14 +38,17 @@ macro_rules! messages {
 
         $(
             impl From<$payload> for Message {
+                /// Wraps a concrete payload in its corresponding message variant.
                 fn from(message: $payload) -> Self {
                     Self::$variant(message)
                 }
             }
 
             impl TryFrom<Message> for $payload {
+                /// Variant mismatch between the received and requested payload types.
                 type Error = Error;
 
+                /// Extracts this payload only when the message variant matches.
                 fn try_from(message: Message) -> Result<Self, Self::Error> {
                     match message {
                         Message::$variant(message) => Ok(message),
@@ -58,3 +64,49 @@ macro_rules! messages {
 }
 
 include!(concat!(env!("OUT_DIR"), "/message.rs"));
+
+/// Checks variant-safe conversion between message bodies and concrete payloads.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use crate::protocol::{self, DeviceInfoRequest, DeviceInfoResponse, Error, Message};
+
+    /// Requires variant-checked extraction even when protobuf byte decoding would accept
+    /// another message type. These conversions already execute while the API is a skeleton.
+    #[test]
+    fn response_extraction_checks_the_variant() {
+        use prost::Message as _;
+
+        let other = protocol::OnboardingResponse {};
+        assert!(DeviceInfoResponse::decode(other.encode_to_vec().as_slice()).is_ok());
+        let message: Message = other.into();
+        assert!(matches!(
+            DeviceInfoResponse::try_from(message),
+            Err(Error::UnexpectedResponse {
+                expected: "DeviceInfoResponse",
+                received: "OnboardingResponse",
+            })
+        ));
+
+        // These bodies have the same field name and tag in opposite wire envelopes,
+        // but must remain distinct variants in the common public message enum.
+        let message: Message = DeviceInfoRequest {}.into();
+        assert!(matches!(
+            DeviceInfoResponse::try_from(message),
+            Err(Error::UnexpectedResponse {
+                expected: "DeviceInfoResponse",
+                received: "DeviceInfoRequest",
+            })
+        ));
+
+        let response = DeviceInfoResponse {
+            version_id: 7,
+            ..Default::default()
+        };
+        let message: Message = response.clone().into();
+        assert_eq!(DeviceInfoResponse::try_from(message).unwrap(), response);
+
+        let message: Message = vec![1, 2, 3].into();
+        assert_eq!(Vec::<u8>::try_from(message).unwrap(), vec![1, 2, 3]);
+    }
+}

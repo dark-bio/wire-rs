@@ -1,6 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
+//! Request and reply promises; completion and observation remain API skeletons.
+
 use super::{Error, Message};
 
 /// Promise for an eagerly submitted request's answer.
@@ -17,6 +19,7 @@ use super::{Error, Message};
 /// }
 /// ```
 pub struct Pending {
+    /// Prevents external construction until operation registration supplies promises.
     _private: (),
 }
 
@@ -39,6 +42,10 @@ impl Pending {
 }
 
 impl Drop for Pending {
+    /// Abandons observation without cancelling the submitted request.
+    ///
+    /// # Panics
+    /// API skeleton; observation release is not implemented yet.
     fn drop(&mut self) {
         todo!("protocol request observation release")
     }
@@ -48,6 +55,7 @@ impl Drop for Pending {
 /// Dropping it abandons observation; the reply continues under its original
 /// deadline. Completion does not mean the peer received or processed the reply.
 pub struct WritePending {
+    /// Prevents external construction until reply registration supplies promises.
     _private: (),
 }
 
@@ -63,7 +71,27 @@ impl WritePending {
 }
 
 impl Drop for WritePending {
+    /// Abandons observation without removing the reply from output.
+    ///
+    /// # Panics
+    /// API skeleton; observation release is not implemented yet.
     fn drop(&mut self) {
         todo!("protocol reply observation release")
+    }
+}
+
+/// Checks that both promise owners can be transferred to application threads.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::{Pending, WritePending};
+
+    /// Checks the send bound required to transfer ownership to an application thread.
+    #[test]
+    fn test_thread_capabilities() {
+        /// Requires an owned value to be transferable to a background thread.
+        fn movable<T: Send + 'static>() {}
+        movable::<Pending>();
+        movable::<WritePending>();
     }
 }

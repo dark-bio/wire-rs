@@ -1,14 +1,20 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
+//! Clonable request submission bound to the originating session.
+
+use super::session::Shared;
 use super::{Error, Message, Pending};
+use std::sync::Weak;
 use std::time::Instant;
 
 /// Clonable capability to initiate requests in its original session.
 /// Does not keep the session open or follow a replacement session. Dropping a
 /// requester does not close the session or cancel operations it already submitted.
+#[derive(Clone)]
 pub struct Requester {
-    _private: (),
+    /// Original session, never a lookup of the endpoint's newest session.
+    session: Weak<Shared>,
 }
 
 impl Requester {
@@ -25,18 +31,57 @@ impl Requester {
     /// The expected response type is selected at [`Pending::wait`].
     ///
     /// # Panics
-    /// API skeleton; not implemented yet.
+    /// Open-session submission is not implemented yet. Ended sessions are refused.
     pub fn request(
         &self,
-        _request: impl Into<Message>,
-        _deadline: Instant,
+        request: impl Into<Message>,
+        deadline: Instant,
     ) -> Result<Pending, Error> {
-        todo!("protocol request submission")
+        self.session
+            .upgrade()
+            .ok_or(Error::Closed)?
+            .request(request.into(), deadline)
+    }
+
+    /// Creates a submission capability that does not retain its session owner.
+    pub(super) fn new(session: Weak<Shared>) -> Self {
+        Self { session }
     }
 }
 
-impl Clone for Requester {
-    fn clone(&self) -> Self {
-        todo!("protocol requester clone")
+/// Checks requester sharing and compiles pipelined request submission.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use crate::protocol::{
+        DeviceInfoRequest, DeviceInfoResponse, Error, Message, Pending, Requester, Session,
+    };
+    use std::time::Instant;
+
+    /// Compiles pipelined requests, discarded observations and caller-selected replies.
+    #[allow(dead_code)]
+    fn pipeline(session: &Session, deadline: Instant) -> Result<(), Error> {
+        let requester: Requester = session.requester();
+        let first: Pending = requester.request(DeviceInfoRequest {}, deadline)?;
+        let second = requester.request(DeviceInfoRequest {}, deadline)?;
+
+        // Observation can be abandoned without selecting a response type.
+        drop(requester.request(DeviceInfoRequest {}, deadline)?);
+
+        // Caller-selected typing, by annotation or by explicit generic argument.
+        let _: DeviceInfoResponse = second.wait()?;
+        let _ = first.wait::<DeviceInfoResponse>()?;
+
+        // Callers may also request the message enum to match it themselves.
+        let _: Message = requester.request(DeviceInfoRequest {}, deadline)?.wait()?;
+        Ok(())
+    }
+
+    /// Checks the clone, send and sync bounds required for a shared capability.
+    #[test]
+    fn test_thread_capabilities() {
+        /// Requires a capability to be clonable and usable by multiple threads.
+        fn shared<T: Clone + Send + Sync + 'static>() {}
+        shared::<Requester>();
     }
 }

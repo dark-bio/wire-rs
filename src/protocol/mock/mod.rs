@@ -1,0 +1,7 @@
+// wire-rs: encrypted protocol between Ark and host
+// Copyright 2026 Dark Bio AG. All rights reserved.
+
+//! Scripted scenarios for protocol ownership, retirement and session isolation.
+//! Each runner keeps its regression scripts in a neighboring tests module.
+
+mod session;

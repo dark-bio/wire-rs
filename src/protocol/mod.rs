@@ -3,10 +3,12 @@
 
 //! Bidirectional requests over the transport, with pipelining and explicit sessions.
 //!
-//! **API skeleton:** the session API is not implemented yet. Its operations panic
-//! with `todo!`; the documentation records the contracts to implement. The working
-//! previous implementation and its scenario runners live in [`legacy`]. Protobuf
-//! bindings and message/content conversions are implemented.
+//! **Work in progress:** session ownership, local retirement and receive wakeups
+//! are implemented. Connection construction, request/reply execution and promises
+//! still contain `todo!` skeletons. Session construction and delivery are currently
+//! exercised through internal fixtures; real transport integration comes later.
+//! The working previous implementation and its scenario runners live in [`legacy`].
+//! Protobuf bindings and message/content conversions are implemented.
 //!
 //! The application opens a [`crate::transport::Stream`]; this layer constructs and
 //! owns its transport. [`connect`] establishes one client session. [`Server`] owns
@@ -23,8 +25,9 @@
 //! receiving requests while jobs wait for reverse requests. All waiting is blocking;
 //! no async runtime is required. Notification-like requests receive a reply too.
 //!
-//! Configuration, resource limits and close completion relative to in-progress
-//! writes remain to be specified before their implementation.
+//! Closing retires unresolved operations instead of draining RPCs. Already-admitted
+//! transport I/O may still return. Configuration and resource limits remain to be
+//! specified before their implementation.
 
 mod closer;
 mod envelope;
@@ -36,6 +39,10 @@ mod requester;
 mod responder;
 mod server;
 mod session;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod mock;
 
 pub use closer::Closer;
 pub use envelope::Envelope;

@@ -1,6 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
+//! Cloneable operation failures shared by retirement and promise completion.
+
 use super::RemoteError;
 use crate::transport;
 use std::convert::Infallible;
@@ -52,19 +54,21 @@ pub enum Error {
 }
 
 impl From<transport::Error> for Error {
+    /// Shares a transport failure so every affected operation can retain its cause.
     fn from(error: transport::Error) -> Self {
         Self::Transport(Arc::new(error))
     }
 }
 
 impl From<RemoteError> for Error {
+    /// Preserves a peer application's error without classifying it as session loss.
     fn from(error: RemoteError) -> Self {
         Self::Remote(error)
     }
 }
 
-// Message can be taken directly via its infallible identity conversion.
 impl From<Infallible> for Error {
+    /// Supports taking `Message` directly through its infallible identity conversion.
     fn from(error: Infallible) -> Self {
         match error {}
     }
