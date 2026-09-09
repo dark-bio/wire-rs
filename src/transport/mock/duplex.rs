@@ -165,17 +165,17 @@ impl Pipe {
         let deadline = Instant::now() + PATIENCE;
         let mut state = self.state.lock().unwrap();
         while state.waiting[operation.index()] == 0 {
-            let (next, timeout) = self
-                .changed
-                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
-            state = next;
-            if timeout.timed_out() {
+            if Instant::now() >= deadline {
                 // Do not poison the pipe on assertion failure: the watchdog and
                 // peer cleanup still need its lock to release blocked calls.
                 drop(state);
                 panic!("{operation:?} never blocked");
             }
+            state = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .0;
         }
     }
 
@@ -229,6 +229,9 @@ impl Pipe {
             FaultKind::Timeout => loop {
                 if state.closed {
                     return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(io::ErrorKind::TimedOut.into());
                 }
                 state = self.wait(state, operation, deadline)?;
             },
