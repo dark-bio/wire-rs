@@ -14,6 +14,7 @@ use crate::transport::{
 };
 use crate::transport::{Read, Write};
 use base64::prelude::*;
+use darkbio_cobs as cobs;
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use serde_json::Value;
 use std::io::{self, ErrorKind};
@@ -435,14 +436,11 @@ impl Peer {
                 // Encryption may change the bytes and frame length, but not
                 // the recipient. A failed recording can end mid-frame even
                 // when the fresh, shorter replay frame was fully accepted.
-                if !failed || recorded.last() == Some(&0) {
-                    let recorded_packet = unframe(&recorded[..recorded.len() - 1]);
-                    assert_eq!(
-                        fingerprint,
-                        cose::recipient(&recorded_packet).expect("recorded ack has no recipient"),
-                        "client ack recipient differs from the recorded one"
-                    );
-                }
+                assert_eq!(
+                    fingerprint,
+                    recorded_ack_recipient(recorded),
+                    "client ack recipient differs from the recorded one"
+                );
                 let crypto = self
                     .xhpke
                     .iter()
@@ -479,6 +477,34 @@ impl Peer {
             }
         }
     }
+}
+
+/// Extracts the expected recipient from a complete or partially recorded ACK.
+/// A failed prefix covering a complete replay frame contains the protected
+/// header even if the final ciphertext chunk is incomplete. Decode its complete
+/// COBS chunks and require that header; never infer it from the replay's output.
+fn recorded_ack_recipient(frame: &[u8]) -> xhpke::Fingerprint {
+    if let Some(frame) = frame.strip_suffix(&[0]) {
+        return cose::recipient(&unframe(frame)).expect("recorded ack has no recipient");
+    }
+    let mut packet = vec![0; cobs::decode_buffer(frame.len())];
+    let size = match cobs::decode(frame, &mut packet) {
+        Err(cobs::DecodeError::ChunkOverflow { at, .. }) => cobs::decode(&frame[..at], &mut packet),
+        result => result,
+    }
+    .expect("recorded ack prefix has invalid COBS");
+    let mut decoder = cbor::Decoder::new(&packet[..size]);
+    assert_eq!(
+        decoder.decode_array_header().unwrap(),
+        3,
+        "expected Encrypt0"
+    );
+    let protected = decoder
+        .decode_bytes()
+        .expect("recorded ack prefix lacks its protected header");
+    let header: cose::EncProtectedHeader =
+        cbor::decode(&protected).expect("recorded ack has invalid protected header");
+    header.kid
 }
 
 // Tests a failed prefix whose recorded length covers a shorter replay frame.
@@ -553,11 +579,11 @@ fn test_vectors_replay() {
 
 /// Builds a replay peer, a sealed HostAck and its client sending context.
 /// The peer has not processed the acknowledgement yet.
-fn checker_session() -> (Peer, Vec<u8>, xhpke::Sender) {
+fn checker_session(seed: u8) -> (Peer, Vec<u8>, xhpke::Sender) {
     use crate::transport::mock::frame;
 
     let identity = xdsa::SecretKey::from_bytes(&[1; xdsa::SECRET_KEY_SIZE]).public_key();
-    let crypto = xhpke::SecretKey::from_bytes(&[2; xhpke::SECRET_KEY_SIZE]);
+    let crypto = xhpke::SecretKey::from_bytes(&[seed; xhpke::SECRET_KEY_SIZE]);
     let signer = xdsa::SecretKey::from_bytes(&[3; xdsa::SECRET_KEY_SIZE]);
     let (sender, encap) = crypto
         .public_key()
@@ -597,7 +623,7 @@ fn test_checker_rejects_incomplete_successful_output() {
         (&[0, 2, 42, 0][..], &[0, 2, 42][..]),
         (&[0, 0][..], &[0][..]),
     ] {
-        let (mut peer, _, _) = checker_session();
+        let (mut peer, _, _) = checker_session(2);
         assert!(
             catch_unwind(AssertUnwindSafe(
                 || peer.check(recorded, actual, false, None)
@@ -616,7 +642,7 @@ fn test_checker_requires_recovery_delimiter() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     for failed in [false, true] {
-        let (mut peer, ack, _) = checker_session();
+        let (mut peer, ack, _) = checker_session(2);
         let mut recorded = vec![0];
         recorded.extend_from_slice(&ack);
         assert!(
@@ -636,8 +662,8 @@ fn test_checker_requires_recovery_delimiter() {
 fn test_checker_exact_ack_installs_receiver() {
     use crate::transport::mock::frame;
 
-    let (mut peer, ack, mut sender) = checker_session();
-    let (_, _, mut recorded_sender) = checker_session();
+    let (mut peer, ack, mut sender) = checker_session(2);
+    let (_, _, mut recorded_sender) = checker_session(2);
     peer.check(&ack, &ack, false, None);
 
     let message = b"first request";
@@ -654,8 +680,8 @@ fn test_checker_exact_ack_installs_receiver() {
 fn test_checker_exact_request_advances_receiver() {
     use crate::transport::mock::frame;
 
-    let (mut peer, ack, mut sender) = checker_session();
-    let (_, recorded_ack, mut recorded_sender) = checker_session();
+    let (mut peer, ack, mut sender) = checker_session(2);
+    let (_, recorded_ack, mut recorded_sender) = checker_session(2);
     assert_ne!(ack, recorded_ack);
     peer.check(&recorded_ack, &ack, false, None);
 
@@ -675,7 +701,7 @@ fn test_checker_exact_request_advances_receiver() {
 // while a successful write may match an explicitly recorded unfinished prefix.
 #[test]
 fn test_checker_accepts_recorded_partial_output() {
-    let (mut peer, _, _) = checker_session();
+    let (mut peer, _, _) = checker_session(2);
     peer.check(&[2, 42, 0], &[2, 42], true, None);
     peer.check(&[2, 42], &[2, 42], false, None);
     peer.check(&[0], &[0], false, None);
@@ -685,36 +711,16 @@ fn test_checker_accepts_recorded_partial_output() {
 // signature from the current client. Randomized encryption preserves its recipient.
 #[test]
 fn test_checker_requires_recorded_ack_recipient() {
-    use crate::transport::mock::frame;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    let (mut peer, recorded_ack, _) = checker_session();
-    let stale_crypto = xhpke::SecretKey::from_bytes(&[9; xhpke::SECRET_KEY_SIZE]);
-    let signer = xdsa::SecretKey::from_bytes(&[3; xdsa::SECRET_KEY_SIZE]);
-    let (_, encap) = stale_crypto
-        .public_key()
-        .new_sender(CRYPTO_DOMAIN_WIRE_HOST_TO_ARK)
-        .unwrap();
-    let wrong_ack = cose::seal_at(
-        &handshake::HostAck {
-            h2a_encap: encap.to_vec(),
-        },
-        &handshake::HostAckAuth {
-            ark_signer: peer.identity.clone(),
-            ark_crypto: stale_crypto.public_key(),
-        },
-        &signer,
-        &stale_crypto.public_key(),
-        CRYPTO_DOMAIN_WIRE,
-        TIMESTAMP,
-    )
-    .unwrap();
-    peer.xhpke.push(stale_crypto);
+    let (mut peer, recorded_ack, _) = checker_session(2);
+    let (stale, wrong_ack, _) = checker_session(9);
+    peer.xhpke.extend(stale.xhpke);
 
     for failed in [false, true] {
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                peer.check(&recorded_ack, &frame(&wrong_ack), failed, None);
+                peer.check(&recorded_ack, &wrong_ack, failed, None);
             }))
             .is_err(),
             "accepted an ack for a different recorded server key"
@@ -722,15 +728,41 @@ fn test_checker_requires_recorded_ack_recipient() {
     }
 }
 
-// Tests a shorter replay ACK fully accepted before a deferred write failure,
-// when the recording contains only an unfinished prefix of its longer frame.
+// Tests complete replay ACKs against real prefixes of longer recorded ACKs.
+// Matching recipients must work; another saved key must be refused even when
+// the recording ends before its delimiter or inside its final COBS chunk.
 #[test]
-fn test_checker_accepts_complete_ack_after_recorded_prefix_failure() {
-    let (mut peer, ack, _) = checker_session();
-    // The unfinished recording must be longer than the actual frame for the
-    // writer to accept that frame in full before reporting its deferred error.
-    let mut prefix = ack[..ack.len() - 1].to_vec();
-    prefix.extend_from_slice(&[1, 1]);
-    peer.check(&prefix, &ack, true, None);
-    assert!(peer.receiver.is_some());
+fn test_checker_checks_complete_ack_after_recorded_prefix_failure() {
+    use crate::transport::mock::frame;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    for (seed, accepted) in [(2, true), (9, false)] {
+        // Randomized COBS lengths must leave room for a genuine partial write:
+        // Writer can only accept a complete replay frame if it fits the prefix.
+        let (mut peer, recorded, other, ack, mut sender) = (0..128)
+            .find_map(|_| {
+                let (peer, recorded, _) = checker_session(2);
+                let (other, ack, sender) = checker_session(seed);
+                let mut decoded = vec![0; cobs::decode_buffer(recorded.len())];
+                (recorded.len() >= ack.len() + 2
+                    && matches!(
+                        cobs::decode(&recorded[..recorded.len() - 2], &mut decoded),
+                        Err(cobs::DecodeError::ChunkOverflow { .. })
+                    ))
+                .then_some((peer, recorded, other, ack, sender))
+            })
+            .expect("randomized ACKs provide a shorter replay frame");
+        peer.xhpke.extend(other.xhpke);
+        for len in [recorded.len() - 1, recorded.len() - 2] {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                peer.check(&recorded[..len], &ack, true, None);
+            }));
+            assert_eq!(result.is_ok(), accepted, "incorrect ACK recipient decision");
+            assert_eq!(peer.receiver.is_some(), accepted);
+        }
+        if accepted {
+            let message = frame(&sender.seal(b"fresh context", &[]).unwrap());
+            peer.check(&message, &message, false, Some(b"fresh context"));
+        }
+    }
 }
