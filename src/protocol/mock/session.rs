@@ -1,14 +1,17 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Lifecycle scenarios for the replacement API. The fixtures supply sessions and
-//! messages where the transport reader will eventually do so. All receive, close,
-//! handle-drop and ended-session refusal operations use the real public API.
-//! Explicit wait notifications permit overlap without sleep-based ordering.
+//! Lifecycle and operation scenarios for the replacement API. Fixtures supply
+//! sessions, peer input, output completion and protocol time; submissions, waits,
+//! retirement and handle drops use the real public API. Explicit wait notifications
+//! permit overlap without sleep-based ordering.
 
+use crate::protocol::operation::{Body, Output};
 use crate::protocol::{
-    Closer, Error, Message, Requester, Responder, Server, Session, server, session,
+    Closer, Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder, Server,
+    Session, server, session,
 };
+use crate::transport::{Stream, testing::Memory};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Weak, mpsc};
 use std::thread::{self, JoinHandle};
@@ -26,12 +29,21 @@ enum Failure {
     Reset,
     /// The fixture's publication source ended the endpoint.
     Terminated,
+    /// The operation reached its absolute deadline before settlement.
+    Timeout,
+    /// The peer returned this application-defined error code.
+    Remote(u64),
+    /// The answer variant did not match the requested Rust response type.
+    WrongType,
 }
 
 /// Classifies a runtime error, rejecting outcomes outside the lifecycle contract.
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
+        Error::Timeout => Failure::Timeout,
+        Error::Remote(error) => Failure::Remote(error.code),
+        Error::UnexpectedResponse { .. } => Failure::WrongType,
         Error::Transport(error) => match &*error {
             crate::transport::Error::SessionReset => Failure::Reset,
             crate::transport::Error::Terminated => Failure::Terminated,
@@ -39,6 +51,36 @@ fn failure(error: Error) -> Failure {
         },
         other => panic!("unexpected protocol error: {other}"),
     }
+}
+
+/// Creates the output failures supported by scripted writer completions.
+fn output_error(error: Failure) -> Error {
+    match error {
+        Failure::Closed => Error::Closed,
+        Failure::Timeout => Error::Timeout,
+        Failure::Reset => crate::transport::Error::SessionReset.into(),
+        Failure::Terminated => crate::transport::Error::Terminated.into(),
+        other => panic!("not an output failure: {other:?}"),
+    }
+}
+
+/// Builds an application response from a body tag or an application error code.
+fn response(result: Result<u8, u64>) -> Result<Message, RemoteError> {
+    result
+        .map(|tag| vec![tag].into())
+        .map_err(|code| RemoteError {
+            code,
+            msg: "refused".into(),
+        })
+}
+
+/// Expected output content, specified independently of the runtime queue types.
+#[derive(Clone, Debug)]
+enum Sent {
+    /// Locally initiated request carrying the given body tag.
+    Request(u8),
+    /// Reply to this peer request ID, with its body tag or error code.
+    Reply(u64, Result<u8, u64>),
 }
 
 /// Requires failure with the script's exact ending reason, regardless of result type.
@@ -143,6 +185,57 @@ enum Step {
     RaceServerCloses,
     /// Overlaps endpoint closure and publication; any published owner must end.
     RaceServerCloseOpen,
+    /// Submits a request: session, promise slot, body tag, absolute time in milliseconds.
+    Request(u8, u8, u8, u64),
+    /// Submits a reply: responder slot, promise slot, body/error, absolute deadline.
+    Reply(u8, u8, Result<u8, u64>, u64),
+    /// Takes output: session, output slot, expected content and original deadline.
+    Output(u8, u8, Sent, u64),
+    /// Requires this session to have no eligible queued output.
+    NoOutput(u8),
+    /// Reports local write/flush completion for a retained output slot.
+    Written(u8, Result<(), Failure>),
+    /// Supplies the peer answer for a retained request output slot.
+    Answer(u8, Result<u8, u64>),
+    /// Supplies an answer whose content is not the byte-vector type used by the waiter.
+    AnswerOther(u8),
+    /// Waits for a request's byte-vector answer or its exact failure.
+    Wait(u8, Result<u8, Failure>),
+    /// Takes the untyped Message result to permit application pattern matching.
+    WaitMessage(u8, u8),
+    /// Starts a request wait and waits for its blocking-call notification.
+    StartWait(u8),
+    /// Finishes an overlapping request wait with the expected outcome.
+    FinishWait(u8, Result<u8, Failure>),
+    /// Waits for a reply's local write completion.
+    WaitWrite(u8, Result<(), Failure>),
+    /// Starts observing a reply before the output service completes it.
+    StartWaitWrite(u8),
+    /// Finishes an overlapping reply wait with the expected outcome.
+    FinishWaitWrite(u8, Result<(), Failure>),
+    /// Drops request observation while retaining the registered operation.
+    DropPromise(u8),
+    /// Drops reply observation while retaining the output obligation.
+    DropWritePromise(u8),
+    /// Advances protocol time without running deadline servicing.
+    Time(u64),
+    /// Runs deadline servicing for this session while output may be held elsewhere.
+    Expire(u8),
+    /// Checks the deadline service's next wakeup, or the absence of unresolved work.
+    Deadline(u8, Option<u64>),
+    /// Releases request registration and session closure together; either admission
+    /// outcome must be closed by the time both calls have returned.
+    RaceRequestClose(u8),
+    /// Releases answer delivery and closure together, accepting either first result.
+    RaceAnswerClose(u8, u8, u8),
+    /// Releases reply registration and session closure together for this responder.
+    RaceReplyClose(u8, u8),
+    /// Releases reply write completion and closure together; either may settle first.
+    RaceWriteClose(u8, u8, u8),
+    /// Switches a session to wall-clock time and submits a request with this budget.
+    RealRequest(u8, u8, u64),
+    /// Submits a reply with a wall-clock deadline to a session already using real time.
+    RealReply(u8, u8, u64),
 }
 
 /// A receive result returned with its owner so the driver can use the session again.
@@ -176,12 +269,33 @@ struct Driver {
     accepting: Option<Job<Accept>>,
     /// Endpoint closer usable while acceptance owns the server or after owner drop.
     closer: Closer,
+    /// Base for deterministic absolute deadlines, kept ahead of the wall clock.
+    epoch: Instant,
+    /// Current scripted time in milliseconds, independent of expiry servicing.
+    time: u64,
+    /// Unobserved request promises indexed by script slot.
+    pending: HashMap<u8, Promise<Message>>,
+    /// Unobserved reply write promises indexed by script slot.
+    writes: HashMap<u8, Promise<()>>,
+    /// Admitted output held independently to model blocked I/O and delayed answers.
+    output: HashMap<u8, Output>,
+    /// Request observers already inside their waiting calls.
+    waiting: HashMap<u8, Job<Result<Vec<u8>, Error>>>,
+    /// Reply observers already inside their waiting calls.
+    writing: HashMap<u8, Job<Result<(), Error>>>,
 }
 
 impl Driver {
     /// Creates an open endpoint fixture with no published sessions or running jobs.
     fn new() -> Self {
-        let (server, publisher) = Server::pair();
+        Self::with_timeout(crate::transport::DEFAULT_WRITE_TIMEOUT)
+    }
+
+    /// Uses the real Stream configuration accessor to supply the abandonment budget.
+    fn with_timeout(timeout: Duration) -> Self {
+        let stream = Stream::new(Memory::new(&b""[..]), Memory::new(Vec::new()), || {})
+            .set_write_timeout(timeout);
+        let (server, publisher) = Server::pair(stream.write_timeout());
         Self {
             endpoint: Arc::downgrade(&server.shared),
             closer: server.closer(),
@@ -194,6 +308,13 @@ impl Driver {
             replies: HashMap::new(),
             receiving: HashMap::new(),
             accepting: None,
+            epoch: Instant::now() + Duration::from_secs(3600),
+            time: 0,
+            pending: HashMap::new(),
+            writes: HashMap::new(),
+            output: HashMap::new(),
+            waiting: HashMap::new(),
+            writing: HashMap::new(),
         }
     }
 
@@ -218,13 +339,296 @@ impl Driver {
         self.sessions.insert(id, session);
     }
 
+    /// Converts script milliseconds into an absolute deadline.
+    fn at(&self, millis: u64) -> Instant {
+        self.epoch + Duration::from_millis(millis)
+    }
+
+    /// Checks a typed answer while preserving the exact error category.
+    fn answer_result(result: Result<Vec<u8>, Error>, expected: Result<u8, Failure>) {
+        match expected {
+            Ok(tag) => assert_eq!(result.unwrap(), vec![tag]),
+            Err(error) => refused(result, error),
+        }
+    }
+
+    /// Checks local output completion without treating it as remote acknowledgment.
+    fn write_result(result: Result<(), Error>, expected: Result<(), Failure>) {
+        match expected {
+            Ok(()) => result.unwrap(),
+            Err(error) => refused(result, error),
+        }
+    }
+
     /// Executes one script action, using watchdogs for operations allowed to block.
     /// Assertions also reject invalid scripts, such as overwriting an owned slot.
     fn step(&mut self, step: Step) {
         match step {
             Step::Open(id) => {
                 let session = self.publisher.as_mut().unwrap().open().unwrap();
+                session.upgrade().unwrap().set_time(self.at(self.time));
                 assert!(self.incoming.insert(id, session).is_none());
+            }
+            Step::Request(id, slot, tag, deadline) => {
+                let requester = self.requesters[&id].clone();
+                let deadline = self.at(deadline);
+                let pending = Job::start(move || requester.request(vec![tag], deadline))
+                    .finish()
+                    .unwrap();
+                assert!(self.pending.insert(slot, pending).is_none());
+            }
+            Step::Reply(responder, slot, result, deadline) => {
+                let responder = self.replies.remove(&responder).unwrap();
+                let deadline = self.at(deadline);
+                let pending = Job::start(move || responder.reply(response(result), deadline))
+                    .finish()
+                    .unwrap();
+                assert!(self.writes.insert(slot, pending).is_none());
+            }
+            Step::Output(id, slot, expected, deadline) => {
+                let output = self.incoming[&id]
+                    .upgrade()
+                    .unwrap()
+                    .take_output()
+                    .expect("output queued");
+                assert_eq!(output.deadline, self.at(deadline));
+                match (&output.body, expected) {
+                    (Body::Request(message), Sent::Request(tag)) => {
+                        assert_eq!(message, &Message::Develop(vec![tag]))
+                    }
+                    (Body::Reply { id, result }, Sent::Reply(expected_id, expected)) => {
+                        assert_eq!(*id, expected_id);
+                        match (result, expected) {
+                            (Ok(message), Ok(tag)) => {
+                                assert_eq!(message, &Message::Develop(vec![tag]))
+                            }
+                            (Err(error), Err(code)) => {
+                                assert_eq!(error.code, code);
+                                assert_eq!(
+                                    error.msg,
+                                    if code == ReservedErrors::Unanswered as u64 {
+                                        "request left unanswered"
+                                    } else {
+                                        "refused"
+                                    }
+                                );
+                            }
+                            _ => panic!("unexpected reply result"),
+                        }
+                    }
+                    _ => panic!("unexpected output kind"),
+                }
+                assert!(self.output.insert(slot, output).is_none());
+            }
+            Step::NoOutput(id) => assert!(
+                self.incoming[&id]
+                    .upgrade()
+                    .unwrap()
+                    .take_output()
+                    .is_none()
+            ),
+            Step::Written(slot, result) => self.output[&slot]
+                .completion
+                .written(result.map_err(output_error)),
+            Step::Answer(slot, result) => {
+                let output = self.output.remove(&slot).unwrap();
+                assert!(matches!(output.body, Body::Request(_)));
+                output.completion.answer(response(result));
+            }
+            Step::AnswerOther(slot) => {
+                let output = self.output.remove(&slot).unwrap();
+                assert!(matches!(output.body, Body::Request(_)));
+                output
+                    .completion
+                    .answer(Ok(crate::protocol::DeviceInfoResponse::default().into()));
+            }
+            Step::Wait(slot, expected) => {
+                let pending = self.pending.remove(&slot).unwrap();
+                Self::answer_result(Job::start(move || pending.wait()).finish(), expected);
+            }
+            Step::WaitMessage(slot, tag) => {
+                let pending = self.pending.remove(&slot).unwrap();
+                assert_eq!(
+                    Job::start(move || pending.wait::<Message>())
+                        .finish()
+                        .unwrap(),
+                    Message::Develop(vec![tag])
+                );
+            }
+            Step::StartWait(slot) => {
+                let mut pending = self.pending.remove(&slot).unwrap();
+                let waiting = pending.watch();
+                assert!(
+                    self.waiting
+                        .insert(slot, Job::start(move || pending.wait()))
+                        .is_none()
+                );
+                waiting
+                    .recv_timeout(PATIENCE)
+                    .expect("request reached its wait");
+            }
+            Step::FinishWait(slot, expected) => {
+                Self::answer_result(self.waiting.remove(&slot).unwrap().finish(), expected)
+            }
+            Step::WaitWrite(slot, expected) => {
+                let pending = self.writes.remove(&slot).unwrap();
+                Self::write_result(Job::start(move || pending.wait()).finish(), expected);
+            }
+            Step::StartWaitWrite(slot) => {
+                let mut pending = self.writes.remove(&slot).unwrap();
+                let waiting = pending.watch();
+                assert!(
+                    self.writing
+                        .insert(slot, Job::start(move || pending.wait()))
+                        .is_none()
+                );
+                waiting
+                    .recv_timeout(PATIENCE)
+                    .expect("reply reached its wait");
+            }
+            Step::FinishWaitWrite(slot, expected) => {
+                Self::write_result(self.writing.remove(&slot).unwrap().finish(), expected)
+            }
+            Step::DropPromise(slot) => drop(self.pending.remove(&slot).unwrap()),
+            Step::DropWritePromise(slot) => drop(self.writes.remove(&slot).unwrap()),
+            Step::Time(time) => {
+                assert!(time >= self.time);
+                self.time = time;
+                for session in self.incoming.values().filter_map(Weak::upgrade) {
+                    session.set_time(self.at(time));
+                }
+            }
+            Step::Expire(id) => self.incoming[&id].upgrade().unwrap().expire(),
+            Step::Deadline(id, expected) => assert_eq!(
+                self.incoming[&id].upgrade().unwrap().next_deadline(),
+                expected.map(|time| self.at(time))
+            ),
+            Step::RealRequest(id, slot, budget) => {
+                self.incoming[&id].upgrade().unwrap().use_realtime();
+                let pending = self.requesters[&id]
+                    .request(vec![1], Instant::now() + Duration::from_millis(budget))
+                    .unwrap();
+                assert!(self.pending.insert(slot, pending).is_none());
+            }
+            Step::RealReply(responder, slot, budget) => {
+                let responder = self.replies.remove(&responder).unwrap();
+                let pending = responder
+                    .reply(
+                        response(Ok(2)),
+                        Instant::now() + Duration::from_millis(budget),
+                    )
+                    .unwrap();
+                assert!(self.writes.insert(slot, pending).is_none());
+            }
+            Step::RaceReplyClose(id, responder) => {
+                let responder = self.replies.remove(&responder).unwrap();
+                let closer = self.closers[&id].clone();
+                let deadline = self.at(self.time + 100);
+                let gate = Arc::new(Barrier::new(3));
+                let replied = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        responder.reply(response(Ok(42)), deadline)
+                    })
+                };
+                let closed = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        closer.close();
+                    })
+                };
+                gate.wait();
+                closed.finish();
+                match replied.finish() {
+                    Ok(pending) => {
+                        refused(Job::start(move || pending.wait()).finish(), Failure::Closed)
+                    }
+                    Err(error) => assert_eq!(failure(error), Failure::Closed),
+                }
+            }
+            Step::RaceWriteClose(id, output, pending) => {
+                let output = self.output.remove(&output).unwrap();
+                let pending = self.writes.remove(&pending).unwrap();
+                let closer = self.closers[&id].clone();
+                let gate = Arc::new(Barrier::new(3));
+                let written = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        output.completion.written(Ok(()));
+                    })
+                };
+                let closed = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        closer.close();
+                    })
+                };
+                gate.wait();
+                closed.finish();
+                written.finish();
+                if let Err(error) = Job::start(move || pending.wait()).finish() {
+                    assert_eq!(failure(error), Failure::Closed);
+                }
+            }
+            Step::RaceRequestClose(id) => {
+                let requester = self.requesters[&id].clone();
+                let closer = self.closers[&id].clone();
+                let deadline = self.at(self.time + 100);
+                let gate = Arc::new(Barrier::new(3));
+                let requested = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        requester.request(vec![1], deadline)
+                    })
+                };
+                let closed = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        closer.close();
+                    })
+                };
+                gate.wait();
+                closed.finish();
+                match requested.finish() {
+                    Ok(pending) => refused(
+                        Job::start(move || pending.wait::<Message>()).finish(),
+                        Failure::Closed,
+                    ),
+                    Err(error) => assert_eq!(failure(error), Failure::Closed),
+                }
+            }
+            Step::RaceAnswerClose(id, output, pending) => {
+                let output = self.output.remove(&output).unwrap();
+                let pending = self.pending.remove(&pending).unwrap();
+                let closer = self.closers[&id].clone();
+                let gate = Arc::new(Barrier::new(3));
+                let answered = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        output.completion.answer(response(Ok(42)));
+                    })
+                };
+                let closed = {
+                    let gate = gate.clone();
+                    Job::start(move || {
+                        gate.wait();
+                        closer.close();
+                    })
+                };
+                gate.wait();
+                closed.finish();
+                answered.finish();
+                match Job::start(move || pending.wait::<Vec<u8>>()).finish() {
+                    Ok(body) => assert_eq!(body, vec![42]),
+                    Err(error) => assert_eq!(failure(error), Failure::Closed),
+                }
             }
             Step::Accept(id) => {
                 let mut server = self.server.take().unwrap();
@@ -345,11 +749,29 @@ impl Driver {
                     expected,
                 );
             }
-            Step::DropReply(slot) => drop(self.replies.remove(&slot).unwrap()),
+            Step::DropReply(slot) => {
+                let responder = self.replies.remove(&slot).unwrap();
+                Job::start(move || drop(responder)).finish();
+            }
             Step::Abandoned(id, expected) => {
-                assert_eq!(
-                    self.incoming[&id].upgrade().unwrap().take_abandoned(),
-                    expected
+                let session = self.incoming[&id].upgrade().unwrap();
+                for id in expected {
+                    let output = session.take_output().expect("abandonment queued");
+                    let Body::Reply {
+                        id: actual,
+                        result: Err(error),
+                    } = output.body
+                    else {
+                        panic!("expected an abandonment reply");
+                    };
+                    assert_eq!(actual, id);
+                    assert_eq!(error.code, ReservedErrors::Unanswered as u64);
+                    assert_eq!(error.msg, "request left unanswered");
+                    output.completion.written(Ok(()));
+                }
+                assert!(
+                    session.take_output().is_none(),
+                    "unexpected additional output"
                 );
             }
             Step::Released(id) => assert!(self.incoming[&id].upgrade().is_none()),
@@ -442,7 +864,16 @@ impl Drop for Driver {
 
 /// Runs a scenario, reporting the exact failed step and rejecting unfinished jobs.
 fn run(steps: Vec<Step>) {
-    let mut driver = Driver::new();
+    run_with(Driver::new(), steps);
+}
+
+/// Runs with an explicitly configured stream write budget for abandonment scenarios.
+fn run_with_timeout(timeout: Duration, steps: Vec<Step>) {
+    run_with(Driver::with_timeout(timeout), steps);
+}
+
+/// Executes a prepared driver and requires every explicitly started waiter to finish.
+fn run_with(mut driver: Driver, steps: Vec<Step>) {
     for (index, step) in steps.into_iter().enumerate() {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.step(step.clone())));
@@ -456,6 +887,14 @@ fn run(steps: Vec<Step>) {
         "unfinished receive in scenario"
     );
     assert!(driver.accepting.is_none(), "unfinished accept in scenario");
+    assert!(
+        driver.waiting.is_empty(),
+        "unfinished request wait in scenario"
+    );
+    assert!(
+        driver.writing.is_empty(),
+        "unfinished reply wait in scenario"
+    );
 }
 
 #[cfg(test)]

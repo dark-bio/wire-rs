@@ -8,6 +8,8 @@ use super::{Closer, Error, Session};
 use crate::transport::{Attester, Read, Stream, Write};
 use darkbio_crypto::xdsa;
 use std::sync::{Arc, Condvar, Mutex, Weak};
+#[cfg(test)]
+use std::time::Duration;
 
 /// Owner of a persistent server stream, accepting successive sessions.
 /// Closing or dropping the endpoint ends its active session and shuts down the
@@ -164,12 +166,14 @@ impl Shared {
 pub(super) struct Sessions {
     /// Publication destination, without extending the endpoint owner's lifetime.
     endpoint: Weak<Shared>,
+    /// Stream write budget copied into each newly published session.
+    write_timeout: Duration,
 }
 
 #[cfg(test)]
 impl Server {
     /// Constructs an endpoint and its sole session publisher without physical I/O.
-    pub(super) fn pair() -> (Self, Sessions) {
+    pub(super) fn pair(write_timeout: Duration) -> (Self, Sessions) {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::Open {
                 session: Weak::new(),
@@ -180,6 +184,7 @@ impl Server {
         });
         let sessions = Sessions {
             endpoint: Arc::downgrade(&shared),
+            write_timeout,
         };
         (Self { shared }, sessions)
     }
@@ -206,7 +211,7 @@ impl Sessions {
         if let Some(previous) = previous {
             previous.retire(crate::transport::Error::SessionReset.into());
         }
-        let session = Session::new();
+        let session = Session::new(self.write_timeout);
         let incoming = Arc::downgrade(&session.shared);
         let previous = {
             let mut state = endpoint.state.lock().expect("endpoint state not poisoned");

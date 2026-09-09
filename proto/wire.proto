@@ -145,23 +145,17 @@ message ArkToHost {
 // Error is sent along a response to a failed request.
 //
 // Codes 0x00 through 0xff (inclusive) are reserved for protocol-wide errors.
-// ReservedErrors names the currently assigned codes; the rest of this range is
-// reserved for future use. Codes 0x100 and above are defined by the request type
-// and may be reused with different meanings for different requests. Receivers
-// must preserve codes they do not recognize. The message text is descriptive,
-// not a stable code.
-//
-// Keep code as uint64: ReservedErrors provides names without restricting the
-// field to enum values or changing the deployed field type.
+// Codes 0x100 and above are defined by the request type and may be reused
+// with different meanings for different requests. The message text is human,
+// readable error, not a stable code.
 message Error {
   uint64 code = 1; // Error code for programmatic interpretation
   string msg = 2;  // Error message for user interfacing
 }
 
 // ReservedErrors names the assigned protocol-wide errors in the reserved range
-// 0x00 through 0xff (inclusive). No code in this range may be assigned a
-// request-specific meaning. Assigned codes must not be repurposed.
-// This is not an exhaustive list of values accepted by Error.code.
+// 0x00 to 0xff (inclusive). No code in this range may be assigned a request
+// specific meaning. Assigned codes must not be repurposed.
 enum ReservedErrors {
   // A failure without a standardized reason. Zero does not indicate success;
   // the presence of an Error in the response indicates failure.

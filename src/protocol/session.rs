@@ -3,11 +3,12 @@
 
 //! Session ownership, incoming requests and the shared retirement boundary.
 
-use super::{Closer, Error, Message, Requester, Responder};
+use super::operation::{Body, Completion, Operation, Output, Token, Waiting};
+use super::{Closer, Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder};
 use crate::transport::{Read, Stream, Verifier, Write};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Establishes a client session, verifies the peer and returns the verifier's info.
 /// Takes ownership of the stream and constructs the transport internally. Failure
@@ -93,8 +94,13 @@ impl Drop for Session {
 pub(super) struct Shared {
     /// Serializes queue access and the one-way transition to the ending reason.
     state: Mutex<State>,
-    /// Wakes receivers when a request arrives or the session ends.
+    /// Wakes receivers and future output/deadline services when state changes.
     changed: Condvar,
+    /// Existing stream write budget, also used for automatic abandonment replies.
+    timeout: Duration,
+    /// Controlled protocol time for scenarios; production always uses Instant::now.
+    #[cfg(test)]
+    time: Mutex<Option<Instant>>,
 }
 
 /// A session is either open with owned work or permanently ended with one reason.
@@ -112,8 +118,10 @@ enum State {
     Open {
         /// Peer requests awaiting application receipt, paired with their request IDs.
         incoming: VecDeque<(u64, Message)>,
-        /// Request IDs requiring abandonment replies from the future output worker.
-        abandoned: VecDeque<u64>,
+        /// Unresolved local operations; only removal from this registry settles them.
+        operations: HashMap<Token, Operation>,
+        /// Output admitted locally but not yet taken by the independent writer.
+        output: VecDeque<Output>,
         /// One-shot test notification sent under the state lock before waiting.
         #[cfg(test)]
         waiting: Option<std::sync::mpsc::Sender<()>>,
@@ -153,68 +161,242 @@ impl Shared {
         }
     }
 
-    /// Terminal transition ordered with receive and abandonment admission.
-    /// Every caller notifies, including a concurrent/repeated retire: it must not
-    /// depend on the first caller reaching its notification before being delayed.
+    /// Terminal transition ordered with registration, completion and output admission.
+    /// All unresolved operations settle under this lock. Each uses the retirement
+    /// time, giving already-expired operations Timeout and the rest the ending reason.
+    /// Every closer notifies, including concurrent/repeated retirement calls.
     pub(super) fn retire(&self, error: Error) {
         let removed = {
             let mut state = self.state.lock().expect("session state not poisoned");
             match &*state {
                 State::Ended(_) => None,
-                State::Open { .. } => Some(std::mem::replace(&mut *state, State::Ended(error))),
+                State::Open { .. } => {
+                    let now = self.now();
+                    let mut removed = std::mem::replace(&mut *state, State::Ended(error.clone()));
+                    if let State::Open { operations, .. } = &mut removed {
+                        for (_, operation) in operations.drain() {
+                            operation.fail(error.clone(), now);
+                        }
+                    }
+                    Some(removed)
+                }
             }
         };
         self.changed.notify_all();
         drop(removed);
     }
 
-    /// Schedules an abandonment in its original session. No user code or I/O
-    /// runs here. The reply execution chunk will service these obligations.
-    pub(super) fn abandon(&self, id: u64) {
-        let mut state = self.state.lock().expect("session state not poisoned");
-        if let State::Open { abandoned, .. } = &mut *state {
-            abandoned.push_back(id);
-        }
+    /// Transfers an unanswered responder into one automatic error output. The
+    /// budget starts on entry, before acquiring the session lock, and includes
+    /// queueing. An unrepresentable deadline expires immediately instead of
+    /// panicking from Drop. No I/O, capacity wait or retry occurs here.
+    pub(super) fn abandon(self: &Arc<Self>, id: u64) {
+        let now = self.now();
+        let deadline = now.checked_add(self.timeout).unwrap_or(now);
+        let _ = self.reply(
+            id,
+            Err(RemoteError {
+                code: ReservedErrors::Unanswered as u64,
+                msg: "request left unanswered".into(),
+            }),
+            deadline,
+        );
     }
 
-    /// Request registration will live under this same lock as retirement. Until
-    /// that chunk is implemented, only refusal by an ended session is supported.
-    ///
-    /// # Panics
-    /// Open-session registration and promise completion are not implemented yet.
+    /// Registers an eager request and its sole result producer under the retirement
+    /// lock, before any output service can take it. Expired submissions return an
+    /// already-failed promise without entering the output queue.
     pub(super) fn request(
-        &self,
-        _request: Message,
-        _deadline: Instant,
-    ) -> Result<super::Pending, Error> {
-        let state = self.state.lock().expect("session state not poisoned");
-        if let State::Ended(error) = &*state {
-            return Err(error.clone());
-        }
-        // The remaining branch is a skeleton, not admission. Unlock before its
-        // intentional panic so destroying the owner does not encounter poison.
-        drop(state);
-        todo!("protocol request registration and completion")
+        self: &Arc<Self>,
+        request: Message,
+        deadline: Instant,
+    ) -> Result<Promise<Message>, Error> {
+        let (result, promise) = Promise::pair(Arc::downgrade(self), deadline);
+        self.submit(
+            Body::Request(request),
+            Operation {
+                deadline,
+                waiting: Waiting::Answer(result),
+            },
+        )?;
+        Ok(promise)
     }
 
-    /// Registers a reply for a request ID belonging to this session. Only refusal
-    /// after retirement is implemented; successful registration will transfer the
-    /// responder's obligation to output under the same lock as retirement.
-    ///
-    /// # Panics
-    /// Open-session registration and promise completion are not implemented yet.
+    /// Transfers a responder's obligation into output under the retirement lock.
+    /// The returned promise observes local write/flush, including a queued timeout.
     pub(super) fn reply(
-        &self,
-        _id: u64,
-        _result: Result<Message, super::RemoteError>,
-        _deadline: Instant,
-    ) -> Result<super::WritePending, Error> {
-        let state = self.state.lock().expect("session state not poisoned");
-        if let State::Ended(error) = &*state {
-            return Err(error.clone());
+        self: &Arc<Self>,
+        id: u64,
+        result: Result<Message, RemoteError>,
+        deadline: Instant,
+    ) -> Result<Promise<()>, Error> {
+        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline);
+        self.submit(
+            Body::Reply { id, result },
+            Operation {
+                deadline,
+                waiting: Waiting::Write(sender),
+            },
+        )?;
+        Ok(promise)
+    }
+
+    /// Atomically installs both the completion producer and its output obligation.
+    /// Only an already-ended session refuses registration synchronously.
+    fn submit(self: &Arc<Self>, body: Body, operation: Operation) -> Result<(), Error> {
+        {
+            let mut state = self.state.lock().expect("session state not poisoned");
+            let State::Open {
+                operations, output, ..
+            } = &mut *state
+            else {
+                let State::Ended(error) = &*state else {
+                    unreachable!()
+                };
+                return Err(error.clone());
+            };
+            let now = self.now();
+            if now >= operation.deadline {
+                operation.fail(Error::Timeout, now);
+                return Ok(());
+            }
+            let token = Token::new();
+            output.push_back(Output {
+                body,
+                deadline: operation.deadline,
+                completion: Completion {
+                    session: Arc::downgrade(self),
+                    token: token.clone(),
+                },
+            });
+            operations.insert(token, operation);
         }
-        drop(state);
-        todo!("protocol reply registration and completion")
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Settles every elapsed operation and removes output that never started.
+    /// The independent deadline service will call this even without any waiter.
+    /// Expiring a transmitted request does not establish that remote work ended;
+    /// remote credit obligations belong to the later flow-control implementation.
+    pub(super) fn expire(&self) {
+        let mut state = self.state.lock().expect("session state not poisoned");
+        state.expire(self.now());
+    }
+
+    /// Inspects the nearest unresolved deadline for scenario assertions. The
+    /// production timer's wait will need to hold the state lock until sleeping.
+    #[cfg(test)]
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        let state = self.state.lock().expect("session state not poisoned");
+        match &*state {
+            State::Open { operations, .. } => operations
+                .values()
+                .map(|operation| operation.deadline)
+                .min(),
+            State::Ended(_) => None,
+        }
+    }
+
+    /// Admits the next unexpired output under the retirement lock. The owned
+    /// completion capability remains bound to this session after admission.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "serviced by the upcoming transport bridge")
+    )]
+    pub(super) fn take_output(&self) -> Option<Output> {
+        let mut state = self.state.lock().expect("session state not poisoned");
+        state.expire(self.now());
+        match &mut *state {
+            State::Open { output, .. } => output.pop_front(),
+            State::Ended(_) => None,
+        }
+    }
+
+    /// Accepts output completion under the same lock as expiry and retirement.
+    /// Successful request output retains its operation for the eventual answer.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reported by the upcoming transport bridge")
+    )]
+    pub(super) fn written(&self, token: &Token, result: Result<(), Error>) {
+        let mut state = self.state.lock().expect("session state not poisoned");
+        let State::Open { operations, .. } = &mut *state else {
+            return;
+        };
+        let Some(operation) = operations.get(token) else {
+            return;
+        };
+        let now = self.now();
+        if now >= operation.deadline || result.is_err() {
+            let operation = operations.remove(token).expect("operation held under lock");
+            operation.fail(result.err().unwrap_or(Error::Timeout), now);
+        } else if matches!(operation.waiting, Waiting::Write(_)) {
+            let operation = operations.remove(token).expect("operation held under lock");
+            let Waiting::Write(sender) = operation.waiting else {
+                unreachable!()
+            };
+            let _ = sender.send(Ok(()));
+        }
+    }
+
+    /// Accepts a request answer strictly before its deadline. Removed operations
+    /// make late completions inert without any separate current-session check.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reported by the upcoming transport bridge")
+    )]
+    pub(super) fn answered(&self, token: &Token, result: Result<Message, Error>) {
+        let mut state = self.state.lock().expect("session state not poisoned");
+        let State::Open { operations, .. } = &mut *state else {
+            return;
+        };
+        let Some(operation) = operations.remove(token) else {
+            return;
+        };
+        let now = self.now();
+        if now >= operation.deadline {
+            operation.fail(Error::Timeout, now);
+        } else {
+            let Waiting::Answer(sender) = operation.waiting else {
+                unreachable!("only a request completion accepts a peer answer");
+            };
+            let _ = sender.send(result);
+        }
+    }
+
+    /// Reads protocol time. Outcome decisions call this while holding the session
+    /// lock; abandonment also samples on entry to include time waiting for that lock.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.time.lock().expect("scenario clock not poisoned") {
+            return now;
+        }
+        Instant::now()
+    }
+}
+
+impl State {
+    /// Removes expired registrations and their unstarted output at one locked
+    /// decision point. Each removed sender settles once, including dropped observers.
+    fn expire(&mut self, now: Instant) {
+        if let Self::Open {
+            operations, output, ..
+        } = self
+        {
+            let expired: Vec<_> = operations
+                .iter()
+                .filter(|(_, operation)| now >= operation.deadline)
+                .map(|(token, _)| token.clone())
+                .collect();
+            for token in expired {
+                operations
+                    .remove(&token)
+                    .expect("expired operation held under lock")
+                    .fail(Error::Timeout, now);
+            }
+            output.retain(|output| operations.contains_key(&output.completion.token));
+        }
     }
 }
 
@@ -224,15 +406,18 @@ impl Shared {
 #[cfg(test)]
 impl Session {
     /// Constructs an open session without physical I/O for lifecycle scenarios.
-    pub(super) fn new() -> Self {
+    pub(super) fn new(timeout: Duration) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::Open {
                     incoming: VecDeque::new(),
-                    abandoned: VecDeque::new(),
+                    operations: HashMap::new(),
+                    output: VecDeque::new(),
                     waiting: None,
                 }),
                 changed: Condvar::new(),
+                timeout,
+                time: Mutex::new(None),
             }),
         }
     }
@@ -254,14 +439,22 @@ impl Shared {
         Ok(())
     }
 
-    /// Removes recorded abandonment obligations for scenario assertions. Ended
-    /// sessions have already discarded them and therefore return an empty list.
-    pub(super) fn take_abandoned(&self) -> Vec<u64> {
-        let mut state = self.state.lock().expect("session state not poisoned");
-        match &mut *state {
-            State::Open { abandoned, .. } => abandoned.drain(..).collect(),
-            State::Ended(_) => Vec::new(),
-        }
+    /// Advances the scenario clock without servicing deadlines, allowing tests to
+    /// model a delayed timer. Clock changes are ordered with all outcome decisions.
+    pub(super) fn set_time(&self, now: Instant) {
+        let _state = self.state.lock().expect("session state not poisoned");
+        let mut time = self.time.lock().expect("scenario clock not poisoned");
+        assert!(
+            time.is_none_or(|previous| now >= previous),
+            "clock cannot go backwards"
+        );
+        *time = Some(now);
+    }
+
+    /// Restores wall-clock time for scenarios that exercise the waiter's real timer.
+    pub(super) fn use_realtime(&self) {
+        let _state = self.state.lock().expect("session state not poisoned");
+        *self.time.lock().expect("scenario clock not poisoned") = None;
     }
 
     /// Arms a one-shot notification for the next receive waiting on an empty queue.

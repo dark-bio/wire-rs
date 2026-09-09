@@ -4,7 +4,7 @@
 //! Clonable request submission bound to the originating session.
 
 use super::session::Shared;
-use super::{Error, Message, Pending};
+use super::{Error, Message, Promise};
 use std::sync::Weak;
 use std::time::Instant;
 
@@ -28,15 +28,12 @@ impl Requester {
     /// The deadline covers waiting for capacity, sending and receiving the reply.
     /// Waiting on the promise does not start or refresh it. Dropping the promise
     /// only abandons observation. Neither dropping nor expiry cancels remote work.
-    /// The expected response type is selected at [`Pending::wait`].
-    ///
-    /// # Panics
-    /// Open-session submission is not implemented yet. Ended sessions are refused.
+    /// The expected response type is selected when waiting on [`Promise<Message>`].
     pub fn request(
         &self,
         request: impl Into<Message>,
         deadline: Instant,
-    ) -> Result<Pending, Error> {
+    ) -> Result<Promise<Message>, Error> {
         self.session
             .upgrade()
             .ok_or(Error::Closed)?
@@ -54,7 +51,7 @@ impl Requester {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::protocol::{
-        DeviceInfoRequest, DeviceInfoResponse, Error, Message, Pending, Requester, Session,
+        DeviceInfoRequest, DeviceInfoResponse, Error, Message, Promise, Requester, Session,
     };
     use std::time::Instant;
 
@@ -62,7 +59,7 @@ mod tests {
     #[allow(dead_code)]
     fn pipeline(session: &Session, deadline: Instant) -> Result<(), Error> {
         let requester: Requester = session.requester();
-        let first: Pending = requester.request(DeviceInfoRequest {}, deadline)?;
+        let first: Promise<Message> = requester.request(DeviceInfoRequest {}, deadline)?;
         let second = requester.request(DeviceInfoRequest {}, deadline)?;
 
         // Observation can be abandoned without selecting a response type.

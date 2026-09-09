@@ -57,6 +57,16 @@ impl<R: Read, W: Write> Stream<R, W> {
         self
     }
 
+    /// Reads the configured write budget before protocol construction transfers
+    /// stream ownership to the transport. Automatic replies reuse this budget.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the upcoming protocol constructors")
+    )]
+    pub(crate) fn write_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// A handle that can close the stream from another thread.
     pub fn closer(&self) -> Closer {
         self.closer.clone()

@@ -4,7 +4,7 @@
 //! One-use reply obligations bound to the session that received the request.
 
 use super::session::Shared;
-use super::{Error, Message, RemoteError, WritePending};
+use super::{Error, Message, Promise, RemoteError};
 use std::sync::Weak;
 use std::time::Instant;
 
@@ -53,14 +53,11 @@ impl Responder {
     /// A reply needs no further acknowledgment. Dropping its promise leaves it queued.
     /// Success content can be converted from a protobuf message using `.into()`;
     /// the concrete content type also lets `reply(Err(error), deadline)` infer fully.
-    ///
-    /// # Panics
-    /// Open-session submission is not implemented yet. Ended sessions are refused.
     pub fn reply(
         mut self,
         result: Result<Message, RemoteError>,
         deadline: Instant,
-    ) -> Result<WritePending, Error> {
+    ) -> Result<Promise<()>, Error> {
         let pending = self.session.upgrade().ok_or(Error::Closed)?.reply(
             self.id.expect("reply obligation present"),
             result,
@@ -96,7 +93,7 @@ impl Drop for Responder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::protocol::{
-        DeviceInfoResponse, Error, Message, RemoteError, Responder, Session, WritePending,
+        DeviceInfoResponse, Error, Message, Promise, RemoteError, Responder, Session,
     };
     use std::time::Instant;
 
@@ -122,7 +119,7 @@ mod tests {
         let (request, responder): (Message, Responder) = session.recv()?;
         match request {
             Message::DeviceInfoRequest(_) => {
-                let written: WritePending =
+                let written: Promise<()> =
                     responder.reply(Ok(DeviceInfoResponse::default().into()), deadline)?;
                 written.wait()?;
             }
@@ -135,7 +132,7 @@ mod tests {
                     Ok(())
                 });
             }
-            _ => drop(responder), // Schedules an abandonment error in the real implementation.
+            _ => drop(responder), // Schedules the standard unanswered error.
         }
         Ok(())
     }
