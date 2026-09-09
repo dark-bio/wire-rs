@@ -76,27 +76,34 @@ pub trait Seedable: for<'a> Arbitrary<'a> + PartialEq + std::fmt::Debug {
 /// First checks that the encoded bytes decode back into the same script.
 /// A content hash names the file, so an unchanged script keeps the same path.
 pub fn seed<S: Seedable>(target: &str, steps: &[S]) {
+    write(target, || {
+        let mut seed = Seed(Vec::new());
+        for step in steps {
+            seed.flag(true);
+            step.seed(&mut seed);
+        }
+        seed.flag(false);
+
+        let decoded = Vec::<S>::arbitrary_take_rest(Unstructured::new(&seed.0))
+            .expect("seed failed to decode");
+        assert_eq!(decoded, steps, "seed decoded into another script");
+        seed.0
+    });
+}
+
+/// Encodes and writes one corpus input only when `WIRE_SEEDS` is set.
+pub fn write(target: &str, encode: impl FnOnce() -> Vec<u8>) {
     let Some(root) = std::env::var_os(ENV) else {
         return;
     };
-    let mut seed = Seed(Vec::new());
-    for step in steps {
-        seed.flag(true);
-        step.seed(&mut seed);
-    }
-    seed.flag(false);
-
-    let decoded =
-        Vec::<S>::arbitrary_take_rest(Unstructured::new(&seed.0)).expect("seed failed to decode");
-    assert_eq!(decoded, steps, "seed decoded into another script");
-
+    let bytes = encode();
     let dir = Path::new(&root).join(target);
     std::fs::create_dir_all(&dir).expect("failed to create the seed directory");
-    let name: String = Sha256::digest(&seed.0)
+    let name: String = Sha256::digest(&bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    std::fs::write(dir.join(name), &seed.0).expect("failed to write the seed");
+    std::fs::write(dir.join(name), bytes).expect("failed to write the seed");
 }
 
 impl Seedable for CutPoint {

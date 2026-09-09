@@ -108,6 +108,10 @@ enum Step {
     ReceiveFailed(u8, Failure),
     /// Reply through a responder, retaining its write promise.
     Reply(u8, u8, Result<u8, u64>, u64),
+    /// Reply with a body invalid for the labeled session's wire direction.
+    WrongDirectionReply(u8, u8, u8),
+    /// Reply with a body beyond the plaintext limit, retaining its write promise.
+    OversizedReply(u8, u8),
     /// Drop a responder to queue the automatic error.
     Abandon(u8),
     /// Reads the request's result channel directly, so its deadline worker must
@@ -503,6 +507,34 @@ impl Driver {
                         .remove(&slot)
                         .unwrap()
                         .reply(body, Instant::now() + Duration::from_millis(ms))
+                        .unwrap(),
+                );
+            }
+            Step::WrongDirectionReply(session, slot, promise) => {
+                let body: Message = if session == 0 {
+                    protocol::DeviceInfoResponse::default().into()
+                } else {
+                    protocol::DeviceInfoRequest {}.into()
+                };
+                self.writes.insert(
+                    promise,
+                    self.responders
+                        .remove(&slot)
+                        .unwrap()
+                        .reply(Ok(body), Instant::now() + BUDGET)
+                        .unwrap(),
+                );
+            }
+            Step::OversizedReply(slot, promise) => {
+                self.writes.insert(
+                    promise,
+                    self.responders
+                        .remove(&slot)
+                        .unwrap()
+                        .reply(
+                            Ok(vec![0; transport::MAX_MESSAGE_SIZE + 1].into()),
+                            Instant::now() + BUDGET,
+                        )
                         .unwrap(),
                 );
             }

@@ -52,3 +52,10 @@ path = "fuzz_targets/protocol_connection.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "protocol-envelope"
+path = "fuzz_targets/protocol_envelope.rs"
+test = false
+doc = false
+bench = false

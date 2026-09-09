@@ -4,9 +4,14 @@
 //! Turns arbitrary actions into valid scripts with independently predicted results.
 //! The model uses integer time and a ledger of operations; it never reads session
 //! internals to decide which result, queued message or deadline to expect.
+//!
+//! The fixture supplies requests and write results directly, so duplicate wire
+//! IDs and transport failures that end a whole session belong to the connection
+//! runner instead. Everything here stays on the simulated clock.
 
 use super::{ExpectedMessage, Failure, Step};
 use crate::protocol::ReservedErrors;
+use crate::transport::mock::MAX_STEPS;
 use std::time::Duration;
 
 /// One mutation-friendly action. Selectors wrap over previously created objects,
@@ -39,12 +44,16 @@ pub enum Kind {
     Answer,
     Advance,
     Expire,
+    Wait,
     DropPromise,
     Close,
     Drop,
     CloseServer,
     DropSource,
 }
+
+/// Default abandonment budget of a fresh session, in script milliseconds.
+const ABANDONMENT: u64 = 5000;
 
 struct Session {
     reason: Option<Failure>,
@@ -57,7 +66,10 @@ struct Operation {
     body: ExpectedMessage,
     deadline: u64,
     result: Option<Result<u8, Failure>>,
-    observed: bool,
+    /// The driver still owns the promise, either directly or in a waiting job.
+    retained: bool,
+    /// A waiting job owns the promise until a later action collects its result.
+    parked: bool,
     queued: bool,
     writing: bool,
 }
@@ -65,6 +77,13 @@ struct Operation {
 impl Operation {
     fn request(&self) -> bool {
         matches!(self.body, ExpectedMessage::Request(_))
+    }
+
+    fn abandonment(&self) -> bool {
+        matches!(
+            self.body,
+            ExpectedMessage::Reply(_, Err(code)) if code == ReservedErrors::Unanswered as u64
+        )
     }
 
     fn complete(&mut self, now: u64, result: Result<u8, Failure>) {
@@ -86,6 +105,10 @@ struct Model {
     responders: Vec<Option<usize>>,
     server: Option<Failure>,
     source: bool,
+    /// Acceptance owns the server until an attach or closure wakes it.
+    accepting: bool,
+    /// The server owner was dropped; its weak closer and source may remain.
+    server_dropped: bool,
     steps: Vec<Step>,
 }
 
@@ -111,16 +134,38 @@ impl Model {
         }
     }
 
-    fn enqueue(&mut self, session: usize, body: ExpectedMessage, deadline: u64, observed: bool) {
+    fn enqueue(&mut self, session: usize, body: ExpectedMessage, deadline: u64, retained: bool) {
         self.operations.push(Operation {
             session,
             body,
             deadline,
             result: (deadline <= self.time).then_some(Err(Failure::Timeout)),
-            observed,
+            retained,
+            parked: false,
             queued: deadline > self.time,
             writing: false,
         });
+    }
+
+    /// Whether a completion can race with closure. The promise must still be
+    /// pending, its deadline in the future, and both owners available to the driver.
+    fn raceable(&self, operation: usize) -> bool {
+        let operation = &self.operations[operation];
+        let session = &self.sessions[operation.session];
+        operation.result.is_none()
+            && operation.retained
+            && !operation.parked
+            && self.time < operation.deadline
+            && session.reason.is_none()
+            && session.owner
+    }
+
+    /// Releases an operation whose promise and queued message a race consumed.
+    fn consume(&mut self, operation: usize) {
+        let operation = &mut self.operations[operation];
+        operation.retained = false;
+        operation.queued = false;
+        operation.writing = false;
     }
 
     fn step(&mut self, action: Action) {
@@ -138,12 +183,18 @@ impl Model {
             Kind::Open if self.source => {
                 if let Some(reason) = self.server {
                     self.steps.push(Step::RefuseOpen(reason));
+                } else if !self.accepting && budget % 3 == 2 {
+                    // Leave acceptance blocked, for a later attach or closure to end.
+                    self.steps.push(Step::StartAccept);
+                    self.accepting = true;
                 } else {
                     if !self.sessions.is_empty() {
                         self.close(self.sessions.len() - 1, Failure::Reset);
                     }
                     let id = self.sessions.len() as u8;
-                    if budget & 1 == 0 {
+                    if std::mem::take(&mut self.accepting) {
+                        self.steps.extend([Step::Open(id), Step::FinishAccept(id)]);
+                    } else if budget & 1 == 0 {
                         self.steps.extend([Step::Open(id), Step::Accept(id)]);
                     } else {
                         self.steps.extend([
@@ -155,7 +206,7 @@ impl Model {
                     self.sessions.push(Session {
                         reason: None,
                         owner: true,
-                        abandonment: 5000,
+                        abandonment: ABANDONMENT,
                     });
                 }
             }
@@ -172,23 +223,30 @@ impl Model {
                     self.enqueue(session, ExpectedMessage::Request(value), deadline, true);
                 }
             }
-            Kind::Receive
-                if !self.sessions.is_empty() && self.sessions[session].reason.is_none() =>
-            {
-                let slot = self.responders.len() as u8;
-                if budget & 1 == 0 {
-                    self.steps.extend([
-                        Step::Deliver(session as u8, u64::from(slot), value),
-                        Step::Receive(session as u8, value, slot),
-                    ]);
+            Kind::Receive if !self.sessions.is_empty() && self.sessions[session].owner => {
+                if let Some(reason) = self.sessions[session].reason {
+                    // A closed session refuses delivery and wakes its receivers.
+                    self.steps.push(if budget & 1 == 0 {
+                        Step::RefuseDelivery(session as u8, reason)
+                    } else {
+                        Step::ReceiveError(session as u8, reason)
+                    });
                 } else {
-                    self.steps.extend([
-                        Step::StartReceive(session as u8),
-                        Step::Deliver(session as u8, u64::from(slot), value),
-                        Step::FinishReceive(session as u8, value, slot),
-                    ]);
+                    let slot = self.responders.len() as u8;
+                    if budget & 1 == 0 {
+                        self.steps.extend([
+                            Step::Deliver(session as u8, u64::from(slot), value),
+                            Step::Receive(session as u8, value, slot),
+                        ]);
+                    } else {
+                        self.steps.extend([
+                            Step::StartReceive(session as u8),
+                            Step::Deliver(session as u8, u64::from(slot), value),
+                            Step::FinishReceive(session as u8, value, slot),
+                        ]);
+                    }
+                    self.responders.push(Some(session));
                 }
-                self.responders.push(Some(session));
             }
             Kind::Reply | Kind::Abandon if !self.responders.is_empty() => {
                 if let Some(session) = self.responders[responder].take() {
@@ -207,6 +265,11 @@ impl Model {
                         }
                     } else if let Some(reason) = self.sessions[session].reason {
                         self.steps.push(Step::RefuseReply(responder as u8, reason));
+                    } else if value % 4 == 3 {
+                        // Closure fails the reply whether submission wins or loses.
+                        self.steps
+                            .push(Step::RaceReplyClose(session as u8, responder as u8));
+                        self.close(session, Failure::Closed);
                     } else {
                         let result = if value & 1 == 0 {
                             Ok(value)
@@ -239,34 +302,68 @@ impl Model {
             }
             Kind::Outgoing if !self.sessions.is_empty() && self.sessions[session].owner => {
                 self.expire(session);
-                if let Some((id, outgoing)) = self
+                let queued: Vec<usize> = self
                     .operations
-                    .iter_mut()
+                    .iter()
                     .enumerate()
-                    .find(|(_, op)| op.session == session && op.queued)
-                {
-                    self.steps.push(Step::Outgoing(
-                        session as u8,
-                        id as u8,
-                        outgoing.body.clone(),
-                        outgoing.deadline,
-                    ));
-                    outgoing.queued = false;
-                    outgoing.writing = true;
+                    .filter(|(_, operation)| operation.session == session && operation.queued)
+                    .map(|(id, _)| id)
+                    .collect();
+                let abandoned = !queued.is_empty()
+                    && queued.iter().all(|&id| self.operations[id].abandonment());
+                if value & 1 == 1 && abandoned {
+                    // Drain automatic replies when no application messages remain.
+                    let ids = queued
+                        .iter()
+                        .map(|&id| match self.operations[id].body {
+                            ExpectedMessage::Reply(request, _) => request,
+                            ExpectedMessage::Request(_) => unreachable!("abandonment is a reply"),
+                        })
+                        .collect();
+                    self.steps.push(Step::Abandoned(session as u8, ids));
+                    for id in queued {
+                        let now = self.time;
+                        let operation = &mut self.operations[id];
+                        operation.queued = false;
+                        operation.complete(now, Ok(0));
+                    }
+                } else if let Some(&id) = queued.first() {
+                    let body = self.operations[id].body.clone();
+                    let at = self.operations[id].deadline;
+                    self.steps
+                        .push(Step::Outgoing(session as u8, id as u8, body, at));
+                    self.operations[id].queued = false;
+                    self.operations[id].writing = true;
                 } else {
                     self.steps.push(Step::NoOutgoing(session as u8));
                 }
             }
             Kind::Written if !self.operations.is_empty() && self.operations[operation].writing => {
-                let op = &mut self.operations[operation];
-                let result = match value % 4 {
-                    0 => Err(Failure::Closed),
-                    1 => Err(Failure::Reset),
-                    _ => Ok(()),
-                };
-                self.steps.push(Step::Written(operation as u8, result));
-                if result.is_err() || !op.request() || self.time >= op.deadline {
-                    op.complete(self.time, result.map(|()| 0));
+                let owner = self.operations[operation].session;
+                if value % 8 == 7
+                    && !self.operations[operation].request()
+                    && self.raceable(operation)
+                {
+                    // Either the write result or closure may settle the promise.
+                    self.steps.push(Step::RaceWriteClose(
+                        owner as u8,
+                        operation as u8,
+                        operation as u8,
+                    ));
+                    self.consume(operation);
+                    self.close(owner, Failure::Closed);
+                } else {
+                    let result = match value % 4 {
+                        0 => Err(Failure::Reset),
+                        1 => Err(Failure::Terminated),
+                        _ => Ok(()),
+                    };
+                    self.steps.push(Step::Written(operation as u8, result));
+                    let now = self.time;
+                    let pending = &mut self.operations[operation];
+                    if result.is_err() || !pending.request() || now >= pending.deadline {
+                        pending.complete(now, result.map(|()| 0));
+                    }
                 }
             }
             Kind::Answer
@@ -274,19 +371,32 @@ impl Model {
                     && self.operations[operation].writing
                     && self.operations[operation].request() =>
             {
-                let op = &mut self.operations[operation];
-                let result = match value % 3 {
-                    0 => Ok(value),
-                    1 => Err(Failure::Remote(u64::from(value) + 256)),
-                    _ => Err(Failure::WrongType),
-                };
-                self.steps.push(match result {
-                    Ok(tag) => Step::Answer(operation as u8, Ok(tag)),
-                    Err(Failure::Remote(code)) => Step::Answer(operation as u8, Err(code)),
-                    _ => Step::AnswerOther(operation as u8),
-                });
-                op.writing = false;
-                op.complete(self.time, result);
+                let owner = self.operations[operation].session;
+                if value % 8 == 7 && self.raceable(operation) {
+                    // Either the peer answer or closure may settle the promise.
+                    self.steps.push(Step::RaceAnswerClose(
+                        owner as u8,
+                        operation as u8,
+                        operation as u8,
+                    ));
+                    self.consume(operation);
+                    self.close(owner, Failure::Closed);
+                } else {
+                    let result = match value % 3 {
+                        0 => Ok(value),
+                        1 => Err(Failure::Remote(u64::from(value) + 256)),
+                        _ => Err(Failure::WrongType),
+                    };
+                    self.steps.push(match result {
+                        Ok(tag) => Step::Answer(operation as u8, Ok(tag)),
+                        Err(Failure::Remote(code)) => Step::Answer(operation as u8, Err(code)),
+                        _ => Step::AnswerOther(operation as u8),
+                    });
+                    let now = self.time;
+                    let pending = &mut self.operations[operation];
+                    pending.writing = false;
+                    pending.complete(now, result);
+                }
             }
             Kind::Advance => {
                 self.time += u64::from(budget);
@@ -296,12 +406,42 @@ impl Model {
                 self.expire(session);
                 self.steps.push(Step::Expire(session as u8));
             }
+            Kind::Wait if !self.operations.is_empty() && self.operations[operation].retained => {
+                let request = self.operations[operation].request();
+                match self.operations[operation].parked {
+                    // Collect a settled waiter while later actions can still use
+                    // its session.
+                    true => {
+                        if let Some(result) = self.operations[operation].result {
+                            self.operations[operation].parked = false;
+                            self.operations[operation].retained = false;
+                            self.steps.push(if request {
+                                Step::FinishWait(operation as u8, result)
+                            } else {
+                                Step::FinishWaitWrite(operation as u8, result.map(|_| ()))
+                            });
+                        }
+                    }
+                    // Waiting expires overdue operations in the same session
+                    // before blocking. Later actions supply the result.
+                    false => {
+                        self.expire(self.operations[operation].session);
+                        self.operations[operation].parked = true;
+                        self.steps.push(if request {
+                            Step::StartWait(operation as u8)
+                        } else {
+                            Step::StartWaitWrite(operation as u8)
+                        });
+                    }
+                }
+            }
             Kind::DropPromise
-                if !self.operations.is_empty() && self.operations[operation].observed =>
+                if !self.operations.is_empty()
+                    && self.operations[operation].retained
+                    && !self.operations[operation].parked =>
             {
-                let op = &mut self.operations[operation];
-                op.observed = false;
-                self.steps.push(if op.request() {
+                self.operations[operation].retained = false;
+                self.steps.push(if self.operations[operation].request() {
                     Step::DropPromise(operation as u8)
                 } else {
                     Step::DropWritePromise(operation as u8)
@@ -319,30 +459,64 @@ impl Model {
                     // promises retain the reason that ended the original session.
                     self.sessions[session].reason = Some(Failure::Closed);
                 } else {
-                    self.steps.push(match value % 3 {
-                        0 if self.sessions[session].reason.is_none() => {
-                            Step::RaceRequestClose(session as u8)
-                        }
-                        1 => Step::RaceCloses(session as u8),
-                        _ => Step::CloseSession(session as u8),
-                    });
+                    let open = self.sessions[session].reason.is_none();
+                    match value % 4 {
+                        0 if open => self.steps.push(Step::RaceRequestClose(session as u8)),
+                        1 => self.steps.push(Step::RaceCloses(session as u8)),
+                        // Close under a receive already blocked on an empty queue,
+                        // which has to wake with the reason that ended the session.
+                        2 if open && self.sessions[session].owner => self.steps.extend([
+                            Step::StartReceive(session as u8),
+                            Step::CloseSession(session as u8),
+                            Step::FinishReceiveError(session as u8, Failure::Closed),
+                        ]),
+                        _ => self.steps.push(Step::CloseSession(session as u8)),
+                    }
                     self.close(session, Failure::Closed);
                 }
             }
             Kind::CloseServer | Kind::DropSource => {
+                // Racing an attach needs an already closed session, so the reason
+                // ending it cannot depend on which thread wins.
+                let raced = kind == Kind::CloseServer
+                    && value % 4 == 2
+                    && self.source
+                    && self
+                        .sessions
+                        .last()
+                        .is_none_or(|session| session.reason.is_some());
                 let reason = if kind == Kind::CloseServer {
-                    self.steps.push(Step::CloseServer);
-                    Failure::Closed
+                    self.steps.push(match value % 4 {
+                        1 => Step::RaceServerCloses,
+                        2 if raced => Step::RaceServerCloseOpen,
+                        _ => Step::CloseServer,
+                    });
+                    Some(Failure::Closed)
                 } else if self.source {
                     self.steps.push(Step::DropSource);
                     self.source = false;
-                    Failure::Terminated
+                    Some(Failure::Terminated)
                 } else {
-                    return;
+                    None
                 };
-                let reason = *self.server.get_or_insert(reason);
-                if !self.sessions.is_empty() {
-                    self.close(self.sessions.len() - 1, reason);
+                if let Some(reason) = reason {
+                    let reason = *self.server.get_or_insert(reason);
+                    if !self.sessions.is_empty() {
+                        self.close(self.sessions.len() - 1, reason);
+                    }
+                    if std::mem::take(&mut self.accepting) {
+                        // An attach may have won the race and handed over a session,
+                        // which acceptance then finds already closed.
+                        self.steps.push(if raced {
+                            Step::FinishAcceptClosed
+                        } else {
+                            Step::FinishAcceptError(reason)
+                        });
+                    }
+                    if kind == Kind::CloseServer && value % 4 == 3 && !self.server_dropped {
+                        self.steps.push(Step::DropServer);
+                        self.server_dropped = true;
+                    }
                 }
             }
             _ => {}
@@ -352,8 +526,8 @@ impl Model {
                 let next = self
                     .operations
                     .iter()
-                    .filter(|op| op.session == session && op.result.is_none())
-                    .map(|op| op.deadline)
+                    .filter(|operation| operation.session == session && operation.result.is_none())
+                    .map(|operation| operation.deadline)
                     .min();
                 self.steps.push(Step::Deadline(session as u8, next));
             }
@@ -361,11 +535,12 @@ impl Model {
     }
 }
 
-/// Executes up to 64 arbitrary actions, then closes all owners and checks every
-/// retained promise. Simulated time never requires sleeps or deadline races.
+/// Executes up to [`MAX_STEPS`] arbitrary actions, then closes all owners and
+/// checks every retained promise, including the ones parked in a blocking wait.
+/// Simulated time never requires sleeps or deadline races.
 pub fn run(actions: &[Action]) {
     #[cfg(feature = "fuzz")]
-    crate::transport::mock::seed::seed("protocol-session", actions);
+    super::super::seed::seed(super::super::seed::SESSION_TARGET, actions);
     let mut model = Model {
         source: true,
         ..Model::default()
@@ -376,7 +551,7 @@ pub fn run(actions: &[Action]) {
         value: 0,
         budget: 0,
     });
-    for &action in actions.iter().take(64) {
+    for &action in actions.iter().take(MAX_STEPS) {
         model.step(action);
     }
     model.step(Action {
@@ -385,118 +560,30 @@ pub fn run(actions: &[Action]) {
         value: 0,
         budget: 0,
     });
-    for (id, op) in model.operations.iter().enumerate() {
-        if op.observed {
-            let result = op.result.expect("closed session settles every operation");
-            model.steps.push(if op.request() {
-                Step::Wait(id as u8, result)
-            } else {
-                Step::WaitWrite(id as u8, result.map(|_| ()))
-            });
+    for (id, operation) in model.operations.iter().enumerate() {
+        if !operation.retained {
+            continue;
         }
+        let result = operation
+            .result
+            .expect("closed session settles every operation");
+        model
+            .steps
+            .push(match (operation.request(), operation.parked) {
+                (true, true) => Step::FinishWait(id as u8, result),
+                // An answered request can also hand back the message enum itself,
+                // leaving the variant check to the application.
+                (true, false) => match result {
+                    Ok(tag) if id % 2 == 1 => Step::WaitMessage(id as u8, tag),
+                    result => Step::Wait(id as u8, result),
+                },
+                (false, true) => Step::FinishWaitWrite(id as u8, result.map(|_| ())),
+                (false, false) => Step::WaitWrite(id as u8, result.map(|_| ())),
+            });
     }
     super::run(model.steps);
 }
 
-#[cfg(feature = "fuzz")]
-impl crate::transport::mock::seed::Seedable for Action {
-    fn seed(&self, seed: &mut crate::transport::mock::seed::Seed) {
-        seed.variant(self.kind as u32, 16);
-        seed.byte(self.slot);
-        seed.byte(self.value);
-        seed.byte(self.budget);
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_completion_orderings() {
-        use Kind::*;
-        for time in [9, 10, 11] {
-            for result in 0..3 {
-                let steps = [
-                    (Request, 0, 10, 10),
-                    (Request, 0, 20, 20),
-                    (Outgoing, 0, 0, 0),
-                    (Outgoing, 0, 0, 0),
-                    (Receive, 0, 30, 1),
-                    (Reply, 0, 40, 10),
-                    (Outgoing, 0, 0, 0),
-                    (Written, 1, 2, 0),
-                    (Written, 1, 2, 0),
-                    (Advance, 0, 0, time),
-                    (Written, 2, 2, 0),
-                    (Answer, 1, result, 0),
-                    (Answer, 0, result, 0),
-                    (Open, 0, 0, 1),
-                    (Written, 2, 0, 0),
-                    (Request, 1, 50, 20),
-                    (Outgoing, 1, 0, 0),
-                    (Close, 0, 1, 0),
-                    (Answer, 3, result, 0),
-                    (Drop, 0, 0, 0),
-                ];
-                run(&steps.map(|(kind, slot, value, budget)| Action {
-                    kind,
-                    slot,
-                    value,
-                    budget,
-                }));
-            }
-        }
-    }
-
-    #[test]
-    fn test_model_scripts() {
-        use Kind::*;
-        for ending in [Open, Close, Drop, CloseServer, DropSource] {
-            for budget in [0, 1, 10, 255] {
-                let actions = [
-                    Request,
-                    Request,
-                    Outgoing,
-                    Written,
-                    Receive,
-                    Reply,
-                    Outgoing,
-                    Advance,
-                    Answer,
-                    Expire,
-                    ending,
-                    Request,
-                    Receive,
-                    Abandon,
-                    Outgoing,
-                    DropPromise,
-                    Drop,
-                ];
-                run(&actions.map(|kind| Action {
-                    kind,
-                    slot: 0,
-                    value: 3,
-                    budget,
-                }));
-            }
-        }
-        run(&[
-            Receive,
-            AbandonmentTimeout,
-            Abandon,
-            Outgoing,
-            Written,
-            Open,
-            Close,
-            Request,
-            Drop,
-        ]
-        .map(|kind| Action {
-            kind,
-            slot: 0,
-            value: 0,
-            budget: 10,
-        }));
-    }
-}
+#[path = "fuzz_tests.rs"]
+mod tests;

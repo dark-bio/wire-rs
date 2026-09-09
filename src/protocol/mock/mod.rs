@@ -2,23 +2,16 @@
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
 //! Scripted scenarios for requests, replies, closing and replacing sessions.
-//! Each runner keeps its regression scripts in a neighboring tests module.
+//!
+//! Session and connection fixtures execute explicit steps. Their `fuzz` modules
+//! turn arbitrary actions into those steps, with regression scripts in neighboring
+//! `tests` modules. The envelope runner checks peer bytes directly.
+//!
+//! With `WIRE_SEEDS` set, the runners record each scenario through the encoders
+//! in `seed.rs`. `make fuzz-seeds` runs the tests to regenerate `fuzz/seeds`.
 
 pub mod connection;
 pub mod envelope;
+#[cfg(feature = "fuzz")]
+pub mod seed;
 pub mod session;
-
-/// Target driving session lifecycles against a model on an integer clock.
-/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
-/// every binary has seeds.
-pub const SESSION_TARGET: &str = "protocol-session";
-
-/// Target composing protocol exchanges over live encrypted connections.
-/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
-/// every binary has seeds.
-pub const CONNECTION_TARGET: &str = "protocol-connection";
-
-/// Target decoding arbitrary peer envelopes and re-encoding what it accepted.
-/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
-/// every binary has seeds.
-pub const ENVELOPE_TARGET: &str = "protocol-envelope";

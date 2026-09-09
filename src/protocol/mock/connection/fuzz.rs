@@ -37,22 +37,61 @@ pub enum Kind {
     ReuseDuringFlush,
     Duplicate,
     Malformed,
+    Exhaust,
     Replace,
+    Disconnect,
+    HandshakeFailure,
     Close,
     Fault,
+    ReplyRefusal,
+    QueuedTimeout,
+    ResponseBeforeFailure,
+}
+
+/// Maximum actions run from one input, each driving several live exchanges.
+const ACTIONS: usize = 8;
+
+/// Whether an action ends the client session. Its stream cannot reconnect, so
+/// the runner defers the first such action until the other exchanges finish.
+fn ends_client(action: &Action) -> bool {
+    match action.kind {
+        Kind::Duplicate
+        | Kind::Malformed
+        | Kind::Exhaust
+        | Kind::Close
+        | Kind::Fault
+        | Kind::ResponseBeforeFailure => true,
+        Kind::ReuseDuringFlush => action.budget & 1 == 1,
+        Kind::Replace | Kind::Disconnect | Kind::HandshakeFailure => true,
+        _ => false,
+    }
 }
 
 /// Runs arbitrary live connection actions and joins all workers before returning.
 pub fn run(actions: &[Action]) {
     #[cfg(feature = "fuzz")]
-    crate::transport::mock::seed::seed("protocol-connection", actions);
+    super::super::seed::seed(super::super::seed::CONNECTION_TARGET, actions);
     let server = actions.first().is_none_or(|action| action.slot & 1 == 0);
     let mode = if server { Mode::Server } else { Mode::Client };
+
+    // Run a client's ending action last, so the actions behind it still execute
+    // instead of being discarded along with its connection.
+    let mut ordered: Vec<Action> = Vec::new();
+    let mut ending = None;
+    for &action in actions.iter().take(ACTIONS) {
+        if server || !ends_client(&action) {
+            ordered.push(action);
+        } else {
+            ending.get_or_insert(action);
+        }
+    }
+    ordered.extend(ending);
+
     let mut script = Vec::new();
     let mut local = u8::from(server);
     let mut next = if server { 2 } else { 1 };
     let outgoing = u8::from(server);
-    for (index, action) in actions.iter().take(8).enumerate() {
+    for (index, action) in ordered.iter().enumerate() {
         let Action {
             kind,
             slot,
@@ -148,6 +187,89 @@ pub fn run(actions: &[Action]) {
                     ),
                 ]);
                 next += 2;
+            }
+            Kind::ReplyRefusal => {
+                // Refusing a reply must not queue UNANSWERED or retain the peer ID.
+                steps.extend([
+                    Step::Send(peer, content.clone()),
+                    Step::Receive(local, value, 0),
+                    if value & 1 == 0 {
+                        Step::WrongDirectionReply(local, 0, 0)
+                    } else {
+                        Step::OversizedReply(0, 0)
+                    },
+                    Step::Written(
+                        0,
+                        Err(if value & 1 == 0 {
+                            Failure::Direction
+                        } else {
+                            Failure::Large
+                        }),
+                    ),
+                    Step::Send(peer, answer.clone()),
+                    Step::Receive(local, value.wrapping_add(1), 1),
+                    Step::Reply(1, 1, Ok(value), 3000),
+                    Step::Read(peer, content.clone()),
+                    Step::Written(1, Ok(())),
+                ]);
+            }
+            Kind::QueuedTimeout => {
+                // The blocked writer leaves both messages queued until expiry.
+                // Reusing the peer ID and the next local ID checks their cleanup.
+                let timeout = 50 + u64::from(budget % 10);
+                steps.extend([
+                    Step::Pause(outgoing, Operation::Write, true),
+                    Step::Request(local, 0, value, 3000),
+                    Step::Blocked(outgoing, Operation::Write),
+                    Step::Request(local, 1, value.wrapping_add(1), timeout),
+                    Step::Send(peer, content.clone()),
+                    Step::Receive(local, value, 0),
+                    Step::Reply(0, 0, Ok(value), timeout),
+                    Step::Answer(1, Err(Failure::Timeout)),
+                    Step::Written(0, Err(Failure::Timeout)),
+                    Step::Send(peer, answer.clone()),
+                    Step::Receive(local, value.wrapping_add(1), 1),
+                    Step::Reply(1, 1, Ok(value), 3000),
+                    Step::Pause(outgoing, Operation::Write, false),
+                    Step::Read(next, content.clone()),
+                    Step::Send(next, answer.clone()),
+                    Step::Answer(0, Ok(value.wrapping_add(1))),
+                    Step::Read(peer, content.clone()),
+                    Step::Written(1, Ok(())),
+                ]);
+                next += 2;
+            }
+            Kind::ResponseBeforeFailure => {
+                let (body, result) = if value & 1 == 0 {
+                    (answer.clone(), Ok(value.wrapping_add(1)))
+                } else {
+                    (
+                        EnvelopeShape::Error(u64::from(value)),
+                        Err(Failure::Remote(u64::from(value))),
+                    )
+                };
+                steps.extend([
+                    Step::Pause(outgoing, Operation::Flush, true),
+                    Step::Request(local, 0, value, 3000),
+                    Step::Blocked(outgoing, Operation::Flush),
+                    Step::Read(next, content.clone()),
+                    Step::Send(next, body),
+                    // This receive fences the answer while leaving its result
+                    // buffered until after the write closes the session.
+                    Step::Send(peer, content.clone()),
+                    Step::Receive(local, value, 0),
+                    Step::Outstanding(local, vec![]),
+                    Step::Request(local, 1, value, 3000),
+                    Step::Reply(0, 0, Ok(value), 3000),
+                    Step::StartReceive(local),
+                    Step::Fault(outgoing, Operation::Flush, io::ErrorKind::BrokenPipe),
+                    Step::Pause(outgoing, Operation::Flush, false),
+                    Step::ReceiveFailed(local, Failure::Transport),
+                    Step::Answer(0, result),
+                    Step::Answer(1, Err(Failure::Transport)),
+                    Step::Written(0, Err(Failure::Transport)),
+                ]);
+                ended = true;
             }
             Kind::ResponseDuringFlush | Kind::RequestTimeout => {
                 let timeout = kind == Kind::RequestTimeout;
@@ -269,6 +391,63 @@ pub fn run(actions: &[Action]) {
                 ]);
                 ended = true;
             }
+            Kind::Exhaust => {
+                // One allocatable ID is left; taking another would abort the writer.
+                let last = if server { u64::MAX - 1 } else { u64::MAX };
+                steps.extend([
+                    Step::LastId(local),
+                    Step::Request(local, 0, value, 3000),
+                    Step::Read(last, content.clone()),
+                    Step::Send(last, answer.clone()),
+                    Step::Answer(0, Ok(value.wrapping_add(1))),
+                    Step::Outstanding(local, vec![]),
+                    Step::Close(local),
+                ]);
+                ended = true;
+            }
+            Kind::Disconnect if server => {
+                // A writer paused before its disconnect must leave the session
+                // that replaced it connected.
+                steps.extend([
+                    Step::PauseDisconnect(local),
+                    Step::Pause(outgoing, Operation::Flush, true),
+                    Step::Request(local, 0, value, 3000),
+                    Step::Blocked(outgoing, Operation::Flush),
+                    Step::Read(next, content.clone()),
+                    Step::Close(local),
+                    Step::Answer(0, Err(Failure::Closed)),
+                    Step::Pause(outgoing, Operation::Flush, false),
+                    Step::DisconnectPaused(local),
+                    Step::Reconnect(local + 1),
+                    Step::ResumeDisconnect(local),
+                    Step::Refused(local),
+                    Step::Drop(local),
+                    Step::Released(local),
+                ]);
+                local += 1;
+                next = 2;
+            }
+            Kind::HandshakeFailure if server => {
+                // Failed handshake output or input must leave the server reader
+                // available for the next reset.
+                if value & 1 == 0 {
+                    steps.extend([
+                        Step::Fault(outgoing, Operation::Write, io::ErrorKind::BrokenPipe),
+                        Step::FailedReconnect,
+                    ]);
+                } else {
+                    steps.push(Step::HandshakeReadTimeout);
+                }
+                steps.extend([
+                    Step::Reconnect(local + 1),
+                    Step::Close(local),
+                    Step::Refused(local),
+                    Step::Drop(local),
+                    Step::Released(local),
+                ]);
+                local += 1;
+                next = 2;
+            }
             Kind::Replace if server => {
                 // Retain an unanswered request and a responder across replacement.
                 steps.extend([
@@ -287,7 +466,7 @@ pub fn run(actions: &[Action]) {
                 local += 1;
                 next = 2;
             }
-            Kind::Close | Kind::Replace => {
+            Kind::Close | Kind::Replace | Kind::Disconnect | Kind::HandshakeFailure => {
                 steps.extend([
                     Step::StartReceive(local),
                     Step::Close(local),
@@ -352,84 +531,6 @@ pub fn run(actions: &[Action]) {
     super::run(mode, &script);
 }
 
-#[cfg(feature = "fuzz")]
-impl crate::transport::mock::seed::Seedable for Action {
-    fn seed(&self, seed: &mut crate::transport::mock::seed::Seed) {
-        seed.variant(self.kind as u32, 12);
-        seed.byte(self.slot);
-        seed.byte(self.value);
-        seed.byte(self.budget);
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_connection_fuzz_sequences() {
-        use Kind::*;
-        for slot in 0..2 {
-            for kinds in [
-                [
-                    Pipeline,
-                    Incoming,
-                    ResponseDuringFlush,
-                    Refusal,
-                    ReuseDuringFlush,
-                    ReplyTimeout,
-                    RequestTimeout,
-                    Pipeline,
-                ],
-                [
-                    Replace, Pipeline, Malformed, Incoming, Fault, Pipeline, Close, Incoming,
-                ],
-            ] {
-                run(&kinds.map(|kind| Action {
-                    kind,
-                    slot,
-                    value: 255,
-                    budget: 6,
-                }));
-            }
-        }
-    }
-
-    #[test]
-    fn test_connection_fuzz_actions() {
-        use Kind::*;
-        for slot in 0..6 {
-            for kind in [
-                Pipeline,
-                Incoming,
-                Refusal,
-                ResponseDuringFlush,
-                RequestTimeout,
-                ReplyTimeout,
-                ReuseDuringFlush,
-                Duplicate,
-                Malformed,
-                Replace,
-                Close,
-                Fault,
-            ] {
-                for budget in 0..3 {
-                    run(&[
-                        Action {
-                            kind,
-                            slot,
-                            value: slot * 11,
-                            budget,
-                        },
-                        Action {
-                            kind: Pipeline,
-                            slot,
-                            value: 255,
-                            budget: 7,
-                        },
-                    ]);
-                }
-            }
-        }
-    }
-}
+#[path = "fuzz_tests.rs"]
+mod tests;

@@ -3,9 +3,13 @@
 
 //! Scenarios through public constructors, real crypto/framing, and gated adapters.
 
-use super::{EnvelopeShape, Failure, Mode, Step, run};
+use super::{BUDGET, Driver, EnvelopeShape, Failure, Job, Mode, Step, run};
+use crate::protocol::{Error, Message};
+use crate::transport;
 use crate::transport::mock::duplex::Operation;
 use std::io;
+use std::sync::{Arc, Barrier};
+use std::time::Instant;
 
 /// Both peers queue multiple requests before waiting for answers or calling `recv()`.
 #[test]
@@ -34,6 +38,59 @@ fn test_bidirectional_exchange() {
             Stopped,
         ],
     );
+}
+
+/// Cloned requesters can submit concurrently without losing work or sharing IDs.
+/// Reversed answers must still reach each producer's original promise.
+#[test]
+fn test_concurrent_requesters() {
+    const PRODUCERS: u8 = 8;
+    const REQUESTS: u8 = 8;
+
+    crate::testing::init_tracing();
+    for (mode, local, first) in [(Mode::Client, 0, 1), (Mode::Server, 1, 2)] {
+        let mut driver = Driver::new(mode);
+        let start = Arc::new(Barrier::new(PRODUCERS as usize));
+        let jobs: Vec<_> = (0..PRODUCERS)
+            .map(|producer| {
+                let requester = driver.requesters[&local].clone();
+                let start = start.clone();
+                Job::start(move || {
+                    start.wait();
+                    (0..REQUESTS)
+                        .map(|index| {
+                            let tag = producer * REQUESTS + index;
+                            let promise = requester
+                                .request(vec![tag], Instant::now() + BUDGET)
+                                .unwrap();
+                            (tag, promise)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let promises: Vec<_> = jobs.into_iter().flat_map(Job::finish).collect();
+        let raw = driver.raw.as_mut().unwrap();
+        let mut received = Vec::new();
+        for index in 0..PRODUCERS * REQUESTS {
+            let (id, body) = raw.read();
+            assert_eq!(id, first + 2 * u64::from(index));
+            let EnvelopeShape::Content(tag) = body else {
+                panic!("expected request content");
+            };
+            received.push((id, tag));
+        }
+        let mut tags: Vec<_> = received.iter().map(|&(_, tag)| tag).collect();
+        tags.sort_unstable();
+        assert_eq!(tags, (0..PRODUCERS * REQUESTS).collect::<Vec<_>>());
+        for (id, tag) in received.into_iter().rev() {
+            raw.send(id, EnvelopeShape::Content(tag + 100)).unwrap();
+        }
+        for (tag, promise) in promises {
+            assert_eq!(promise.wait::<Vec<u8>>().unwrap(), vec![tag + 100]);
+        }
+        driver.step(Step::Outstanding(local, vec![]));
+    }
 }
 
 /// Out-of-order answers, unknown IDs and duplicates cannot complete the wrong promise.
@@ -243,6 +300,47 @@ fn test_response_before_send_completion() {
     }
 }
 
+/// An answer buffered before a failed flush survives session closure. Requests
+/// and replies still queued behind that flush must fail with the transport.
+#[test]
+fn test_response_before_send_failure() {
+    use Step::*;
+    for (mode, local, id, peer, outgoing) in
+        [(Mode::Client, 0, 1, 2, 0), (Mode::Server, 1, 2, 1, 1)]
+    {
+        for (body, result) in [
+            (EnvelopeShape::Content(20), Ok(20)),
+            (EnvelopeShape::Error(0x123), Err(Failure::Remote(0x123))),
+        ] {
+            run(
+                mode,
+                &[
+                    Pause(outgoing, Operation::Flush, true),
+                    Request(local, 0, 10, 3000),
+                    Blocked(outgoing, Operation::Flush),
+                    Read(id, EnvelopeShape::Content(10)),
+                    Send(id, body),
+                    // Receiving the next peer message proves the reader processed
+                    // the answer, without consuming its promise before closure.
+                    Send(peer, EnvelopeShape::Content(30)),
+                    Receive(local, 30, 0),
+                    Outstanding(local, vec![]),
+                    Request(local, 1, 11, 3000),
+                    Reply(0, 0, Ok(40), 3000),
+                    StartReceive(local),
+                    Fault(outgoing, Operation::Flush, io::ErrorKind::BrokenPipe),
+                    Pause(outgoing, Operation::Flush, false),
+                    ReceiveFailed(local, Failure::Transport),
+                    Answer(0, result),
+                    Answer(1, Err(Failure::Transport)),
+                    Written(0, Err(Failure::Transport)),
+                    Refused(local),
+                ],
+            );
+        }
+    }
+}
+
 /// Write failures wake `Session::recv()` even while the transport reader is blocked.
 #[test]
 fn test_send_failure_wakes_receivers() {
@@ -260,6 +358,98 @@ fn test_send_failure_wakes_receivers() {
                     Refused(local),
                 ],
             );
+        }
+    }
+}
+
+/// Fatal reads fail every pending request and wake both receive and acceptance.
+/// EOF and adapter errors retain their cause, including on later submissions.
+#[test]
+fn test_read_failure_wakes_callers() {
+    use Step::*;
+    crate::testing::init_tracing();
+    for (mode, local, first, peer, incoming) in
+        [(Mode::Client, 0, 1, 2, 1), (Mode::Server, 1, 2, 1, 0)]
+    {
+        for eof in [false, true] {
+            let mut driver = Driver::new(mode);
+            for step in [
+                Send(peer, EnvelopeShape::Content(30)),
+                Receive(local, 30, 0),
+                Request(local, 0, 10, 3000),
+                Request(local, 1, 11, 3000),
+                Read(first, EnvelopeShape::Content(10)),
+                Read(first + 2, EnvelopeShape::Content(11)),
+                StartReceive(local),
+                Blocked(incoming, Operation::Read),
+            ] {
+                driver.step(step);
+            }
+            let accepting = driver.server.take().map(|mut server| {
+                let waiting = server.inner.watch_accept_wait();
+                let job = Job::start(move || {
+                    let error = server.accept().err().expect("accept must fail");
+                    (server, error)
+                });
+                waiting.recv_timeout(BUDGET).unwrap();
+                job
+            });
+            if eof {
+                driver.pipes[incoming as usize].close();
+            } else {
+                driver.step(Fault(incoming, Operation::Read, io::ErrorKind::BrokenPipe));
+            }
+            let mut errors = Vec::new();
+            for slot in [0, 1] {
+                errors.push(
+                    driver
+                        .promises
+                        .remove(&slot)
+                        .unwrap()
+                        .wait_worker_result()
+                        .unwrap_err(),
+                );
+            }
+            let (session, result) = driver.receiving.remove(&local).unwrap().finish();
+            errors.push(result.err().expect("receive must fail"));
+            driver.sessions.insert(local, session);
+            if let Some(accepting) = accepting {
+                let (server, error) = accepting.finish();
+                errors.push(error);
+                driver.server = Some(server);
+            }
+            errors.push(
+                driver.requesters[&local]
+                    .request(vec![12], Instant::now() + BUDGET)
+                    .err()
+                    .expect("request must fail"),
+            );
+            errors.push(
+                driver
+                    .responders
+                    .remove(&0)
+                    .unwrap()
+                    .reply(Ok(Message::Develop(vec![31])), Instant::now() + BUDGET)
+                    .err()
+                    .expect("reply must fail"),
+            );
+            for error in errors {
+                let Error::Transport(error) = error else {
+                    panic!("expected transport error: {error:?}");
+                };
+                match error.as_ref() {
+                    transport::Error::Terminated if eof => {}
+                    transport::Error::RecvFailed(error) if !eof => {
+                        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                    }
+                    other => panic!("unexpected read failure: {other:?}"),
+                }
+            }
+            // Worker termination must follow the read failure itself, before
+            // the driver's cleanup closes any remaining owners or pipes.
+            driver.step(Stopped);
+            driver.step(Drop(local));
+            driver.step(Released(local));
         }
     }
 }
@@ -395,6 +585,34 @@ fn test_local_refusals_and_abandoned_observers() {
                 Answer(3, Ok(23)),
             ],
         );
+    }
+}
+
+/// A local reply refusal consumes the responder without sending UNANSWERED.
+/// The peer can reuse its ID, and the next reply is the first message sent.
+#[test]
+fn test_reply_refusals_release_incoming_id() {
+    use Step::*;
+    for (mode, local, id) in [(Mode::Client, 0, 2), (Mode::Server, 1, 1)] {
+        for (reply, failure) in [
+            (WrongDirectionReply(local, 0, 0), Failure::Direction),
+            (OversizedReply(0, 0), Failure::Large),
+        ] {
+            run(
+                mode,
+                &[
+                    Send(id, EnvelopeShape::Content(10)),
+                    Receive(local, 10, 0),
+                    reply,
+                    Written(0, Err(failure)),
+                    Send(id, EnvelopeShape::Content(11)),
+                    Receive(local, 11, 1),
+                    Reply(1, 1, Ok(21), 3000),
+                    Read(id, EnvelopeShape::Content(21)),
+                    Written(1, Ok(())),
+                ],
+            );
+        }
     }
 }
 
@@ -552,6 +770,45 @@ fn test_expired_reply_releases_incoming_id() {
                 Reply(1, 1, Ok(21), 3000),
                 Read(id, EnvelopeShape::Content(21)),
                 Written(1, Ok(())),
+            ],
+        );
+    }
+}
+
+/// Expiring a queued reply releases its peer ID without sending the reply.
+/// Expiring a queued request must not consume a local wire ID either.
+#[test]
+fn test_queued_expiry_releases_ids() {
+    use Step::*;
+    for (mode, local, first, peer, outgoing) in
+        [(Mode::Client, 0, 1, 2, 0), (Mode::Server, 1, 2, 1, 1)]
+    {
+        run(
+            mode,
+            &[
+                Pause(outgoing, Operation::Write, true),
+                Request(local, 0, 10, 3000),
+                Blocked(outgoing, Operation::Write),
+                Request(local, 1, 11, 50),
+                Send(peer, EnvelopeShape::Content(20)),
+                Receive(local, 20, 0),
+                Reply(0, 0, Ok(30), 50),
+                Answer(1, Err(Failure::Timeout)),
+                Written(0, Err(Failure::Timeout)),
+                Send(peer, EnvelopeShape::Content(21)),
+                Receive(local, 21, 1),
+                Reply(1, 1, Ok(31), 3000),
+                Pause(outgoing, Operation::Write, false),
+                Read(first, EnvelopeShape::Content(10)),
+                Send(first, EnvelopeShape::Content(40)),
+                Answer(0, Ok(40)),
+                Read(peer, EnvelopeShape::Content(31)),
+                Written(1, Ok(())),
+                Request(local, 2, 12, 3000),
+                Read(first + 2, EnvelopeShape::Content(12)),
+                Send(first + 2, EnvelopeShape::Content(42)),
+                Answer(2, Ok(42)),
+                Outstanding(local, vec![]),
             ],
         );
     }

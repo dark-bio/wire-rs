@@ -48,11 +48,11 @@ fuzz:
 		$(SEEDED) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
-# fuzz-minimize drops the inputs of every fuzz corpus that add no coverage,
+# fuzz-minimize uses set cover to retain coverage features with fewer inputs,
 # keeping a corpus grown by fuzz runs small before it is committed.
 fuzz-minimize:
 	for target in $$(cargo +nightly fuzz list); do \
-		$(SEEDED) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target || exit 1; \
+		$(SEEDED) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target -- -set_cover_merge=1 || exit 1; \
 	done
 
 # fuzz-loop runs the fuzz targets round robin until a finding stops it or the
