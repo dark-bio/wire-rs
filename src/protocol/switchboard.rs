@@ -12,6 +12,7 @@ use crate::protocol::envelope::{Envelope, Ids, Kind, Parity, Side};
 use crate::protocol::mux::{ANSWERS, CHARGE, Error, INBOX, Reader, Responder, WINDOW, Writer};
 use crate::transport::{self, Attester, Closer, Event, MAX_MESSAGE_SIZE, Sender};
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -171,8 +172,9 @@ pub(super) trait Source: Send + 'static {
 
     /// Reads the next message of the session, or the session ending and the
     /// next one opening, see the transport server's. A client's session is
-    /// its connection, so it only ever reads messages. A server retries failed
-    /// handshake output on its reusable stream; errors returned here end the mux.
+    /// its connection, so it only ever reads messages. A server retries timed-out
+    /// handshakes and failed handshake output on its reusable stream; errors
+    /// returned here end the mux.
     fn recv(&mut self) -> Result<Event<Writer>, transport::Error>;
 
     /// Ends the live session and tells the peer through
@@ -203,6 +205,11 @@ impl<A: Attester + Send + 'static> Source for transport::Server<Reader, Writer, 
                 // Keep consuming the persistent server stream for a new reset.
                 Err(transport::Error::SendFailed(err)) => {
                     warn!("wire handshake output failed: {}", err);
+                }
+                // The handshake deadline expired without installing a session.
+                // The next receive waits for another reset on the same stream.
+                Err(transport::Error::RecvFailed(err)) if err.kind() == io::ErrorKind::TimedOut => {
+                    warn!("wire handshake timed out: {}", err);
                 }
                 result => return result,
             }
@@ -734,7 +741,7 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// Fails the client's first read once the server's output fault has fired,
     /// allowing the client to abandon that attempt and reconnect on the same pipe.
@@ -772,6 +779,29 @@ mod tests {
         }
     }
 
+    /// Reports an actual handshake read timeout so the peer can retry only
+    /// after the incomplete attempt has exhausted its deadline.
+    struct TimeoutReader {
+        reader: PipeReader,
+        expired: mpsc::Sender<()>,
+    }
+
+    impl io::Read for TimeoutReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let result = self.reader.read(buf);
+            if matches!(&result, Err(err) if err.kind() == io::ErrorKind::TimedOut) {
+                let _ = self.expired.send(());
+            }
+            result
+        }
+    }
+
+    impl Read for TimeoutReader {
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.reader.set_read_deadline(deadline)
+        }
+    }
+
     /// Rejects the first server hello, reports that rejection to the client
     /// reader, and accepts all later output, including a failure notification.
     struct FaultWriter {
@@ -806,24 +836,28 @@ mod tests {
         }
     }
 
-    // Tests the real server Source after a failed hello write and after a hello
-    // timeout. Its receive call must keep consuming input until a new handshake
-    // connects, allowing a message round trip without closing the original stream.
-    // Protocol scenarios bypass the transport handshake, so cannot exercise this.
+    // Tests the real server Source after failed handshake output or an expired
+    // handshake read. It must accept a new session on the same stream, while EOF
+    // still escapes. Protocol scenarios bypass the transport handshake.
     #[test]
-    fn test_server_source_retries_handshake_output_failure() {
+    fn test_server_source_retries_handshake_failure() {
         testing::init_tracing();
 
-        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::TimedOut] {
+        enum Fault {
+            Write(io::ErrorKind),
+            ReadTimeout,
+        }
+
+        for fault in [
+            Fault::Write(io::ErrorKind::BrokenPipe),
+            Fault::Write(io::ErrorKind::TimedOut),
+            Fault::ReadTimeout,
+        ] {
             let (ark_reader, host_writer) = testing::pipe();
             let (host_reader, ark_writer) = testing::pipe();
             let (failure, failed) = mpsc::channel();
-            let signer = xdsa::SecretKey::generate();
-            let identity = signer.public_key();
-            let attestation = self_attestation(&signer);
-            let closed = Arc::new(AtomicBool::new(false));
-            let server = transport::Server::new(
-                Stream::new(
+            let (ark_reader, ark_writer, host_reader, expired) = match fault {
+                Fault::Write(kind) => (
                     Box::new(ark_reader) as Reader,
                     Box::new(FaultWriter {
                         writer: ark_writer,
@@ -831,14 +865,36 @@ mod tests {
                         kind,
                         deadline: None,
                     }) as Writer,
-                    {
-                        let closed = closed.clone();
-                        move || closed.store(true, Ordering::Release)
-                    },
+                    Box::new(FaultReader {
+                        reader: host_reader,
+                        failure: Some(failed),
+                        deadline: None,
+                    }) as Reader,
+                    None,
                 ),
+                Fault::ReadTimeout => (
+                    Box::new(TimeoutReader {
+                        reader: ark_reader,
+                        expired: failure,
+                    }) as Reader,
+                    Box::new(ark_writer) as Writer,
+                    Box::new(host_reader) as Reader,
+                    Some(failed),
+                ),
+            };
+            let signer = xdsa::SecretKey::generate();
+            let identity = signer.public_key();
+            let attestation = self_attestation(&signer);
+            let closed = Arc::new(AtomicBool::new(false));
+            let server = transport::Server::new(
+                Stream::new(ark_reader, ark_writer, {
+                    let closed = closed.clone();
+                    move || closed.store(true, Ordering::Release)
+                }),
                 signer,
                 attestation,
-            );
+            )
+            .set_handshake_timeout(Duration::from_secs(1));
             let peer = thread::spawn(move || {
                 let mut server = server;
                 let sender = match Source::recv(&mut server).unwrap() {
@@ -850,25 +906,30 @@ mod tests {
                     _ => panic!("fresh session did not deliver its message"),
                 };
                 sender.send(&message).unwrap();
+                assert!(matches!(
+                    Source::recv(&mut server),
+                    Err(transport::Error::Terminated)
+                ));
                 server
             });
 
-            let mut client = transport::Client::new(Stream::new(
-                FaultReader {
-                    reader: host_reader,
-                    failure: Some(failed),
-                    deadline: None,
-                },
-                host_writer,
-                || {},
-            ));
-            assert!(matches!(
-                client.connect(&identity),
-                Err(transport::Error::RecvFailed(_))
-            ));
+            let mut client = transport::Client::new(Stream::new(host_reader, host_writer, || {}));
+            if let Some(expired) = expired {
+                // Start a handshake without providing a hello. Waiting on the
+                // adapter's timeout keeps the retry from rescuing that attempt.
+                client.send_frame_blob(&[]).unwrap();
+                expired.recv_timeout(Duration::from_secs(5)).unwrap();
+            } else {
+                assert!(matches!(
+                    client.connect(&identity),
+                    Err(transport::Error::RecvFailed(_))
+                ));
+            }
             let (sender, _) = client.connect(&identity).unwrap();
             sender.send(&payload(1)).unwrap();
             assert_eq!(client.recv().unwrap(), payload(1));
+            drop(sender);
+            drop(client);
             let _server = peer.join().unwrap();
             assert!(!closed.load(Ordering::Acquire));
         }

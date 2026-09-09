@@ -100,9 +100,9 @@ pub type Server = Mux<ArkToHost, HostToArk>;
 impl Server {
     /// Starts multiplexing over a transport server, serving the clients it
     /// handshakes one session at a time, a session ending failing whatever it
-    /// left pending. Failed handshake output leaves the byte stream available
-    /// for another handshake. Closing or failing the multiplexer closes the
-    /// server's byte stream.
+    /// left pending. Handshake timeouts and failed handshake output leave the
+    /// byte stream available for another handshake. Closing or failing the
+    /// multiplexer closes the server's byte stream.
     pub fn new<A: Attester + Send + 'static>(server: transport::Server<Reader, Writer, A>) -> Self {
         Self {
             switchboard: Switchboard::start(Side::Server, server, None),

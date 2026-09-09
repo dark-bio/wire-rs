@@ -92,11 +92,9 @@ impl Envelope for HostToArk {
             content: Some(content),
         }
     }
-
     fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self {
         Self { id, err, content }
     }
-
     fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
@@ -112,11 +110,9 @@ impl Envelope for ArkToHost {
             content: Some(content),
         }
     }
-
     fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self {
         Self { id, err, content }
     }
-
     fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
