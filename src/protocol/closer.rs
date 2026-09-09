@@ -3,14 +3,14 @@
 
 //! Handles for closing a session or server from another thread.
 
-use super::{Error, server, session};
+use super::{Error, server::ServerInner, session::SessionInner};
 use std::sync::Weak;
 
 /// Clonable handle for closing the session or server that created it.
 ///
 /// From [`super::Session::closer`], it closes that session, with the semantics of
 /// [`super::Session::close`]. From [`super::Server::closer`], it closes the server
-/// endpoint and its active session, with the semantics of [`super::Server::close`].
+/// and its active session, with the semantics of [`super::Server::close`].
 /// Its target never changes: a session's closer cannot affect a successor session.
 ///
 /// This handle does not keep its owner open. Dropping it does not close anything.
@@ -24,9 +24,9 @@ pub struct Closer {
 #[derive(Clone)]
 enum Target {
     /// One session, even after another session connects to the same server.
-    Session(Weak<session::Shared>),
-    /// One persistent endpoint and whichever session it has attached at closure.
-    Server(Weak<server::Shared>),
+    Session(Weak<SessionInner>),
+    /// One persistent server and whichever session it has attached at closure.
+    Server(Weak<ServerInner>),
 }
 
 impl Closer {
@@ -47,14 +47,14 @@ impl Closer {
     }
 
     /// Creates a closer for one session using a weak reference.
-    pub(super) fn session(target: Weak<session::Shared>) -> Self {
+    pub(super) fn session(target: Weak<SessionInner>) -> Self {
         Self {
             target: Target::Session(target),
         }
     }
 
     /// Creates a closer for one server using a weak reference.
-    pub(super) fn server(target: Weak<server::Shared>) -> Self {
+    pub(super) fn server(target: Weak<ServerInner>) -> Self {
         Self {
             target: Target::Server(target),
         }
@@ -71,11 +71,11 @@ mod tests {
     #[allow(dead_code)]
     fn cross_thread_close(session: &Session, server: &Server) {
         let session_closer: Closer = session.closer();
-        let endpoint_closer: Closer = server.closer();
+        let server_closer: Closer = server.closer();
         let session_copy = session_closer.clone();
-        let endpoint_copy = endpoint_closer.clone();
+        let server_copy = server_closer.clone();
         std::thread::spawn(move || session_copy.close());
-        std::thread::spawn(move || endpoint_copy.close());
+        std::thread::spawn(move || server_copy.close());
         session.close();
         server.close();
     }

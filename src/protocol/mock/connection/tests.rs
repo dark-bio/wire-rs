@@ -3,7 +3,7 @@
 
 //! Scenarios through public constructors, real crypto/framing, and gated adapters.
 
-use super::{Body, Failure, Mode, Step, run};
+use super::{EnvelopeShape, Failure, Mode, Step, run};
 use crate::transport::mock::duplex::Operation;
 use std::io;
 
@@ -46,19 +46,19 @@ fn test_response_correlation() {
             &[
                 Request(local, 0, 10, 3000),
                 Request(local, 1, 11, 3000),
-                Read(first, Body::Content(10)),
-                Read(first + 2, Body::Content(11)),
-                Send(first + 100, Body::Content(99)),
-                Send(first + 2, Body::Content(21)),
+                Read(first, EnvelopeShape::Content(10)),
+                Read(first + 2, EnvelopeShape::Content(11)),
+                Send(first + 100, EnvelopeShape::Content(99)),
+                Send(first + 2, EnvelopeShape::Content(21)),
                 Answer(1, Ok(21)),
                 Outstanding(local, vec![first]),
-                Send(first + 2, Body::Content(99)),
-                Send(first, Body::Error(0x123)),
+                Send(first + 2, EnvelopeShape::Content(99)),
+                Send(first, EnvelopeShape::Error(0x123)),
                 Answer(0, Err(Failure::Remote(0x123))),
                 Outstanding(local, vec![]),
                 Request(local, 2, 12, 3000),
-                Read(first + 4, Body::Content(12)),
-                Send(first + 4, Body::Content(22)),
+                Read(first + 4, EnvelopeShape::Content(12)),
+                Send(first + 4, EnvelopeShape::Content(22)),
                 Answer(2, Ok(22)),
             ],
         );
@@ -76,24 +76,24 @@ fn test_unordered_peer_requests() {
         run(
             mode,
             &[
-                Send(ids[0], Body::Content(10)),
-                Send(ids[1], Body::Content(11)),
-                Send(ids[2], Body::Content(12)),
+                Send(ids[0], EnvelopeShape::Content(10)),
+                Send(ids[1], EnvelopeShape::Content(11)),
+                Send(ids[2], EnvelopeShape::Content(12)),
                 Receive(local, 10, 0),
                 Receive(local, 11, 1),
                 Receive(local, 12, 2),
                 Reply(2, 2, Ok(22), 3000),
-                Read(ids[2], Body::Content(22)),
+                Read(ids[2], EnvelopeShape::Content(22)),
                 Written(2, Ok(())),
                 Abandon(0),
-                Read(ids[0], Body::Error(1)),
+                Read(ids[0], EnvelopeShape::Error(1)),
                 Reply(1, 1, Err(0x100), 3000),
-                Read(ids[1], Body::Error(0x100)),
+                Read(ids[1], EnvelopeShape::Error(0x100)),
                 Written(1, Ok(())),
-                Send(ids[2], Body::Content(13)),
+                Send(ids[2], EnvelopeShape::Content(13)),
                 Receive(local, 13, 3),
                 Abandon(3),
-                Read(ids[2], Body::Error(1)),
+                Read(ids[2], EnvelopeShape::Error(1)),
             ],
         );
     }
@@ -105,12 +105,12 @@ fn test_strict_envelope_validation() {
     use Step::*;
     for (mode, local, request, response) in [(Mode::Client, 0, 2, 1), (Mode::Server, 1, 1, 2)] {
         for (id, body) in [
-            (request, Body::Both),
-            (response, Body::Both),
-            (request, Body::Neither),
-            (response, Body::Neither),
-            (request, Body::Error(1)),
-            (request, Body::Invalid),
+            (request, EnvelopeShape::Both),
+            (response, EnvelopeShape::Both),
+            (request, EnvelopeShape::Neither),
+            (response, EnvelopeShape::Neither),
+            (request, EnvelopeShape::Error(1)),
+            (request, EnvelopeShape::Invalid),
         ] {
             let mut steps = vec![
                 StartReceive(local),
@@ -122,8 +122,8 @@ fn test_strict_envelope_validation() {
                 steps.extend([
                     Reconnect(2),
                     Request(2, 0, 7, 3000),
-                    Read(2, Body::Content(7)),
-                    Send(2, Body::Content(8)),
+                    Read(2, EnvelopeShape::Content(7)),
+                    Send(2, EnvelopeShape::Content(8)),
                     Answer(0, Ok(8)),
                 ]);
             }
@@ -139,7 +139,7 @@ fn test_duplicate_active_request_ids() {
     use Step::*;
     for (mode, local, id, outgoing) in [(Mode::Client, 0, 2, 0), (Mode::Server, 1, 1, 1)] {
         for phase in 0..3 {
-            let mut steps = vec![Send(id, Body::Content(1))];
+            let mut steps = vec![Send(id, EnvelopeShape::Content(1))];
             if phase != 0 {
                 steps.push(Receive(local, 1, 0));
             }
@@ -155,7 +155,7 @@ fn test_duplicate_active_request_ids() {
             // return the first queued request before the duplicate is processed.
             steps.extend([
                 Request(local, 1, 3, 3000),
-                Reject(id, Body::Content(9)),
+                Reject(id, EnvelopeShape::Content(9)),
                 Answer(1, Err(Failure::Malformed)),
                 Refused(local),
             ]);
@@ -185,12 +185,12 @@ fn test_deadline_during_write() {
                 Answer(0, Err(Failure::Timeout)),
                 Outstanding(local, vec![id]),
                 Pause(outgoing, Operation::Write, false),
-                Read(id, Body::Content(10)),
-                Send(id, Body::Content(20)),
+                Read(id, EnvelopeShape::Content(10)),
+                Send(id, EnvelopeShape::Content(20)),
                 Request(local, 1, 11, 3000),
-                Read(id + 2, Body::Content(11)),
-                Send(id, Body::Content(99)),
-                Send(id + 2, Body::Content(21)),
+                Read(id + 2, EnvelopeShape::Content(11)),
+                Send(id, EnvelopeShape::Content(99)),
+                Send(id + 2, EnvelopeShape::Content(21)),
                 Answer(1, Ok(21)),
                 Outstanding(local, vec![]),
             ],
@@ -206,18 +206,18 @@ fn test_reply_deadline_during_flush() {
         run(
             mode,
             &[
-                Send(request, Body::Content(10)),
+                Send(request, EnvelopeShape::Content(10)),
                 Receive(local, 10, 0),
                 Pause(outgoing, Operation::Flush, true),
                 Reply(0, 0, Ok(20), 50),
                 Blocked(outgoing, Operation::Flush),
                 Written(0, Err(Failure::Timeout)),
-                Read(request, Body::Content(20)),
+                Read(request, EnvelopeShape::Content(20)),
                 Pause(outgoing, Operation::Flush, false),
-                Send(request + 2, Body::Content(11)),
+                Send(request + 2, EnvelopeShape::Content(11)),
                 Receive(local, 11, 1),
                 Abandon(1),
-                Read(request + 2, Body::Error(1)),
+                Read(request + 2, EnvelopeShape::Error(1)),
             ],
         );
     }
@@ -234,8 +234,8 @@ fn test_response_before_send_completion() {
                 Pause(outgoing, Operation::Flush, true),
                 Request(local, 0, 10, 3000),
                 Blocked(outgoing, Operation::Flush),
-                Read(id, Body::Content(10)),
-                Send(id, Body::Content(20)),
+                Read(id, EnvelopeShape::Content(10)),
+                Send(id, EnvelopeShape::Content(20)),
                 Answer(0, Ok(20)),
                 Pause(outgoing, Operation::Flush, false),
             ],
@@ -300,8 +300,8 @@ fn test_server_session_close_and_replacement() {
             Close(1),
             Refused(1),
             Request(2, 0, 10, 3000),
-            Read(2, Body::Content(10)),
-            Send(2, Body::Content(20)),
+            Read(2, EnvelopeShape::Content(10)),
+            Send(2, EnvelopeShape::Content(20)),
             Answer(0, Ok(20)),
             Drop(2),
             Released(2),
@@ -312,25 +312,26 @@ fn test_server_session_close_and_replacement() {
     );
 }
 
-/// Replacement gives fresh IDs and makes old responders and completions harmless.
+/// Replacement gives fresh IDs. Old responders and write results still target
+/// their original session.
 #[test]
 fn test_replacement_with_old_work() {
     use Step::*;
     run(
         Mode::Server,
         &[
-            Send(1, Body::Content(10)),
+            Send(1, EnvelopeShape::Content(10)),
             Receive(1, 10, 0),
             Request(1, 0, 11, 3000),
-            Read(2, Body::Content(11)),
+            Read(2, EnvelopeShape::Content(11)),
             Reconnect(2),
             Answer(0, Err(Failure::Transport)),
             Abandon(0),
             Close(1),
             Refused(1),
             Request(2, 1, 12, 3000),
-            Read(2, Body::Content(12)),
-            Send(2, Body::Content(22)),
+            Read(2, EnvelopeShape::Content(12)),
+            Send(2, EnvelopeShape::Content(22)),
             Answer(1, Ok(22)),
             Drop(1),
             Released(1),
@@ -386,11 +387,11 @@ fn test_local_refusals_and_abandoned_observers() {
                 Answer(1, Err(Failure::Large)),
                 Request(local, 2, 12, 3000),
                 DropPromise(2),
-                Read(first + 4, Body::Content(12)),
-                Send(first + 4, Body::Content(22)),
+                Read(first + 4, EnvelopeShape::Content(12)),
+                Send(first + 4, EnvelopeShape::Content(22)),
                 Request(local, 3, 13, 3000),
-                Read(first + 6, Body::Content(13)),
-                Send(first + 6, Body::Content(23)),
+                Read(first + 6, EnvelopeShape::Content(13)),
+                Send(first + 6, EnvelopeShape::Content(23)),
                 Answer(3, Ok(23)),
             ],
         );
@@ -409,8 +410,8 @@ fn test_id_exhaustion() {
                 &[
                     LastId(local),
                     Request(local, 0, 10, 3000),
-                    Read(last, Body::Content(10)),
-                    Send(last, Body::Content(20)),
+                    Read(last, EnvelopeShape::Content(10)),
+                    Send(last, EnvelopeShape::Content(20)),
                     Answer(0, Ok(20)),
                     Request(local, 1, 11, 3000),
                     Stopped,
@@ -479,27 +480,27 @@ fn worker_aborts(scenario: impl Fn(Mode, u8), message: &str) {
 
 /// A delayed `Sender::disconnect()` from an old session cannot disconnect the new one.
 #[test]
-fn test_delayed_retirement_after_replacement() {
+fn test_delayed_disconnect_after_replacement() {
     use Step::*;
     run(
         Mode::Server,
         &[
-            HoldRetirement(1),
+            PauseDisconnect(1),
             Pause(1, Operation::Flush, true),
             Request(1, 0, 10, 3000),
             Blocked(1, Operation::Flush),
-            Read(2, Body::Content(10)),
+            Read(2, EnvelopeShape::Content(10)),
             Close(1),
             Answer(0, Err(Failure::Closed)),
             Pause(1, Operation::Flush, false),
-            Retiring(1),
+            DisconnectPaused(1),
             Reconnect(2),
-            ReleaseRetirement(1),
+            ResumeDisconnect(1),
             Drop(1),
             Released(1),
             Request(2, 1, 11, 3000),
-            Read(2, Body::Content(11)),
-            Send(2, Body::Content(21)),
+            Read(2, EnvelopeShape::Content(11)),
+            Send(2, EnvelopeShape::Content(21)),
             Answer(1, Ok(21)),
         ],
     );
@@ -516,8 +517,8 @@ fn test_handshake_failure_recovery() {
             FailedReconnect,
             Reconnect(2),
             Request(2, 0, 10, 3000),
-            Read(2, Body::Content(10)),
-            Send(2, Body::Content(20)),
+            Read(2, EnvelopeShape::Content(10)),
+            Send(2, EnvelopeShape::Content(20)),
             Answer(0, Ok(20)),
         ],
     );
@@ -527,8 +528,8 @@ fn test_handshake_failure_recovery() {
             HandshakeReadTimeout,
             Reconnect(2),
             Request(2, 0, 10, 3000),
-            Read(2, Body::Content(10)),
-            Send(2, Body::Content(20)),
+            Read(2, EnvelopeShape::Content(10)),
+            Send(2, EnvelopeShape::Content(20)),
             Answer(0, Ok(20)),
         ],
     );
@@ -542,14 +543,14 @@ fn test_expired_reply_releases_incoming_id() {
         run(
             mode,
             &[
-                Send(id, Body::Content(10)),
+                Send(id, EnvelopeShape::Content(10)),
                 Receive(local, 10, 0),
                 Reply(0, 0, Ok(20), 0),
                 Written(0, Err(Failure::Timeout)),
-                Send(id, Body::Content(11)),
+                Send(id, EnvelopeShape::Content(11)),
                 Receive(local, 11, 1),
                 Reply(1, 1, Ok(21), 3000),
-                Read(id, Body::Content(21)),
+                Read(id, EnvelopeShape::Content(21)),
                 Written(1, Ok(())),
             ],
         );
@@ -565,13 +566,13 @@ fn test_new_earlier_deadline() {
             mode,
             &[
                 Request(local, 0, 10, 3000),
-                Read(first, Body::Content(10)),
+                Read(first, EnvelopeShape::Content(10)),
                 Request(local, 1, 11, 50),
-                Read(first + 2, Body::Content(11)),
+                Read(first + 2, EnvelopeShape::Content(11)),
                 Answer(1, Err(Failure::Timeout)),
                 Outstanding(local, vec![first, first + 2]),
-                Send(first + 2, Body::Content(21)),
-                Send(first, Body::Content(20)),
+                Send(first + 2, EnvelopeShape::Content(21)),
+                Send(first, EnvelopeShape::Content(20)),
                 Answer(0, Ok(20)),
                 Outstanding(local, vec![]),
             ],
@@ -587,13 +588,13 @@ fn test_peer_id_reuse_before_local_flush() {
     for (mode, local, id, outgoing) in [(Mode::Server, 1, 1, 1), (Mode::Client, 0, 2, 0)] {
         for duplicate in [false, true] {
             let mut steps = vec![
-                Send(id, Body::Content(10)),
+                Send(id, EnvelopeShape::Content(10)),
                 Receive(local, 10, 0),
                 Pause(outgoing, Operation::Flush, true),
                 Reply(0, 0, Ok(20), 3000),
                 Blocked(outgoing, Operation::Flush),
-                Read(id, Body::Content(20)),
-                Send(id, Body::Content(11)),
+                Read(id, EnvelopeShape::Content(20)),
+                Send(id, EnvelopeShape::Content(11)),
                 Receive(local, 11, 1),
                 Pause(outgoing, Operation::Flush, false),
                 Written(0, Ok(())),
@@ -602,13 +603,13 @@ fn test_peer_id_reuse_before_local_flush() {
                 // Finishing the old reply must not remove the new request's ID.
                 steps.extend([
                     StartReceive(local),
-                    Reject(id, Body::Content(12)),
+                    Reject(id, EnvelopeShape::Content(12)),
                     ReceiveFailed(local, Failure::Malformed),
                 ]);
             } else {
                 steps.extend([
                     Reply(1, 1, Ok(21), 3000),
-                    Read(id, Body::Content(21)),
+                    Read(id, EnvelopeShape::Content(21)),
                     Written(1, Ok(())),
                 ]);
             }

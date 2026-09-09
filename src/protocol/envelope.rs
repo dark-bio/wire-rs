@@ -10,17 +10,16 @@
 //! may contain errors.
 
 use crate::protocol::{ArkToHost, HostToArk, RemoteError, ark_to_host, host_to_ark};
-use prost::Message;
-use std::sync::atomic::{AtomicU64, Ordering};
+use prost::Message as ProtobufMessage;
 
-use super::{Error, Message as Body};
+use super::{Error, Message};
 
 /// Role deciding envelope direction and request parity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Side {
     /// Host requests have odd IDs and its connection serves one session.
     Client,
-    /// Ark requests have even IDs and its endpoint accepts successive sessions.
+    /// Ark requests have even IDs; the server accepts successive sessions.
     Server,
 }
 
@@ -30,7 +29,7 @@ impl Side {
     pub(super) fn encode(
         &self,
         id: u64,
-        body: Result<Body, RemoteError>,
+        body: Result<Message, RemoteError>,
     ) -> Result<Vec<u8>, Error> {
         match self {
             Self::Client => encode::<HostToArk>(id, body),
@@ -39,9 +38,12 @@ impl Side {
     }
 
     /// Decodes the peer's envelope, requiring exactly one of content or error.
-    /// `Shared::received()` then uses the ID to distinguish requests from
-    /// responses and rejects requests containing errors.
-    pub(super) fn decode(&self, bytes: &[u8]) -> Result<(u64, Result<Body, RemoteError>), Error> {
+    /// `SessionInner::handle_message()` classifies the ID and rejects requests
+    /// containing errors.
+    pub(super) fn decode(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(u64, Result<Message, RemoteError>), Error> {
         match self {
             Self::Client => decode::<ArkToHost>(bytes),
             Self::Server => decode::<HostToArk>(bytes),
@@ -50,13 +52,13 @@ impl Side {
 }
 
 /// Builds an envelope and checks its size before allocating the encoded bytes.
-fn encode<E: Envelope>(id: u64, body: Result<Body, RemoteError>) -> Result<Vec<u8>, Error>
+fn encode<E: Envelope>(id: u64, body: Result<Message, RemoteError>) -> Result<Vec<u8>, Error>
 where
-    E::Content: TryFrom<Body, Error = Error>,
+    E::Content: TryFrom<Message, Error = Error>,
 {
     let envelope = match body {
-        Ok(body) => E::response(id, Some(body.try_into()?), None),
-        Err(error) => E::response(id, None, Some(error)),
+        Ok(body) => E::from_parts(id, None, Some(body.try_into()?)),
+        Err(error) => E::from_parts(id, Some(error), None),
     };
     let size = envelope.encoded_len();
     if size > crate::transport::MAX_MESSAGE_SIZE {
@@ -67,9 +69,9 @@ where
 
 /// Decodes an envelope, rejecting invalid protobuf or anything other than
 /// exactly one of content or error.
-fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Body, RemoteError>), Error>
+fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Message, RemoteError>), Error>
 where
-    Body: From<E::Content>,
+    Message: From<E::Content>,
 {
     let (id, error, content) = E::decode(bytes).map_err(|_| Error::Malformed)?.into_parts();
     let body = match (content, error) {
@@ -80,23 +82,22 @@ where
     Ok((id, body))
 }
 
-/// Parity of the ids a side allocates, telling its own requests from the
-/// peer's.
+/// Parity of the IDs a side allocates, distinguishing its requests from the peer's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Parity {
-    /// The ids of a client's requests.
+pub(super) enum Parity {
+    /// The IDs of a client's requests.
     Odd,
-    /// The ids of a server's requests.
+    /// The IDs of a server's requests.
     Even,
 }
 
 impl Parity {
-    /// Parity of an id.
-    pub(crate) fn of(id: u64) -> Self {
+    /// Returns the parity of an ID, treating zero as even.
+    fn of(id: u64) -> Self {
         if id % 2 == 1 { Self::Odd } else { Self::Even }
     }
 
-    /// Lowest positive id of the parity, the first one allocated.
+    /// Returns the lowest positive ID of this parity, the first one allocated.
     pub(super) fn first(self) -> u64 {
         match self {
             Self::Odd => 1,
@@ -117,18 +118,16 @@ impl From<Side> for Parity {
 
 /// Common methods for `HostToArk` and `ArkToHost`. Only these two generated
 /// protobuf types can implement this trait.
-pub trait Envelope: Message + Default + sealed::Sealed + 'static {
+pub trait Envelope: ProtobufMessage + Default + sealed::Sealed + 'static {
     /// Generated content enum for this envelope's requests and responses.
     type Content: Send + 'static;
 
-    /// Creates a request with the given ID and content.
-    fn request(id: u64, content: Self::Content) -> Self;
+    /// Assembles the ID, error and content in the order returned by
+    /// [`Self::into_parts`]. This does not validate the field combination or
+    /// classify the envelope as a request or response.
+    fn from_parts(id: u64, err: Option<RemoteError>, content: Option<Self::Content>) -> Self;
 
-    /// Creates a response with the original request's ID. Supply content for
-    /// success or an error for failure; this method does not validate that choice.
-    fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self;
-
-    /// Takes the envelope apart into its id, its error and its content.
+    /// Takes the envelope apart into its ID, error and content.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>);
 }
 
@@ -145,18 +144,11 @@ impl Envelope for HostToArk {
     /// Payload variants available in the host-to-Ark envelope.
     type Content = host_to_ark::Content;
 
-    /// Builds a host-to-Ark request with content and no application error.
-    fn request(id: u64, content: Self::Content) -> Self {
-        Self {
-            id,
-            err: None,
-            content: Some(content),
-        }
-    }
-    /// Builds a host-to-Ark response, preserving the supplied content and error.
-    fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self {
+    /// Assembles a host-to-Ark envelope without validating its fields.
+    fn from_parts(id: u64, err: Option<RemoteError>, content: Option<Self::Content>) -> Self {
         Self { id, err, content }
     }
+
     /// Takes the host-to-Ark envelope apart without validating its field combination.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
         (self.id, self.err, self.content)
@@ -167,18 +159,11 @@ impl Envelope for ArkToHost {
     /// Payload variants available in the Ark-to-host envelope.
     type Content = ark_to_host::Content;
 
-    /// Builds an Ark-to-host request with content and no application error.
-    fn request(id: u64, content: Self::Content) -> Self {
-        Self {
-            id,
-            err: None,
-            content: Some(content),
-        }
-    }
-    /// Builds an Ark-to-host response, preserving the supplied content and error.
-    fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self {
+    /// Assembles an Ark-to-host envelope without validating its fields.
+    fn from_parts(id: u64, err: Option<RemoteError>, content: Option<Self::Content>) -> Self {
         Self { id, err, content }
     }
+
     /// Takes the Ark-to-host envelope apart without validating its field combination.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
         (self.id, self.err, self.content)
@@ -187,49 +172,26 @@ impl Envelope for ArkToHost {
 
 /// Whether an incoming envelope is a peer request or a response to our request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    /// Peer request whose response must echo this ID.
-    Request(u64),
+pub(super) enum MessageKind {
+    /// Peer request whose response must echo the received ID.
+    Request,
     /// Response carrying the ID of one of our requests.
-    Response(u64),
+    Response,
 }
 
-impl Kind {
+impl MessageKind {
     /// Uses our request parity to classify an incoming ID: matching parity
     /// means a response, opposite parity means a request.
-    pub(crate) fn of(id: u64, parity: Parity) -> Self {
+    pub(super) fn from_id(id: u64, parity: Parity) -> Self {
         if Parity::of(id) == parity {
-            Self::Response(id)
+            Self::Response
         } else {
-            Self::Request(id)
+            Self::Request
         }
     }
 }
 
-/// Atomic request ID allocator used by the legacy protocol. Hands out IDs of
-/// one parity in order, starting at the lowest positive ID.
-pub(crate) struct Ids {
-    /// Next ID to hand out, incremented atomically by two to preserve parity.
-    next: AtomicU64,
-}
-
-impl Ids {
-    /// Creates the allocator of a side, starting at the lowest positive id
-    /// of the parity.
-    pub(crate) fn new(parity: Parity) -> Self {
-        Self {
-            next: AtomicU64::new(parity.first()),
-        }
-    }
-
-    /// Hands out the next ID, wrapping on overflow. The new protocol uses
-    /// `State::Open.next_id` instead and panics when it runs out of IDs.
-    pub(crate) fn next(&self) -> u64 {
-        self.next.fetch_add(2, Ordering::Relaxed)
-    }
-}
-
-/// Checks the existing envelope construction and parity conventions.
+/// Checks incoming request and response classification by ID parity.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -245,101 +207,49 @@ mod tests {
             id: u64,
             /// Parity allocated by the side receiving this envelope.
             parity: Parity,
-            /// Expected request or response classification, retaining the same ID.
-            kind: Kind,
+            /// Expected request or response classification.
+            kind: MessageKind,
         }
         let tests = [
             TestCase {
                 id: 1,
                 parity: Parity::Odd,
-                kind: Kind::Response(1),
+                kind: MessageKind::Response,
             },
             TestCase {
                 id: 2,
                 parity: Parity::Odd,
-                kind: Kind::Request(2),
+                kind: MessageKind::Request,
             },
             TestCase {
                 id: 1,
                 parity: Parity::Even,
-                kind: Kind::Request(1),
+                kind: MessageKind::Request,
             },
             TestCase {
                 id: 2,
                 parity: Parity::Even,
-                kind: Kind::Response(2),
+                kind: MessageKind::Response,
             },
-            // An old Ark's message without an id decodes as zero, a request to a host
+            // Zero is an ordinary even ID, with the same classification rules.
             TestCase {
                 id: 0,
                 parity: Parity::Odd,
-                kind: Kind::Request(0),
+                kind: MessageKind::Request,
             },
             TestCase {
                 id: 0,
                 parity: Parity::Even,
-                kind: Kind::Response(0),
+                kind: MessageKind::Response,
             },
             TestCase {
                 id: u64::MAX,
                 parity: Parity::Even,
-                kind: Kind::Request(u64::MAX),
+                kind: MessageKind::Request,
             },
         ];
         for (i, tt) in tests.iter().enumerate() {
-            assert_eq!(Kind::of(tt.id, tt.parity), tt.kind, "test {i}");
+            assert_eq!(MessageKind::from_id(tt.id, tt.parity), tt.kind, "test {i}");
         }
-    }
-
-    /// Tests the first IDs of both allocators and their interpretation on each side.
-    #[test]
-    fn test_ids() {
-        let client = Ids::new(Parity::from(Side::Client));
-        let server = Ids::new(Parity::from(Side::Server));
-
-        let clients: Vec<u64> = (0..4).map(|_| client.next()).collect();
-        let servers: Vec<u64> = (0..4).map(|_| server.next()).collect();
-        assert_eq!(clients, vec![1, 3, 5, 7]);
-        assert_eq!(servers, vec![2, 4, 6, 8]);
-
-        for id in clients {
-            assert_eq!(Kind::of(id, Parity::Odd), Kind::Response(id));
-            assert_eq!(Kind::of(id, Parity::Even), Kind::Request(id));
-        }
-        for id in servers {
-            assert_eq!(Kind::of(id, Parity::Even), Kind::Response(id));
-            assert_eq!(Kind::of(id, Parity::Odd), Kind::Request(id));
-        }
-    }
-
-    /// Tests that encoding preserves envelope IDs, content and application errors.
-    #[test]
-    fn test_envelopes() {
-        let err = RemoteError {
-            code: 7,
-            msg: "nope".into(),
-        };
-
-        // A host request, opened by the Ark as a request with its content
-        let request = HostToArk::request(3, host_to_ark::Content::Develop(vec![1, 2]));
-        let (id, err_out, content) = HostToArk::decode(&request.encode_to_vec()[..])
-            .unwrap()
-            .into_parts();
-        assert_eq!((id, err_out), (3, None));
-        assert_eq!(content, Some(host_to_ark::Content::Develop(vec![1, 2])));
-
-        // An Ark response failing the request, the error surviving the trip
-        let response = ArkToHost::response(3, None, Some(err.clone()));
-        let (id, err_out, content) = ArkToHost::decode(&response.encode_to_vec()[..])
-            .unwrap()
-            .into_parts();
-        assert_eq!((id, err_out, content), (3, Some(err.clone()), None));
-
-        // A host response failing an Ark request, its error field the new one
-        let response = HostToArk::response(4, None, Some(err.clone()));
-        let (id, err_out, content) = HostToArk::decode(&response.encode_to_vec()[..])
-            .unwrap()
-            .into_parts();
-        assert_eq!((id, err_out, content), (4, Some(err), None));
     }
 }

@@ -3,7 +3,7 @@
 
 //! Sending requests through a shared handle to a session.
 
-use super::session::Shared;
+use super::session::SessionInner;
 use super::{Error, Message, Promise};
 use std::sync::Weak;
 use std::time::Instant;
@@ -14,7 +14,7 @@ use std::time::Instant;
 #[derive(Clone)]
 pub struct Requester {
     /// Session that created this requester, even after a replacement connects.
-    session: Weak<Shared>,
+    session: Weak<SessionInner>,
 }
 
 impl Requester {
@@ -41,7 +41,7 @@ impl Requester {
     }
 
     /// Creates a requester from a weak reference to its session.
-    pub(super) fn new(session: Weak<Shared>) -> Self {
+    pub(super) fn new(session: Weak<SessionInner>) -> Self {
         Self { session }
     }
 }

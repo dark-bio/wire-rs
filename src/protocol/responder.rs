@@ -3,7 +3,7 @@
 
 //! Sending one reply to a received request, or `UNANSWERED` when dropped.
 
-use super::session::Shared;
+use super::session::SessionInner;
 use super::{Error, Message, Promise, RemoteError};
 use std::sync::Weak;
 use std::time::Instant;
@@ -38,7 +38,7 @@ use std::time::Instant;
 /// ```
 pub struct Responder {
     /// Session that received the request; holding a responder cannot keep it open.
-    session: Weak<Shared>,
+    session: Weak<SessionInner>,
     /// Request ID to answer. Cleared after queueing a reply so `Drop` does nothing.
     id: Option<u64>,
 }
@@ -60,17 +60,17 @@ impl Responder {
         result: Result<Message, RemoteError>,
         deadline: Instant,
     ) -> Result<Promise<()>, Error> {
-        let pending = self.session.upgrade().ok_or(Error::Closed)?.reply(
+        let promise = self.session.upgrade().ok_or(Error::Closed)?.reply(
             self.id.expect("reply obligation present"),
             result,
             deadline,
         )?;
         self.id = None; // Prevent Drop from also queueing UNANSWERED.
-        Ok(pending)
+        Ok(promise)
     }
 
     /// Creates a responder for the request taken by `Session::recv()`.
-    pub(super) fn new(session: Weak<Shared>, id: u64) -> Self {
+    pub(super) fn new(session: Weak<SessionInner>, id: u64) -> Self {
         Self {
             session,
             id: Some(id),
@@ -85,7 +85,7 @@ impl Drop for Responder {
         if let Some(id) = self.id.take()
             && let Some(session) = self.session.upgrade()
         {
-            session.abandon(id);
+            session.reply_unanswered(id);
         }
     }
 }

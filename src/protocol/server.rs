@@ -1,22 +1,23 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Persistent endpoint ownership and ordered attachment of successive sessions.
+//! Persistent server ownership and ordered attachment of successive sessions.
 
 use super::envelope::Side;
+use super::session::SessionInner;
+use super::worker;
 use super::{Closer, Error, Session};
-use super::{session, worker};
 use crate::transport::{self, Attester, Read, Stream, Write};
 use darkbio_crypto::xdsa;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Owner of a persistent server stream, accepting successive sessions.
-/// Closing or dropping the endpoint ends its active session and shuts down the
+/// Closing or dropping the server ends its active session and shuts down the
 /// physical stream. Closing an individual [`Session`] keeps this owner and
 /// its stream available for another handshake.
 pub struct Server {
-    /// Endpoint state retained independently of any accepted session owner.
-    pub(super) shared: Arc<Shared>,
+    /// Server state retained independently of any accepted session owner.
+    pub(super) inner: Arc<ServerInner>,
 }
 
 impl Server {
@@ -30,243 +31,242 @@ impl Server {
         W: Write + Send + 'static,
         A: Attester + Send + 'static,
     {
-        let shutdown = stream.closer();
+        let stream_closer = stream.closer();
         let server = Self {
-            shared: Arc::new(Shared {
+            inner: Arc::new(ServerInner {
                 state: Mutex::new(State::Open {
                     session: Weak::new(),
-                    pending: None,
+                    ready: None,
                     #[cfg(test)]
-                    waiting: None,
+                    wait_hook: None,
                 }),
                 changed: Condvar::new(),
-                shutdown: Some(shutdown),
+                stream_closer: Some(stream_closer),
                 #[cfg(test)]
                 workers: Arc::new(worker::Tracker::default()),
             }),
         };
-        let endpoint = Arc::downgrade(&server.shared);
+        let server_ref = Arc::downgrade(&server.inner);
         worker::spawn(
-            "wire-reader",
+            "wire-server-reader",
             #[cfg(test)]
-            &server.shared.workers,
+            &server.inner.workers,
             move || {
-                // Wrap the transport and create the session tracker
-                let mut transport = transport::Server::new(stream, signer, attester);
-                let mut current: Weak<session::Shared> = Weak::new();
-
-                loop {
-                    // Block without retaining endpoint state. Dropping the server
-                    // shuts down this read through the endpoint's stream closer.
-                    let result = transport.recv();
-                    let Some(endpoint) = endpoint.upgrade() else {
-                        break;
-                    };
-                    match result {
-                        // If a new client connects, create a new session for it
-                        Ok(transport::Event::Connected(sender)) => {
-                            let session = Session::start(
-                                Side::Server,
-                                sender,
-                                None,
-                                #[cfg(test)]
-                                endpoint.workers.clone(),
-                            );
-                            current = Arc::downgrade(&session.shared);
-                            if endpoint.attach(session).is_err() {
-                                break;
-                            }
-                        }
-                        // If a client disconnects, drop the current session
-                        Ok(transport::Event::Disconnected) => {
-                            if let Some(session) = current.upgrade() {
-                                session.close(transport::Error::SessionReset.into());
-                            }
-                            current = Weak::new();
-                        }
-                        // If a message arrives, deliver it into the current session
-                        Ok(transport::Event::Message(bytes)) => {
-                            if let Some(session) = current.upgrade()
-                                && let Err(error) = session.received(&bytes)
-                            {
-                                session.close(error);
-                            }
-                        }
-                        // Handshake timeouts and send failures are ignored
-                        Err(transport::Error::RecvFailed(error))
-                            if error.kind() == std::io::ErrorKind::TimedOut => {}
-                        Err(transport::Error::SendFailed(error)) => {
-                            tracing::debug!(%error, "server handshake output failed");
-                        }
-                        // Any other error tears down the endpoint
-                        Err(error) => {
-                            endpoint.close(error.into());
-                            break;
-                        }
-                    }
-                }
+                let transport = transport::Server::new(stream, signer, attester);
+                run_reader(transport, server_ref);
             },
         );
         server
     }
 
-    /// Blocks until a session is established or the endpoint ends. Recoverable
+    /// Blocks until a session is established or the server ends. Recoverable
     /// handshake failures leave the stream available for another attempt. A
     /// replacement session closes the previous one; old handles still refer to it.
     pub fn accept(&mut self) -> Result<Session, Error> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("endpoint state not poisoned");
+        let mut state = self.inner.state.lock().expect("server state not poisoned");
         loop {
             match &mut *state {
-                State::Ended { reason, .. } => return Err(reason.clone()),
+                State::Closed { reason, .. } => return Err(reason.clone()),
                 State::Open {
-                    pending,
+                    ready,
                     #[cfg(test)]
-                    waiting,
+                    wait_hook,
                     ..
                 } => {
-                    if let Some(session) = pending.take() {
+                    if let Some(session) = ready.take() {
                         return Ok(session);
                     }
                     #[cfg(test)]
-                    if let Some(waiting) = waiting.take() {
-                        let _ = waiting.send(());
+                    if let Some(wait_hook) = wait_hook.take() {
+                        let _ = wait_hook.send(());
                     }
                     state = self
-                        .shared
+                        .inner
                         .changed
                         .wait(state)
-                        .expect("endpoint state not poisoned");
+                        .expect("server state not poisoned");
                 }
             }
         }
     }
 
-    /// Returns a clonable handle for closing this endpoint from another thread,
+    /// Returns a clonable handle for closing this server from another thread,
     /// including while its owner is blocked in [`Self::accept`].
     pub fn closer(&self) -> Closer {
-        Closer::server(Arc::downgrade(&self.shared))
+        Closer::server(Arc::downgrade(&self.inner))
     }
 
-    /// Permanently closes this endpoint and its active session, wakes blocked
+    /// Permanently closes this server and its active session, wakes blocked
     /// acceptance and receive calls, and fails unresolved operations. Idempotent.
     /// Does not join application jobs or guarantee the peer has observed closure.
     pub fn close(&self) {
-        self.shared.close(Error::Closed);
+        self.inner.close(Error::Closed);
+    }
+}
+
+/// Receives transport events across successive server sessions. Weak references
+/// let closed sessions be freed while this reader waits for another handshake.
+fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
+    mut transport: transport::Server<R, W, A>,
+    server_ref: Weak<ServerInner>,
+) {
+    let mut current: Weak<SessionInner> = Weak::new();
+    loop {
+        // Hold no server state across the blocking read. Dropping Server closes
+        // its stream and wakes this call.
+        let result = transport.recv();
+        let Some(server) = server_ref.upgrade() else {
+            break;
+        };
+        match result {
+            // A successful handshake gets its own session and workers.
+            Ok(transport::Event::Connected(sender)) => {
+                let session = Session::start(
+                    Side::Server,
+                    sender,
+                    None,
+                    #[cfg(test)]
+                    server.workers.clone(),
+                );
+                current = Arc::downgrade(&session.inner);
+                if server.attach(session).is_err() {
+                    break;
+                }
+            }
+            // Disconnecting closes the session while keeping the server stream.
+            Ok(transport::Event::Disconnected) => {
+                if let Some(session) = current.upgrade() {
+                    session.close(transport::Error::SessionReset.into());
+                }
+                current = Weak::new();
+            }
+            Ok(transport::Event::Message(bytes)) => {
+                if let Some(session) = current.upgrade()
+                    && let Err(error) = session.handle_message(&bytes)
+                {
+                    session.close(error);
+                }
+            }
+            // A failed handshake leaves the reader available for the next reset.
+            Err(transport::Error::RecvFailed(error))
+                if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(transport::Error::SendFailed(error)) => {
+                tracing::debug!(%error, "server handshake output failed");
+            }
+            Err(error) => {
+                server.close(error.into());
+                break;
+            }
+        }
     }
 }
 
 impl Drop for Server {
-    /// Ends the endpoint and its attached session even when handles remain.
+    /// Ends the server and its attached session even when handles remain.
     fn drop(&mut self) {
         self.close();
     }
 }
 
-/// Endpoint lifetime and the at-most-one session waiting for accept. The reader
+/// Server lifetime and the at-most-one session waiting for accept. The reader
 /// attaches replacements in transport order. Accepted sessions own themselves;
-/// the endpoint retains only a weak reference for endpoint shutdown.
-pub(super) struct Shared {
-    /// Protects the attached session, pending acceptance, and endpoint closure.
+/// the server retains only a weak reference for server shutdown.
+pub(super) struct ServerInner {
+    /// Protects the attached session, pending acceptance, and server closure.
     state: Mutex<State>,
-    /// Wakes `accept()` when a session is attached or the endpoint closes.
+    /// Wakes `accept()` when a session is attached or the server closes.
     changed: Condvar,
-    /// Closes the endpoint's stream. Empty in tests that supply sessions directly.
-    shutdown: Option<transport::Closer>,
+    /// Closes the server's stream. Empty in tests that supply sessions directly.
+    stream_closer: Option<transport::Closer>,
     /// Lets tests wait for the reader and all session workers to exit.
     #[cfg(test)]
     pub(super) workers: Arc<worker::Tracker>,
 }
 
-/// Sessions waiting for acceptance, or the error that closed the endpoint.
+/// Sessions waiting for acceptance, or the error that closed the server.
 enum State {
     /// Tracks the current session and keeps its owner until `accept()` takes it.
     Open {
-        /// Lets endpoint closure close the session after `accept()` returns it.
-        session: Weak<session::Shared>,
+        /// Lets server closure close the session after `accept()` returns it.
+        session: Weak<SessionInner>,
         /// Session waiting for `accept()`. A new handshake replaces it.
-        pending: Option<Session>,
-        /// One-shot test notification sent under the endpoint lock before waiting.
+        ready: Option<Session>,
+        /// One-shot test notification sent under the server lock before waiting.
         #[cfg(test)]
-        waiting: Option<std::sync::mpsc::Sender<()>>,
+        wait_hook: Option<std::sync::mpsc::Sender<()>>,
     },
     /// Saves the closing error and attached session. Repeated `close()` calls
     /// can finish closing that session if the first closer is still doing so.
-    Ended {
-        /// First reason the endpoint ended; later closes cannot replace it.
+    Closed {
+        /// First reason the server ended; later closes cannot replace it.
         reason: Error,
-        /// Session that was attached when the endpoint closed.
-        session: Weak<session::Shared>,
+        /// Session that was attached when the server closed.
+        session: Weak<SessionInner>,
     },
 }
 
-impl Shared {
+impl ServerInner {
     /// Refuses attachment/acceptance before closing the attached session.
-    /// Releases the endpoint lock before closing or dropping a `Session`, since
+    /// Releases the server lock before closing or dropping a `Session`, since
     /// those operations take the session's own lock.
     pub(super) fn close(&self, error: Error) {
-        // Stop attach() and accept() by switching to Ended. Save the attached
+        // Stop attach() and accept() by switching to Closed. Save the attached
         // session so repeated close() calls can finish closing it too.
-        let (session, reason, pending) = {
-            let mut state = self.state.lock().expect("endpoint state not poisoned");
+        let (session, reason, ready) = {
+            let mut state = self.state.lock().expect("server state not poisoned");
             match &mut *state {
-                State::Ended { reason, session } => (session.upgrade(), reason.clone(), None),
-                State::Open {
-                    session, pending, ..
-                } => {
+                State::Closed { reason, session } => (session.upgrade(), reason.clone(), None),
+                State::Open { session, ready, .. } => {
                     let session = session.clone();
-                    let pending = pending.take();
-                    *state = State::Ended {
+                    let ready = ready.take();
+                    *state = State::Closed {
                         reason: error.clone(),
                         session: session.clone(),
                     };
-                    (session.upgrade(), error, pending)
+                    (session.upgrade(), error, ready)
                 }
             }
         };
-        // Release the endpoint lock before taking the session's lock. Wake local
+        // Release the server lock before taking the session's lock. Wake local
         // callers before closing the stream, which waits for active I/O to return.
         if let Some(session) = session {
             session.close(reason);
         }
         self.changed.notify_all();
-        drop(pending);
-        if let Some(shutdown) = &self.shutdown {
-            shutdown.close();
+        drop(ready);
+        if let Some(stream_closer) = &self.stream_closer {
+            stream_closer.close();
         }
     }
 
     /// Closes the previous session and makes this one available to `accept()`.
     /// Only the reader, or the test fixture replacing it, calls this method.
     fn attach(&self, session: Session) -> Result<(), Error> {
-        // Take an Arc to the previous session, then release the endpoint lock
+        // Take an Arc to the previous session, then release the server lock
         // before closing that session.
         let previous = {
-            let state = self.state.lock().expect("endpoint state not poisoned");
+            let state = self.state.lock().expect("server state not poisoned");
             match &*state {
-                State::Ended { reason, .. } => return Err(reason.clone()),
+                State::Closed { reason, .. } => return Err(reason.clone()),
                 State::Open { session, .. } => session.upgrade(),
             }
         };
         if let Some(previous) = previous {
             previous.close(transport::Error::SessionReset.into());
         }
-        // Another thread may have closed the endpoint while we closed the old
+        // Another thread may have closed the server while we closed the old
         // session. Check again under the lock before installing the new one.
         let previous = {
-            let mut state = self.state.lock().expect("endpoint state not poisoned");
+            let mut state = self.state.lock().expect("server state not poisoned");
             match &mut *state {
-                State::Ended { reason, .. } => return Err(reason.clone()),
+                State::Closed { reason, .. } => return Err(reason.clone()),
                 State::Open {
                     session: attached,
-                    pending,
+                    ready,
                     ..
                 } => {
-                    *attached = Arc::downgrade(&session.shared);
-                    pending.replace(session)
+                    *attached = Arc::downgrade(&session.inner);
+                    ready.replace(session)
                 }
             }
         };
@@ -279,80 +279,80 @@ impl Shared {
 
 /// Supplies sessions in tests in place of the server's transport reader.
 #[cfg(test)]
-pub(super) struct Sessions {
-    /// Endpoint that receives sessions created by `open()`.
-    endpoint: Weak<Shared>,
+pub(super) struct SessionSource {
+    /// Server that receives sessions created by `open()`.
+    server_ref: Weak<ServerInner>,
 }
 
 #[cfg(test)]
 impl Server {
-    /// Creates an endpoint and a fixture that attaches sessions without a stream.
-    pub(super) fn pair() -> (Self, Sessions) {
-        let shared = Arc::new(Shared {
+    /// Creates a server and a fixture that attaches sessions without a stream.
+    pub(super) fn fixture() -> (Self, SessionSource) {
+        let inner = Arc::new(ServerInner {
             state: Mutex::new(State::Open {
                 session: Weak::new(),
-                pending: None,
-                waiting: None,
+                ready: None,
+                wait_hook: None,
             }),
             changed: Condvar::new(),
-            shutdown: None,
+            stream_closer: None,
             workers: Arc::new(worker::Tracker::default()),
         });
-        let sessions = Sessions {
-            endpoint: Arc::downgrade(&shared),
+        let source = SessionSource {
+            server_ref: Arc::downgrade(&inner),
         };
-        (Self { shared }, sessions)
+        (Self { inner }, source)
     }
 }
 
 #[cfg(test)]
-impl Sessions {
+impl SessionSource {
     /// Creates a session and passes it to `attach()`, just as the reader does
     /// after a handshake. Returns its weak reference so tests can deliver messages
     /// to it even after another session connects.
-    pub(super) fn open(&mut self) -> Result<Weak<session::Shared>, Error> {
-        let endpoint = self.endpoint.upgrade().ok_or(Error::Closed)?;
-        let session = Session::new();
-        let incoming = Arc::downgrade(&session.shared);
-        endpoint.attach(session)?;
-        Ok(incoming)
+    pub(super) fn open(&mut self) -> Result<Weak<SessionInner>, Error> {
+        let server = self.server_ref.upgrade().ok_or(Error::Closed)?;
+        let session = Session::fixture();
+        let session_ref = Arc::downgrade(&session.inner);
+        server.attach(session)?;
+        Ok(session_ref)
     }
 }
 
 #[cfg(test)]
-impl Drop for Sessions {
-    /// Models loss of the transport reader by permanently ending its endpoint.
+impl Drop for SessionSource {
+    /// Models loss of the transport reader by permanently ending its server.
     fn drop(&mut self) {
-        if let Some(endpoint) = self.endpoint.upgrade() {
-            endpoint.close(crate::transport::Error::Terminated.into());
+        if let Some(server) = self.server_ref.upgrade() {
+            server.close(crate::transport::Error::Terminated.into());
         }
     }
 }
 
 #[cfg(test)]
-impl Shared {
-    /// Arms a one-shot notification for acceptance waiting without a pending owner.
+impl ServerInner {
+    /// Arms a one-shot notification for `accept()` waiting without a ready session.
     /// Sent while holding `state`, just before `accept()` waits on `changed`.
     /// Tests can then attach a session or close the server without using sleeps.
     ///
     /// # Panics
     /// The fixture must still be open and have no session waiting for acceptance.
-    pub(super) fn watch_accept(&self) -> std::sync::mpsc::Receiver<()> {
+    pub(super) fn watch_accept_wait(&self) -> std::sync::mpsc::Receiver<()> {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let mut state = self.state.lock().expect("endpoint state not poisoned");
+        let mut state = self.state.lock().expect("server state not poisoned");
         let State::Open {
-            pending, waiting, ..
+            ready, wait_hook, ..
         } = &mut *state
         else {
-            panic!("only watch an open endpoint accept");
+            panic!("only watch an open server accept");
         };
-        assert!(pending.is_none());
-        *waiting = Some(sender);
+        assert!(ready.is_none());
+        *wait_hook = Some(sender);
         receiver
     }
 }
 
-/// Checks endpoint ownership bounds and compiles server construction and acceptance.
+/// Checks server ownership bounds and compiles server construction and acceptance.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

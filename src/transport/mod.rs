@@ -44,10 +44,6 @@ pub use sender::Sender;
 pub use server::{Attestation, Attester, Event, Server};
 pub use stream::{Closer, Stream};
 
-/// Stream writer for the protocol mock's real framing and reset notifications.
-#[cfg(any(test, feature = "fuzz"))]
-pub(crate) use outbound::{Outbound, Side};
-
 /// Default budget for a handshake's output and peer replies. Configure it with
 /// [`Client::set_handshake_timeout`] or [`Server::set_handshake_timeout`].
 /// Progress, stale frames and resets within the attempt do not refresh it.

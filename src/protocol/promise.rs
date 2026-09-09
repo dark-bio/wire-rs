@@ -3,7 +3,7 @@
 
 //! Waiting for request answers and reply write results.
 
-use super::session::Shared;
+use super::session::SessionInner;
 use super::{Error, Message};
 use std::sync::{Weak, mpsc};
 #[cfg(test)]
@@ -23,22 +23,22 @@ use std::time::Instant;
 ///
 /// ```compile_fail,E0382
 /// use darkbio_wire::protocol::{DeviceInfoResponse, Message, Promise};
-/// fn take_twice(pending: Promise<Message>) {
-///     let _ = pending.wait::<DeviceInfoResponse>();
-///     let _ = pending.wait::<DeviceInfoResponse>();
+/// fn take_twice(promise: Promise<Message>) {
+///     let _ = promise.wait::<DeviceInfoResponse>();
+///     let _ = promise.wait::<DeviceInfoResponse>();
 /// }
 /// ```
 pub struct Promise<T> {
-    /// Receives one result from the corresponding `Operation`. A buffered result
-    /// remains available even after the session is dropped.
+    /// Receives one result from the corresponding `PendingOperation`. A buffered
+    /// result remains available even after the session is dropped.
     result: mpsc::Receiver<Result<T, Error>>,
-    /// Lets the waiter call `Shared::expire()` when its deadline is reached.
-    session: Weak<Shared>,
+    /// Lets the waiter call `SessionInner::expire()` when its deadline is reached.
+    session: Weak<SessionInner>,
     /// Deadline supplied with the request or reply. `wait()` does not restart it.
     deadline: Instant,
     /// One-shot notification just before entering the blocking receive.
     #[cfg(test)]
-    waiting: Option<mpsc::Sender<()>>,
+    wait_hook: Option<mpsc::Sender<()>>,
 }
 
 impl Promise<Message> {
@@ -52,7 +52,7 @@ impl Promise<Message> {
         T: TryFrom<Message>,
         Error: From<T::Error>,
     {
-        T::try_from(self.receive()?).map_err(Error::from)
+        T::try_from(self.wait_result()?).map_err(Error::from)
     }
 }
 
@@ -60,15 +60,15 @@ impl Promise<()> {
     /// Blocks for local write/flush completion under the reply's original deadline.
     /// The peer does not send another acknowledgment for this reply.
     pub fn wait(self) -> Result<(), Error> {
-        self.receive()
+        self.wait_result()
     }
 }
 
 impl<T> Promise<T> {
-    /// Creates a promise and the channel sender that its `Operation` will own.
+    /// Creates a promise and the sender that its `PendingOperation` will own.
     /// The channel holds one result without waiting for the caller to receive it.
     pub(super) fn pair(
-        session: Weak<Shared>,
+        session: Weak<SessionInner>,
         deadline: Instant,
     ) -> (mpsc::SyncSender<Result<T, Error>>, Self) {
         let (sender, result) = mpsc::sync_channel(1);
@@ -79,7 +79,7 @@ impl<T> Promise<T> {
                 session,
                 deadline,
                 #[cfg(test)]
-                waiting: None,
+                wait_hook: None,
             },
         )
     }
@@ -87,13 +87,13 @@ impl<T> Promise<T> {
     /// Waits for the result channel. On timeout, asks the session to expire pending
     /// operations, then reads the result it sent. The session decides whether an
     /// answer or timeout came first; results already in the channel are kept.
-    fn receive(self) -> Result<T, Error> {
+    fn wait_result(self) -> Result<T, Error> {
         if let Some(session) = self.session.upgrade() {
             session.expire();
         }
         #[cfg(test)]
-        if let Some(waiting) = self.waiting {
-            let _ = waiting.send(());
+        if let Some(wait_hook) = self.wait_hook {
+            let _ = wait_hook.send(());
         }
         loop {
             match self
@@ -113,19 +113,20 @@ impl<T> Promise<T> {
         }
     }
 
-    /// Notifies a test just before `receive()` starts waiting on the result channel.
+    /// Notifies a test just before `wait_result()` starts waiting on the result channel.
     /// A result sent before the wait stays buffered in that channel.
     #[cfg(test)]
-    pub(super) fn watch(&mut self) -> mpsc::Receiver<()> {
+    pub(super) fn watch_wait(&mut self) -> mpsc::Receiver<()> {
         let (sender, receiver) = mpsc::channel();
-        self.waiting = Some(sender);
+        self.wait_hook = Some(sender);
         receiver
     }
 
-    /// Reads the result without calling `Shared::expire()`, so tests can prove
-    /// the workers process deadlines without help from `Promise::wait()`.
+    /// Waits for a worker result without calling `SessionInner::expire()`, so tests
+    /// can prove workers process deadlines without help from `Promise::wait()`.
+    /// Fails the test if the result does not arrive within five seconds.
     #[cfg(test)]
-    pub(super) fn settled(self) -> Result<T, Error> {
+    pub(super) fn wait_worker_result(self) -> Result<T, Error> {
         self.result
             .recv_timeout(Duration::from_secs(5))
             .expect("protocol worker must settle the promise")

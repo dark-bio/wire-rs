@@ -5,6 +5,7 @@
 //! Scripts can run both protocol peers or inspect one peer through a raw transport.
 
 use super::session::Job;
+use crate::protocol::session::SessionInner;
 use crate::protocol::worker::{self, Tracker};
 use crate::protocol::{
     self, ArkToHost, Closer, Error, HostToArk, Message, Promise, RemoteError, Requester, Responder,
@@ -27,7 +28,7 @@ const BUDGET: Duration = Duration::from_secs(3);
 /// Transport write timeout, shorter than the scenario watchdog.
 const WRITE_BUDGET: Duration = Duration::from_millis(500);
 
-/// Which peer exposes raw envelopes rather than the protocol API.
+/// Which peers run the protocol API; the other peer, if any, uses raw envelopes.
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     /// Both peers use the public protocol constructors.
@@ -73,7 +74,7 @@ fn failure(error: Error) -> Failure {
 
 /// Raw wire shape, including field combinations that protobuf itself permits.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Body {
+enum EnvelopeShape {
     /// Opaque develop body carrying one distinguishing byte.
     Content(u8),
     /// Error-only response.
@@ -110,19 +111,19 @@ enum Step {
     /// Reads the request's result channel directly, so its deadline worker must
     /// deliver any timeout without help from `Promise::wait()`.
     Answer(u8, Result<u8, Failure>),
-    /// Either local closure or the peer's shutdown may win on the other endpoint.
+    /// The promise may fail from local closure or from the peer closing its stream.
     AnswerClosed(u8),
     /// Reads the reply's result channel directly, without calling `Promise::wait()`.
     Written(u8, Result<(), Failure>),
     /// Drops the promise, leaving the request in progress.
     DropPromise(u8),
     /// Send a chosen ID and shape from the raw peer.
-    Send(u64, Body),
+    Send(u64, EnvelopeShape),
     /// Send invalid traffic; peer shutdown may race the sender's final flush.
     /// Following receive/promise assertions must prove the actual rejection.
-    Reject(u64, Body),
+    Reject(u64, EnvelopeShape),
     /// Inspect a raw received ID and shape.
-    Read(u64, Body),
+    Read(u64, EnvelopeShape),
     /// Pause or resume one physical direction (0 host output, 1 Ark output).
     Pause(u8, Operation, bool),
     /// Wait until the selected adapter operation is actually blocked.
@@ -140,16 +141,16 @@ enum Step {
     /// Inject a read timeout after ArkHello, while the server awaits HostAck.
     HandshakeReadTimeout,
     /// Pause the session writer just before it calls `Sender::disconnect()`.
-    HoldRetirement(u8),
+    PauseDisconnect(u8),
     /// Wait until the writer is paused before `Sender::disconnect()`.
-    Retiring(u8),
+    DisconnectPaused(u8),
     /// Let the paused writer call `Sender::disconnect()`.
-    ReleaseRetirement(u8),
+    ResumeDisconnect(u8),
     /// Require a request through an old `Requester` to fail.
     Refused(u8),
     /// Check that the session's weak reference stops upgrading after its workers exit.
     Released(u8),
-    /// Close the endpoint and all protocol connections.
+    /// Close the server and all protocol connections.
     Shutdown,
     /// Start a protocol worker that panics to test that the process aborts.
     WorkerPanic(u8),
@@ -162,7 +163,7 @@ enum Step {
 }
 
 /// Transport owner and bound sender retained by the scripted remote peer.
-enum Raw {
+enum RawPeer {
     /// Raw host can re-handshake on the same open pipe.
     Client(
         Box<transport::Client<Adapter, Adapter>>,
@@ -175,28 +176,28 @@ enum Raw {
     ),
 }
 
-impl Raw {
+impl RawPeer {
     /// Sends an envelope without applying the protocol's validation rules.
-    fn send(&self, id: u64, body: Body) -> Result<(), transport::Error> {
+    fn send(&self, id: u64, body: EnvelopeShape) -> Result<(), transport::Error> {
         let (tag, error) = match body {
-            Body::Content(tag) => (Some(tag), None),
-            Body::Error(code) => (
+            EnvelopeShape::Content(tag) => (Some(tag), None),
+            EnvelopeShape::Error(code) => (
                 None,
                 Some(RemoteError {
                     code,
                     msg: "remote failure".into(),
                 }),
             ),
-            Body::Both => (
+            EnvelopeShape::Both => (
                 Some(1),
                 Some(RemoteError {
                     code: 1,
                     msg: "invalid".into(),
                 }),
             ),
-            Body::Neither | Body::Invalid => (None, None),
+            EnvelopeShape::Neither | EnvelopeShape::Invalid => (None, None),
         };
-        let bytes = if body == Body::Invalid {
+        let bytes = if body == EnvelopeShape::Invalid {
             vec![0x80]
         } else {
             match self {
@@ -220,7 +221,7 @@ impl Raw {
     }
 
     /// Receives and extracts one raw peer result for script assertions.
-    fn read(&mut self) -> (u64, Body) {
+    fn read(&mut self) -> (u64, EnvelopeShape) {
         let (id, error, content) = match self {
             Self::Client(client, _) => {
                 let envelope = ArkToHost::decode(client.recv().unwrap().as_slice()).unwrap();
@@ -243,8 +244,8 @@ impl Raw {
             }
         };
         let body = match (content, error) {
-            (Some(Message::Develop(bytes)), None) => Body::Content(bytes[0]),
-            (None, Some(error)) => Body::Error(error.code),
+            (Some(Message::Develop(bytes)), None) => EnvelopeShape::Content(bytes[0]),
+            (None, Some(error)) => EnvelopeShape::Error(error.code),
             other => panic!("unexpected wire body: {other:?}"),
         };
         (id, body)
@@ -252,11 +253,11 @@ impl Raw {
 }
 
 /// Connection fixtures, application handles, and an independent hang watchdog.
-struct Peers {
-    /// Persistent protocol endpoint, if this scenario exercises one.
+struct Driver {
+    /// Persistent protocol server, if this scenario exercises one.
     server: Option<Server>,
     /// Optional scripted transport peer.
-    raw: Option<Raw>,
+    raw: Option<RawPeer>,
     /// Server handshake identity for raw reconnects.
     identity: xdsa::PublicKey,
     /// Host-to-Ark and Ark-to-host pipes.
@@ -268,7 +269,7 @@ struct Peers {
     /// Closer handles saved for each session.
     closers: HashMap<u8, Closer>,
     /// Weak references used to check that closed sessions are freed.
-    states: HashMap<u8, Weak<protocol::session::Shared>>,
+    states: HashMap<u8, Weak<SessionInner>>,
     /// Trackers used to wait for each connection's workers to finish.
     workers: Vec<Arc<Tracker>>,
     /// Request promises saved for later steps.
@@ -281,7 +282,7 @@ struct Peers {
     receiving: HashMap<u8, ReceiveJob>,
     /// Gates that pause old writers before `Sender::disconnect()` while a new
     /// session connects.
-    retirements: HashMap<u8, (mpsc::Receiver<()>, mpsc::Sender<()>)>,
+    disconnects: HashMap<u8, (mpsc::Receiver<()>, mpsc::Sender<()>)>,
     /// Physical closers used on normal cleanup and watchdog expiry.
     shutdown: [transport::Closer; 2],
     /// Stops the watchdog once all workers and calls have been released.
@@ -293,7 +294,7 @@ struct Peers {
 /// A receive call returning its non-cloneable owner alongside its result.
 type ReceiveJob = Job<(Session, Result<(Message, Responder), Error>)>;
 
-impl Peers {
+impl Driver {
     /// Constructs peers on shared transport gates, with space for a full handshake.
     fn new(mode: Mode) -> Self {
         let pipes = [Pipe::new(64 * 1024), Pipe::new(64 * 1024)];
@@ -331,7 +332,7 @@ impl Peers {
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
-        let mut peers = Self {
+        let mut driver = Self {
             server: None,
             raw: None,
             identity: identity.clone(),
@@ -345,7 +346,7 @@ impl Peers {
             writes: HashMap::new(),
             responders: HashMap::new(),
             receiving: HashMap::new(),
-            retirements: HashMap::new(),
+            disconnects: HashMap::new(),
             shutdown,
             stop: Some(stop),
             watchdog: Some(watchdog),
@@ -353,24 +354,24 @@ impl Peers {
         match mode {
             Mode::Both | Mode::Server => {
                 let mut server = Server::new(ark, signer, attestation);
-                peers.workers.push(server.shared.workers.clone());
+                driver.workers.push(server.inner.workers.clone());
                 match mode {
                     Mode::Both => {
                         let (client, info) = protocol::connect(host, &identity).unwrap();
                         assert!(!info.as_bytes().is_empty());
-                        peers.workers.push(client.shared.workers.clone());
-                        peers.save(0, client);
+                        driver.workers.push(client.inner.workers.clone());
+                        driver.save(0, client);
                     }
                     Mode::Server => {
                         let mut client =
                             transport::Client::new(host).set_handshake_timeout(WRITE_BUDGET);
                         let (sender, _) = client.connect(&identity).unwrap();
-                        peers.raw = Some(Raw::Client(Box::new(client), sender));
+                        driver.raw = Some(RawPeer::Client(Box::new(client), sender));
                     }
                     Mode::Client => unreachable!(),
                 }
-                peers.save(1, server.accept().unwrap());
-                peers.server = Some(server);
+                driver.save(1, server.accept().unwrap());
+                driver.server = Some(server);
             }
             Mode::Client => {
                 let server = Job::start(move || {
@@ -378,22 +379,22 @@ impl Peers {
                     let transport::Event::Connected(sender) = server.recv().unwrap() else {
                         panic!("expected handshake")
                     };
-                    Raw::Server(Box::new(server), sender)
+                    RawPeer::Server(Box::new(server), sender)
                 });
                 let (client, _) = protocol::connect(host, &identity).unwrap();
-                peers.workers.push(client.shared.workers.clone());
-                peers.save(0, client);
-                peers.raw = Some(server.finish());
+                driver.workers.push(client.inner.workers.clone());
+                driver.save(0, client);
+                driver.raw = Some(server.finish());
             }
         }
-        peers
+        driver
     }
 
     /// Saves a session and its requester, closer, and weak state reference.
     fn save(&mut self, label: u8, session: Session) {
         self.requesters.insert(label, session.requester());
         self.closers.insert(label, session.closer());
-        self.states.insert(label, Arc::downgrade(&session.shared));
+        self.states.insert(label, Arc::downgrade(&session.inner));
         assert!(self.sessions.insert(label, session).is_none());
     }
 
@@ -472,7 +473,7 @@ impl Peers {
             }
             Step::StartReceive(label) => {
                 let mut session = self.sessions.remove(&label).unwrap();
-                let waiting = session.shared.watch_recv();
+                let waiting = session.inner.watch_recv_wait();
                 self.receiving.insert(
                     label,
                     Job::start(move || {
@@ -511,14 +512,14 @@ impl Peers {
                     .promises
                     .remove(&slot)
                     .unwrap()
-                    .settled()
+                    .wait_worker_result()
                     .map(|body| Vec::<u8>::try_from(body).unwrap()[0])
                     .map_err(failure);
                 assert_eq!(result, expected);
             }
             Step::AnswerClosed(slot) => {
                 assert!(matches!(
-                    self.promises.remove(&slot).unwrap().settled(),
+                    self.promises.remove(&slot).unwrap().wait_worker_result(),
                     Err(Error::Closed | Error::Transport(_))
                 ));
             }
@@ -527,7 +528,7 @@ impl Peers {
                     self.writes
                         .remove(&slot)
                         .unwrap()
-                        .settled()
+                        .wait_worker_result()
                         .map_err(failure),
                     expected
                 );
@@ -550,7 +551,7 @@ impl Peers {
                 drop(self.sessions.remove(&label).unwrap());
             }
             Step::Reconnect(label) => {
-                let Some(Raw::Client(client, sender)) = &mut self.raw else {
+                let Some(RawPeer::Client(client, sender)) = &mut self.raw else {
                     panic!("raw client required")
                 };
                 *sender = client.connect(&self.identity).unwrap().0;
@@ -558,7 +559,7 @@ impl Peers {
                 self.save(label, session);
             }
             Step::FailedReconnect => {
-                let Some(Raw::Client(client, _)) = &mut self.raw else {
+                let Some(RawPeer::Client(client, _)) = &mut self.raw else {
                     panic!("raw client required")
                 };
                 assert!(client.connect(&self.identity).is_err());
@@ -572,21 +573,23 @@ impl Peers {
                     incoming.fail_read_deadline(io::ErrorKind::TimedOut);
                     outgoing.pause(Operation::Flush, false);
                 });
-                let Some(Raw::Client(client, _)) = &mut self.raw else {
+                let Some(RawPeer::Client(client, _)) = &mut self.raw else {
                     panic!("raw client required")
                 };
                 let _ = client.connect(&self.identity);
                 gate.finish();
             }
-            Step::HoldRetirement(label) => {
-                self.retirements.insert(
+            Step::PauseDisconnect(label) => {
+                self.disconnects.insert(
                     label,
-                    self.states[&label].upgrade().unwrap().hold_retirement(),
+                    self.states[&label].upgrade().unwrap().pause_disconnect(),
                 );
             }
-            Step::Retiring(label) => self.retirements[&label].0.recv_timeout(BUDGET).unwrap(),
-            Step::ReleaseRetirement(label) => {
-                self.retirements.remove(&label).unwrap().1.send(()).unwrap();
+            Step::DisconnectPaused(label) => {
+                self.disconnects[&label].0.recv_timeout(BUDGET).unwrap()
+            }
+            Step::ResumeDisconnect(label) => {
+                self.disconnects.remove(&label).unwrap().1.send(()).unwrap();
             }
             Step::Refused(label) => {
                 assert!(
@@ -596,10 +599,10 @@ impl Peers {
                 );
             }
             Step::Released(label) => {
-                // Workers drop their Shared references when they exit. Wait up
-                // to BUDGET for the last strong reference to disappear.
+                // Workers release their SessionInner references on exit. Wait up to
+                // BUDGET for the last strong reference to disappear.
                 if let Some(state) = self.states[&label].upgrade() {
-                    let released = state.watch_release();
+                    let released = state.watch_drop();
                     drop(state);
                     released.recv_timeout(BUDGET).unwrap();
                 }
@@ -613,9 +616,12 @@ impl Peers {
                     || panic!("scripted worker failure"),
                 );
             }
-            Step::LastId(label) => self.states[&label].upgrade().unwrap().last_id(),
+            Step::LastId(label) => self.states[&label].upgrade().unwrap().use_last_request_id(),
             Step::Outstanding(label, ids) => {
-                assert_eq!(self.states[&label].upgrade().unwrap().outstanding(), ids)
+                assert_eq!(
+                    self.states[&label].upgrade().unwrap().outstanding_ids(),
+                    ids
+                )
             }
             Step::Stopped => {
                 for workers in &self.workers {
@@ -626,11 +632,11 @@ impl Peers {
     }
 }
 
-impl Drop for Peers {
+impl Drop for Driver {
     /// Closes the pipes even if an assertion panics. On success, also checks that
     /// every protocol worker exits.
     fn drop(&mut self) {
-        self.retirements.clear();
+        self.disconnects.clear();
         self.shutdown();
         // The server tracker also counts workers from replaced sessions and
         // sessions the application never accepted.
@@ -648,10 +654,10 @@ impl Drop for Peers {
 /// Runs a script with automatic cleanup and step diagnostics on failure.
 fn run(mode: Mode, steps: &[Step]) {
     crate::testing::init_tracing();
-    let mut peers = Peers::new(mode);
+    let mut driver = Driver::new(mode);
     for (index, step) in steps.iter().enumerate() {
         tracing::debug!(index, ?step, "protocol connection scenario");
-        peers.step(step.clone());
+        driver.step(step.clone());
     }
 }
 

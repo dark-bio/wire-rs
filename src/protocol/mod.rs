@@ -6,11 +6,11 @@
 //! A reader receives messages from each connection. Each session also has a writer
 //! that sends queued messages and a deadline worker that times out operations.
 //! Flow control and memory limits are not implemented yet; the outgoing queue is
-//! currently unbounded. The previous implementation lives in [`legacy`].
+//! currently unbounded.
 //!
 //! The application opens a [`crate::transport::Stream`]; this layer constructs and
 //! owns its transport. [`connect`] establishes one client session. [`Server`] owns
-//! a persistent endpoint and accepts successive server sessions. Each [`Session`]
+//! a persistent stream and accepts successive server sessions. Each [`Session`]
 //! owns its receive queue and closes when dropped. Its [`Requester`] and
 //! [`Responder`] handles always target that session, even after it closes and
 //! another session connects.
@@ -32,7 +32,6 @@
 mod closer;
 mod envelope;
 mod error;
-pub mod legacy;
 mod message;
 mod operation;
 mod promise;

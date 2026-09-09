@@ -5,10 +5,12 @@
 //! Scripts call the public request, reply, wait and close methods. Test hooks
 //! report when a call starts waiting so later steps can run while it is blocked.
 
-use crate::protocol::operation::{Body, Output};
+use crate::protocol::operation::{OutgoingBody, OutgoingMessage};
+use crate::protocol::server::{ServerInner, SessionSource};
+use crate::protocol::session::SessionInner;
 use crate::protocol::{
     Closer, Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder, Server,
-    Session, server, session,
+    Session,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Weak, mpsc};
@@ -25,7 +27,7 @@ enum Failure {
     Closed,
     /// A new session replaced the original one.
     Reset,
-    /// The fixture dropped `Sessions`, as if the server reader had stopped.
+    /// The fixture dropped `SessionSource`, as if the server reader had stopped.
     Terminated,
     /// The deadline passed before the operation got a result.
     Timeout,
@@ -51,14 +53,14 @@ fn failure(error: Error) -> Failure {
     }
 }
 
-/// Creates the output failures supported by scripted writer completions.
-fn output_error(error: Failure) -> Error {
+/// Creates the write failures supported by scripted writer results.
+fn write_error(error: Failure) -> Error {
     match error {
         Failure::Closed => Error::Closed,
         Failure::Timeout => Error::Timeout,
         Failure::Reset => crate::transport::Error::SessionReset.into(),
         Failure::Terminated => crate::transport::Error::Terminated.into(),
-        other => panic!("not an output failure: {other:?}"),
+        other => panic!("not a write failure: {other:?}"),
     }
 }
 
@@ -72,9 +74,9 @@ fn response(result: Result<u8, u64>) -> Result<Message, RemoteError> {
         })
 }
 
-/// Expected output content, specified independently of the runtime queue types.
+/// Expected outgoing content, specified independently of the runtime queue types.
 #[derive(Clone, Debug)]
-enum Sent {
+enum ExpectedMessage {
     /// Locally initiated request carrying the given body tag.
     Request(u8),
     /// Reply to this peer request ID, with its body tag or error code.
@@ -173,15 +175,15 @@ enum Step {
     Released(u8),
     /// Closes the server through its saved `Closer`.
     CloseServer,
-    /// Drops the endpoint owner and checks weak handles do not retain its state.
+    /// Drops the server owner and checks weak handles do not retain its state.
     DropServer,
     /// Drops the source of sessions, modeling a terminated reader.
-    DropPublisher,
+    DropSource,
     /// Requires attaching a new session to fail with the given reason.
     RefuseOpen(Failure),
     /// Releases two threads together to close the same labeled session.
     RaceCloses(u8),
-    /// Releases two threads together to close the persistent endpoint.
+    /// Releases two threads together to close the persistent server.
     RaceServerCloses,
     /// Races server closure with attaching a session; that session must end too.
     RaceServerCloseOpen,
@@ -189,13 +191,13 @@ enum Step {
     Request(u8, u8, u8, u64),
     /// Submits a reply: responder slot, promise slot, body/error, absolute deadline.
     Reply(u8, u8, Result<u8, u64>, u64),
-    /// Takes output: session, output slot, expected content and original deadline.
-    Output(u8, u8, Sent, u64),
+    /// Takes a queued message: session, outgoing slot, content and original deadline.
+    Outgoing(u8, u8, ExpectedMessage, u64),
     /// Checks that no unexpired messages remain in this session's outgoing queue.
-    NoOutput(u8),
-    /// Reports local write/flush completion for a retained output slot.
+    NoOutgoing(u8),
+    /// Reports local write/flush completion for a retained outgoing slot.
     Written(u8, Result<(), Failure>),
-    /// Supplies the peer answer for a retained request output slot.
+    /// Supplies the peer answer for a retained outgoing request slot.
     Answer(u8, Result<u8, u64>),
     /// Supplies an answer whose content is not the byte-vector type used by the waiter.
     AnswerOther(u8),
@@ -239,45 +241,45 @@ enum Step {
 }
 
 /// A receive result returned with its owner so the driver can use the session again.
-type Receive = (Session, Result<(Message, Responder), Error>);
-/// An acceptance result returned with its persistent endpoint owner.
-type Accept = (Server, Result<Session, Error>);
+type ReceiveResult = (Session, Result<(Message, Responder), Error>);
+/// An acceptance result returned with its persistent server owner.
+type AcceptResult = (Server, Result<Session, Error>);
 
 /// Sessions, saved handles and background calls used by one script. Labels keep
 /// referring to the same session after replacement so steps can exercise old handles.
 struct Driver {
-    /// Endpoint owner, temporarily moved out while acceptance runs.
+    /// Server owner, temporarily moved out while acceptance runs.
     server: Option<Server>,
     /// Weak reference used to check that dropping the server frees its state.
-    endpoint: Weak<server::Shared>,
+    server_ref: Weak<ServerInner>,
     /// Sole source of replacement sessions in place of a real transport reader.
-    publisher: Option<server::Sessions>,
+    source: Option<SessionSource>,
     /// Accepted owners currently available to the script, indexed by session label.
     sessions: HashMap<u8, Session>,
     /// Session references saved by `Open`, including sessions later replaced.
-    incoming: HashMap<u8, Weak<session::Shared>>,
+    session_refs: HashMap<u8, Weak<SessionInner>>,
     /// Requester handles kept after dropping their sessions.
     requesters: HashMap<u8, Requester>,
     /// Session closers retained to exercise closure after replacement or owner drop.
     closers: HashMap<u8, Closer>,
     /// Responders indexed by script slot, not by wire request ID.
-    replies: HashMap<u8, Responder>,
+    responders: HashMap<u8, Responder>,
     /// In-progress receive jobs, each holding its labeled session owner.
-    receiving: HashMap<u8, Job<Receive>>,
-    /// In-progress acceptance job, holding the unique endpoint owner.
-    accepting: Option<Job<Accept>>,
-    /// Endpoint closer usable while acceptance owns the server or after owner drop.
+    receiving: HashMap<u8, Job<ReceiveResult>>,
+    /// In-progress acceptance job, holding the unique server owner.
+    accepting: Option<Job<AcceptResult>>,
+    /// Server closer usable while acceptance owns the server or after owner drop.
     closer: Closer,
     /// Base for deterministic absolute deadlines, kept ahead of the wall clock.
     epoch: Instant,
     /// Current scripted time in milliseconds, independent of expiry servicing.
     time: u64,
     /// Request promises saved for later wait or drop steps.
-    pending: HashMap<u8, Promise<Message>>,
+    promises: HashMap<u8, Promise<Message>>,
     /// Reply promises saved for later wait or drop steps.
     writes: HashMap<u8, Promise<()>>,
     /// Messages taken from the queue whose write results and answers are supplied later.
-    output: HashMap<u8, Output>,
+    outgoing: HashMap<u8, OutgoingMessage>,
     /// Background calls waiting for request answers.
     waiting: HashMap<u8, Job<Result<Vec<u8>, Error>>>,
     /// Background calls waiting for reply write results.
@@ -287,36 +289,36 @@ struct Driver {
 impl Driver {
     /// Creates a server fixture with no attached sessions or running jobs.
     fn new() -> Self {
-        let (server, publisher) = Server::pair();
+        let (server, source) = Server::fixture();
         Self {
-            endpoint: Arc::downgrade(&server.shared),
+            server_ref: Arc::downgrade(&server.inner),
             closer: server.closer(),
             server: Some(server),
-            publisher: Some(publisher),
+            source: Some(source),
             sessions: HashMap::new(),
-            incoming: HashMap::new(),
+            session_refs: HashMap::new(),
             requesters: HashMap::new(),
             closers: HashMap::new(),
-            replies: HashMap::new(),
+            responders: HashMap::new(),
             receiving: HashMap::new(),
             accepting: None,
             epoch: Instant::now() + Duration::from_secs(3600),
             time: 0,
-            pending: HashMap::new(),
+            promises: HashMap::new(),
             writes: HashMap::new(),
-            output: HashMap::new(),
+            outgoing: HashMap::new(),
             waiting: HashMap::new(),
             writing: HashMap::new(),
         }
     }
 
     /// Checks an accepted session's identity and saves its owner and cloned handles.
-    fn accepted(&mut self, id: u8, (server, result): Accept) {
+    fn accepted(&mut self, id: u8, (server, result): AcceptResult) {
         self.server = Some(server);
         let session = result.unwrap();
         assert!(Weak::ptr_eq(
-            &Arc::downgrade(&session.shared),
-            &self.incoming[&id]
+            &Arc::downgrade(&session.inner),
+            &self.session_refs[&id]
         ));
         self.requesters.insert(id, session.requester().clone());
         self.closers.insert(id, session.closer().clone());
@@ -324,10 +326,10 @@ impl Driver {
     }
 
     /// Checks the received body tag, saves its responder and restores the owner.
-    fn received(&mut self, id: u8, tag: u8, slot: u8, (session, result): Receive) {
+    fn received(&mut self, id: u8, tag: u8, slot: u8, (session, result): ReceiveResult) {
         let (message, responder) = result.unwrap();
         assert_eq!(message, Message::Develop(vec![tag]));
-        assert!(self.replies.insert(slot, responder).is_none());
+        assert!(self.responders.insert(slot, responder).is_none());
         self.sessions.insert(id, session);
     }
 
@@ -357,38 +359,41 @@ impl Driver {
     fn step(&mut self, step: Step) {
         match step {
             Step::Open(id) => {
-                let session = self.publisher.as_mut().unwrap().open().unwrap();
+                let session = self.source.as_mut().unwrap().open().unwrap();
                 session.upgrade().unwrap().set_time(self.at(self.time));
-                assert!(self.incoming.insert(id, session).is_none());
+                assert!(self.session_refs.insert(id, session).is_none());
             }
             Step::Request(id, slot, tag, deadline) => {
                 let requester = self.requesters[&id].clone();
                 let deadline = self.at(deadline);
-                let pending = Job::start(move || requester.request(vec![tag], deadline))
+                let promise = Job::start(move || requester.request(vec![tag], deadline))
                     .finish()
                     .unwrap();
-                assert!(self.pending.insert(slot, pending).is_none());
+                assert!(self.promises.insert(slot, promise).is_none());
             }
             Step::Reply(responder, slot, result, deadline) => {
-                let responder = self.replies.remove(&responder).unwrap();
+                let responder = self.responders.remove(&responder).unwrap();
                 let deadline = self.at(deadline);
-                let pending = Job::start(move || responder.reply(response(result), deadline))
+                let promise = Job::start(move || responder.reply(response(result), deadline))
                     .finish()
                     .unwrap();
-                assert!(self.writes.insert(slot, pending).is_none());
+                assert!(self.writes.insert(slot, promise).is_none());
             }
-            Step::Output(id, slot, expected, deadline) => {
-                let output = self.incoming[&id]
+            Step::Outgoing(id, slot, expected, deadline) => {
+                let outgoing = self.session_refs[&id]
                     .upgrade()
                     .unwrap()
-                    .take_output()
-                    .expect("output queued");
-                assert_eq!(output.deadline, self.at(deadline));
-                match (&output.body, expected) {
-                    (Body::Request(message), Sent::Request(tag)) => {
+                    .take_outgoing()
+                    .expect("outgoing queued");
+                assert_eq!(outgoing.deadline, self.at(deadline));
+                match (&outgoing.body, expected) {
+                    (OutgoingBody::Request(message), ExpectedMessage::Request(tag)) => {
                         assert_eq!(message, &Message::Develop(vec![tag]))
                     }
-                    (Body::Reply { id, result }, Sent::Reply(expected_id, expected)) => {
+                    (
+                        OutgoingBody::Reply { id, result },
+                        ExpectedMessage::Reply(expected_id, expected),
+                    ) => {
                         assert_eq!(*id, expected_id);
                         match (result, expected) {
                             (Ok(message), Ok(tag)) => {
@@ -408,51 +413,51 @@ impl Driver {
                             _ => panic!("unexpected reply result"),
                         }
                     }
-                    _ => panic!("unexpected output kind"),
+                    _ => panic!("unexpected outgoing kind"),
                 }
-                assert!(self.output.insert(slot, output).is_none());
+                assert!(self.outgoing.insert(slot, outgoing).is_none());
             }
-            Step::NoOutput(id) => assert!(
-                self.incoming[&id]
+            Step::NoOutgoing(id) => assert!(
+                self.session_refs[&id]
                     .upgrade()
                     .unwrap()
-                    .take_output()
+                    .take_outgoing()
                     .is_none()
             ),
-            Step::Written(slot, result) => self.output[&slot]
-                .completion
-                .written(result.map_err(output_error)),
+            Step::Written(slot, result) => self.outgoing[&slot]
+                .operation
+                .record_write(result.map_err(write_error)),
             Step::Answer(slot, result) => {
-                let output = self.output.remove(&slot).unwrap();
-                assert!(matches!(output.body, Body::Request(_)));
-                output.completion.answer(response(result));
+                let outgoing = self.outgoing.remove(&slot).unwrap();
+                assert!(matches!(outgoing.body, OutgoingBody::Request(_)));
+                outgoing.operation.record_response(response(result));
             }
             Step::AnswerOther(slot) => {
-                let output = self.output.remove(&slot).unwrap();
-                assert!(matches!(output.body, Body::Request(_)));
-                output
-                    .completion
-                    .answer(Ok(crate::protocol::DeviceInfoResponse::default().into()));
+                let outgoing = self.outgoing.remove(&slot).unwrap();
+                assert!(matches!(outgoing.body, OutgoingBody::Request(_)));
+                outgoing
+                    .operation
+                    .record_response(Ok(crate::protocol::DeviceInfoResponse::default().into()));
             }
             Step::Wait(slot, expected) => {
-                let pending = self.pending.remove(&slot).unwrap();
-                Self::answer_result(Job::start(move || pending.wait()).finish(), expected);
+                let promise = self.promises.remove(&slot).unwrap();
+                Self::answer_result(Job::start(move || promise.wait()).finish(), expected);
             }
             Step::WaitMessage(slot, tag) => {
-                let pending = self.pending.remove(&slot).unwrap();
+                let promise = self.promises.remove(&slot).unwrap();
                 assert_eq!(
-                    Job::start(move || pending.wait::<Message>())
+                    Job::start(move || promise.wait::<Message>())
                         .finish()
                         .unwrap(),
                     Message::Develop(vec![tag])
                 );
             }
             Step::StartWait(slot) => {
-                let mut pending = self.pending.remove(&slot).unwrap();
-                let waiting = pending.watch();
+                let mut promise = self.promises.remove(&slot).unwrap();
+                let waiting = promise.watch_wait();
                 assert!(
                     self.waiting
-                        .insert(slot, Job::start(move || pending.wait()))
+                        .insert(slot, Job::start(move || promise.wait()))
                         .is_none()
                 );
                 waiting
@@ -463,15 +468,15 @@ impl Driver {
                 Self::answer_result(self.waiting.remove(&slot).unwrap().finish(), expected)
             }
             Step::WaitWrite(slot, expected) => {
-                let pending = self.writes.remove(&slot).unwrap();
-                Self::write_result(Job::start(move || pending.wait()).finish(), expected);
+                let promise = self.writes.remove(&slot).unwrap();
+                Self::write_result(Job::start(move || promise.wait()).finish(), expected);
             }
             Step::StartWaitWrite(slot) => {
-                let mut pending = self.writes.remove(&slot).unwrap();
-                let waiting = pending.watch();
+                let mut promise = self.writes.remove(&slot).unwrap();
+                let waiting = promise.watch_wait();
                 assert!(
                     self.writing
-                        .insert(slot, Job::start(move || pending.wait()))
+                        .insert(slot, Job::start(move || promise.wait()))
                         .is_none()
                 );
                 waiting
@@ -481,39 +486,39 @@ impl Driver {
             Step::FinishWaitWrite(slot, expected) => {
                 Self::write_result(self.writing.remove(&slot).unwrap().finish(), expected)
             }
-            Step::DropPromise(slot) => drop(self.pending.remove(&slot).unwrap()),
+            Step::DropPromise(slot) => drop(self.promises.remove(&slot).unwrap()),
             Step::DropWritePromise(slot) => drop(self.writes.remove(&slot).unwrap()),
             Step::Time(time) => {
                 assert!(time >= self.time);
                 self.time = time;
-                for session in self.incoming.values().filter_map(Weak::upgrade) {
+                for session in self.session_refs.values().filter_map(Weak::upgrade) {
                     session.set_time(self.at(time));
                 }
             }
-            Step::Expire(id) => self.incoming[&id].upgrade().unwrap().expire(),
+            Step::Expire(id) => self.session_refs[&id].upgrade().unwrap().expire(),
             Step::Deadline(id, expected) => assert_eq!(
-                self.incoming[&id].upgrade().unwrap().next_deadline(),
+                self.session_refs[&id].upgrade().unwrap().next_deadline(),
                 expected.map(|time| self.at(time))
             ),
             Step::RealRequest(id, slot, budget) => {
-                self.incoming[&id].upgrade().unwrap().use_realtime();
-                let pending = self.requesters[&id]
+                self.session_refs[&id].upgrade().unwrap().use_realtime();
+                let promise = self.requesters[&id]
                     .request(vec![1], Instant::now() + Duration::from_millis(budget))
                     .unwrap();
-                assert!(self.pending.insert(slot, pending).is_none());
+                assert!(self.promises.insert(slot, promise).is_none());
             }
             Step::RealReply(responder, slot, budget) => {
-                let responder = self.replies.remove(&responder).unwrap();
-                let pending = responder
+                let responder = self.responders.remove(&responder).unwrap();
+                let promise = responder
                     .reply(
                         response(Ok(2)),
                         Instant::now() + Duration::from_millis(budget),
                     )
                     .unwrap();
-                assert!(self.writes.insert(slot, pending).is_none());
+                assert!(self.writes.insert(slot, promise).is_none());
             }
             Step::RaceReplyClose(id, responder) => {
-                let responder = self.replies.remove(&responder).unwrap();
+                let responder = self.responders.remove(&responder).unwrap();
                 let closer = self.closers[&id].clone();
                 let deadline = self.at(self.time + 100);
                 let gate = Arc::new(Barrier::new(3));
@@ -534,22 +539,22 @@ impl Driver {
                 gate.wait();
                 closed.finish();
                 match replied.finish() {
-                    Ok(pending) => {
-                        refused(Job::start(move || pending.wait()).finish(), Failure::Closed)
+                    Ok(promise) => {
+                        refused(Job::start(move || promise.wait()).finish(), Failure::Closed)
                     }
                     Err(error) => assert_eq!(failure(error), Failure::Closed),
                 }
             }
-            Step::RaceWriteClose(id, output, pending) => {
-                let output = self.output.remove(&output).unwrap();
-                let pending = self.writes.remove(&pending).unwrap();
+            Step::RaceWriteClose(id, outgoing, promise) => {
+                let outgoing = self.outgoing.remove(&outgoing).unwrap();
+                let promise = self.writes.remove(&promise).unwrap();
                 let closer = self.closers[&id].clone();
                 let gate = Arc::new(Barrier::new(3));
-                let written = {
+                let record_write = {
                     let gate = gate.clone();
                     Job::start(move || {
                         gate.wait();
-                        output.completion.written(Ok(()));
+                        outgoing.operation.record_write(Ok(()));
                     })
                 };
                 let closed = {
@@ -561,8 +566,8 @@ impl Driver {
                 };
                 gate.wait();
                 closed.finish();
-                written.finish();
-                if let Err(error) = Job::start(move || pending.wait()).finish() {
+                record_write.finish();
+                if let Err(error) = Job::start(move || promise.wait()).finish() {
                     assert_eq!(failure(error), Failure::Closed);
                 }
             }
@@ -588,23 +593,23 @@ impl Driver {
                 gate.wait();
                 closed.finish();
                 match requested.finish() {
-                    Ok(pending) => refused(
-                        Job::start(move || pending.wait::<Message>()).finish(),
+                    Ok(promise) => refused(
+                        Job::start(move || promise.wait::<Message>()).finish(),
                         Failure::Closed,
                     ),
                     Err(error) => assert_eq!(failure(error), Failure::Closed),
                 }
             }
-            Step::RaceAnswerClose(id, output, pending) => {
-                let output = self.output.remove(&output).unwrap();
-                let pending = self.pending.remove(&pending).unwrap();
+            Step::RaceAnswerClose(id, outgoing, promise) => {
+                let outgoing = self.outgoing.remove(&outgoing).unwrap();
+                let promise = self.promises.remove(&promise).unwrap();
                 let closer = self.closers[&id].clone();
                 let gate = Arc::new(Barrier::new(3));
                 let answered = {
                     let gate = gate.clone();
                     Job::start(move || {
                         gate.wait();
-                        output.completion.answer(response(Ok(42)));
+                        outgoing.operation.record_response(response(Ok(42)));
                     })
                 };
                 let closed = {
@@ -617,7 +622,7 @@ impl Driver {
                 gate.wait();
                 closed.finish();
                 answered.finish();
-                match Job::start(move || pending.wait::<Vec<u8>>()).finish() {
+                match Job::start(move || promise.wait::<Vec<u8>>()).finish() {
                     Ok(body) => assert_eq!(body, vec![42]),
                     Err(error) => assert_eq!(failure(error), Failure::Closed),
                 }
@@ -633,7 +638,7 @@ impl Driver {
             }
             Step::StartAccept => {
                 let mut server = self.server.take().unwrap();
-                let waiting = server.shared.watch_accept();
+                let waiting = server.inner.watch_accept_wait();
                 assert!(self.accepting.is_none());
                 self.accepting = Some(Job::start(move || {
                     let result = server.accept();
@@ -663,18 +668,18 @@ impl Driver {
                 self.server = Some(server);
             }
             Step::Deliver(id, request, tag) => {
-                self.incoming[&id]
+                self.session_refs[&id]
                     .upgrade()
                     .unwrap()
-                    .deliver(request, Message::Develop(vec![tag]))
+                    .inject_request(request, Message::Develop(vec![tag]))
                     .unwrap();
             }
             Step::RefuseDelivery(id, expected) => {
                 refused(
-                    self.incoming[&id]
+                    self.session_refs[&id]
                         .upgrade()
                         .unwrap()
-                        .deliver(1, Message::Develop(vec![0xff])),
+                        .inject_request(1, Message::Develop(vec![0xff])),
                     expected,
                 );
             }
@@ -689,7 +694,7 @@ impl Driver {
             }
             Step::StartReceive(id) => {
                 let mut session = self.sessions.remove(&id).unwrap();
-                let waiting = session.shared.watch_recv();
+                let waiting = session.inner.watch_recv_wait();
                 let job = Job::start(move || {
                     let result = session.recv();
                     (session, result)
@@ -734,7 +739,7 @@ impl Driver {
             }
             Step::RefuseReply(slot, expected) => {
                 refused(
-                    self.replies
+                    self.responders
                         .remove(&slot)
                         .unwrap()
                         .reply(Ok(vec![1].into()), Instant::now()),
@@ -742,7 +747,7 @@ impl Driver {
                 );
             }
             Step::DropReply(slot) => {
-                let responder = self.replies.remove(&slot).unwrap();
+                let responder = self.responders.remove(&slot).unwrap();
                 Job::start(move || drop(responder)).finish();
             }
             Step::AbandonmentTimeout(id, timeout) => {
@@ -751,27 +756,27 @@ impl Driver {
                     .insert(id, session.set_abandonment_timeout(timeout));
             }
             Step::Abandoned(id, expected) => {
-                let session = self.incoming[&id].upgrade().unwrap();
+                let session = self.session_refs[&id].upgrade().unwrap();
                 for id in expected {
-                    let output = session.take_output().expect("abandonment queued");
-                    let Body::Reply {
+                    let outgoing = session.take_outgoing().expect("abandonment queued");
+                    let OutgoingBody::Reply {
                         id: actual,
                         result: Err(error),
-                    } = output.body
+                    } = outgoing.body
                     else {
                         panic!("expected an abandonment reply");
                     };
                     assert_eq!(actual, id);
                     assert_eq!(error.code, ReservedErrors::Unanswered as u64);
                     assert_eq!(error.msg, "request left unanswered");
-                    output.completion.written(Ok(()));
+                    outgoing.operation.record_write(Ok(()));
                 }
                 assert!(
-                    session.take_output().is_none(),
-                    "unexpected additional output"
+                    session.take_outgoing().is_none(),
+                    "unexpected additional outgoing message"
                 );
             }
-            Step::Released(id) => assert!(self.incoming[&id].upgrade().is_none()),
+            Step::Released(id) => assert!(self.session_refs[&id].upgrade().is_none()),
             Step::CloseServer => {
                 let closer = self.closer.clone();
                 Job::start(move || closer.close()).finish();
@@ -780,14 +785,12 @@ impl Driver {
                 let server = self.server.take().unwrap();
                 Job::start(move || drop(server)).finish();
                 assert!(
-                    self.endpoint.upgrade().is_none(),
-                    "closer/publisher must not retain endpoint"
+                    self.server_ref.upgrade().is_none(),
+                    "closer/source must not retain server state"
                 );
             }
-            Step::DropPublisher => drop(self.publisher.take().unwrap()),
-            Step::RefuseOpen(expected) => {
-                refused(self.publisher.as_mut().unwrap().open(), expected)
-            }
+            Step::DropSource => drop(self.source.take().unwrap()),
+            Step::RefuseOpen(expected) => refused(self.source.as_mut().unwrap().open(), expected),
             step @ (Step::RaceCloses(_) | Step::RaceServerCloses) => {
                 let closer = match step {
                     Step::RaceCloses(id) => self.closers[&id].clone(),
@@ -812,13 +815,13 @@ impl Driver {
             }
             Step::RaceServerCloseOpen => {
                 let gate = Arc::new(Barrier::new(3));
-                let mut publisher = self.publisher.take().unwrap();
+                let mut source = self.source.take().unwrap();
                 let opened = {
                     let gate = gate.clone();
                     Job::start(move || {
                         gate.wait();
-                        let result = publisher.open();
-                        (publisher, result)
+                        let result = source.open();
+                        (source, result)
                     })
                 };
                 let closer = self.closer.clone();
@@ -831,18 +834,18 @@ impl Driver {
                 };
                 gate.wait();
                 closed.finish();
-                let (publisher, result) = opened.finish();
+                let (source, result) = opened.finish();
                 // If accept() took the session, it may still exist but must be
                 // closed now. Otherwise server closure also drops that session.
                 match result {
                     Ok(session) => {
                         if let Some(session) = session.upgrade() {
-                            refused(session.deliver(1, vec![1].into()), Failure::Closed);
+                            refused(session.inject_request(1, vec![1].into()), Failure::Closed);
                         }
                     }
                     Err(error) => assert_eq!(failure(error), Failure::Closed),
                 }
-                self.publisher = Some(publisher);
+                self.source = Some(source);
             }
         }
     }

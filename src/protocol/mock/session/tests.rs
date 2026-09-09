@@ -7,7 +7,7 @@ use super::{Failure, Step, run};
 
 /// Closure discards queued work, refuses later operations and remains repeatable.
 #[test]
-fn test_session_retirement() {
+fn test_session_close() {
     use Failure::*;
     use Step::*;
     run(vec![
@@ -42,9 +42,9 @@ fn test_receiver_wakeups() {
         CloseServer,
         RaceServerCloses,
         DropServer,
-        DropPublisher,
+        DropSource,
     ] {
-        let expected = if matches!(ending, DropPublisher) {
+        let expected = if matches!(ending, DropSource) {
             Terminated
         } else {
             Closed
@@ -137,7 +137,7 @@ fn test_owner_drop_with_retained_handles() {
 /// `accept()` wakes when a session is attached or the server closes. If several
 /// sessions connect before acceptance, only the newest one remains available.
 #[test]
-fn test_acceptance_and_endpoint_retirement() {
+fn test_acceptance_and_server_close() {
     use Failure::*;
     use Step::*;
     run(vec![
@@ -161,7 +161,7 @@ fn test_acceptance_and_endpoint_retirement() {
     ]);
     run(vec![
         StartAccept,
-        DropPublisher,
+        DropSource,
         FinishAcceptError(Terminated),
         CloseServer,
     ]);
@@ -183,7 +183,7 @@ fn test_acceptance_and_endpoint_retirement() {
 
 /// Attaching a session concurrently with server closure leaves that session closed.
 #[test]
-fn test_publication_races_endpoint_close() {
+fn test_attach_races_server_close() {
     use Failure::*;
     use Step::*;
     run(vec![
@@ -205,7 +205,7 @@ fn test_publication_races_endpoint_close() {
 /// results after closing or dropping the session.
 #[test]
 fn test_operation_results() {
-    use super::Sent;
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     run(vec![
@@ -214,9 +214,9 @@ fn test_operation_results() {
         Request(1, 0, 10, 100),
         Request(1, 1, 11, 100),
         Request(1, 2, 12, 100),
-        Output(1, 0, Sent::Request(10), 100),
-        Output(1, 1, Sent::Request(11), 100),
-        Output(1, 2, Sent::Request(12), 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
+        Outgoing(1, 1, ExpectedMessage::Request(11), 100),
+        Outgoing(1, 2, ExpectedMessage::Request(12), 100),
         StartWait(0),
         Written(0, Ok(())),
         Deadline(1, Some(100)),
@@ -225,12 +225,12 @@ fn test_operation_results() {
         FinishWait(0, Ok(20)),
         AnswerOther(2),
         Request(1, 3, 13, 100),
-        Output(1, 3, Sent::Request(13), 100),
+        Outgoing(1, 3, ExpectedMessage::Request(13), 100),
         Answer(3, Ok(23)),
         Deliver(1, 7, 30),
         Receive(1, 30, 0),
         Reply(0, 0, Ok(40), 100),
-        Output(1, 4, Sent::Reply(7, Ok(40)), 100),
+        Outgoing(1, 4, ExpectedMessage::Reply(7, Ok(40)), 100),
         StartWaitWrite(0),
         Written(4, Ok(())),
         Written(4, Err(Terminated)),
@@ -249,7 +249,7 @@ fn test_operation_results() {
 /// after the deadline produce `Timeout`, even before the timer processes expiry.
 #[test]
 fn test_completion_deadline_boundary() {
-    use super::Sent;
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     for time in [99, 100, 101] {
@@ -259,11 +259,11 @@ fn test_completion_deadline_boundary() {
             Open(1),
             Accept(1),
             Request(1, 0, 10, 100),
-            Output(1, 0, Sent::Request(10), 100),
+            Outgoing(1, 0, ExpectedMessage::Request(10), 100),
             Deliver(1, 7, 30),
             Receive(1, 30, 0),
             Reply(0, 0, Ok(40), 100),
-            Output(1, 1, Sent::Reply(7, Ok(40)), 100),
+            Outgoing(1, 1, ExpectedMessage::Reply(7, Ok(40)), 100),
             Time(time),
             Answer(0, Ok(20)),
             Written(1, Ok(())),
@@ -279,7 +279,7 @@ fn test_completion_deadline_boundary() {
         Open(1),
         Accept(1),
         Request(1, 0, 10, 100),
-        Output(1, 0, Sent::Request(10), 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
         Time(100),
         Written(0, Err(Terminated)),
         Answer(0, Ok(20)),
@@ -290,8 +290,8 @@ fn test_completion_deadline_boundary() {
 /// Expiry works without a waiting caller and while a write result is withheld.
 /// Expired queued messages are discarded; new requests can still use the session.
 #[test]
-fn test_deadlines_without_output_progress() {
-    use super::Sent;
+fn test_deadlines_without_writer_progress() {
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     run(vec![
@@ -300,7 +300,7 @@ fn test_deadlines_without_output_progress() {
         Request(1, 0, 10, 100),
         Request(1, 1, 11, 100),
         Request(1, 2, 12, 200),
-        Output(1, 0, Sent::Request(10), 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
         Deliver(1, 7, 30),
         Receive(1, 30, 0),
         Reply(0, 0, Ok(40), 100),
@@ -312,8 +312,8 @@ fn test_deadlines_without_output_progress() {
         Deadline(1, Some(200)),
         FinishWait(0, Err(Timeout)),
         FinishWaitWrite(0, Err(Timeout)),
-        Output(1, 1, Sent::Request(12), 200),
-        NoOutput(1),
+        Outgoing(1, 1, ExpectedMessage::Request(12), 200),
+        NoOutgoing(1),
         Answer(0, Ok(20)),
         Answer(1, Ok(22)),
         Wait(1, Err(Timeout)),
@@ -322,12 +322,12 @@ fn test_deadlines_without_output_progress() {
         // Already-expired submission still returns a promise, without queueing.
         Request(1, 3, 13, 100),
         Wait(3, Err(Timeout)),
-        NoOutput(1),
+        NoOutgoing(1),
         Deliver(1, 8, 31),
         Receive(1, 31, 1),
         Reply(1, 1, Ok(41), 99),
         WaitWrite(1, Err(Timeout)),
-        NoOutput(1),
+        NoOutgoing(1),
     ]);
     // Taking a queued message checks its deadline even before expire() runs.
     run(vec![
@@ -335,7 +335,7 @@ fn test_deadlines_without_output_progress() {
         Accept(1),
         Request(1, 0, 10, 100),
         Time(100),
-        NoOutput(1),
+        NoOutgoing(1),
         Wait(0, Err(Timeout)),
         Deadline(1, None),
     ]);
@@ -346,7 +346,7 @@ fn test_deadlines_without_output_progress() {
         Request(1, 0, 10, 100),
         Time(100),
         Wait(0, Err(Timeout)),
-        NoOutput(1),
+        NoOutgoing(1),
         Deadline(1, None),
     ]);
 }
@@ -354,8 +354,8 @@ fn test_deadlines_without_output_progress() {
 /// Closing fails every pending promise. Closure before its deadline produces
 /// `Closed`; closure at or after its deadline produces `Timeout`.
 #[test]
-fn test_retirement_settles_operations() {
-    use super::Sent;
+fn test_close_fails_pending_operations() {
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     for time in [99, 100, 101] {
@@ -364,12 +364,12 @@ fn test_retirement_settles_operations() {
             DropSession(1),
             CloseServer,
             DropServer,
-            DropPublisher,
+            DropSource,
             RaceCloses(1),
         ] {
             let reason = if time >= 100 {
                 Timeout
-            } else if matches!(ending, DropPublisher) {
+            } else if matches!(ending, DropSource) {
                 Terminated
             } else {
                 Closed
@@ -379,7 +379,7 @@ fn test_retirement_settles_operations() {
                 Accept(1),
                 Request(1, 0, 10, 100),
                 Request(1, 1, 11, 100),
-                Output(1, 0, Sent::Request(10), 100),
+                Outgoing(1, 0, ExpectedMessage::Request(10), 100),
                 Deliver(1, 7, 30),
                 Receive(1, 30, 0),
                 Reply(0, 0, Ok(40), 100),
@@ -402,20 +402,20 @@ fn test_retirement_settles_operations() {
 /// can still arrive; consuming a responder cannot enqueue a second response.
 #[test]
 fn test_observer_drop_keeps_operations() {
-    use super::Sent;
+    use super::ExpectedMessage;
     use Step::*;
     run(vec![
         Open(1),
         Accept(1),
         Request(1, 0, 10, 100),
         DropPromise(0),
-        Output(1, 0, Sent::Request(10), 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
         Written(0, Ok(())),
         Deadline(1, Some(100)),
         Answer(0, Ok(20)),
         Deadline(1, None),
         Request(1, 1, 11, 100),
-        Output(1, 1, Sent::Request(11), 100),
+        Outgoing(1, 1, ExpectedMessage::Request(11), 100),
         DropPromise(1),
         Answer(1, Err(0x123)),
         Deadline(1, None),
@@ -423,15 +423,15 @@ fn test_observer_drop_keeps_operations() {
         Receive(1, 30, 0),
         Reply(0, 0, Err(0x123), 100),
         DropWritePromise(0),
-        Output(1, 2, Sent::Reply(7, Err(0x123)), 100),
-        NoOutput(1),
+        Outgoing(1, 2, ExpectedMessage::Reply(7, Err(0x123)), 100),
+        NoOutgoing(1),
         Written(2, Ok(())),
         Deadline(1, None),
         Request(1, 2, 12, 100),
         DropPromise(2),
         Time(100),
         Expire(1),
-        NoOutput(1),
+        NoOutgoing(1),
         Deadline(1, None),
     ]);
 }
@@ -440,7 +440,7 @@ fn test_observer_drop_keeps_operations() {
 /// queueing. Failed or expired automatic replies do not retry with a fresh budget.
 #[test]
 fn test_abandonment_timeout() {
-    use super::Sent;
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     use std::time::Duration;
@@ -449,31 +449,31 @@ fn test_abandonment_timeout() {
         Accept(1),
         AbandonmentTimeout(1, Duration::from_millis(30)),
         Request(1, 0, 10, 200),
-        Output(1, 0, Sent::Request(10), 200), // Hold unrelated output throughout.
+        Outgoing(1, 0, ExpectedMessage::Request(10), 200), // Hold unrelated output throughout.
         Deliver(1, 7, 30),
         Receive(1, 30, 0),
         Time(20),
         DropReply(0),
         Deadline(1, Some(50)),
         Time(49),
-        Output(1, 1, Sent::Reply(7, Err(1)), 50),
+        Outgoing(1, 1, ExpectedMessage::Reply(7, Err(1)), 50),
         Time(50),
         Written(1, Ok(())),
         Deadline(1, Some(200)),
-        NoOutput(1),
+        NoOutgoing(1),
         Deliver(1, 8, 31),
         Receive(1, 31, 1),
         DropReply(1),
-        Output(1, 2, Sent::Reply(8, Err(1)), 80),
+        Outgoing(1, 2, ExpectedMessage::Reply(8, Err(1)), 80),
         Written(2, Err(Terminated)),
-        NoOutput(1),
+        NoOutgoing(1),
         Deadline(1, Some(200)),
         Deliver(1, 9, 32),
         Receive(1, 32, 2),
         DropReply(2),
         Time(80),
         Expire(1),
-        NoOutput(1),
+        NoOutgoing(1),
         Deadline(1, Some(200)),
         Answer(0, Ok(20)),
         Wait(0, Ok(20)),
@@ -488,7 +488,7 @@ fn test_abandonment_timeout() {
             Deliver(1, 7, 30),
             Receive(1, 30, 0),
             DropReply(0),
-            NoOutput(1),
+            NoOutgoing(1),
             Deadline(1, None),
         ]);
     }
@@ -498,7 +498,7 @@ fn test_abandonment_timeout() {
 /// replacement sessions start with the default.
 #[test]
 fn test_abandonment_timeout_updates() {
-    use super::Sent;
+    use super::ExpectedMessage;
     use Step::*;
     use std::time::Duration;
     run(vec![
@@ -513,51 +513,51 @@ fn test_abandonment_timeout_updates() {
         Time(20),
         DropReply(0), // Uses the five-second default.
         AbandonmentTimeout(1, Duration::from_millis(30)),
-        Output(1, 0, Sent::Reply(7, Err(1)), 5020),
+        Outgoing(1, 0, ExpectedMessage::Reply(7, Err(1)), 5020),
         Written(0, Ok(())),
         DropReply(1), // Held since before reconfiguration, now uses 30ms.
         AbandonmentTimeout(1, Duration::from_millis(90)),
-        Output(1, 1, Sent::Reply(8, Err(1)), 50),
+        Outgoing(1, 1, ExpectedMessage::Reply(8, Err(1)), 50),
         Written(1, Ok(())),
         DropReply(2),
-        Output(1, 2, Sent::Reply(9, Err(1)), 110),
+        Outgoing(1, 2, ExpectedMessage::Reply(9, Err(1)), 110),
         Written(2, Ok(())),
         Open(2),
         Accept(2),
         Deliver(2, 10, 33),
         Receive(2, 33, 3),
         DropReply(3),
-        Output(2, 3, Sent::Reply(10, Err(1)), 5020),
+        Outgoing(2, 3, ExpectedMessage::Reply(10, Err(1)), 5020),
         Written(3, Ok(())),
     ]);
 }
 
 /// Late write results and answers target the original session after replacement.
-/// Keeping promises and completion handles does not keep that session alive.
+/// Keeping promises and operation handles does not keep that session alive.
 #[test]
-fn test_replacement_keeps_completions_bound() {
-    use super::Sent;
+fn test_replacement_keeps_operation_handles_bound() {
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     run(vec![
         Open(1),
         Accept(1),
         Request(1, 0, 10, 100),
-        Output(1, 0, Sent::Request(10), 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
         Deliver(1, 7, 30),
         Receive(1, 30, 0),
         Reply(0, 0, Ok(40), 100),
-        Output(1, 1, Sent::Reply(7, Ok(40)), 100),
+        Outgoing(1, 1, ExpectedMessage::Reply(7, Ok(40)), 100),
         Open(2),
         Accept(2),
         DropSession(1),
         Released(1),
         Request(2, 1, 11, 100),
-        Output(2, 2, Sent::Request(11), 100),
+        Outgoing(2, 2, ExpectedMessage::Request(11), 100),
         Deliver(2, 7, 31),
         Receive(2, 31, 1),
         Reply(1, 1, Ok(41), 100),
-        Output(2, 3, Sent::Reply(7, Ok(41)), 100),
+        Outgoing(2, 3, ExpectedMessage::Reply(7, Ok(41)), 100),
         Written(0, Err(Terminated)),
         Answer(0, Ok(99)),
         Written(1, Ok(())),
@@ -575,22 +575,22 @@ fn test_replacement_keeps_completions_bound() {
 /// Racing `request()` with `close()` leaves the request failed. Racing an answer
 /// with `close()` gives the promise either result once, without overwriting it.
 #[test]
-fn test_operation_retirement_races() {
-    use super::Sent;
+fn test_operation_close_races() {
+    use super::ExpectedMessage;
     use Step::*;
     for _ in 0..32 {
         run(vec![
             Open(1),
             Accept(1),
             RaceRequestClose(1),
-            NoOutput(1),
+            NoOutgoing(1),
             Deadline(1, None),
         ]);
         run(vec![
             Open(1),
             Accept(1),
             Request(1, 0, 10, 100),
-            Output(1, 0, Sent::Request(10), 100),
+            Outgoing(1, 0, ExpectedMessage::Request(10), 100),
             RaceAnswerClose(1, 0, 0),
             Deadline(1, None),
         ]);
@@ -614,7 +614,7 @@ fn test_real_wait_deadlines() {
         StartWaitWrite(0),
         FinishWait(0, Err(Timeout)),
         FinishWaitWrite(0, Err(Timeout)),
-        NoOutput(1),
+        NoOutgoing(1),
         Deadline(1, None),
     ]);
 }
@@ -622,19 +622,19 @@ fn test_real_wait_deadlines() {
 /// A failed reply write fails its promise and does not queue an extra `UNANSWERED`
 /// response: `reply()` already consumed the responder.
 #[test]
-fn test_output_failure_settlement() {
-    use super::Sent;
+fn test_write_failure_results() {
+    use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
     run(vec![
         Open(1),
         Accept(1),
         Request(1, 0, 10, 100),
-        Output(1, 0, Sent::Request(10), 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
         Deliver(1, 7, 30),
         Receive(1, 30, 0),
         Reply(0, 0, Ok(40), 100),
-        Output(1, 1, Sent::Reply(7, Ok(40)), 100),
+        Outgoing(1, 1, ExpectedMessage::Reply(7, Ok(40)), 100),
         StartWait(0),
         StartWaitWrite(0),
         Written(0, Err(Terminated)),
@@ -645,7 +645,7 @@ fn test_output_failure_settlement() {
         CloseSession(1),
         FinishWait(0, Err(Terminated)),
         FinishWaitWrite(0, Err(Terminated)),
-        NoOutput(1),
+        NoOutgoing(1),
         Deadline(1, None),
     ]);
 }
@@ -653,8 +653,8 @@ fn test_output_failure_settlement() {
 /// Racing `reply()` with `close()` leaves the reply failed. Racing its write result
 /// with `close()` completes the promise once with either result.
 #[test]
-fn test_reply_retirement_races() {
-    use super::Sent;
+fn test_reply_close_races() {
+    use super::ExpectedMessage;
     use Step::*;
     for _ in 0..32 {
         run(vec![
@@ -663,7 +663,7 @@ fn test_reply_retirement_races() {
             Deliver(1, 7, 30),
             Receive(1, 30, 0),
             RaceReplyClose(1, 0),
-            NoOutput(1),
+            NoOutgoing(1),
             Deadline(1, None),
         ]);
         run(vec![
@@ -672,9 +672,9 @@ fn test_reply_retirement_races() {
             Deliver(1, 7, 30),
             Receive(1, 30, 0),
             Reply(0, 0, Ok(40), 100),
-            Output(1, 0, Sent::Reply(7, Ok(40)), 100),
+            Outgoing(1, 0, ExpectedMessage::Reply(7, Ok(40)), 100),
             RaceWriteClose(1, 0, 0),
-            NoOutput(1),
+            NoOutgoing(1),
             Deadline(1, None),
         ]);
     }

@@ -16,7 +16,7 @@ pub enum Error {
     #[error("wire operation timed out")]
     Timeout,
 
-    /// The session or endpoint was closed locally, including by dropping its owner.
+    /// The session or server was closed locally, including by dropping its owner.
     #[error("wire protocol closed")]
     Closed,
 

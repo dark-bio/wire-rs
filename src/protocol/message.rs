@@ -30,7 +30,7 @@ macro_rules! messages {
 
         impl Message {
             /// Returns the payload's Rust type name for response mismatch errors.
-            fn message_type(&self) -> &'static str {
+            fn type_name(&self) -> &'static str {
                 match self {
                     $(Self::$variant(_) => stringify!($payload),)*
                 }
@@ -55,7 +55,7 @@ macro_rules! messages {
                         Message::$variant(message) => Ok(message),
                         other => Err(Error::UnexpectedResponse {
                             expected: stringify!($payload),
-                            received: other.message_type(),
+                            received: other.type_name(),
                         }),
                     }
                 }
@@ -85,7 +85,7 @@ macro_rules! contents {
             fn try_from(message: Message) -> Result<Self, Self::Error> {
                 match message {
                     $(Message::$variant(body) => Ok(Self::$field(body)),)*
-                    other => Err(Error::WrongDirection(other.message_type())),
+                    other => Err(Error::WrongDirection(other.type_name())),
                 }
             }
         }
