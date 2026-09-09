@@ -108,7 +108,7 @@ mod tests {
         responder
             .reply(
                 Err(RemoteError {
-                    code: 1,
+                    code: 0x100,
                     msg: "refused".into(),
                 }),
                 deadline,
