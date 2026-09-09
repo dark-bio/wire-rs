@@ -1,8 +1,10 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
+use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
+use crate::transport::io::check_deadline;
 use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
 use crate::transport::sender::Sender;
@@ -13,6 +15,7 @@ use crate::transport::{
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{info, trace, warn};
 
 /// Device attestation presented during the handshake. The CWT must contain
@@ -106,7 +109,8 @@ pub struct Server<R: Read, W: Write, A: Attester> {
     receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this server
     sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
 
-    handshaking: bool, // A reset arrived; the next receive pass must run the handshake
+    handshake_timeout: Duration, // Budget for each new handshake attempt
+    handshake_deadline: Option<Instant>, // Deadline of the handshake requested by a reset
 
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     timestamp: Option<i64>, // Test signing time for ArkHello; otherwise use the clock
@@ -127,10 +131,26 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             attester,
             receiver: None,
             sealer: None,
-            handshaking: false,
+            handshake_deadline: None,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
         }
+    }
+
+    /// Sets the budget for each subsequent handshake, starting when a reset is
+    /// received. Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]. Output and peer
+    /// replies share one deadline; progress and repeated resets within the attempt
+    /// do not refresh it. An already pending handshake keeps its deadline. Each
+    /// outgoing frame is also limited by the stream's write timeout. Waiting for
+    /// locks and attester callbacks can extend the call beyond the deadline.
+    /// Time between recv calls also consumes the budget.
+    ///
+    /// Zero expires attempts immediately. A duration too large to add to an
+    /// [`Instant`] panics when the next handshake's deadline is constructed.
+    pub fn set_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// A handle that permanently closes the stream from another thread.
@@ -168,7 +188,10 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     ///
     /// A client reset or invalid incoming data ends the current session and
     /// returns [`Event::Disconnected`]. Oversized frames count as invalid data.
-    /// After a reset, the next call runs the handshake. A send failure also ends
+    /// After a reset, the next call runs the handshake under one configured
+    /// deadline starting at that reset. Repeated resets within that attempt do
+    /// not refresh it. Expiry returns `RecvFailed(TimedOut)` and a fresh reset
+    /// can start another attempt. A send failure also ends
     /// the session, but does not wake a blocked read. It is reported once
     /// receiving progresses. Sessions ended by a local disconnect are not
     /// reported again.
@@ -184,8 +207,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// write failures surface as errors; calling again waits for a new reset on
     /// the same stream. Adapter read failures and EOF also surface as errors,
     /// without removing the binding. The caller can retry a transient read error,
-    /// disconnect the session or close the stream. Idle read polls are retried
-    /// internally and do not time out the session.
+    /// disconnect the session or close the stream. Outside a handshake, reads
+    /// wait for data or adapter shutdown without a session timeout.
     ///
     /// Outgoing frames and standalone empty notifications use the stream's
     /// configured write timeout. A notification sent while handling a failed
@@ -196,8 +219,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         // Empty frames request a handshake on the next pass.
         loop {
             // If a reset just arrived, run the handshake
-            if std::mem::take(&mut self.handshaking) {
-                match self.handshake() {
+            if let Some(deadline) = self.handshake_deadline.take() {
+                match self.handshake(deadline) {
                     // Transport errors propagate immediately
                     Err(Error::Terminated) => return Err(Error::Terminated),
                     Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
@@ -208,7 +231,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // Tell the client that the handshake did not establish a session
                     Err(err) => {
                         warn!("wire handshake failed: {}", err);
-                        self.send_dropped();
+                        if let Err(err) = self.outbound.send_dropped(Some(deadline)) {
+                            warn!("failed to signal dropped handshake: {}", err);
+                        }
+                        // Do not swallow an attempt deadline exhausted during
+                        // authentication or its failure notification.
+                        check_deadline(deadline).map_err(Error::RecvFailed)?;
                     }
                     // Report the completed handshake before reading messages.
                     // The caller can now send without waiting for a client request.
@@ -245,7 +273,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // A reset ends any active session. Run the handshake on the next
                 // receive call if we return an event, or on the next loop pass.
                 Ok(None) => {
-                    self.handshaking = true;
+                    self.handshake_deadline = Some(Instant::now() + self.handshake_timeout);
                     if self.end_session() {
                         return Ok(Event::Disconnected);
                     }
@@ -327,7 +355,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 
     /// Sends an empty frame to tell the client it has no session. Logs failures.
     fn send_dropped(&self) {
-        if let Err(err) = self.outbound.send_dropped() {
+        if let Err(err) = self.outbound.send_dropped(None) {
             warn!("failed to signal dropped session: {}", err);
         }
     }
@@ -351,12 +379,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     ///   1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
     ///   2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
     ///   3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
-    fn handshake(&mut self) -> Result<(xhpke::Sender, xhpke::Receiver), Error> {
+    fn handshake(&mut self, deadline: Instant) -> Result<(xhpke::Sender, xhpke::Receiver), Error> {
         self.outbound.unbind();
         loop {
             // Message 1: Read the HostHello (skip any trailing empty reset frames)
             let packet = loop {
-                if let Some(packet) = self.reader.next_packet(None)? {
+                if let Some(packet) = self.reader.next_packet(Some(deadline))? {
                     break packet;
                 }
             };
@@ -414,11 +442,11 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Error::HandshakeFailed(format!("failed to seal server hello: {}", err))
             })?;
 
-            self.outbound.send_packet(&ark_hello)?;
+            self.outbound.send_packet(&ark_hello, Some(deadline))?;
 
             // Message 3: Read and open HostAck. An empty frame is another reset;
             // discard this attempt and wait for the next HostHello.
-            let Some(packet) = self.reader.next_packet(None)? else {
+            let Some(packet) = self.reader.next_packet(Some(deadline))? else {
                 warn!("session reset during handshake");
                 continue;
             };
@@ -448,6 +476,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 })?;
 
             // Session established
+            check_deadline(deadline).map_err(Error::RecvFailed)?;
             return Ok((sender, receiver));
         }
     }

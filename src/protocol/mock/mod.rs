@@ -343,7 +343,7 @@ impl Source for Feed {
 
     fn disconnect(&mut self) {
         self.link.end_session();
-        let _ = self.link.outbound.send_dropped();
+        let _ = self.link.outbound.send_dropped(None);
     }
 }
 

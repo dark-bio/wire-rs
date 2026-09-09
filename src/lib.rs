@@ -15,8 +15,8 @@ pub use transport::mock;
 
 pub use protocol::{ArkToHost, HostToArk};
 pub use transport::{
-    Attestation, Attester, Client, Closer, DEFAULT_WRITE_TIMEOUT, Error, MAX_FRAME_SIZE,
-    MAX_MESSAGE_SIZE, Read, Roots, Sender, Server, Stream, Verifier, Write,
+    Attestation, Attester, Client, Closer, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT, Error,
+    MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Read, Roots, Sender, Server, Stream, Verifier, Write,
 };
 
 #[cfg(test)]
@@ -91,8 +91,8 @@ pub(crate) mod testing {
     }
 
     impl Read for PipeReader {
-        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-            self.deadline = Some(deadline);
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.deadline = deadline;
             Ok(())
         }
     }
@@ -159,8 +159,8 @@ pub(crate) mod testing {
 
     #[cfg(unix)]
     impl Read for Socket {
-        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-            self.read_deadline = Some(deadline);
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.read_deadline = deadline;
             Ok(())
         }
     }

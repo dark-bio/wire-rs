@@ -18,8 +18,8 @@ use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use serde_json::Value;
 use std::io::{self, ErrorKind};
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Decodes a transcript from its JSON.
 pub fn parse(json: &str) -> Vector {
@@ -125,7 +125,6 @@ pub fn run(vector: &Vector) {
     let mut client = Client::new(crate::transport::Stream::new(
         Reader {
             playback: tape.clone(),
-            deadline: Instant::now(),
         },
         Writer {
             playback: tape.clone(),
@@ -140,7 +139,6 @@ pub fn run(vector: &Vector) {
     while !tape.tape.lock().unwrap().done() {
         let event = {
             let mut tape = tape.tape.lock().unwrap();
-            tape.output_failed = false;
             tape.next()
         };
         match event {
@@ -205,7 +203,6 @@ fn settle(
 /// Shared replay state for delivering recorded input and checking client output.
 struct Playback {
     tape: Mutex<Tape>,
-    advanced: Condvar,
 }
 
 impl Playback {
@@ -213,7 +210,6 @@ impl Playback {
     fn new(trace: Vec<Event>) -> Self {
         Self {
             tape: Mutex::new(Tape::new(trace)),
-            advanced: Condvar::new(),
         }
     }
 }
@@ -226,7 +222,6 @@ struct Tape {
     offset: usize, // Read cursor; keeps small reads from shifting the buffer
     chunk: usize,  // Maximum read size; zero means no limit
     writes: Vec<(Vec<u8>, Vec<u8>, bool)>, // Recorded bytes, actual bytes and recorded failure
-    output_failed: bool, // A concurrent helper failed, so reads wait for its cancellation
 }
 
 impl Tape {
@@ -239,7 +234,6 @@ impl Tape {
             offset: 0,
             chunk: 0,
             writes: Vec::new(),
-            output_failed: false,
         }
     }
 
@@ -259,48 +253,19 @@ impl Tape {
 /// Delivers transcript input to the real client.
 struct Reader {
     playback: Arc<Playback>,
-    deadline: Instant, // Configured deadline for waiting on concurrent output
 }
 
 impl Read for Reader {
-    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.deadline = deadline;
+    fn set_read_deadline(&mut self, _deadline: Option<Instant>) -> io::Result<()> {
+        // Recorded outcomes determine expiry without wall-clock delays.
         Ok(())
     }
 }
 
 impl io::Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Quiet synthetic polls need not spend the adapter's full allowance.
-        // Their count is deliberately absent from the deterministic transcript.
-        let deadline = self.deadline.min(Instant::now() + Duration::from_millis(1));
         let mut tape = self.playback.tape.lock().unwrap();
         while tape.pending.is_empty() {
-            // Wait for the handshake writer to consume its output events.
-            // After output failure, the next event can be the call's result.
-            // A short read poll lets the client observe the writer's cancellation.
-            if matches!(
-                tape.trace.get(tape.next),
-                Some(
-                    Event::Write { .. }
-                        | Event::WriteTimedOut { .. }
-                        | Event::FlushFailed
-                        | Event::FlushTimedOut
-                )
-            ) || (tape.output_failed
-                && matches!(tape.trace.get(tape.next), Some(Event::Err { .. })))
-            {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    return Err(ErrorKind::TimedOut.into());
-                };
-                tape = self
-                    .playback
-                    .advanced
-                    .wait_timeout(tape, remaining)
-                    .unwrap()
-                    .0;
-                continue;
-            }
             match tape.next() {
                 Event::Read { bytes, chunk } => {
                     tape.pending = bytes;
@@ -372,8 +337,6 @@ impl io::Write for Writer {
         };
         tape.writes
             .push((recorded, buf[..n].to_vec(), error.is_some()));
-        tape.output_failed |= error.is_some();
-        self.playback.advanced.notify_all();
         match error {
             Some(error) if n > 0 => {
                 self.pending_error = Some(error);
@@ -393,14 +356,10 @@ impl io::Write for Writer {
         let mut tape = self.playback.tape.lock().unwrap();
         if tape.trace.get(tape.next) == Some(&Event::FlushFailed) {
             tape.next += 1;
-            tape.output_failed = true;
-            self.playback.advanced.notify_all();
             return Err(ErrorKind::BrokenPipe.into());
         }
         if tape.trace.get(tape.next) == Some(&Event::FlushTimedOut) {
             tape.next += 1;
-            tape.output_failed = true;
-            self.playback.advanced.notify_all();
             return Err(ErrorKind::TimedOut.into());
         }
         Ok(())
@@ -528,6 +487,7 @@ impl Peer {
 #[test]
 fn test_full_prefix_failure_surfaces_on_flush() {
     use std::io::Write as _;
+    use std::time::Duration;
 
     for error in [ErrorKind::BrokenPipe, ErrorKind::TimedOut] {
         let prefix = vec![1, 2, 3, 4];

@@ -9,9 +9,14 @@
 //! Adapters implement standard byte I/O plus the deadline setters in [`Read`]
 //! and [`Write`]. Each outgoing frame has one configurable budget covering
 //! partial writes and flush. A timeout ends that send or handshake without closing
-//! the byte stream. Idle input is polled for cancellation and has no session
-//! timeout. During reconnect, the client drains old input while sending its reset
-//! and hello. This lets both directions progress over bounded stream buffers.
+//! the byte stream. Established-session reads wait for data or adapter shutdown,
+//! with no session timeout. Handshakes use one configurable deadline on each side,
+//! defaulting to five seconds. The client writes reset and hello before draining
+//! stale replies, so adapters need enough available buffering to accept that output
+//! without concurrent client reads. Backpressure may fail an attempt; the caller
+//! can retry with a fresh reset.
+
+use std::time::Duration;
 
 mod client;
 mod framing;
@@ -37,11 +42,24 @@ pub use client::{Client, Roots, Verifier};
 pub use io::{Read, Write};
 pub use sender::Sender;
 pub use server::{Attestation, Attester, Event, Server};
-pub use stream::{Closer, DEFAULT_WRITE_TIMEOUT, Stream};
+pub use stream::{Closer, Stream};
 
 /// Stream writer for the protocol mock's real framing and reset notifications.
 #[cfg(any(test, feature = "fuzz"))]
 pub(crate) use outbound::{Outbound, Side};
+
+/// Default budget for a handshake's output and peer replies. Configure it with
+/// [`Client::set_handshake_timeout`] or [`Server::set_handshake_timeout`].
+/// Progress, stale frames and resets within the attempt do not refresh it.
+/// Writer-lock cleanup and caller callbacks may extend the call, but cannot
+/// extend its I/O deadline.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default budget for encoding, writing and flushing one complete transport frame.
+/// Configure it with [`Stream::set_write_timeout`]. Progress does not refresh it.
+/// The budget starts after acquiring the writer, excluding lock waits and
+/// encryption. Handshake frames are also limited by the handshake deadline.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum encoded frame size, excluding its trailing delimiter. An oversized
 /// incoming frame is a framing error that ends any active session. Its remainder
@@ -113,9 +131,10 @@ pub enum Error {
 
     /// An adapter read or read deadline configuration failed. Idle read timeouts
     /// and interrupted reads are retried internally. Configuration failures are
-    /// returned immediately. The client ends its session; the server leaves its
-    /// binding in place so the caller can decide whether to retry or disconnect.
-    /// Neither side closes the stream because of this error.
+    /// returned immediately, as is expiry of an overall handshake deadline.
+    /// The client ends its session; the server leaves its binding in place so
+    /// the caller can decide whether to retry or disconnect. Neither side closes
+    /// the stream because of this error.
     #[error("wire receive failed: {0}")]
     RecvFailed(std::io::Error),
 

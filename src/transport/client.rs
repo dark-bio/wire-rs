@@ -1,37 +1,23 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
+use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
+use crate::transport::io::check_deadline;
 use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
 use crate::transport::sender::Sender;
 use crate::transport::server::Attestation;
-use crate::transport::stream::Cancelled;
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Closer,
     Error, Read, Stream, Write,
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
-
-/// Cancels a reconnect's reader if its output helper fails or unwinds. On
-/// success the helper disarms this guard, allowing an ordinary idle read to
-/// continue. A helper panic still propagates when the scoped thread is joined.
-struct CancelRead<'a>(Option<&'a AtomicBool>);
-
-impl Drop for CancelRead<'_> {
-    fn drop(&mut self) {
-        if let Some(canceled) = self.0 {
-            canceled.store(true, Ordering::Relaxed);
-        }
-    }
-}
 
 /// Trust policy for the device attestation presented during a handshake.
 /// The caller decides which roots to trust and whether to allow self-signed
@@ -95,10 +81,12 @@ impl Verifier for Roots<'_> {
 /// Transport checks the shape of the device attestation. A [`Verifier`] decides
 /// whether to trust the server presenting it.
 pub struct Client<R: Read, W: Write> {
-    reader: FrameReader<R>,            // COBS framed transport for ingress data
+    handshake_timeout: Duration, // Budget for each new handshake attempt
+
+    reader: FrameReader<R>, // COBS framed transport for ingress data
     receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this client
     sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
-    outbound: Arc<Outbound<W>>,        // Outgoing transport, shared with the senders
+    outbound: Arc<Outbound<W>>, // Outgoing transport, shared with the senders
 }
 
 impl<R: Read, W: Write> Client<R, W> {
@@ -112,11 +100,25 @@ impl<R: Read, W: Write> Client<R, W> {
         let outbound = Arc::new(Outbound::new(writer, Side::Client, close.clone(), timeout));
 
         Self {
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             reader: FrameReader::new(reader, close),
             receiver: None,
             sealer: None,
             outbound,
         }
+    }
+
+    /// Sets the budget for each subsequent handshake, starting when connect is
+    /// called. Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]. Output and peer replies
+    /// share one deadline; progress and stale frames do not refresh it. Each
+    /// outgoing frame is also limited by the stream's write timeout. Waiting for
+    /// locks and verifier callbacks can extend the call beyond the deadline.
+    ///
+    /// Zero expires attempts immediately. A duration too large to add to an
+    /// [`Instant`] panics when the next handshake's deadline is constructed.
+    pub fn set_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// A handle that permanently closes the stream from another thread.
@@ -142,22 +144,22 @@ impl<R: Read, W: Write> Client<R, W> {
     /// is returned alongside the new sender. That sender belongs to this session
     /// and cannot send into a replacement established by a later handshake.
     ///
-    /// A scoped native thread sends the reset and hello while this caller drains
-    /// old input. This prevents reconnect deadlocks on bounded duplex streams.
-    /// Output failure cancels the companion read. Read failure cancels further
-    /// helper I/O. The helper is always joined before returning.
+    /// Sends reset and hello before draining old input. The adapter must allow
+    /// that output to finish without concurrent client reads for this attempt
+    /// to progress. Backpressure can instead fail an outgoing frame on timeout.
     ///
-    /// Each outgoing frame gets the stream's configured write budget. Waiting
-    /// for a peer's reply has no overall timeout. If connecting fails, the client
-    /// has no session and all previously issued senders remain invalid.
-    pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error>
-    where
-        W: Send,
-    {
+    /// The handshake uses one configured deadline, shared by output and peer
+    /// waits. Existing writer-lock cleanup may extend the call. If connecting
+    /// fails, the client has no session and previously issued senders are invalid.
+    pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
+        // Compute the deadline by which the handshake must finish
+        let deadline = Instant::now() + self.handshake_timeout;
+
         // Generate ephemeral client keys for this session
         let host_xdsa_sk = xdsa::SecretKey::generate();
         let host_xhpke_sk = xhpke::SecretKey::generate();
-        self.handshake(verifier, host_xdsa_sk, host_xhpke_sk, None)
+
+        self.handshake(verifier, host_xdsa_sk, host_xhpke_sk, None, deadline)
     }
 
     /// Ends any previous session, sends a reset and drives the handshake with the
@@ -169,10 +171,8 @@ impl<R: Read, W: Write> Client<R, W> {
         host_xdsa_sk: xdsa::SecretKey,
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: Option<i64>,
-    ) -> Result<(Sender<W>, V::Info), Error>
-    where
-        W: Send,
-    {
+        deadline: Instant,
+    ) -> Result<(Sender<W>, V::Info), Error> {
         let host_xdsa_pk = host_xdsa_sk.public_key();
         let host_xhpke_pk = host_xhpke_sk.public_key();
 
@@ -186,7 +186,28 @@ impl<R: Read, W: Write> Client<R, W> {
             Error::HandshakeFailed(format!("failed to encode client hello: {}", err))
         })?;
 
-        let packet = self.exchange_hello(&hello, host_xhpke_pk.fingerprint())?;
+        // Retire the old binding and serialize reset/hello after admitted sends.
+        // The client starts reading only once this output has finished.
+        self.receiver = None;
+        self.sealer = None;
+        self.outbound.send_reset(deadline)?;
+        self.outbound.send_packet(&hello, Some(deadline))?;
+
+        // Message 2: Skip old replies, notifications and partial-frame leftovers
+        // until ArkHello names this attempt's fresh key. All draining shares the
+        // same deadline; authentication follows below.
+        let recipient = host_xhpke_pk.fingerprint();
+        let packet = loop {
+            let packet = match self.reader.next_packet(Some(deadline)) {
+                Ok(Some(packet)) => packet,
+                Ok(None) | Err(Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) => &[],
+                Err(err) => return Err(err),
+            };
+            if cose::recipient(packet).is_ok_and(|fp| fp == recipient) {
+                break packet;
+            }
+            warn!("skipping stale frame during handshake");
+        };
         let auth = handshake::ArkHelloAuth {
             host_signer: host_xdsa_pk.clone(),
             host_crypto: host_xhpke_pk.clone(),
@@ -194,7 +215,7 @@ impl<R: Read, W: Write> Client<R, W> {
 
         // Step 2a: Decrypt the outer COSE_Encrypt0 layer
         let sign1 =
-            cose::decrypt(&packet, &auth, &host_xhpke_sk, CRYPTO_DOMAIN_WIRE).map_err(|err| {
+            cose::decrypt(packet, &auth, &host_xhpke_sk, CRYPTO_DOMAIN_WIRE).map_err(|err| {
                 Error::HandshakeFailed(format!("failed to decrypt server hello: {}", err))
             })?;
 
@@ -263,86 +284,12 @@ impl<R: Read, W: Write> Client<R, W> {
         }
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
-        self.outbound.send_packet(&ack)?;
+        self.outbound.send_packet(&ack, Some(deadline))?;
+        check_deadline(deadline).map_err(Error::RecvFailed)?;
 
         // Session established, the ack ahead of anything sealed into it
         let sender = self.new_session(sender, receiver);
         Ok((sender, info))
-    }
-
-    /// Sends the reset and hello while draining output from earlier sessions.
-    /// The helper retires the old binding before writing. Waiting for its writer
-    /// lock must not prevent this caller from reading. Only a reply addressed to
-    /// the fresh key is returned; the handshake authenticates it afterwards.
-    /// Both directions finish before returning, even if either fails.
-    ///
-    /// TODO(karalabe): Ugh, this torn out with threading
-    fn exchange_hello(
-        &mut self,
-        hello: &[u8],
-        recipient: xhpke::Fingerprint,
-    ) -> Result<Vec<u8>, Error>
-    where
-        W: Send,
-    {
-        // Release the client's old contexts. Active sends may still hold the
-        // sending context. The helper waits for their writer before retiring
-        // its binding. Read while it waits, or both peers can block writing
-        // into each other's full pipe.
-        self.receiver = None;
-        self.sealer = None;
-
-        // Each attempt owns a fresh stop flag. It publishes no other state;
-        // joining the helper synchronizes its result before this attempt ends.
-        let canceled = AtomicBool::new(false);
-        let outbound = &self.outbound;
-        let reader = &mut self.reader;
-
-        thread::scope(|scope| {
-            let cancellation = &canceled;
-            let writer = scope.spawn(|| {
-                let mut cancel_read = CancelRead(Some(cancellation));
-                let result = outbound.begin_handshake(hello, cancellation);
-                if result.is_ok() {
-                    cancel_read.0 = None;
-                }
-                result
-            });
-
-            // Message 2: Read ArkHello while the helper sends reset/HostHello.
-            // Discard buffered output from earlier sessions or attempts until
-            // a reply names our fresh key. There is no frame-count limit: the
-            // amount of legitimate stale traffic depends on adapter buffering.
-            let received = loop {
-                let packet = match reader.next_packet(Some(cancellation)) {
-                    Ok(Some(packet)) => packet,
-                    Ok(None) | Err(Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) => &[],
-                    Err(err) => break Err(err),
-                };
-                if cose::recipient(packet).is_ok_and(|fp| fp == recipient) {
-                    break Ok(packet.to_vec());
-                }
-                warn!("skipping stale frame during handshake");
-            };
-            if received.is_err() {
-                cancellation.store(true, Ordering::Relaxed);
-            }
-            // Join even on read failure. No helper or delayed cancellation can
-            // escape this attempt and interfere with the next use of the stream.
-            let sent = writer
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            match (received, sent) {
-                (Err(Error::RecvFailed(err)), Err(output))
-                    if err.get_ref().is_some_and(|cause| cause.is::<Cancelled>()) =>
-                {
-                    Err(output)
-                }
-                (Err(err), _) => Err(err),
-                (Ok(_), Err(err)) => Err(err),
-                (Ok(packet), Ok(())) => Ok(packet),
-            }
-        })
     }
 
     /// Reads and decrypts the next ark-to-host message. Invalid or oversized
@@ -444,11 +391,14 @@ impl<R: Read, W: Write> Client<R, W> {
         host_xdsa_sk: xdsa::SecretKey,
         host_xhpke_sk: xhpke::SecretKey,
         timestamp: i64,
-    ) -> Result<(Sender<W>, V::Info), Error>
-    where
-        W: Send,
-    {
-        self.handshake(verifier, host_xdsa_sk, host_xhpke_sk, Some(timestamp))
+    ) -> Result<(Sender<W>, V::Info), Error> {
+        self.handshake(
+            verifier,
+            host_xdsa_sk,
+            host_xhpke_sk,
+            Some(timestamp),
+            Instant::now() + self.handshake_timeout,
+        )
     }
 
     /// Reads a framed packet without decryption for tests and benchmarks.
@@ -466,7 +416,7 @@ impl<R: Read, W: Write> Client<R, W> {
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn send_packet_blob(&mut self, packet: &[u8]) -> Result<(), Error> {
-        self.outbound.send_packet(packet)
+        self.outbound.send_packet(packet, None)
     }
 
     /// Reads an encoded frame without its delimiter for tests and benchmarks.
@@ -621,7 +571,7 @@ mod tests {
         let packet = sealing::seal(&mut peer, &payload(1)).unwrap();
         let mut bytes = Vec::new();
         FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
-            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         let (entered_tx, entered) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
@@ -663,7 +613,7 @@ mod tests {
         let packet = sealing::seal(&mut peer, &payload(2)).unwrap();
         let mut bytes = Vec::new();
         FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
-            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT, None)
+            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         let mut client = Client::new(Stream::new(
             Memory::new(&bytes[..]),
@@ -766,7 +716,7 @@ mod tests {
         // The read only returns once the writer is gone
         let mut bytes = Vec::new();
         reader
-            .set_read_deadline(Instant::now() + DEFAULT_WRITE_TIMEOUT)
+            .set_read_deadline(Some(Instant::now() + DEFAULT_WRITE_TIMEOUT))
             .unwrap();
         reader.read_to_end(&mut bytes).unwrap();
         assert!(!bytes.is_empty());

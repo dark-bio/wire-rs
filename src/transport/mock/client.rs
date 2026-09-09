@@ -120,7 +120,7 @@ pub enum Step {
     /// The next matching output operation expires after the selected prefix,
     /// leaving no budget for a failure notification on that operation.
     Timeout(CutPoint),
-    /// An idle read poll expires; the server keeps waiting without a transition.
+    /// An adapter read returns an early timeout; the server keeps waiting without a transition.
     ReadTimeout,
 }
 
@@ -888,7 +888,7 @@ impl Client {
 struct Feed(Arc<Mutex<Client>>);
 
 impl Read for Feed {
-    fn set_read_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
+    fn set_read_deadline(&mut self, _deadline: Option<Instant>) -> io::Result<()> {
         // Every read completes immediately according to the script.
         Ok(())
     }

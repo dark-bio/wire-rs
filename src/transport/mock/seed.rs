@@ -117,7 +117,7 @@ impl Seedable for duplex::Scenario {
     fn seed(&self, seed: &mut Seed) {
         use duplex::Scenario;
 
-        const COUNT: u32 = 7;
+        const COUNT: u32 = 10;
         match self {
             Scenario::Reconnect { both_directions } => {
                 seed.variant(0, COUNT);
@@ -131,10 +131,15 @@ impl Seedable for duplex::Scenario {
                 seed.variant(2, COUNT);
                 seed.flag(*flush);
             }
-            Scenario::HandshakeTimeout { ack, flush } => {
+            Scenario::HandshakeFailure {
+                ack,
+                flush,
+                timeout,
+            } => {
                 seed.variant(3, COUNT);
                 seed.flag(*ack);
                 seed.flag(*flush);
+                seed.flag(*timeout);
             }
             Scenario::FailedPrelude { read } => {
                 seed.variant(4, COUNT);
@@ -145,6 +150,19 @@ impl Seedable for duplex::Scenario {
                 seed.byte(*count);
             }
             Scenario::AbandonedHello => seed.variant(6, COUNT),
+            Scenario::SilentHandshake { ack } => {
+                seed.variant(7, COUNT);
+                seed.flag(*ack);
+            }
+            Scenario::HandshakeNoise { server } => {
+                seed.variant(8, COUNT);
+                seed.flag(*server);
+            }
+            Scenario::Shutdown { handshake, server } => {
+                seed.variant(9, COUNT);
+                seed.flag(*handshake);
+                seed.flag(*server);
+            }
         }
     }
 }

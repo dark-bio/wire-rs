@@ -765,9 +765,9 @@ mod tests {
     }
 
     impl Read for FaultReader {
-        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
             self.reader.set_read_deadline(deadline)?;
-            self.deadline = Some(deadline);
+            self.deadline = deadline;
             Ok(())
         }
     }

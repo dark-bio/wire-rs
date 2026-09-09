@@ -585,8 +585,8 @@ fn test_scripted_broken_transport() {
     assert_eq!(summary.dropped, 2);
 }
 
-// Tests expired read polls while idle, during both handshake phases, and in an
-// established session. Polling timeouts leave every phase intact and produce no
+// Tests early adapter timeouts while idle, during both handshake phases, and in
+// an established session. These leave every phase intact and produce no
 // notification or extra session transition.
 #[test]
 fn test_scripted_read_timeouts() {

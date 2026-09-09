@@ -8,33 +8,35 @@
 use std::io;
 use std::time::Instant;
 
-/// Refuses work whose absolute output deadline has already elapsed.
-pub(super) fn check_deadline(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "I/O deadline expired",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// A standard byte reader whose blocking operations honor an absolute deadline.
 ///
 /// An idle read returns `TimedOut` when its deadline expires, without consuming
-/// bytes. Transport retries these reads until data, cancellation or another error
-/// arrives. Reads that consume bytes must report them through the standard
+/// bytes. Transport retries early timeouts and interruptions within the same
+/// deadline. Reads that consume bytes must report them through the standard
 /// [`io::Read`] contract. Timeouts leave the adapter open and reusable.
 ///
 /// The actual I/O must honor the deadline. Checking the clock before a call that
-/// can block indefinitely is insufficient.
+/// can block indefinitely is insufficient. With no deadline, reads wait for data
+/// or shutdown. The stream's shutdown operation must release blocked reads.
 pub trait Read: io::Read {
-    /// Installs the deadline for subsequent reads until replaced. Returns
-    /// promptly, transfers no bytes and leaves the write deadline unchanged.
+    /// Installs the deadline for subsequent reads until replaced; `None` clears
+    /// it. Returns promptly, transfers no bytes and leaves the write deadline
+    /// unchanged.
     /// Reads attempted after expiration return `TimedOut`. If this setter fails,
     /// transport returns the error without attempting a read.
-    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()>;
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()>;
+}
+
+impl<T: Read + ?Sized> Read for &mut T {
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        (**self).set_read_deadline(deadline)
+    }
+}
+
+impl<T: Read + ?Sized> Read for Box<T> {
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        (**self).set_read_deadline(deadline)
+    }
 }
 
 /// A standard byte writer whose writes and flushes honor an absolute deadline.
@@ -56,18 +58,6 @@ pub trait Write: io::Write {
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()>;
 }
 
-impl<T: Read + ?Sized> Read for &mut T {
-    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        (**self).set_read_deadline(deadline)
-    }
-}
-
-impl<T: Read + ?Sized> Read for Box<T> {
-    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        (**self).set_read_deadline(deadline)
-    }
-}
-
 impl<T: Write + ?Sized> Write for &mut T {
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         (**self).set_write_deadline(deadline)
@@ -77,5 +67,17 @@ impl<T: Write + ?Sized> Write for &mut T {
 impl<T: Write + ?Sized> Write for Box<T> {
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         (**self).set_write_deadline(deadline)
+    }
+}
+
+/// Refuses work whose absolute I/O deadline has already elapsed.
+pub(super) fn check_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "I/O deadline expired",
+        ))
+    } else {
+        Ok(())
     }
 }

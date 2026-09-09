@@ -9,7 +9,6 @@ use super::framing::FrameWriter;
 use super::{Closer, Error, Sender, Write};
 use darkbio_crypto::xhpke;
 use std::io;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tracing::{trace, warn};
@@ -87,7 +86,7 @@ impl<W: Write> Outbound<W> {
         self.lock().end(sealer);
     }
 
-    /// Removes any binding before another handshake, waiting for earlier writes.
+    /// Removes any binding, waiting for earlier writes.
     pub(super) fn unbind(&self) {
         self.lock().unbind();
     }
@@ -143,40 +142,33 @@ impl<W: Write> Outbound<W> {
         self.closer.close();
     }
 
-    /// Removes the old binding and writes the client's reset and fresh hello.
-    /// The caller must drain incoming traffic concurrently, including while this
-    /// waits for a previous send. The writer stays locked across both frames so
-    /// no old output can enter between them. Each frame gets its own deadline.
-    /// Cancellation refuses further adapter calls for this attempt.
-    ///
-    /// TODO(karalabe): Ugh, this is so ugly here with "handshake" leaking out
-    pub(super) fn begin_handshake(&self, hello: &[u8], canceled: &AtomicBool) -> Result<(), Error> {
+    /// Removes the binding and sends a reset under the writer lock. Old sends
+    /// cannot write after the reset. The deadline limits the frame's write budget.
+    pub(super) fn send_reset(&self, deadline: Instant) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
         writer
             .framer
-            .send_reset(Instant::now() + self.timeout, Some(canceled))?;
-        writer
-            .framer
-            .send_packet(hello, Instant::now() + self.timeout, Some(canceled))
+            .send_reset(deadline.min(Instant::now() + self.timeout))
     }
 
-    /// Removes the binding and tells the client that the server has no session.
-    /// Explicit responses to incoming traffic send the signal even if unbound.
-    pub(crate) fn send_dropped(&self) -> Result<(), Error> {
+    /// Removes the binding and sends an empty notification. An optional deadline
+    /// limits this output; otherwise the frame uses the configured write budget.
+    pub(crate) fn send_dropped(&self, limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
-        writer
-            .framer
-            .send_dropped(Instant::now() + self.timeout, None)
+        let budget = Instant::now() + self.timeout;
+        let deadline = limit.map_or(budget, |limit| limit.min(budget));
+        writer.framer.send_dropped(deadline)
     }
 
-    /// Writes a handshake packet through the same framer as session messages.
-    /// The owner removes its old binding before starting the handshake.
-    pub(super) fn send_packet(&self, packet: &[u8]) -> Result<(), Error> {
+    /// Writes an unsealed packet after the owner has removed the binding. The
+    /// optional deadline limits output and any best-effort failure notification.
+    pub(super) fn send_packet(&self, packet: &[u8], limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
-        let deadline = Instant::now() + self.timeout;
-        let result = writer.framer.send_packet(packet, deadline, None);
+        let budget = Instant::now() + self.timeout;
+        let deadline = limit.map_or(budget, |limit| limit.min(budget));
+        let result = writer.framer.send_packet(packet, deadline);
         if let Err(err @ Error::SendFailed(_)) = &result {
             writer.notify_failure(err, deadline);
         }
@@ -190,7 +182,7 @@ impl<W: Write> Outbound<W> {
         let mut writer = self.lock();
         writer
             .framer
-            .send_frame_blob(frame, Instant::now() + self.timeout, None)
+            .send_frame_blob(frame, Instant::now() + self.timeout)
     }
 
     /// Acquires exclusive output ownership. A sender retains its encryption
@@ -270,7 +262,7 @@ impl<W: Write> Writer<'_, W> {
             }
         }
         let deadline = Instant::now() + self.outbound.timeout;
-        if let Err(err) = self.framer.send_packet(packet, deadline, None) {
+        if let Err(err) = self.framer.send_packet(packet, deadline) {
             if self.end(sealer) {
                 self.notify_failure(&err, deadline);
             }
@@ -292,7 +284,7 @@ impl<W: Write> Writer<'_, W> {
     fn notify_failure(&mut self, error: &Error, deadline: Instant) {
         if self.outbound.side == Side::Server
             && !matches!(error, Error::SendFailed(err) if err.kind() == io::ErrorKind::TimedOut)
-            && let Err(err) = self.framer.send_dropped(deadline, None)
+            && let Err(err) = self.framer.send_dropped(deadline)
         {
             warn!("failed to notify client of ended session: {}", err);
         }
@@ -399,7 +391,7 @@ mod tests {
             let sender = outbound.bind(&sealer);
             let result = if handshake {
                 outbound.unbind();
-                outbound.send_packet(b"hello")
+                outbound.send_packet(b"hello", None)
             } else {
                 sender.send(b"message")
             };
@@ -613,7 +605,7 @@ mod tests {
         // Only the first failure notifies, and none can cross the new handshake.
         assert_eq!(*collector.0.lock().unwrap(), [0]);
         outbound.unbind();
-        outbound.send_packet(b"hello").unwrap();
+        outbound.send_packet(b"hello", None).unwrap();
         fail();
 
         let (crypto, mut peer) = contexts();

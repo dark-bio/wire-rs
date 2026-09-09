@@ -22,8 +22,8 @@ use darkbio_cobs as cobs;
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
 use std::io;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use vector::{Event, Vector};
 
 /// Maximum steps run from one script, limiting the work in a fuzz iteration.
@@ -151,18 +151,11 @@ pub enum CutPoint {
 /// Scripts can inject partial writes, timeouts and persistent write failures.
 #[derive(Clone, Default)]
 pub struct Outbox {
-    shared: Arc<Output>,
+    shared: Arc<Mutex<OutputState>>,
     recorder: Recorder, // Transcript the writes are logged into
 }
 
-/// Written bytes and scripted failures, shared with a client's handshake writer.
-#[derive(Default)]
-struct Output {
-    state: Mutex<OutputState>,
-    changed: Condvar,
-}
-
-/// Captured bytes, injected faults and handshake progress under one lock.
+/// Captured bytes and injected faults under one lock.
 #[derive(Default)]
 struct OutputState {
     bytes: Vec<u8>,
@@ -171,15 +164,13 @@ struct OutputState {
     timeout: bool,
     write_error: Option<io::ErrorKind>, // Deferred until the call after accepted bytes
     flush_error: Option<io::ErrorKind>,
-    flushes: usize,
-    handshake: Option<usize>,
 }
 
 impl Outbox {
     /// Removes and returns all delimited frames, without their delimiters.
     /// Keeps any unfinished tail until a later write supplies its delimiter.
     pub fn take_frames(&self) -> Vec<Vec<u8>> {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock().unwrap();
         // The final piece is the unfinished tail, or empty after a delimiter.
         let mut frames: Vec<Vec<u8>> = state.bytes.split(|&b| b == 0).map(<[u8]>::to_vec).collect();
         let tail = frames.pop().expect("split yields at least one piece");
@@ -189,18 +180,18 @@ impl Outbox {
 
     /// Reports whether captured output contains an unfinished frame.
     pub fn has_tail(&self) -> bool {
-        !self.shared.state.lock().unwrap().bytes.is_empty()
+        !self.shared.lock().unwrap().bytes.is_empty()
     }
 
     /// Enables or clears a persistent write failure.
     pub fn set_broken(&self, broken: bool) {
-        self.shared.state.lock().unwrap().broken = broken;
+        self.shared.lock().unwrap().broken = broken;
     }
 
     /// Arms a failure for the next write to which this cut point applies.
     /// The cut takes priority over a persistent write failure.
     pub fn set_cut(&self, point: CutPoint) {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock().unwrap();
         state.cut = Some(point);
         state.timeout = false;
     }
@@ -208,51 +199,9 @@ impl Outbox {
     /// Arms a timeout at the selected cut point.
     /// Returns `TimedOut` without sleeping so scripted timeout tests stay fast.
     pub fn set_timeout(&self, point: CutPoint) {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock().unwrap();
         state.cut = Some(point);
         state.timeout = true;
-    }
-
-    /// Delays scripted reads until the next reset and HostHello have both flushed.
-    /// This keeps model predictions and vector ordering deterministic. Duplex
-    /// scenarios cover the real peer reading while those writes are in progress.
-    pub fn prepare_handshake(&self) {
-        let mut state = self.shared.state.lock().unwrap();
-        state.handshake = Some(state.flushes + 2);
-    }
-
-    /// Releases the read gate after a handshake returns, even if its output failed.
-    pub fn finish_handshake(&self) {
-        self.shared.state.lock().unwrap().handshake = None;
-        self.shared.changed.notify_all();
-    }
-
-    /// Waits for reset and HostHello to flush, releasing the lock while waiting.
-    /// Returns false if this short poll expires. That lets the reader observe
-    /// cancellation when failed output cannot complete the handshake prefix.
-    pub fn await_handshake(&self, deadline: Instant) -> bool {
-        // A short synthetic poll keeps failed-helper fuzz cases fast. Real
-        // adapter deadline behavior is covered by the bounded duplex scenarios.
-        let deadline = deadline.min(Instant::now() + Duration::from_millis(1));
-        let mut state = self.shared.state.lock().unwrap();
-        loop {
-            match state.handshake {
-                Some(goal) if state.flushes < goal => {}
-                _ => {
-                    state.handshake = None;
-                    return true;
-                }
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            state = self
-                .shared
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap()
-                .0;
-        }
     }
 
     /// Chooses how many bytes to accept and which error to report afterwards.
@@ -288,9 +237,8 @@ impl Outbox {
 impl Write for Outbox {
     fn set_write_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
         // Scripted faults determine expiry without wall-clock delays.
-        // Cancellation can leave an error unobserved. Starting a new frame
-        // discards that error because it belongs to the previous output.
-        let mut state = self.shared.state.lock().unwrap();
+        // Starting a new frame discards deferred errors from previous output.
+        let mut state = self.shared.lock().unwrap();
         state.write_error = None;
         state.flush_error = None;
         Ok(())
@@ -299,7 +247,7 @@ impl Write for Outbox {
 
 impl io::Write for Outbox {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock().unwrap();
         if let Some(error) = state.write_error.take() {
             return Err(error.into());
         }
@@ -327,7 +275,7 @@ impl io::Write for Outbox {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock().unwrap();
         if let Some(error) = state.write_error.take() {
             return Err(error.into());
         }
@@ -339,11 +287,7 @@ impl io::Write for Outbox {
                 });
                 Err(error.into())
             }
-            None => {
-                state.flushes += 1;
-                self.shared.changed.notify_all();
-                Ok(())
-            }
+            None => Ok(()),
         }
     }
 }
@@ -352,6 +296,7 @@ impl io::Write for Outbox {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::time::Duration;
 
     // Tests that a scripted partial failure follows the standard write contract:
     // accepted bytes return Ok(n), the next call fails without accepting more,
@@ -379,7 +324,7 @@ mod tests {
         assert_eq!(outbox.take_frames(), vec![vec![1, 2]]);
     }
 
-    // Tests cancellation between accepting bytes and observing a scripted error.
+    // Tests abandoning output between accepting bytes and observing its error.
     // Starting another output operation discards the abandoned error, even when
     // it reuses the original deadline for a failure notification.
     #[test]

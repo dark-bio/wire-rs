@@ -75,7 +75,7 @@ pub enum ReadError {
     Failed,
     /// The read was interrupted, to be retried.
     Interrupted,
-    /// One idle read poll expired; the transport keeps waiting for input.
+    /// An adapter read returned an early timeout; the transport keeps waiting for input.
     TimedOut,
 }
 

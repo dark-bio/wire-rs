@@ -41,8 +41,8 @@ impl<T: io::Read> io::Read for Memory<T> {
 }
 
 impl<T: io::Read> Read for Memory<T> {
-    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.read_deadline = Some(deadline);
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.read_deadline = deadline;
         Ok(())
     }
 }
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn test_independent_deadlines_and_reuse() {
         let mut memory = Memory::new(io::Cursor::new(vec![1, 2, 3]));
-        memory.set_read_deadline(Instant::now()).unwrap();
+        memory.set_read_deadline(Some(Instant::now())).unwrap();
         assert_eq!(
             memory.read_exact(&mut [0]).unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -96,9 +96,7 @@ mod tests {
         assert_eq!(memory.inner.get_ref(), &[4, 2, 3]);
 
         memory.set_write_deadline(Instant::now()).unwrap();
-        memory
-            .set_read_deadline(Instant::now() + Duration::from_secs(1))
-            .unwrap();
+        memory.set_read_deadline(None).unwrap();
         let mut rest = Vec::new();
         memory.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, [2, 3]);

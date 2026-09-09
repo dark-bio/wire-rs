@@ -739,7 +739,7 @@ fn test_scripted_interrupted_reads() {
     assert_eq!(summary.failures, 0);
 }
 
-// Tests that expired idle read polls are retried during the handshake and an
+// Tests that early adapter timeouts are retried during the handshake and an
 // established receive, without invalidating a retained sender or either crypto
 // sequence. Only actual input completes the receive.
 #[test]

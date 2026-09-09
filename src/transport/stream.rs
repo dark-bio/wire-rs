@@ -4,30 +4,15 @@
 //! The byte stream and its shutdown operation, owned together by the transport.
 
 use super::io::check_deadline;
-use super::{Read, Write};
+use super::{DEFAULT_WRITE_TIMEOUT, Read, Write};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Default time budget for writing and flushing one complete transport frame.
-pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Maximum time an idle adapter read runs before checking cancellation again.
-/// Polls observe reconnect cancellation and permanent closure. Ending a session
-/// binding alone does not interrupt its idle receive.
-const READ_POLL: Duration = Duration::from_millis(100);
-
-/// Reports reconnect cancellation without closing the stream.
-#[derive(Debug, thiserror::Error)]
-#[error("reconnect I/O cancelled")]
-pub(super) struct Cancelled;
-
 /// A duplex byte stream with a shutdown operation for both directions.
 ///
-/// The adapter must make blocked reads, writes and flushes return within its
-/// documented cancellation bound after shutdown. Socket adapters can shut down
-/// the socket. Adapters that poll or use I/O timeouts must document those bounds.
+/// Shutdown must release blocked reads, writes and flushes, including reads
+/// with no deadline. Socket adapters can shut down the underlying socket.
 /// The shutdown operation must return promptly, must not panic, and must not
 /// acquire a lock held by a blocked I/O operation. It runs at most once.
 /// Neither shutdown nor an I/O operation may call this stream's closer. Closing
@@ -62,7 +47,8 @@ impl<R: Read, W: Write> Stream<R, W> {
     /// any delimiter needed after failed output. Progress does not restart it.
     /// The budget begins after acquiring the writer and includes frame encoding.
     /// Waiting for locks, encryption and peer replies is outside this budget.
-    /// Reset, hello and acknowledgement frames each get their own budget.
+    /// Handshake frames also share the overall handshake deadline, which can
+    /// shorten this write budget.
     ///
     /// Zero refuses output immediately. A duration too large to add to an
     /// [`Instant`] panics when an outgoing frame's deadline is constructed.
@@ -150,8 +136,8 @@ impl Closer {
     /// threads using the transport or wait for application handlers.
     ///
     /// The callback runs once, without holding a state or I/O lock. It must return
-    /// promptly and make blocked I/O return within the adapter's cancellation
-    /// bound. Calling close from adapter I/O or the callback would wait on itself.
+    /// promptly and release blocked I/O, including reads with no deadline.
+    /// Calling close from adapter I/O or the callback would wait on itself.
     pub fn close(&self) {
         // Wait for another closer to finish or take responsibility for shutdown
         let action = {
@@ -229,27 +215,22 @@ pub(super) struct ReadHalf<R> {
 }
 
 impl<R: Read> ReadHalf<R> {
-    /// Reads with bounded idle polls. Each poll checks reconnect cancellation
-    /// and enters shutdown accounting before configuring the deadline and reading.
-    /// A read may finish normally if the flag is set after its cancellation check.
-    /// Idle timeouts and interrupted reads are retried. Deadline setter errors
-    /// return immediately. Closure refuses another poll and returns EOF.
-    pub(super) fn read(
-        &mut self,
-        buf: &mut [u8],
-        canceled: Option<&AtomicBool>,
-    ) -> io::Result<usize> {
+    /// Reads with the optional handshake deadline. Ordinary reads wait for data
+    /// or adapter shutdown. Timeouts and interruptions retry within the deadline.
+    /// A successful read reports its bytes even if it finishes late, so the framer
+    /// can retain them before surfacing expiry. Closure refuses new I/O with EOF.
+    pub(super) fn read(&mut self, buf: &mut [u8], deadline: Option<Instant>) -> io::Result<usize> {
         loop {
-            // If the read was requested to be canceled, abort
-            if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                return Err(io::Error::other(Cancelled));
+            // Refuse an operation whose deadline has expired
+            if let Some(deadline) = deadline {
+                check_deadline(deadline)?;
             }
             // Keep the setter and read accounted for until both have returned.
             let result = {
                 let Some(_active) = self.closer.enter() else {
                     return Ok(0);
                 };
-                self.inner.set_read_deadline(Instant::now() + READ_POLL)?;
+                self.inner.set_read_deadline(deadline)?;
                 self.inner.read(buf)
             };
             // Retry an idle timeout or interrupted read. Other errors return.
@@ -277,23 +258,15 @@ pub(super) struct WriteHalf<W> {
 impl<W: Write> WriteHalf<W> {
     /// Writes all bytes and flushes them under one absolute deadline. Installs
     /// the deadline once before I/O. Each partial write and flush checks
-    /// cancellation, expiration and closure before calling the adapter.
+    /// expiration and closure before calling the adapter.
     /// Interrupted writes are retried. Zero progress fails with `WriteZero`.
     /// Setter and flush errors are not retried.
     ///
-    /// An admitted call may finish after cancellation or closure begins. Failure
+    /// An admitted call may finish after closure begins. Failure
     /// can leave a written prefix. The framer checks the deadline again after
     /// this operation returns, so a late flush fails the complete frame.
-    pub(super) fn write(
-        &mut self,
-        mut bytes: &[u8],
-        deadline: Instant,
-        canceled: Option<&AtomicBool>,
-    ) -> io::Result<()> {
-        // Short circuit if the operation was canceled or already timed out
-        if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err(io::Error::other(Cancelled));
-        }
+    pub(super) fn write(&mut self, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        // Refuse an operation whose deadline has expired
         check_deadline(deadline)?;
 
         // Account for the deadline setter so shutdown waits for it too.
@@ -306,10 +279,7 @@ impl<W: Write> WriteHalf<W> {
         }
         // Keep writing while bytes remain; flush only after the complete write
         while !bytes.is_empty() {
-            // Recheck cancellation and the deadline before each partial write.
-            if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                return Err(io::Error::other(Cancelled));
-            }
+            // Recheck the deadline before each partial write.
             check_deadline(deadline)?;
 
             // Attempt to write as much data as possible
@@ -328,9 +298,6 @@ impl<W: Write> WriteHalf<W> {
             }
         }
         // Flush is part of the same operation and gets its own admission
-        if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err(io::Error::other(Cancelled));
-        }
         check_deadline(deadline)?;
 
         let _active = self
@@ -347,7 +314,7 @@ mod tests {
     use super::*;
     use crate::transport::Client;
     use crate::transport::testing::Memory;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -365,11 +332,18 @@ mod tests {
 
     impl Adapter {
         /// Waits for the test's release without exceeding this adapter call's deadline.
-        fn wait(&self, deadline: Instant) -> io::Result<()> {
+        fn wait(&self, deadline: Option<Instant>) -> io::Result<()> {
             self.entered.send(()).unwrap();
-            self.released
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            match deadline {
+                Some(deadline) => self
+                    .released
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                None => self
+                    .released
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            }
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
             if self.fails {
                 Err(io::Error::other("adapter failure"))
             } else {
@@ -379,15 +353,15 @@ mod tests {
     }
 
     impl Read for Adapter {
-        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-            self.deadline = Some(deadline);
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.deadline = deadline;
             Ok(())
         }
     }
 
     impl io::Read for Adapter {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.wait(self.deadline.expect("read deadline installed"))?;
+            self.wait(self.deadline)?;
             buf[0] = 0x5a;
             Ok(1)
         }
@@ -402,12 +376,12 @@ mod tests {
 
     impl io::Write for Adapter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.wait(self.deadline.expect("write deadline installed"))?;
+            self.wait(Some(self.deadline.expect("write deadline installed")))?;
             Ok(buf.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            self.wait(self.deadline.expect("write deadline installed"))
+            self.wait(Some(self.deadline.expect("write deadline installed")))
         }
     }
 
@@ -459,7 +433,7 @@ mod tests {
             });
             during_shutdown(fails, move |inner, closer| {
                 let result =
-                    WriteHalf { inner, closer }.write(&[1, 2, 3], Instant::now() + PATIENCE, None);
+                    WriteHalf { inner, closer }.write(&[1, 2, 3], Instant::now() + PATIENCE);
                 if fails {
                     result
                 } else {
@@ -468,7 +442,7 @@ mod tests {
                 }
             });
             during_shutdown(fails, |inner, closer| {
-                WriteHalf { inner, closer }.write(&[], Instant::now() + PATIENCE, None)
+                WriteHalf { inner, closer }.write(&[], Instant::now() + PATIENCE)
             });
         }
     }
@@ -567,7 +541,7 @@ mod tests {
         owner.join().unwrap();
     }
 
-    /// Adapter operation held in flight while the test requests cancellation.
+    /// Adapter operation held in flight while the test requests shutdown.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum BlockAt {
         /// Hold a raw read until the test releases it.
@@ -579,7 +553,7 @@ mod tests {
     }
 
     /// Holds one adapter operation until the test releases it. This keeps I/O in
-    /// progress long enough to observe shutdown or reconnect cancellation.
+    /// progress long enough to observe shutdown.
     struct Gate {
         at: BlockAt,
         entered: mpsc::Sender<()>,
@@ -590,18 +564,27 @@ mod tests {
 
     impl Gate {
         /// Holds the selected operation until released or its supplied deadline expires.
-        fn call(&self, at: BlockAt, deadline: Instant) -> io::Result<()> {
+        fn call(&self, at: BlockAt, deadline: Option<Instant>) -> io::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if at == self.at {
                 self.entered.send(()).unwrap();
-                let (released, _) = self
-                    .changed
-                    .wait_timeout_while(
-                        self.released.lock().unwrap(),
-                        deadline.saturating_duration_since(Instant::now()),
-                        |released| !*released,
-                    )
-                    .unwrap();
+                let released = self.released.lock().unwrap();
+                let released = match deadline {
+                    Some(deadline) => {
+                        self.changed
+                            .wait_timeout_while(
+                                released,
+                                deadline.saturating_duration_since(Instant::now()),
+                                |released| !*released,
+                            )
+                            .unwrap()
+                            .0
+                    }
+                    None => self
+                        .changed
+                        .wait_while(released, |released| !*released)
+                        .unwrap(),
+                };
                 if !*released {
                     return Err(io::ErrorKind::TimedOut.into());
                 }
@@ -623,18 +606,15 @@ mod tests {
     }
 
     impl Read for GatedAdapter {
-        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-            self.deadline = Some(deadline);
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.deadline = deadline;
             Ok(())
         }
     }
 
     impl io::Read for GatedAdapter {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            self.gate.call(
-                BlockAt::Read,
-                self.deadline.expect("read deadline installed"),
-            )?;
+            self.gate.call(BlockAt::Read, self.deadline)?;
             Ok(0)
         }
     }
@@ -650,7 +630,7 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.gate.call(
                 BlockAt::Write,
-                self.deadline.expect("write deadline installed"),
+                Some(self.deadline.expect("write deadline installed")),
             )?;
             Ok(bytes.len())
         }
@@ -658,7 +638,7 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             self.gate.call(
                 BlockAt::Flush,
-                self.deadline.expect("write deadline installed"),
+                Some(self.deadline.expect("write deadline installed")),
             )
         }
     }
@@ -706,10 +686,10 @@ mod tests {
                 match at {
                     BlockAt::Read => assert_eq!(reader.read(&mut [0], None).unwrap(), 0),
                     BlockAt::Write => assert_eq!(
-                        writer.write(&[1], deadline, None).unwrap_err().kind(),
+                        writer.write(&[1], deadline).unwrap_err().kind(),
                         io::ErrorKind::NotConnected
                     ),
-                    BlockAt::Flush => writer.write(&[], deadline, None).unwrap(),
+                    BlockAt::Flush => writer.write(&[], deadline).unwrap(),
                 }
                 (reader, writer)
             });
@@ -732,7 +712,7 @@ mod tests {
             let calls = gate.calls.load(Ordering::SeqCst);
             assert_eq!(reader.read(&mut [0], None).unwrap(), 0);
             assert!(matches!(
-                writer.write(&[1], Instant::now() + PATIENCE, None),
+                writer.write(&[1], Instant::now() + PATIENCE),
                 Err(err) if err.kind() == io::ErrorKind::NotConnected
             ));
             assert_eq!(gate.calls.load(Ordering::SeqCst), calls);
@@ -801,7 +781,7 @@ mod tests {
         let mut writer = WriteHalf { inner, closer };
         let deadline = Instant::now() + configured;
         assert_eq!(
-            writer.write(b"abc", deadline, None).unwrap_err().kind(),
+            writer.write(b"abc", deadline).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
         assert_eq!(writer.inner.deadlines, vec![deadline; 4]);
@@ -809,14 +789,14 @@ mod tests {
 
         writer.inner.stall_flush = false;
         let deadline = Instant::now() + PATIENCE;
-        writer.write(b"d", deadline, None).unwrap();
+        writer.write(b"d", deadline).unwrap();
         assert_eq!(writer.inner.bytes, b"abcd");
         assert_eq!(writer.inner.settings, 2);
 
         let calls = writer.inner.deadlines.len();
         let deadline = Instant::now();
         assert!(matches!(
-            writer.write(b"e", deadline, None),
+            writer.write(b"e", deadline),
             Err(err) if err.kind() == io::ErrorKind::TimedOut
         ));
         assert_eq!(writer.inner.deadlines.len(), calls);
@@ -889,7 +869,7 @@ mod tests {
                 },
                 closer: Closer::new(|| {}),
             };
-            let result = writer.write(b"ab", Instant::now() + PATIENCE, None);
+            let result = writer.write(b"ab", Instant::now() + PATIENCE);
             if stalls {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
             } else if interrupted_flush {
@@ -923,7 +903,7 @@ mod tests {
         }
 
         impl Refused {
-            /// Fails once so an incorrect polling retry fails the test promptly.
+            /// Fails once so an incorrect retry fails the test promptly.
             fn reject(&mut self) -> io::Result<()> {
                 self.settings += 1;
                 assert_eq!(self.settings, 1, "deadline setter failure retried");
@@ -932,7 +912,7 @@ mod tests {
         }
 
         impl Read for Refused {
-            fn set_read_deadline(&mut self, _: Instant) -> io::Result<()> {
+            fn set_read_deadline(&mut self, _: Option<Instant>) -> io::Result<()> {
                 self.reject()
             }
         }
@@ -973,14 +953,14 @@ mod tests {
                 closer: closer.clone(),
             };
             assert!(matches!(
-                writer.write(&[1], Instant::now() + PATIENCE, None),
+                writer.write(&[1], Instant::now() + PATIENCE),
                 Err(err) if err.kind() == kind && err.to_string() == "deadline refused"
             ));
 
             closer.close();
             assert_eq!(reader.read(&mut [0], None).unwrap(), 0);
             assert!(matches!(
-                writer.write(&[1], Instant::now() + PATIENCE, None),
+                writer.write(&[1], Instant::now() + PATIENCE),
                 Err(err) if err.kind() == io::ErrorKind::NotConnected
             ));
             assert_eq!(reader.inner.settings, 1);
@@ -1030,135 +1010,10 @@ mod tests {
             };
             let deadline = Instant::now() + Duration::from_millis(40);
             assert_eq!(
-                writer.write(bytes, deadline, None).unwrap_err().kind(),
+                writer.write(bytes, deadline).unwrap_err().kind(),
                 io::ErrorKind::TimedOut
             );
             assert_eq!(writer.inner.bytes, b"a");
-            writer.closer.close();
-        }
-    }
-
-    /// An idle reader timing out each poll until the test makes a byte available.
-    struct PollReader {
-        ready: Arc<AtomicBool>,
-        entered: mpsc::Sender<()>,
-        deadline: Option<Instant>,
-    }
-
-    impl Read for PollReader {
-        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-            self.deadline = Some(deadline);
-            Ok(())
-        }
-    }
-
-    impl io::Read for PollReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if self.ready.load(Ordering::Acquire) {
-                buf[0] = 0x5a;
-                return Ok(1);
-            }
-            self.entered.send(()).unwrap();
-            thread::sleep(
-                self.deadline
-                    .expect("read deadline installed")
-                    .saturating_duration_since(Instant::now()),
-            );
-            Err(io::ErrorKind::TimedOut.into())
-        }
-    }
-
-    // Tests that idle polls observe reconnect cancellation without closing the
-    // stream. A fresh cancellation flag allows reads on the same adapter.
-    #[test]
-    fn test_cancel_idle_read_and_reuse() {
-        let ready = Arc::new(AtomicBool::new(false));
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let closes = Arc::new(AtomicUsize::new(0));
-        let closer = Closer::new({
-            let closes = closes.clone();
-            move || {
-                closes.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-        let (entered, entries) = mpsc::channel();
-        let reader = ReadHalf {
-            inner: PollReader {
-                ready: ready.clone(),
-                entered,
-                deadline: None,
-            },
-            closer,
-        };
-        let reading = thread::spawn({
-            let cancellation = cancellation.clone();
-            move || {
-                let mut reader = reader;
-                let result = reader.read(&mut [0], Some(&cancellation));
-                (reader, result)
-            }
-        });
-        entries.recv_timeout(PATIENCE).unwrap();
-        cancellation.store(true, Ordering::Relaxed);
-        let (mut reader, result) = reading.join().unwrap();
-        let err = result.unwrap_err();
-        assert!(err.get_ref().unwrap().is::<Cancelled>());
-        assert_eq!(closes.load(Ordering::SeqCst), 0);
-
-        ready.store(true, Ordering::Release);
-        let fresh = AtomicBool::new(false);
-        let mut bytes = [0];
-        assert_eq!(reader.read(&mut bytes, Some(&fresh)).unwrap(), 1);
-        assert_eq!(bytes, [0x5a]);
-        assert_eq!(closes.load(Ordering::SeqCst), 0);
-        reader.closer.close();
-        assert_eq!(closes.load(Ordering::SeqCst), 1);
-    }
-
-    // Tests cancellation during a blocked write or final flush. Cancellation
-    // after an admitted write refuses its remaining flush, while an admitted
-    // final flush may finish successfully. Both cases refuse later output.
-    #[test]
-    fn test_cancel_output_preserves_admitted_result() {
-        for at in [BlockAt::Write, BlockAt::Flush] {
-            let cancellation = Arc::new(AtomicBool::new(false));
-            let (entered, entries) = mpsc::channel();
-            let gate = Arc::new(Gate {
-                at,
-                entered,
-                released: Mutex::new(false),
-                changed: Condvar::new(),
-                calls: AtomicUsize::new(0),
-            });
-            let mut writer = WriteHalf {
-                inner: GatedAdapter {
-                    gate: gate.clone(),
-                    deadline: None,
-                },
-                closer: Closer::new(|| {}),
-            };
-            let running = thread::spawn({
-                let cancellation = cancellation.clone();
-                move || {
-                    let result = writer.write(&[7], Instant::now() + PATIENCE, Some(&cancellation));
-                    (writer, result)
-                }
-            });
-            entries.recv_timeout(PATIENCE).unwrap();
-            cancellation.store(true, Ordering::Relaxed);
-            gate.release();
-            let (mut writer, result) = running.join().unwrap();
-            if at == BlockAt::Write {
-                assert!(result.unwrap_err().get_ref().unwrap().is::<Cancelled>());
-            } else {
-                result.unwrap();
-            }
-            assert!(matches!(
-                writer.write(&[8], Instant::now() + PATIENCE, Some(&cancellation)),
-                Err(err) if err.get_ref().unwrap().is::<Cancelled>()
-            ));
-            let expected_calls = if at == BlockAt::Write { 1 } else { 2 };
-            assert_eq!(gate.calls.load(Ordering::SeqCst), expected_calls);
             writer.closer.close();
         }
     }

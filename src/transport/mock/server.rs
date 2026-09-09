@@ -115,7 +115,7 @@ pub enum Step {
     /// The next matching output operation expires after the selected prefix.
     /// The stream remains reusable after the failed send or handshake.
     Timeout(CutPoint),
-    /// An idle read poll expires. Receiving retries without ending the session.
+    /// An adapter read returns an early timeout. Receiving retries without ending the session.
     ReadTimeout,
 }
 
@@ -854,22 +854,16 @@ impl Server {
 /// Read adapter that advances the mock server's script as the client reads.
 struct Feed {
     server: Arc<Mutex<Server>>,
-    deadline: Instant, // Configured read deadline, also bounding the prefix gate
 }
 
 impl Read for Feed {
-    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.deadline = deadline;
+    fn set_read_deadline(&mut self, _deadline: Option<Instant>) -> io::Result<()> {
         Ok(())
     }
 }
 
 impl io::Read for Feed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let outbox = self.server.lock().unwrap().outbox.clone();
-        if !outbox.await_handshake(self.deadline) {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
         let mut server = self.server.lock().unwrap();
         loop {
             // Deliver the current batch, respecting any per-read size limit.
@@ -1043,7 +1037,6 @@ pub fn run(steps: &[Step]) -> Summary {
     let mut client = Client::new(crate::transport::Stream::new(
         Feed {
             server: server.clone(),
-            deadline: Instant::now(),
         },
         outbox,
         || {},
@@ -1074,14 +1067,13 @@ pub fn run(steps: &[Step]) -> Summary {
             Step::Handshake => {
                 sender = None;
                 // Scripted output faults fail the reset or HostHello. The read
-                // adapter waits for both writes, so no scripted input is consumed.
+                // phase starts after both writes, so no scripted input is consumed.
                 let signer = xdsa::SecretKey::generate();
                 let crypto = xhpke::SecretKey::generate();
                 trace(&recorder, || Event::Handshake {
                     xdsa: signer.to_bytes().to_vec(),
                     xhpke: crypto.to_bytes().to_vec(),
                 });
-                server.lock().unwrap().outbox.prepare_handshake();
                 let failing = {
                     let server = server.lock().unwrap();
                     server.broken || server.cut.is_some()
@@ -1090,7 +1082,6 @@ pub fn run(steps: &[Step]) -> Summary {
                     let result = client
                         .handshake_with_keys(&identity, signer, crypto, TIMESTAMP)
                         .map(|_| ());
-                    server.lock().unwrap().outbox.finish_handshake();
                     assert!(matches!(result, Err(Error::SendFailed(_))), "{result:?}");
                     trace(&recorder, || Event::Err {
                         kind: "SendFailed".into(),
@@ -1121,7 +1112,6 @@ pub fn run(steps: &[Step]) -> Summary {
                     };
                 }
                 let result = client.handshake_with_keys(&identity, signer, crypto, TIMESTAMP);
-                server.lock().unwrap().outbox.finish_handshake();
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
                     Err(err) => Event::Err {
