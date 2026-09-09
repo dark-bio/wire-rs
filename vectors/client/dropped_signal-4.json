@@ -20,8 +20,7 @@
     {"event": "read", "bytes": "AA=="},
     {"event": "error", "kind": "SessionReset"},
     {"event": "recv"},
-    {"event": "read", "bytes": "AA=="},
-    {"event": "error", "kind": "SessionReset"},
+    {"event": "error", "kind": "EncryptionFailed"},
     {"event": "session", "established": false}
   ]
 }

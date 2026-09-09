@@ -307,6 +307,7 @@ pub struct Server {
     call: Call,                  // Active client call consuming incoming frames
     expect: Option<Expect>,      // Predicted result once a frame determines it
     client_session: Option<u64>, // Generation of the client's live session
+    client_receiver: bool,       // Receive context retained even after a local send failure
     client_seq: u64,             // Packets the client opened in it
 
     generation: u64, // Hellos parsed from the outbox
@@ -342,6 +343,7 @@ impl Server {
             call: Call::None,
             expect: None,
             client_session: None,
+            client_receiver: false,
             client_seq: 0,
             generation: 0,
             latest_hello: None,
@@ -745,6 +747,7 @@ impl Server {
                 };
                 if result == Expect::Ok(None) {
                     self.client_session = Some(generation);
+                    self.client_receiver = true;
                     self.client_seq = 0;
                 }
                 self.settle(result);
@@ -763,7 +766,8 @@ impl Server {
                         self.client_session = None;
                         Expect::Err(Kind::FrameDecoding)
                     }
-                    // Framing errors take precedence over a missing session.
+                    // A local send failure leaves the receive context present,
+                    // so framing errors still take precedence in that case.
                     (None, _) => Expect::Err(Kind::Encryption),
                     (
                         Some(id),
@@ -1066,6 +1070,7 @@ pub fn run(steps: &[Step]) -> Summary {
         match call {
             Step::Handshake => {
                 sender = None;
+                server.lock().unwrap().client_receiver = false;
                 // Scripted output faults fail the reset or HostHello. The read
                 // phase starts after both writes, so no scripted input is consumed.
                 let signer = xdsa::SecretKey::generate();
@@ -1207,7 +1212,13 @@ pub fn run(steps: &[Step]) -> Summary {
                 server.lock().unwrap().ingest();
             }
             Step::Recv => {
-                server.lock().unwrap().call = Call::Recv;
+                {
+                    let mut server = server.lock().unwrap();
+                    server.call = Call::Recv;
+                    if !server.client_receiver {
+                        server.settle(Expect::Err(Kind::Encryption));
+                    }
+                }
                 trace(&recorder, || Event::Recv);
                 let result = client.recv();
                 trace(&recorder, || match &result {
@@ -1220,6 +1231,9 @@ pub fn run(steps: &[Step]) -> Summary {
                 });
                 let result = result.map(Some).map_err(kind);
                 let mut server = server.lock().unwrap();
+                if result.is_err() {
+                    server.client_receiver = false;
+                }
                 match result {
                     Ok(_) => server.summary.messages += 1,
                     Err(Kind::SessionReset) => server.summary.resets += 1,

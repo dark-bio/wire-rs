@@ -298,6 +298,7 @@ impl<R: Read, W: Write> Client<R, W> {
     /// An empty frame means the server dropped the session and ends it here too.
     /// Adapter read failures and EOF also end the session. Idle read timeouts are
     /// retried internally. Call [`Self::connect`] to establish a new session after failure.
+    /// Without a receive context, returns an error without reading the stream.
     ///
     /// After decryption, message acceptance is ordered with session ending
     /// without waiting for the writer. A concurrent send failure can cause a
@@ -305,6 +306,11 @@ impl<R: Read, W: Write> Client<R, W> {
     /// may reach this caller after another thread ends the session. Returning
     /// a receive error does wait for outgoing writes to finish.
     pub fn recv(&mut self) -> Result<Vec<u8>, Error> {
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
+
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
         // An empty frame is the server telling us it has no session with us.
@@ -319,11 +325,6 @@ impl<R: Read, W: Write> Client<R, W> {
             }
             Ok(Some(packet)) => packet,
         };
-        let receiver = self
-            .receiver
-            .as_mut()
-            .ok_or_else(|| Error::EncryptionFailed("no active session".into()))?;
-
         let sealer = self
             .sealer
             .as_ref()

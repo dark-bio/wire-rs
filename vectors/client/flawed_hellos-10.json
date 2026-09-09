@@ -10,7 +10,6 @@
   },
   "trace": [
     {"event": "recv"},
-    {"event": "read", "bytes": "JHNlcnZlciBoZWxsbyB3aXRob3V0IGEgY2xpZW50IGhlbGxvAA=="},
     {"event": "error", "kind": "EncryptionFailed"},
     {"event": "session", "established": false}
   ]

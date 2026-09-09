@@ -369,10 +369,11 @@ fn test_scripted_dropped_signal() {
     assert_eq!(summary.resets, 1);
     assert_eq!(summary.failures, 0);
 
-    // Every signal reports SessionReset, including when no session exists and
-    // when several signals from the same ended session arrive consecutively.
+    // Without a receive context, signals stay queued for the next handshake.
     let summary = run_logged(&[Step::Dropped, Step::Recv]);
-    assert_eq!(summary.resets, 1);
+    assert_eq!(summary.resets, 0);
+    assert_eq!(summary.failures, 1);
+    assert_eq!(summary.reads, 0);
 
     let summary = run_logged(&[
         Step::Handshake,
@@ -383,24 +384,47 @@ fn test_scripted_dropped_signal() {
         Step::Recv,
     ]);
     assert!(!summary.established);
-    assert_eq!(summary.resets, 2);
+    assert_eq!(summary.resets, 1);
+    assert_eq!(summary.failures, 1);
 }
 
-// Tests that receiving without a session still consumes input. Framing errors
-// and EOF take precedence over the error for a missing session.
+// Tests that receiving without a context fails before reading, regardless of
+// whether input is absent, malformed or waiting to be drained by a handshake.
 #[test]
 fn test_scripted_recv_without_session() {
     let summary = run_logged(&[Step::Junk(vec![1]), Step::Recv]);
     assert_eq!(summary.failures, 1);
+    assert_eq!(summary.reads, 0);
 
     let summary = run_logged(&[Step::Undecodable, Step::Recv]);
     assert_eq!(summary.failures, 1);
+    assert_eq!(summary.reads, 0);
 
     let summary = run_logged(&[Step::Recv]);
     assert_eq!(summary.failures, 1);
+    assert_eq!(summary.reads, 0);
 
     let summary = run_logged(&[Step::Send(1)]);
     assert_eq!(summary.failures, 0);
+
+    // A failed receive releases its context. Further receives leave queued
+    // input for reconnect to drain before accepting fresh session traffic.
+    let summary = run_logged(&[
+        Step::Handshake,
+        Step::Hello,
+        Step::Undecodable,
+        Step::Recv,
+        Step::Junk(vec![1]),
+        Step::Recv,
+        Step::Handshake,
+        Step::Hello,
+        Step::Reply(1),
+        Step::Recv,
+    ]);
+    assert!(summary.established);
+    assert_eq!(summary.failures, 2);
+    assert_eq!(summary.handshakes, 2);
+    assert_eq!(summary.messages, 1);
 }
 
 // Tests that a read error or EOF ends an established client session and prevents
@@ -851,8 +875,8 @@ fn test_scripted_oversized_frames() {
 }
 
 // Tests oversized input after a partial hello, with batched and chunked reads.
-// Its remaining bytes and delimiter are discarded before the fresh ArkHello or
-// later reset signal. Only one size error is reported during session receive.
+// Its remaining bytes and delimiter are discarded before the fresh ArkHello.
+// Further receives fail immediately until reconnect establishes a new context.
 #[test]
 fn test_scripted_oversized_fragments() {
     for chunk in [0, 255] {
@@ -870,11 +894,18 @@ fn test_scripted_oversized_fragments() {
             Step::SendRetained(1),
             Step::Recv,
             Step::Dropped,
+            Step::Handshake,
+            Step::Hello,
+            Step::SendRetained(2),
+            Step::Send(3),
+            Step::Reply(3),
+            Step::Recv,
         ]);
-        assert!(!summary.established, "chunk {chunk}");
-        assert_eq!(summary.handshakes, 1, "chunk {chunk}");
-        assert_eq!(summary.failures, 1, "chunk {chunk}");
-        assert_eq!(summary.resets, 1, "chunk {chunk}");
+        assert!(summary.established, "chunk {chunk}");
+        assert_eq!(summary.handshakes, 2, "chunk {chunk}");
+        assert_eq!(summary.failures, 2, "chunk {chunk}");
+        assert_eq!(summary.resets, 0, "chunk {chunk}");
+        assert_eq!(summary.messages, 1, "chunk {chunk}");
     }
 }
 
