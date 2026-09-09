@@ -3,7 +3,7 @@
 
 #![no_main]
 
-use darkbio_wire::protocol::mock::peer::{Step, run_client};
+use darkbio_wire::protocol::legacy::mock::peer::{Step, run_client};
 use libfuzzer_sys::fuzz_target;
 
 // Drives a real client multiplexer through an arbitrary interleaving of its

@@ -20,7 +20,9 @@
 
 use super::{Delivery, Feed, Link, MAX_STEPS, PATIENCE, Sink, payload, payload_len, tag as tagged};
 use crate::protocol::envelope::Side;
-use crate::protocol::mux::{ANSWERS, CHARGE, Error, INBOX, Mux, Pending, Responder, WINDOW};
+use crate::protocol::legacy::mux::{
+    ANSWERS, CHARGE, Error, INBOX, Mux, Pending, Responder, WINDOW,
+};
 use crate::protocol::{self, ArkToHost, Envelope, HostToArk, ark_to_host, host_to_ark};
 use crate::transport::mock::unframe;
 use crate::transport::{self, MAX_MESSAGE_SIZE};
@@ -684,7 +686,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
                 In::response(
                     id,
                     None,
-                    Some(protocol::Error {
+                    Some(protocol::RemoteError {
                         code: REJECTION.0,
                         msg: REJECTION.1.into(),
                     }),
@@ -1038,7 +1040,7 @@ impl<Out: Tagged, In: Tagged> Peer<Out, In> {
         let message = Out::response(
             id,
             None,
-            Some(protocol::Error {
+            Some(protocol::RemoteError {
                 code: failure.0,
                 msg: failure.1.into(),
             }),
@@ -1277,7 +1279,7 @@ fn run<Out: Tagged, In: Tagged>(side: Side, steps: &[Step]) -> Summary {
                 let _ = responder.reply(Out::develop(payload));
             }
             Ok(Order::Refuse) => {
-                let _ = responder.fail(protocol::Error {
+                let _ = responder.fail(protocol::RemoteError {
                     code: REFUSAL.0,
                     msg: REFUSAL.1.into(),
                 });

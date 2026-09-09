@@ -1,7 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! The machine behind a multiplexer, what its callers, its reader thread and
+//! The machine behind the legacy multiplexer, what its callers, its reader thread and
 //! its worker thread all plug into. It keeps the requests waiting for their
 //! answer, the window, the inbox and the handler, and routes what the reader
 //! brings in, an answer to the caller waiting for it, a request to the
@@ -9,7 +9,9 @@
 
 use crate::protocol;
 use crate::protocol::envelope::{Envelope, Ids, Kind, Parity, Side};
-use crate::protocol::mux::{ANSWERS, CHARGE, Error, INBOX, Reader, Responder, WINDOW, Writer};
+use crate::protocol::legacy::mux::{
+    ANSWERS, CHARGE, Error, INBOX, Reader, Responder, WINDOW, Writer,
+};
 use crate::transport::{self, Attester, Closer, Event, MAX_MESSAGE_SIZE, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -498,7 +500,7 @@ impl<Out: Envelope, In: Envelope> Switchboard<Out, In> {
     /// reader always drains, so the reader may send it too.
     fn refuse(&self, mut responder: Responder<Out>, msg: &str) {
         let id = responder.id;
-        let failure = protocol::Error {
+        let failure = protocol::RemoteError {
             code: 0,
             msg: msg.into(),
         };

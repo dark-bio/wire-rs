@@ -1,7 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Multiplexer of requests and responses over one session, for either side
+//! Legacy multiplexer of requests and responses over one session, for either side
 //! of the wire. A reader thread owns the transport and routes what arrives,
 //! answers to the callers waiting for them, requests to a worker thread
 //! running the handler, so the reader blocks on nothing but its read. Callers
@@ -15,8 +15,8 @@
 
 use crate::protocol::envelope::{Envelope, Side};
 #[cfg(any(test, feature = "fuzz"))]
-use crate::protocol::switchboard::Source;
-use crate::protocol::switchboard::{Release, ReplySender, Session, Switchboard};
+use crate::protocol::legacy::switchboard::Source;
+use crate::protocol::legacy::switchboard::{Release, ReplySender, Session, Switchboard};
 use crate::protocol::{self, ArkToHost, HostToArk};
 use crate::transport::{self, Attester, MAX_MESSAGE_SIZE, Read, Sender, Write};
 use std::marker::PhantomData;
@@ -77,7 +77,7 @@ pub enum Error {
     TooLarge(usize),
 
     #[error("wire peer failed the request, code {}: {}", .0.code, .0.msg)]
-    Remote(protocol::Error),
+    Remote(protocol::RemoteError),
 }
 
 /// The client side of the protocol, what a host holds.
@@ -183,7 +183,7 @@ impl<Out: Envelope> Responder<Out> {
     }
 
     /// Fails the request with the error.
-    pub fn fail(&mut self, err: protocol::Error) -> Result<(), Error> {
+    pub fn fail(&mut self, err: protocol::RemoteError) -> Result<(), Error> {
         self.send(Out::response(self.id, None, Some(err)))
     }
 
@@ -213,7 +213,7 @@ impl<Out: Envelope> Responder<Out> {
 impl<Out: Envelope> Drop for Responder<Out> {
     fn drop(&mut self) {
         if !self.answered {
-            let failure = protocol::Error {
+            let failure = protocol::RemoteError {
                 code: 0,
                 msg: "request left unanswered".into(),
             };
@@ -371,7 +371,7 @@ mod tests {
     }
 
     /// The bytes of a request payload, none for anything else.
-    fn pinged(message: HostToArk) -> (u64, Option<protocol::Error>, Option<Vec<u8>>) {
+    fn pinged(message: HostToArk) -> (u64, Option<protocol::RemoteError>, Option<Vec<u8>>) {
         let (id, err, content) = message.into_parts();
         let bytes = match content {
             Some(host_to_ark::Content::Develop(bytes)) => Some(bytes),
@@ -447,7 +447,11 @@ mod tests {
     /// Reads the next message of the server's, taken apart.
     fn hear(
         client: &mut PeerClient,
-    ) -> (u64, Option<protocol::Error>, Option<ark_to_host::Content>) {
+    ) -> (
+        u64,
+        Option<protocol::RemoteError>,
+        Option<ark_to_host::Content>,
+    ) {
         let message = client.recv().unwrap();
         ArkToHost::decode(&message[..]).unwrap().into_parts()
     }

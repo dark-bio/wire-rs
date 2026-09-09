@@ -20,8 +20,8 @@ pub mod peer;
 pub mod seed;
 
 use crate::protocol::envelope::Side;
-use crate::protocol::mux::Writer;
-use crate::protocol::switchboard::Source;
+use crate::protocol::legacy::mux::Writer;
+use crate::protocol::legacy::switchboard::Source;
 use crate::transport::testing::Memory;
 use crate::transport::{self, Closer, Event, Outbound, Sender, Stream, Write};
 use darkbio_crypto::xhpke;

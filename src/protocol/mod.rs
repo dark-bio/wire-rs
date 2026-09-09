@@ -1,21 +1,53 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Protocol spoken over the transport, the protobuf messages generated from
-//! `proto/wire.proto` at build time and the conventions of their envelopes.
+//! Bidirectional requests over the transport, with pipelining and explicit sessions.
+//!
+//! **API skeleton:** the session API is not implemented yet. Its operations panic
+//! with `todo!`; the documentation records the contracts to implement. The working
+//! previous implementation and its scenario runners live in [`legacy`]. Protobuf
+//! bindings and message/content conversions are implemented.
+//!
+//! The application opens a [`crate::transport::Stream`]; this layer constructs and
+//! owns its transport. [`connect`] establishes one client session. [`Server`] owns
+//! a persistent endpoint and accepts successive server sessions. Each [`Session`]
+//! owns its lifetime and receive queue. Its [`Requester`] and [`Responder`] handles
+//! always target that session, including after a replacement connects.
+//! Both sides use the same concrete handle types and [`Message`] enum; the role and
+//! wire envelope direction are internal details. Callers select response types at
+//! [`Pending::wait`].
+//!
+//! Requests and replies return eager promises without waiting for capacity or I/O.
+//! Their supplied deadlines cover capacity waits and I/O; `wait()` never restarts
+//! them. I/O progresses independently of application dispatch. Applications must keep
+//! receiving requests while jobs wait for reverse requests. All waiting is blocking;
+//! no async runtime is required. Notification-like requests receive a reply too.
+//!
+//! Configuration, resource limits and close completion relative to in-progress
+//! writes remain to be specified before their implementation.
 
+mod closer;
 mod envelope;
-pub mod mux;
-mod switchboard;
+mod error;
+pub mod legacy;
+mod message;
+mod pending;
+mod requester;
+mod responder;
+mod server;
+mod session;
 
-#[cfg(any(test, feature = "fuzz"))]
-#[doc(hidden)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub mod mock;
-
+pub use closer::Closer;
 pub use envelope::Envelope;
+pub use error::Error;
+pub use generated::Error as RemoteError;
 pub use generated::*;
-pub use mux::{Client, Pending, Responder, Server};
+pub use message::Message;
+pub use pending::{Pending, WritePending};
+pub use requester::Requester;
+pub use responder::Responder;
+pub use server::Server;
+pub use session::{Session, connect};
 
 /// The generated bindings, kept out of the lints the crate holds itself to.
 #[allow(clippy::all)]

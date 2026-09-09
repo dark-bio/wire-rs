@@ -8,7 +8,7 @@
 //! parity of an id tells a response to one's own request from a request of
 //! the peer's.
 
-use crate::protocol::{ArkToHost, Error, HostToArk, ark_to_host, host_to_ark};
+use crate::protocol::{ArkToHost, HostToArk, RemoteError, ark_to_host, host_to_ark};
 use prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,10 +68,10 @@ pub trait Envelope: Message + Default + sealed::Sealed + 'static {
 
     /// A response to the request with the id, content on success and an
     /// error on failure.
-    fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self;
+    fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self;
 
     /// Takes the envelope apart into its id, its error and its content.
-    fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>);
+    fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>);
 }
 
 /// Supertrait nobody outside the crate can implement, closing the envelopes.
@@ -92,10 +92,10 @@ impl Envelope for HostToArk {
             content: Some(content),
         }
     }
-    fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self {
+    fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self {
         Self { id, err, content }
     }
-    fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>) {
+    fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }
@@ -110,10 +110,10 @@ impl Envelope for ArkToHost {
             content: Some(content),
         }
     }
-    fn response(id: u64, content: Option<Self::Content>, err: Option<Error>) -> Self {
+    fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self {
         Self { id, err, content }
     }
-    fn into_parts(self) -> (u64, Option<Error>, Option<Self::Content>) {
+    fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }
@@ -243,7 +243,7 @@ mod tests {
     // say and come apart the same after a trip through their encoding.
     #[test]
     fn test_envelopes() {
-        let err = Error {
+        let err = RemoteError {
             code: 7,
             msg: "nope".into(),
         };
