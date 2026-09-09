@@ -130,6 +130,7 @@ impl<T: Send + 'static> Job<T> {
 /// Scripted actions with explicit session labels, responder slots and expectations.
 /// Start/finish pairs let other steps run while a call is blocked.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum Step {
     /// Attaches a session under the given label, closing the previous session.
     Open(u8),
@@ -889,3 +890,6 @@ fn run(steps: Vec<Step>) {
 
 #[cfg(test)]
 mod tests;
+
+mod fuzz;
+pub use fuzz::{Action, Kind, run as fuzz};

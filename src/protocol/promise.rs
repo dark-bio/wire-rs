@@ -6,7 +6,7 @@
 use super::session::SessionInner;
 use super::{Error, Message};
 use std::sync::{Weak, mpsc};
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -37,7 +37,7 @@ pub struct Promise<T> {
     /// Deadline supplied with the request or reply. `wait()` does not restart it.
     deadline: Instant,
     /// One-shot notification just before entering the blocking receive.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     wait_hook: Option<mpsc::Sender<()>>,
 }
 
@@ -78,7 +78,7 @@ impl<T> Promise<T> {
                 result,
                 session,
                 deadline,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fuzz"))]
                 wait_hook: None,
             },
         )
@@ -91,7 +91,7 @@ impl<T> Promise<T> {
         if let Some(session) = self.session.upgrade() {
             session.expire();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         if let Some(wait_hook) = self.wait_hook {
             let _ = wait_hook.send(());
         }
@@ -115,7 +115,7 @@ impl<T> Promise<T> {
 
     /// Notifies a test just before `wait_result()` starts waiting on the result channel.
     /// A result sent before the wait stays buffered in that channel.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn watch_wait(&mut self) -> mpsc::Receiver<()> {
         let (sender, receiver) = mpsc::channel();
         self.wait_hook = Some(sender);
@@ -125,7 +125,7 @@ impl<T> Promise<T> {
     /// Waits for a worker result without calling `SessionInner::expire()`, so tests
     /// can prove workers process deadlines without help from `Promise::wait()`.
     /// Fails the test if the result does not arrive within five seconds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn wait_worker_result(self) -> Result<T, Error> {
         self.result
             .recv_timeout(Duration::from_secs(5))

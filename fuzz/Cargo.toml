@@ -38,3 +38,17 @@ path = "fuzz_targets/transport_duplex.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "protocol-session"
+path = "fuzz_targets/protocol_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol-connection"
+path = "fuzz_targets/protocol_connection.rs"
+test = false
+doc = false
+bench = false

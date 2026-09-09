@@ -30,6 +30,7 @@ const WRITE_BUDGET: Duration = Duration::from_millis(500);
 
 /// Which peers run the protocol API; the other peer, if any, uses raw envelopes.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum Mode {
     /// Both peers use the public protocol constructors.
     Both,
@@ -89,6 +90,7 @@ enum EnvelopeShape {
 
 /// Serial script with explicit starts and completions for concurrent API calls.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum Step {
     /// Round-trip a concrete schema body through the public typed waiting API.
     TypedExchange,
@@ -653,6 +655,7 @@ impl Drop for Driver {
 
 /// Runs a script with automatic cleanup and step diagnostics on failure.
 fn run(mode: Mode, steps: &[Step]) {
+    #[cfg(test)]
     crate::testing::init_tracing();
     let mut driver = Driver::new(mode);
     for (index, step) in steps.iter().enumerate() {
@@ -661,5 +664,9 @@ fn run(mode: Mode, steps: &[Step]) {
     }
 }
 
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;
+
+mod fuzz;
+pub use fuzz::{Action, Kind, run as fuzz};

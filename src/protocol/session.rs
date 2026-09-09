@@ -31,20 +31,20 @@ where
     let mut client = transport::Client::new(stream);
 
     let (sender, info) = client.connect(verifier)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     let workers = Arc::new(worker::Tracker::default());
     let session = Session::start(
         Side::Client,
         sender,
         Some(client.closer()),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         workers.clone(),
     );
     let inner = session.inner.clone();
 
     worker::spawn(
         "wire-client-reader",
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         &workers,
         move || run_reader(client, inner),
     );
@@ -167,23 +167,23 @@ pub(super) struct SessionInner {
     /// leave this empty; a server's stream is closed by `Server`.
     stream_closer: Option<transport::Closer>,
     /// Lets tests wait for worker threads to exit.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
     /// Controlled protocol time for scenarios; production always uses Instant::now.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     time: Mutex<Option<Instant>>,
     /// Notifies tests when the last `Arc<SessionInner>` is dropped.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     drop_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// Pauses the writer before `sender.disconnect()` in replacement tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     disconnect_hook: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// An open session's queues, or the error that closed the session.
 // Keep the same inline state layout in tests; the wait hook crosses Clippy's
 // size threshold for the difference between variants.
-#[cfg_attr(test, allow(clippy::large_enum_variant))]
+#[cfg_attr(any(test, feature = "fuzz"), allow(clippy::large_enum_variant))]
 enum State {
     /// Holds queued messages and pending operations. `close()` replaces this
     /// with `Closed`, then drops the queues after releasing the state lock.
@@ -209,7 +209,7 @@ enum State {
         /// local flush returns.
         reserved_ids: HashSet<u64>,
         /// One-shot test notification sent under the state lock before waiting.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         wait_hook: Option<std::sync::mpsc::Sender<()>>,
     },
     /// Keeps the first closing reason for every subsequent operation.
@@ -221,7 +221,7 @@ impl SessionInner {
     fn new(
         side: Side,
         stream_closer: Option<transport::Closer>,
-        #[cfg(test)] workers: Arc<worker::Tracker>,
+        #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
         Self {
             state: Mutex::new(State::Open {
@@ -232,19 +232,19 @@ impl SessionInner {
                 next_id: Some(Parity::from(side).first()),
                 outstanding: HashMap::new(),
                 reserved_ids: HashSet::new(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fuzz"))]
                 wait_hook: None,
             }),
             changed: Condvar::new(),
             side,
             stream_closer,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             workers,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             time: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             drop_hook: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             disconnect_hook: Mutex::new(None),
         }
     }
@@ -259,14 +259,14 @@ impl SessionInner {
                 State::Closed(error) => return Err(error.clone()),
                 State::Open {
                     incoming,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fuzz"))]
                     wait_hook,
                     ..
                 } => {
                     if let Some((id, message)) = incoming.pop_front() {
                         return Ok((message, Responder::new(Arc::downgrade(self), id)));
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fuzz"))]
                     if let Some(wait_hook) = wait_hook.take() {
                         let _ = wait_hook.send(());
                     }
@@ -406,7 +406,7 @@ impl SessionInner {
             let key = OperationKey::new();
             outgoing.push_back(OutgoingMessage {
                 body,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fuzz"))]
                 deadline: operation.deadline,
                 operation: OperationHandle {
                     session: Arc::downgrade(self),
@@ -428,7 +428,7 @@ impl SessionInner {
     }
 
     /// Returns the earliest pending operation deadline for scenario assertions.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         let state = self.state.lock().expect("session state not poisoned");
         match &*state {
@@ -441,7 +441,7 @@ impl SessionInner {
     }
 
     /// Takes the next unexpired `OutgoingMessage` for tests that drive writing themselves.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn take_outgoing(&self) -> Option<OutgoingMessage> {
         let mut state = self.state.lock().expect("session state not poisoned");
         state.expire(self.now());
@@ -476,7 +476,7 @@ impl SessionInner {
 
     /// Supplies a peer answer in tests. If the operation is still pending,
     /// `PendingOperation::complete_response()` checks its deadline and sends the result.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn record_response(&self, key: &OperationKey, result: Result<Message, Error>) {
         let mut state = self.state.lock().expect("session state not poisoned");
         let State::Open { operations, .. } = &mut *state else {
@@ -491,7 +491,7 @@ impl SessionInner {
     /// Returns `Instant::now()` or the test clock. Deadline checks use this while
     /// holding `state`; `reply_unanswered()` also calls it before waiting for that lock.
     fn now(&self) -> Instant {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         if let Some(now) = *self.time.lock().expect("scenario clock not poisoned") {
             return now;
         }
@@ -625,7 +625,7 @@ impl SessionInner {
             // A response or timeout may have completed it during the write.
             outgoing.operation.record_write(result);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         if let Some((entered, released)) = self.disconnect_hook.lock().unwrap().take() {
             let _ = entered.send(());
             let _ = released.recv();
@@ -675,27 +675,27 @@ impl Session {
         side: Side,
         sender: transport::Sender<W>,
         stream_closer: Option<transport::Closer>,
-        #[cfg(test)] workers: Arc<worker::Tracker>,
+        #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
         let session = Self {
             inner: Arc::new(SessionInner::new(
                 side,
                 stream_closer,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fuzz"))]
                 workers.clone(),
             )),
         };
         let inner = session.inner.clone();
         worker::spawn(
             "wire-writer",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             &workers,
             move || inner.run_writer(sender),
         );
         let inner = session.inner.clone();
         worker::spawn(
             "wire-deadlines",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             &workers,
             move || inner.run_deadlines(),
         );
@@ -739,7 +739,7 @@ impl State {
 }
 
 // These fixtures let tests drive time, incoming requests, and write results.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl Session {
     /// Creates a session without a stream or workers for lifecycle scenarios.
     pub(super) fn fixture() -> Self {
@@ -753,7 +753,7 @@ impl Session {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl SessionInner {
     /// Pauses the writer before `sender.disconnect()`, so a test can connect a
     /// replacement session before letting the old writer finish.
@@ -858,7 +858,7 @@ impl SessionInner {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl Drop for SessionInner {
     /// Notifies the test when the last `Arc<SessionInner>` is dropped.
     fn drop(&mut self) {

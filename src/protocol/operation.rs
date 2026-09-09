@@ -97,7 +97,7 @@ pub(super) struct OutgoingMessage {
     pub(super) body: OutgoingBody,
     /// Deadline checked by scenarios. The live deadline worker reads the
     /// corresponding entry in the session's `operations` map instead.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) deadline: Instant,
     /// Reports the write result to this message's operation.
     pub(super) operation: OperationHandle,
@@ -136,7 +136,7 @@ impl OperationHandle {
     }
 
     /// Supplies a request answer in tests that replace the transport reader.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn record_response(self, result: Result<Message, RemoteError>) {
         if let Some(session) = self.session.upgrade() {
             session.record_response(&self.key, result.map_err(Error::Remote));

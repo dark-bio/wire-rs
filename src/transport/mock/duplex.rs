@@ -152,7 +152,6 @@ impl Pipe {
 
     /// Makes the next `set_read_deadline()` fail. Unlike a timeout from `read()`,
     /// this error is returned immediately by the framer without retrying.
-    #[cfg(test)]
     pub(crate) fn fail_read_deadline(&self, error: io::ErrorKind) {
         self.state.lock().unwrap().read_error = Some(error);
     }

@@ -41,9 +41,10 @@ mod server;
 mod session;
 mod worker;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod mock;
+#[doc(hidden)]
+pub mod mock;
 
 pub use closer::Closer;
 pub use envelope::Envelope;

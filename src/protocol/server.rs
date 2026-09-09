@@ -37,19 +37,19 @@ impl Server {
                 state: Mutex::new(State::Open {
                     session: Weak::new(),
                     ready: None,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fuzz"))]
                     wait_hook: None,
                 }),
                 changed: Condvar::new(),
                 stream_closer: Some(stream_closer),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fuzz"))]
                 workers: Arc::new(worker::Tracker::default()),
             }),
         };
         let server_ref = Arc::downgrade(&server.inner);
         worker::spawn(
             "wire-server-reader",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fuzz"))]
             &server.inner.workers,
             move || {
                 let transport = transport::Server::new(stream, signer, attester);
@@ -69,14 +69,14 @@ impl Server {
                 State::Closed { reason, .. } => return Err(reason.clone()),
                 State::Open {
                     ready,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fuzz"))]
                     wait_hook,
                     ..
                 } => {
                     if let Some(session) = ready.take() {
                         return Ok(session);
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fuzz"))]
                     if let Some(wait_hook) = wait_hook.take() {
                         let _ = wait_hook.send(());
                     }
@@ -125,7 +125,7 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
                     Side::Server,
                     sender,
                     None,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fuzz"))]
                     server.workers.clone(),
                 );
                 current = Arc::downgrade(&session.inner);
@@ -179,7 +179,7 @@ pub(super) struct ServerInner {
     /// Closes the server's stream. Empty in tests that supply sessions directly.
     stream_closer: Option<transport::Closer>,
     /// Lets tests wait for the reader and all session workers to exit.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
 }
 
@@ -192,7 +192,7 @@ enum State {
         /// Session waiting for `accept()`. A new handshake replaces it.
         ready: Option<Session>,
         /// One-shot test notification sent under the server lock before waiting.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fuzz"))]
         wait_hook: Option<std::sync::mpsc::Sender<()>>,
     },
     /// Saves the closing error and attached session. Repeated `close()` calls
@@ -278,13 +278,13 @@ impl ServerInner {
 }
 
 /// Supplies sessions in tests in place of the server's transport reader.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 pub(super) struct SessionSource {
     /// Server that receives sessions created by `open()`.
     server_ref: Weak<ServerInner>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl Server {
     /// Creates a server and a fixture that attaches sessions without a stream.
     pub(super) fn fixture() -> (Self, SessionSource) {
@@ -305,7 +305,7 @@ impl Server {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl SessionSource {
     /// Creates a session and passes it to `attach()`, just as the reader does
     /// after a handshake. Returns its weak reference so tests can deliver messages
@@ -319,7 +319,7 @@ impl SessionSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl Drop for SessionSource {
     /// Models loss of the transport reader by permanently ending its server.
     fn drop(&mut self) {
@@ -329,7 +329,7 @@ impl Drop for SessionSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 impl ServerInner {
     /// Arms a one-shot notification for `accept()` waiting without a ready session.
     /// Sent while holding `state`, just before `accept()` waits on `changed`.

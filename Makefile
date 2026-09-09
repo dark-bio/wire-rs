@@ -44,6 +44,7 @@ fuzz-seeds:
 # and the seeds, stopping at the first finding.
 fuzz:
 	for target in $$(cargo +nightly fuzz list); do \
+		mkdir -p fuzz/corpus/$$target; \
 		$(SEEDED) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
