@@ -80,6 +80,17 @@ impl<W: Write> Sender<W> {
         drop(sealer);
         writer.send(&context, &packet)
     }
+
+    /// Ends this sender's session. On the server, also sends Dropped under the
+    /// writer lock. Does nothing if the session has ended or been replaced.
+    /// May wait for an active write, so the protocol closes its local queues and
+    /// promises first, then calls this from its writer thread.
+    pub(crate) fn disconnect(&self) -> Result<(), Error> {
+        if let (Some(outbound), Some(context)) = (self.outbound.upgrade(), self.sealer.upgrade()) {
+            outbound.disconnect(&context)?;
+        }
+        Ok(())
+    }
 }
 
 impl<W: Write> Clone for Sender<W> {

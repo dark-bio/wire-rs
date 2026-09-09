@@ -8,6 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Generates protobuf bindings and schema-derived message/direction conversions.
 fn main() {
     // Use vendored protoc so no system dependency is needed.
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
@@ -24,6 +25,7 @@ fn main() {
     // Collect the union of both envelopes' bodies for the public message enum.
     // A body appears once even if it travels both ways (such as develop bytes).
     let mut messages = BTreeSet::new();
+    let mut conversions = String::new();
     for message in descriptors.file.iter().flat_map(|file| &file.message_type) {
         if !matches!(message.name(), "HostToArk" | "ArkToHost") {
             continue;
@@ -33,6 +35,12 @@ fn main() {
             .iter()
             .position(|oneof| oneof.name() == "content")
             .expect("envelope content oneof");
+        let module = match message.name() {
+            "HostToArk" => "host_to_ark",
+            "ArkToHost" => "ark_to_host",
+            _ => unreachable!(),
+        };
+        writeln!(conversions, "contents! {{ {module},").unwrap();
         for field in &message.field {
             if field.oneof_index != Some(oneof as i32) {
                 continue;
@@ -51,13 +59,29 @@ fn main() {
                 }
             };
             messages.insert((variant, payload));
+            let field_variant: String = field
+                .name()
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    chars
+                        .next()
+                        .expect("nonempty schema identifier")
+                        .to_uppercase()
+                        .collect::<String>()
+                        + chars.as_str()
+                })
+                .collect();
+            writeln!(conversions, "    {field_variant} => {variant},").unwrap();
         }
+        writeln!(conversions, "}}").unwrap();
     }
     let mut content = String::from("messages! {\n");
     for (variant, payload) in messages {
         writeln!(content, "    {variant}({payload}),").unwrap();
     }
     writeln!(content, "}}").unwrap();
+    content.push_str(&conversions);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
     fs::write(out_dir.join("message.rs"), content).expect("write message enum and conversions");
     config

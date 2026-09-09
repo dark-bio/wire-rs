@@ -1,17 +1,15 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Lifecycle and operation scenarios for the replacement API. Fixtures supply
-//! sessions, peer input, output completion and protocol time; submissions, waits,
-//! retirement and handle drops use the real public API. Explicit wait notifications
-//! permit overlap without sleep-based ordering.
+//! Session scenarios with controlled input, write results and time.
+//! Scripts call the public request, reply, wait and close methods. Test hooks
+//! report when a call starts waiting so later steps can run while it is blocked.
 
 use crate::protocol::operation::{Body, Output};
 use crate::protocol::{
     Closer, Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder, Server,
     Session, server, session,
 };
-use crate::transport::{Stream, testing::Memory};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Weak, mpsc};
 use std::thread::{self, JoinHandle};
@@ -20,16 +18,16 @@ use std::time::{Duration, Instant};
 /// Watchdog for scenario jobs and wait hooks, independent of operation deadlines.
 const PATIENCE: Duration = Duration::from_secs(5);
 
-/// Terminal outcomes that lifecycle scripts can require from an operation.
+/// Errors that a script can expect from a protocol call or promise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
     /// The owner closed locally or no longer exists.
     Closed,
-    /// A replacement retired the original session.
+    /// A new session replaced the original one.
     Reset,
-    /// The fixture's publication source ended the endpoint.
+    /// The fixture dropped `Sessions`, as if the server reader had stopped.
     Terminated,
-    /// The operation reached its absolute deadline before settlement.
+    /// The deadline passed before the operation got a result.
     Timeout,
     /// The peer returned this application-defined error code.
     Remote(u64),
@@ -37,7 +35,7 @@ enum Failure {
     WrongType,
 }
 
-/// Classifies a runtime error, rejecting outcomes outside the lifecycle contract.
+/// Converts an error to the script's `Failure`, panicking on unsupported errors.
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
@@ -91,8 +89,8 @@ fn refused<T>(result: Result<T, Error>, expected: Failure) {
     }
 }
 
-/// Background operation whose completion is observed with a bounded watchdog.
-struct Job<T> {
+/// Runs a blocking call on another thread and lets the script check its result.
+pub(super) struct Job<T> {
     /// Completed value; disconnection also exposes a worker panic to the driver.
     result: mpsc::Receiver<T>,
     /// Worker joined after its result arrives so successful jobs leave no thread.
@@ -101,7 +99,7 @@ struct Job<T> {
 
 impl<T: Send + 'static> Job<T> {
     /// Starts an operation without blocking the scenario's remaining steps.
-    fn start(run: impl FnOnce() -> T + Send + 'static) -> Self {
+    pub(super) fn start(run: impl FnOnce() -> T + Send + 'static) -> Self {
         let (result, receiver) = mpsc::channel();
         Self {
             result: receiver,
@@ -115,7 +113,7 @@ impl<T: Send + 'static> Job<T> {
     ///
     /// # Panics
     /// The operation must complete within `PATIENCE` without panicking.
-    fn finish(self) -> T {
+    pub(super) fn finish(self) -> T {
         let result = self
             .result
             .recv_timeout(PATIENCE)
@@ -128,14 +126,14 @@ impl<T: Send + 'static> Job<T> {
 }
 
 /// Scripted actions with explicit session labels, responder slots and expectations.
-/// Start/finish pairs leave calls running while intervening steps change lifetimes.
+/// Start/finish pairs let other steps run while a call is blocked.
 #[derive(Clone, Debug)]
 enum Step {
-    /// Publishes a session under the given label, retiring any predecessor.
+    /// Attaches a session under the given label, closing the previous session.
     Open(u8),
-    /// Accepts the pending owner and checks it belongs to the given session label.
+    /// Calls `accept()` and checks that it returns the labeled session.
     Accept(u8),
-    /// Starts acceptance and waits until it reaches its empty-queue wait.
+    /// Starts `accept()` and waits for the hook reporting that no session is ready.
     StartAccept,
     /// Finishes an overlapping acceptance with the given session label.
     FinishAccept(u8),
@@ -157,7 +155,7 @@ enum Step {
     FinishReceiveError(u8, Failure),
     /// Starts and finishes a receive that must fail with the given ending reason.
     ReceiveError(u8, Failure),
-    /// Closes the labeled session through a retained capability.
+    /// Closes the labeled session through its saved `Closer`.
     CloseSession(u8),
     /// Drops the labeled session owner while retaining its other handles.
     DropSession(u8),
@@ -167,23 +165,25 @@ enum Step {
     RefuseReply(u8, Failure),
     /// Drops the saved responder slot without supplying a reply.
     DropReply(u8),
-    /// Takes this session's abandonment obligations and checks their request IDs.
+    /// Sets the automatic reply budget for subsequent responder drops.
+    AbandonmentTimeout(u8, Duration),
+    /// Takes queued automatic replies and checks their request IDs.
     Abandoned(u8, Vec<u64>),
-    /// Requires retained weak handles to no longer reach this session allocation.
+    /// Checks that the saved weak reference to this session cannot be upgraded.
     Released(u8),
-    /// Closes the endpoint through its retained capability.
+    /// Closes the server through its saved `Closer`.
     CloseServer,
     /// Drops the endpoint owner and checks weak handles do not retain its state.
     DropServer,
     /// Drops the source of sessions, modeling a terminated reader.
     DropPublisher,
-    /// Requires a new session publication to fail with the given reason.
+    /// Requires attaching a new session to fail with the given reason.
     RefuseOpen(Failure),
     /// Releases two threads together to close the same labeled session.
     RaceCloses(u8),
     /// Releases two threads together to close the persistent endpoint.
     RaceServerCloses,
-    /// Overlaps endpoint closure and publication; any published owner must end.
+    /// Races server closure with attaching a session; that session must end too.
     RaceServerCloseOpen,
     /// Submits a request: session, promise slot, body tag, absolute time in milliseconds.
     Request(u8, u8, u8, u64),
@@ -191,7 +191,7 @@ enum Step {
     Reply(u8, u8, Result<u8, u64>, u64),
     /// Takes output: session, output slot, expected content and original deadline.
     Output(u8, u8, Sent, u64),
-    /// Requires this session to have no eligible queued output.
+    /// Checks that no unexpired messages remain in this session's outgoing queue.
     NoOutput(u8),
     /// Reports local write/flush completion for a retained output slot.
     Written(u8, Result<(), Failure>),
@@ -201,7 +201,7 @@ enum Step {
     AnswerOther(u8),
     /// Waits for a request's byte-vector answer or its exact failure.
     Wait(u8, Result<u8, Failure>),
-    /// Takes the untyped Message result to permit application pattern matching.
+    /// Waits for a `Message` and checks its variant and body tag.
     WaitMessage(u8, u8),
     /// Starts a request wait and waits for its blocking-call notification.
     StartWait(u8),
@@ -209,28 +209,28 @@ enum Step {
     FinishWait(u8, Result<u8, Failure>),
     /// Waits for a reply's local write completion.
     WaitWrite(u8, Result<(), Failure>),
-    /// Starts observing a reply before the output service completes it.
+    /// Starts waiting on a reply promise before reporting its write result.
     StartWaitWrite(u8),
     /// Finishes an overlapping reply wait with the expected outcome.
     FinishWaitWrite(u8, Result<(), Failure>),
-    /// Drops request observation while retaining the registered operation.
+    /// Drops a request promise, leaving the request in progress.
     DropPromise(u8),
-    /// Drops reply observation while retaining the output obligation.
+    /// Drops a reply promise, leaving the reply queued or being written.
     DropWritePromise(u8),
-    /// Advances protocol time without running deadline servicing.
+    /// Changes the test clock without calling `expire()`.
     Time(u64),
-    /// Runs deadline servicing for this session while output may be held elsewhere.
+    /// Calls `expire()` to fail timed-out operations and discard expired messages.
     Expire(u8),
-    /// Checks the deadline service's next wakeup, or the absence of unresolved work.
+    /// Checks the earliest pending deadline, or that no operations remain.
     Deadline(u8, Option<u64>),
-    /// Releases request registration and session closure together; either admission
-    /// outcome must be closed by the time both calls have returned.
+    /// Starts `request()` and `close()` together. The request must fail either
+    /// immediately or through its promise once both calls return.
     RaceRequestClose(u8),
     /// Releases answer delivery and closure together, accepting either first result.
     RaceAnswerClose(u8, u8, u8),
-    /// Releases reply registration and session closure together for this responder.
+    /// Starts `reply()` and `close()` together for this responder's session.
     RaceReplyClose(u8, u8),
-    /// Releases reply write completion and closure together; either may settle first.
+    /// Races a reply's write result with `close()`; either result may reach the promise.
     RaceWriteClose(u8, u8, u8),
     /// Switches a session to wall-clock time and submits a request with this budget.
     RealRequest(u8, u8, u64),
@@ -243,25 +243,24 @@ type Receive = (Session, Result<(Message, Responder), Error>);
 /// An acceptance result returned with its persistent endpoint owner.
 type Accept = (Server, Result<Session, Error>);
 
-/// Scenario-owned endpoints, sessions, saved capabilities and overlapping jobs.
-/// Labels refer to exact allocations, allowing a script to act on stale handles
-/// after replacement without consulting the implementation's current session.
+/// Sessions, saved handles and background calls used by one script. Labels keep
+/// referring to the same session after replacement so steps can exercise old handles.
 struct Driver {
     /// Endpoint owner, temporarily moved out while acceptance runs.
     server: Option<Server>,
-    /// Weak identity used to assert endpoint release after its owner is dropped.
+    /// Weak reference used to check that dropping the server frees its state.
     endpoint: Weak<server::Shared>,
     /// Sole source of replacement sessions in place of a real transport reader.
     publisher: Option<server::Sessions>,
     /// Accepted owners currently available to the script, indexed by session label.
     sessions: HashMap<u8, Session>,
-    /// Delivery targets recorded at publication, including retired predecessors.
+    /// Session references saved by `Open`, including sessions later replaced.
     incoming: HashMap<u8, Weak<session::Shared>>,
-    /// Request capabilities retained even when the corresponding owner is dropped.
+    /// Requester handles kept after dropping their sessions.
     requesters: HashMap<u8, Requester>,
     /// Session closers retained to exercise closure after replacement or owner drop.
     closers: HashMap<u8, Closer>,
-    /// One-use reply capabilities indexed by script slot, not by wire request ID.
+    /// Responders indexed by script slot, not by wire request ID.
     replies: HashMap<u8, Responder>,
     /// In-progress receive jobs, each holding its labeled session owner.
     receiving: HashMap<u8, Job<Receive>>,
@@ -273,29 +272,22 @@ struct Driver {
     epoch: Instant,
     /// Current scripted time in milliseconds, independent of expiry servicing.
     time: u64,
-    /// Unobserved request promises indexed by script slot.
+    /// Request promises saved for later wait or drop steps.
     pending: HashMap<u8, Promise<Message>>,
-    /// Unobserved reply write promises indexed by script slot.
+    /// Reply promises saved for later wait or drop steps.
     writes: HashMap<u8, Promise<()>>,
-    /// Admitted output held independently to model blocked I/O and delayed answers.
+    /// Messages taken from the queue whose write results and answers are supplied later.
     output: HashMap<u8, Output>,
-    /// Request observers already inside their waiting calls.
+    /// Background calls waiting for request answers.
     waiting: HashMap<u8, Job<Result<Vec<u8>, Error>>>,
-    /// Reply observers already inside their waiting calls.
+    /// Background calls waiting for reply write results.
     writing: HashMap<u8, Job<Result<(), Error>>>,
 }
 
 impl Driver {
-    /// Creates an open endpoint fixture with no published sessions or running jobs.
+    /// Creates a server fixture with no attached sessions or running jobs.
     fn new() -> Self {
-        Self::with_timeout(crate::transport::DEFAULT_WRITE_TIMEOUT)
-    }
-
-    /// Uses the real Stream configuration accessor to supply the abandonment budget.
-    fn with_timeout(timeout: Duration) -> Self {
-        let stream = Stream::new(Memory::new(&b""[..]), Memory::new(Vec::new()), || {})
-            .set_write_timeout(timeout);
-        let (server, publisher) = Server::pair(stream.write_timeout());
+        let (server, publisher) = Server::pair();
         Self {
             endpoint: Arc::downgrade(&server.shared),
             closer: server.closer(),
@@ -352,7 +344,7 @@ impl Driver {
         }
     }
 
-    /// Checks local output completion without treating it as remote acknowledgment.
+    /// Checks the result of waiting for a reply to be written.
     fn write_result(result: Result<(), Error>, expected: Result<(), Failure>) {
         match expected {
             Ok(()) => result.unwrap(),
@@ -753,6 +745,11 @@ impl Driver {
                 let responder = self.replies.remove(&slot).unwrap();
                 Job::start(move || drop(responder)).finish();
             }
+            Step::AbandonmentTimeout(id, timeout) => {
+                let session = self.sessions.remove(&id).unwrap();
+                self.sessions
+                    .insert(id, session.set_abandonment_timeout(timeout));
+            }
             Step::Abandoned(id, expected) => {
                 let session = self.incoming[&id].upgrade().unwrap();
                 for id in expected {
@@ -835,9 +832,8 @@ impl Driver {
                 gate.wait();
                 closed.finish();
                 let (publisher, result) = opened.finish();
-                // If accept already took the owner it may still be retained, but
-                // it must be retired when endpoint close returns. If no accept
-                // took it, endpoint close also releases the unaccepted owner.
+                // If accept() took the session, it may still exist but must be
+                // closed now. Otherwise server closure also drops that session.
                 match result {
                     Ok(session) => {
                         if let Some(session) = session.upgrade() {
@@ -853,7 +849,7 @@ impl Driver {
 }
 
 impl Drop for Driver {
-    /// Retires all remaining owners so blocked jobs can leave even after an assertion.
+    /// Closes the server so blocked calls wake up even if an assertion panics.
     fn drop(&mut self) {
         self.closer.close();
         for closer in self.closers.values() {
@@ -864,16 +860,7 @@ impl Drop for Driver {
 
 /// Runs a scenario, reporting the exact failed step and rejecting unfinished jobs.
 fn run(steps: Vec<Step>) {
-    run_with(Driver::new(), steps);
-}
-
-/// Runs with an explicitly configured stream write budget for abandonment scenarios.
-fn run_with_timeout(timeout: Duration, steps: Vec<Step>) {
-    run_with(Driver::with_timeout(timeout), steps);
-}
-
-/// Executes a prepared driver and requires every explicitly started waiter to finish.
-fn run_with(mut driver: Driver, steps: Vec<Step>) {
+    let mut driver = Driver::new();
     for (index, step) in steps.into_iter().enumerate() {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.step(step.clone())));

@@ -1,15 +1,14 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Persistent endpoint ownership and ordered publication of successive sessions.
+//! Persistent endpoint ownership and ordered attachment of successive sessions.
 
-use super::session;
+use super::envelope::Side;
 use super::{Closer, Error, Session};
-use crate::transport::{Attester, Read, Stream, Write};
+use super::{session, worker};
+use crate::transport::{self, Attester, Read, Stream, Write};
 use darkbio_crypto::xdsa;
 use std::sync::{Arc, Condvar, Mutex, Weak};
-#[cfg(test)]
-use std::time::Duration;
 
 /// Owner of a persistent server stream, accepting successive sessions.
 /// Closing or dropping the endpoint ends its active session and shuts down the
@@ -23,21 +22,97 @@ pub struct Server {
 impl Server {
     /// Takes ownership of a stream and constructs its transport internally.
     /// The attester supplies the current device attestation for each handshake.
-    ///
-    /// # Panics
-    /// API skeleton; not implemented yet.
-    pub fn new<R, W, A>(_stream: Stream<R, W>, _signer: xdsa::SecretKey, _attester: A) -> Self
+    /// Starts its persistent reader immediately. Failure to start a required
+    /// worker or an escaping worker panic aborts the process.
+    pub fn new<R, W, A>(stream: Stream<R, W>, signer: xdsa::SecretKey, attester: A) -> Self
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
         A: Attester + Send + 'static,
     {
-        todo!("protocol server construction")
+        let shutdown = stream.closer();
+        let server = Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::Open {
+                    session: Weak::new(),
+                    pending: None,
+                    #[cfg(test)]
+                    waiting: None,
+                }),
+                changed: Condvar::new(),
+                shutdown: Some(shutdown),
+                #[cfg(test)]
+                workers: Arc::new(worker::Tracker::default()),
+            }),
+        };
+        let endpoint = Arc::downgrade(&server.shared);
+        worker::spawn(
+            "wire-reader",
+            #[cfg(test)]
+            &server.shared.workers,
+            move || {
+                // Wrap the transport and create the session tracker
+                let mut transport = transport::Server::new(stream, signer, attester);
+                let mut current: Weak<session::Shared> = Weak::new();
+
+                loop {
+                    // Block without retaining endpoint state. Dropping the server
+                    // shuts down this read through the endpoint's stream closer.
+                    let result = transport.recv();
+                    let Some(endpoint) = endpoint.upgrade() else {
+                        break;
+                    };
+                    match result {
+                        // If a new client connects, create a new session for it
+                        Ok(transport::Event::Connected(sender)) => {
+                            let session = Session::start(
+                                Side::Server,
+                                sender,
+                                None,
+                                #[cfg(test)]
+                                endpoint.workers.clone(),
+                            );
+                            current = Arc::downgrade(&session.shared);
+                            if endpoint.attach(session).is_err() {
+                                break;
+                            }
+                        }
+                        // If a client disconnects, drop the current session
+                        Ok(transport::Event::Disconnected) => {
+                            if let Some(session) = current.upgrade() {
+                                session.close(transport::Error::SessionReset.into());
+                            }
+                            current = Weak::new();
+                        }
+                        // If a message arrives, deliver it into the current session
+                        Ok(transport::Event::Message(bytes)) => {
+                            if let Some(session) = current.upgrade()
+                                && let Err(error) = session.received(&bytes)
+                            {
+                                session.close(error);
+                            }
+                        }
+                        // Handshake timeouts and send failures are ignored
+                        Err(transport::Error::RecvFailed(error))
+                            if error.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(transport::Error::SendFailed(error)) => {
+                            tracing::debug!(%error, "server handshake output failed");
+                        }
+                        // Any other error tears down the endpoint
+                        Err(error) => {
+                            endpoint.close(error.into());
+                            break;
+                        }
+                    }
+                }
+            },
+        );
+        server
     }
 
     /// Blocks until a session is established or the endpoint ends. Recoverable
     /// handshake failures leave the stream available for another attempt. A
-    /// replacement session retires its predecessor; old handles remain bound to it.
+    /// replacement session closes the previous one; old handles still refer to it.
     pub fn accept(&mut self) -> Result<Session, Error> {
         let mut state = self
             .shared
@@ -80,7 +155,7 @@ impl Server {
     /// acceptance and receive calls, and fails unresolved operations. Idempotent.
     /// Does not join application jobs or guarantee the peer has observed closure.
     pub fn close(&self) {
-        self.shared.retire(Error::Closed);
+        self.shared.close(Error::Closed);
     }
 }
 
@@ -92,49 +167,49 @@ impl Drop for Server {
 }
 
 /// Endpoint lifetime and the at-most-one session waiting for accept. The reader
-/// will publish replacements in transport order. Accepted sessions own themselves;
+/// attaches replacements in transport order. Accepted sessions own themselves;
 /// the endpoint retains only a weak reference for endpoint shutdown.
 pub(super) struct Shared {
-    /// Orders acceptance, publication and permanent endpoint retirement.
+    /// Protects the attached session, pending acceptance, and endpoint closure.
     state: Mutex<State>,
-    /// Wakes acceptance when a session is published or the endpoint ends.
+    /// Wakes `accept()` when a session is attached or the endpoint closes.
     changed: Condvar,
+    /// Closes the endpoint's stream. Empty in tests that supply sessions directly.
+    shutdown: Option<transport::Closer>,
+    /// Lets tests wait for the reader and all session workers to exit.
+    #[cfg(test)]
+    pub(super) workers: Arc<worker::Tracker>,
 }
 
-/// An endpoint accepts sessions until it permanently retains an ending reason.
+/// Sessions waiting for acceptance, or the error that closed the endpoint.
 enum State {
-    /// Holds the attached session and any owner not yet taken by acceptance.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed by fixtures until transport integration"
-        )
-    )]
+    /// Tracks the current session and keeps its owner until `accept()` takes it.
     Open {
-        /// Weak shutdown target, retained even after acceptance takes the owner.
+        /// Lets endpoint closure close the session after `accept()` returns it.
         session: Weak<session::Shared>,
-        /// At most one unaccepted owner; replacement retires and releases its predecessor.
+        /// Session waiting for `accept()`. A new handshake replaces it.
         pending: Option<Session>,
         /// One-shot test notification sent under the endpoint lock before waiting.
         #[cfg(test)]
         waiting: Option<std::sync::mpsc::Sender<()>>,
     },
-    /// Retains the original target weakly so every concurrent or repeated close
-    /// can finish its logical retirement without depending on the first closer.
+    /// Saves the closing error and attached session. Repeated `close()` calls
+    /// can finish closing that session if the first closer is still doing so.
     Ended {
         /// First reason the endpoint ended; later closes cannot replace it.
         reason: Error,
-        /// Exact session attached at endpoint retirement, never a successor.
+        /// Session that was attached when the endpoint closed.
         session: Weak<session::Shared>,
     },
 }
 
 impl Shared {
-    /// Refuses publication/acceptance before retiring the attached session.
-    /// Session retirement and dropping pending owners happen outside this lock;
-    /// no endpoint/session locks are ever nested.
-    pub(super) fn retire(&self, error: Error) {
+    /// Refuses attachment/acceptance before closing the attached session.
+    /// Releases the endpoint lock before closing or dropping a `Session`, since
+    /// those operations take the session's own lock.
+    pub(super) fn close(&self, error: Error) {
+        // Stop attach() and accept() by switching to Ended. Save the attached
+        // session so repeated close() calls can finish closing it too.
         let (session, reason, pending) = {
             let mut state = self.state.lock().expect("endpoint state not poisoned");
             match &mut *state {
@@ -152,69 +227,37 @@ impl Shared {
                 }
             }
         };
+        // Release the endpoint lock before taking the session's lock. Wake local
+        // callers before closing the stream, which waits for active I/O to return.
         if let Some(session) = session {
-            session.retire(reason);
+            session.close(reason);
         }
         self.changed.notify_all();
         drop(pending);
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.close();
+        }
     }
-}
 
-/// Single publisher used by the lifecycle scenarios until the transport reader
-/// is connected. Mutable access orders replacement: retire A before publishing B.
-#[cfg(test)]
-pub(super) struct Sessions {
-    /// Publication destination, without extending the endpoint owner's lifetime.
-    endpoint: Weak<Shared>,
-    /// Stream write budget copied into each newly published session.
-    write_timeout: Duration,
-}
-
-#[cfg(test)]
-impl Server {
-    /// Constructs an endpoint and its sole session publisher without physical I/O.
-    pub(super) fn pair(write_timeout: Duration) -> (Self, Sessions) {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::Open {
-                session: Weak::new(),
-                pending: None,
-                waiting: None,
-            }),
-            changed: Condvar::new(),
-        });
-        let sessions = Sessions {
-            endpoint: Arc::downgrade(&shared),
-            write_timeout,
-        };
-        (Self { shared }, sessions)
-    }
-}
-
-#[cfg(test)]
-impl Sessions {
-    /// Retires the previous session before publishing a replacement for acceptance.
-    /// Mutable access serializes publications. Endpoint closure may interleave,
-    /// but each retirement holds its exact target and publication checks closure
-    /// under the same lock that installs the new owner. The returned weak handle
-    /// lets scenarios deliver only to this particular session.
-    pub(super) fn open(&mut self) -> Result<Weak<session::Shared>, Error> {
-        let endpoint = self.endpoint.upgrade().ok_or(Error::Closed)?;
+    /// Closes the previous session and makes this one available to `accept()`.
+    /// Only the reader, or the test fixture replacing it, calls this method.
+    fn attach(&self, session: Session) -> Result<(), Error> {
+        // Take an Arc to the previous session, then release the endpoint lock
+        // before closing that session.
         let previous = {
-            let state = endpoint.state.lock().expect("endpoint state not poisoned");
+            let state = self.state.lock().expect("endpoint state not poisoned");
             match &*state {
                 State::Ended { reason, .. } => return Err(reason.clone()),
                 State::Open { session, .. } => session.upgrade(),
             }
         };
-        // This is an owned target, not a current-session predicate. Concurrent
-        // endpoint closure may retire it too, but it can never become session B.
         if let Some(previous) = previous {
-            previous.retire(crate::transport::Error::SessionReset.into());
+            previous.close(transport::Error::SessionReset.into());
         }
-        let session = Session::new(self.write_timeout);
-        let incoming = Arc::downgrade(&session.shared);
+        // Another thread may have closed the endpoint while we closed the old
+        // session. Check again under the lock before installing the new one.
         let previous = {
-            let mut state = endpoint.state.lock().expect("endpoint state not poisoned");
+            let mut state = self.state.lock().expect("endpoint state not poisoned");
             match &mut *state {
                 State::Ended { reason, .. } => return Err(reason.clone()),
                 State::Open {
@@ -222,13 +265,56 @@ impl Sessions {
                     pending,
                     ..
                 } => {
-                    *attached = incoming.clone();
+                    *attached = Arc::downgrade(&session.shared);
                     pending.replace(session)
                 }
             }
         };
-        endpoint.changed.notify_one();
+        self.changed.notify_all();
+        // A previous session that accept never took still needs its owner dropped.
         drop(previous);
+        Ok(())
+    }
+}
+
+/// Supplies sessions in tests in place of the server's transport reader.
+#[cfg(test)]
+pub(super) struct Sessions {
+    /// Endpoint that receives sessions created by `open()`.
+    endpoint: Weak<Shared>,
+}
+
+#[cfg(test)]
+impl Server {
+    /// Creates an endpoint and a fixture that attaches sessions without a stream.
+    pub(super) fn pair() -> (Self, Sessions) {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::Open {
+                session: Weak::new(),
+                pending: None,
+                waiting: None,
+            }),
+            changed: Condvar::new(),
+            shutdown: None,
+            workers: Arc::new(worker::Tracker::default()),
+        });
+        let sessions = Sessions {
+            endpoint: Arc::downgrade(&shared),
+        };
+        (Self { shared }, sessions)
+    }
+}
+
+#[cfg(test)]
+impl Sessions {
+    /// Creates a session and passes it to `attach()`, just as the reader does
+    /// after a handshake. Returns its weak reference so tests can deliver messages
+    /// to it even after another session connects.
+    pub(super) fn open(&mut self) -> Result<Weak<session::Shared>, Error> {
+        let endpoint = self.endpoint.upgrade().ok_or(Error::Closed)?;
+        let session = Session::new();
+        let incoming = Arc::downgrade(&session.shared);
+        endpoint.attach(session)?;
         Ok(incoming)
     }
 }
@@ -238,7 +324,7 @@ impl Drop for Sessions {
     /// Models loss of the transport reader by permanently ending its endpoint.
     fn drop(&mut self) {
         if let Some(endpoint) = self.endpoint.upgrade() {
-            endpoint.retire(crate::transport::Error::Terminated.into());
+            endpoint.close(crate::transport::Error::Terminated.into());
         }
     }
 }
@@ -246,8 +332,8 @@ impl Drop for Sessions {
 #[cfg(test)]
 impl Shared {
     /// Arms a one-shot notification for acceptance waiting without a pending owner.
-    /// The notification precedes the atomic unlock-and-wait, letting a scenario
-    /// overlap acceptance with publication or closure without relying on sleeps.
+    /// Sent while holding `state`, just before `accept()` waits on `changed`.
+    /// Tests can then attach a session or close the server without using sleeps.
     ///
     /// # Panics
     /// The fixture must still be open and have no session waiting for acceptance.

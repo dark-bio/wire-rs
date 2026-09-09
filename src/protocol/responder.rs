@@ -1,22 +1,24 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! One-use reply obligations bound to the session that received the request.
+//! Sending one reply to a received request, or `UNANSWERED` when dropped.
 
 use super::session::Shared;
 use super::{Error, Message, Promise, RemoteError};
 use std::sync::Weak;
 use std::time::Instant;
 
-/// One-use capability to answer an incoming request in its original session.
+/// Handle for answering one incoming request through the session that received it.
 /// The handler selects the success content, without a static request/response map.
 /// This handle cannot keep its session open or address a replacement session.
 ///
-/// Dropping an unanswered responder schedules a standard abandonment error without
-/// blocking on I/O, using the configured write timeout. If the session has ended,
-/// the obligation ends with it. No reply can escape into another session.
+/// Dropping an unanswered responder queues an `UNANSWERED` error without blocking
+/// on I/O, using the session's current abandonment timeout.
+/// Configure that budget with [`super::Session::set_abandonment_timeout`]. If the
+/// session has closed, no reply is queued. The handle always refers to that same
+/// session, including after a replacement connects.
 ///
-/// Replying consumes the capability, so it cannot be reused:
+/// Replying consumes the responder, so it cannot be reused:
 ///
 /// ```compile_fail,E0382
 /// use darkbio_wire::protocol::{DeviceInfoResponse, Responder};
@@ -28,7 +30,7 @@ use std::time::Instant;
 /// }
 /// ```
 ///
-/// Reply capabilities cannot be cloned either:
+/// Responders cannot be cloned either:
 ///
 /// ```compile_fail,E0599
 /// use darkbio_wire::protocol::Responder;
@@ -37,22 +39,22 @@ use std::time::Instant;
 pub struct Responder {
     /// Session that received the request; holding a responder cannot keep it open.
     session: Weak<Shared>,
-    /// Outstanding request ID, cleared only when output takes its reply obligation.
+    /// Request ID to answer. Cleared after queueing a reply so `Drop` does nothing.
     id: Option<u64>,
 }
 
 impl Responder {
-    /// Consumes this capability and promptly returns a promise for writing/flushing
-    /// the reply. An ended session may fail immediately. The deadline covers output
-    /// scheduling and I/O; waiting on the promise does not restart it.
+    /// Consumes the responder and returns a promise for writing and flushing
+    /// the reply. A closed session returns an error immediately. The deadline
+    /// includes time in the queue and I/O; waiting on the promise does not restart it.
     /// A message invalid for this session's direction fails the promise with
     /// [`Error::WrongDirection`].
     ///
-    /// Replies bypass outgoing request credit so reverse requests cannot prevent
-    /// responses. Their resource needs are accounted for when requests are accepted.
     /// A reply needs no further acknowledgment. Dropping its promise leaves it queued.
-    /// Success content can be converted from a protobuf message using `.into()`;
-    /// the concrete content type also lets `reply(Err(error), deadline)` infer fully.
+    /// Flow control is not implemented yet. The plan is to reserve room for a
+    /// reply when accepting a request, so replies can still be sent when the
+    /// outgoing request window is full.
+    /// Use `.into()` to convert a protobuf response into `Message`.
     pub fn reply(
         mut self,
         result: Result<Message, RemoteError>,
@@ -63,11 +65,11 @@ impl Responder {
             result,
             deadline,
         )?;
-        self.id = None; // Ownership passed to the output path.
+        self.id = None; // Prevent Drop from also queueing UNANSWERED.
         Ok(pending)
     }
 
-    /// Creates the sole reply capability for a request removed from this session.
+    /// Creates a responder for the request taken by `Session::recv()`.
     pub(super) fn new(session: Weak<Shared>, id: u64) -> Self {
         Self {
             session,
@@ -77,8 +79,8 @@ impl Responder {
 }
 
 impl Drop for Responder {
-    /// Records an unanswered request for abandonment without performing I/O.
-    /// Consumed replies and retired sessions have no remaining obligation here.
+    /// Queues `UNANSWERED` if this responder still has an ID and its session is
+    /// open. The writer sends the error later.
     fn drop(&mut self) {
         if let Some(id) = self.id.take()
             && let Some(session) = self.session.upgrade()

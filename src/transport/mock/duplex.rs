@@ -68,7 +68,7 @@ pub enum Scenario {
 
 /// Adapter operation addressed by a test gate or a one-shot fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Operation {
+pub(crate) enum Operation {
     /// Read from the pipe's queued input.
     Read,
     /// Append bytes to its bounded output queue.
@@ -90,7 +90,7 @@ impl Operation {
 
 /// Failure injected once the selected operation becomes eligible.
 #[derive(Clone, Copy, Debug)]
-enum FaultKind {
+pub(crate) enum FaultKind {
     /// Return the specified error without consuming bytes.
     Error(io::ErrorKind),
     /// Wait until the supplied absolute deadline and return TimedOut.
@@ -115,13 +115,14 @@ struct State {
     flushes: usize,
     delimiters: usize,
     read_deadline: Option<Instant>, // Last installed deadline, observed while the read is blocked
+    read_error: Option<io::ErrorKind>, // One failed deadline installation, before any bytes are read
     faults: VecDeque<Fault>,
 }
 
 /// Bounded byte pipe with deadline-aware I/O.
 /// Blocked calls release the state lock, so closing can acquire it and wake them.
 #[derive(Debug)]
-struct Pipe {
+pub(crate) struct Pipe {
     capacity: usize,
     state: Mutex<State>,
     changed: Condvar,
@@ -129,7 +130,7 @@ struct Pipe {
 
 impl Pipe {
     /// Creates a bounded queue with no pending operations or faults.
-    fn new(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
             state: Mutex::new(State::default()),
@@ -138,19 +139,26 @@ impl Pipe {
     }
 
     /// Permanently closes this test adapter, waking every blocked call.
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.state.lock().unwrap().closed = true;
         self.changed.notify_all();
     }
 
     /// Holds or releases the selected operation independently of buffer capacity.
-    fn pause(&self, operation: Operation, paused: bool) {
+    pub(crate) fn pause(&self, operation: Operation, paused: bool) {
         self.state.lock().unwrap().paused[operation.index()] = paused;
         self.changed.notify_all();
     }
 
+    /// Makes the next `set_read_deadline()` fail. Unlike a timeout from `read()`,
+    /// this error is returned immediately by the framer without retrying.
+    #[cfg(test)]
+    pub(crate) fn fail_read_deadline(&self, error: io::ErrorKind) {
+        self.state.lock().unwrap().read_error = Some(error);
+    }
+
     /// Arms a one-shot fault and wakes a matching call already waiting in I/O.
-    fn fault(&self, operation: Operation, after_flushes: usize, kind: FaultKind) {
+    pub(crate) fn fault(&self, operation: Operation, after_flushes: usize, kind: FaultKind) {
         self.state.lock().unwrap().faults.push_back(Fault {
             operation,
             after_flushes,
@@ -161,7 +169,7 @@ impl Pipe {
 
     /// Waits for an adapter call to block, so scenarios depend on an observed
     /// operation rather than a scheduling delay.
-    fn wait_blocked(&self, operation: Operation) {
+    pub(crate) fn wait_blocked(&self, operation: Operation) {
         let deadline = Instant::now() + PATIENCE;
         let mut state = self.state.lock().unwrap();
         while state.waiting[operation.index()] == 0 {
@@ -242,7 +250,7 @@ impl Pipe {
 /// A cloneable endpoint used as either the reader or writer of its pipe.
 /// Each clone configures its own deadlines, independently of the shared bytes.
 #[derive(Clone, Debug)]
-struct Adapter {
+pub(crate) struct Adapter {
     pipe: Arc<Pipe>,
     read_deadline: Option<Instant>,
     write_deadline: Instant,
@@ -250,7 +258,7 @@ struct Adapter {
 
 impl Adapter {
     /// Creates an endpoint whose I/O deadlines must be configured before use.
-    fn new(pipe: Arc<Pipe>) -> Self {
+    pub(crate) fn new(pipe: Arc<Pipe>) -> Self {
         let now = Instant::now();
         Self {
             pipe,
@@ -263,7 +271,11 @@ impl Adapter {
 impl Read for Adapter {
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.read_deadline = deadline;
-        self.pipe.state.lock().unwrap().read_deadline = deadline;
+        let mut state = self.pipe.state.lock().unwrap();
+        state.read_deadline = deadline;
+        if let Some(error) = state.read_error.take() {
+            return Err(error.into());
+        }
         Ok(())
     }
 }

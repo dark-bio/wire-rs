@@ -1,23 +1,25 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Promises for requests and replies, independent of operation execution.
+//! Waiting for request answers and reply write results.
 
 use super::session::Shared;
 use super::{Error, Message};
 use std::sync::{Weak, mpsc};
+#[cfg(test)]
+use std::time::Duration;
 use std::time::Instant;
 
-/// Promise for an eagerly submitted operation's result.
+/// Result of a queued request or reply.
 ///
 /// Requests return `Promise<Message>`; their wait selects the expected response
 /// type or takes the message directly. Replies return `Promise<()>`; their wait
 /// observes local writing and flushing, not peer receipt or processing.
 ///
-/// Dropping it abandons observation, not the operation, which continues under its
-/// original deadline. Eventual answers still settle accounting and are discarded
-/// if unobserved. A timeout does not prove that the peer stopped working. Completed
-/// results remain available after closure. A promise yields its result once:
+/// Dropping a promise leaves the request or reply running with its original
+/// deadline. The session still processes a later answer, but discards its result.
+/// A timeout does not mean the peer stopped working. A completed result remains
+/// available after the session closes. Each promise returns its result once:
 ///
 /// ```compile_fail,E0382
 /// use darkbio_wire::protocol::{DeviceInfoResponse, Message, Promise};
@@ -27,12 +29,12 @@ use std::time::Instant;
 /// }
 /// ```
 pub struct Promise<T> {
-    /// Sole observer; only the session registry owns the result sender. Buffered
-    /// results survive session destruction without retaining its other operations.
+    /// Receives one result from the corresponding `Operation`. A buffered result
+    /// remains available even after the session is dropped.
     result: mpsc::Receiver<Result<T, Error>>,
-    /// Original session, used to service expiry when the waiter reaches its deadline.
+    /// Lets the waiter call `Shared::expire()` when its deadline is reached.
     session: Weak<Shared>,
-    /// Submission deadline, never recomputed when observation starts.
+    /// Deadline supplied with the request or reply. `wait()` does not restart it.
     deadline: Instant,
     /// One-shot notification just before entering the blocking receive.
     #[cfg(test)]
@@ -63,8 +65,8 @@ impl Promise<()> {
 }
 
 impl<T> Promise<T> {
-    /// Creates a promise and its sole result sender before registration makes
-    /// output visible. One slot buffers completion without waiting for observation.
+    /// Creates a promise and the channel sender that its `Operation` will own.
+    /// The channel holds one result without waiting for the caller to receive it.
     pub(super) fn pair(
         session: Weak<Shared>,
         deadline: Instant,
@@ -82,9 +84,9 @@ impl<T> Promise<T> {
         )
     }
 
-    /// Waits for the one accepted result. A delayed waiter first services expiry;
-    /// an already-buffered result is unaffected. Timeout wakes also go through the
-    /// session lock, so racing completion and retirement use the same decision point.
+    /// Waits for the result channel. On timeout, asks the session to expire pending
+    /// operations, then reads the result it sent. The session decides whether an
+    /// answer or timeout came first; results already in the channel are kept.
     fn receive(self) -> Result<T, Error> {
         if let Some(session) = self.session.upgrade() {
             session.expire();
@@ -111,14 +113,22 @@ impl<T> Promise<T> {
         }
     }
 
-    /// Arms notification before a scenario starts observing an unresolved promise.
-    /// Channels retain sent results, so completion cannot lose a wakeup even if it
-    /// races the receiver's entry into its blocking call.
+    /// Notifies a test just before `receive()` starts waiting on the result channel.
+    /// A result sent before the wait stays buffered in that channel.
     #[cfg(test)]
     pub(super) fn watch(&mut self) -> mpsc::Receiver<()> {
         let (sender, receiver) = mpsc::channel();
         self.waiting = Some(sender);
         receiver
+    }
+
+    /// Reads the result without calling `Shared::expire()`, so tests can prove
+    /// the workers process deadlines without help from `Promise::wait()`.
+    #[cfg(test)]
+    pub(super) fn settled(self) -> Result<T, Error> {
+        self.result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("protocol worker must settle the promise")
     }
 }
 

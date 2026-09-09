@@ -1,33 +1,33 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Clonable request submission bound to the originating session.
+//! Sending requests through a shared handle to a session.
 
 use super::session::Shared;
 use super::{Error, Message, Promise};
 use std::sync::Weak;
 use std::time::Instant;
 
-/// Clonable capability to initiate requests in its original session.
+/// Clonable handle for sending requests through the session that created it.
 /// Does not keep the session open or follow a replacement session. Dropping a
 /// requester does not close the session or cancel operations it already submitted.
 #[derive(Clone)]
 pub struct Requester {
-    /// Original session, never a lookup of the endpoint's newest session.
+    /// Session that created this requester, even after a replacement connects.
     session: Weak<Shared>,
 }
 
 impl Requester {
-    /// Submits a request and promptly returns its eager promise. Does not wait for
-    /// request credit, the writer or a reply. An ended session may return an error
-    /// immediately; accepted operations report subsequent failures via the promise.
-    /// A full request window delays the operation instead of rejecting it.
+    /// Queues a request and returns its promise without waiting for the writer or
+    /// a reply. A closed session returns an error immediately; errors after queueing
+    /// are returned through the promise. Request-window limits are not implemented
+    /// yet; the planned limit delays queued requests when the window is full.
     /// A message invalid for this session's direction fails the promise with
     /// [`Error::WrongDirection`].
     ///
     /// The deadline covers waiting for capacity, sending and receiving the reply.
     /// Waiting on the promise does not start or refresh it. Dropping the promise
-    /// only abandons observation. Neither dropping nor expiry cancels remote work.
+    /// does not cancel the request. The peer may keep working after a timeout.
     /// The expected response type is selected when waiting on [`Promise<Message>`].
     pub fn request(
         &self,
@@ -40,7 +40,7 @@ impl Requester {
             .request(request.into(), deadline)
     }
 
-    /// Creates a submission capability that does not retain its session owner.
+    /// Creates a requester from a weak reference to its session.
     pub(super) fn new(session: Weak<Shared>) -> Self {
         Self { session }
     }
@@ -55,14 +55,15 @@ mod tests {
     };
     use std::time::Instant;
 
-    /// Compiles pipelined requests, discarded observations and caller-selected replies.
+    /// Compiles sending several requests before waiting, dropping promises, and
+    /// choosing the expected response type at `wait()`.
     #[allow(dead_code)]
     fn pipeline(session: &Session, deadline: Instant) -> Result<(), Error> {
         let requester: Requester = session.requester();
         let first: Promise<Message> = requester.request(DeviceInfoRequest {}, deadline)?;
         let second = requester.request(DeviceInfoRequest {}, deadline)?;
 
-        // Observation can be abandoned without selecting a response type.
+        // A promise can be dropped without selecting a response type.
         drop(requester.request(DeviceInfoRequest {}, deadline)?);
 
         // Caller-selected typing, by annotation or by explicit generic argument.
@@ -74,10 +75,10 @@ mod tests {
         Ok(())
     }
 
-    /// Checks the clone, send and sync bounds required for a shared capability.
+    /// Checks that `Requester` implements `Clone`, `Send`, and `Sync`.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires a capability to be clonable and usable by multiple threads.
+        /// Requires a handle to be clonable and usable by multiple threads.
         fn shared<T: Clone + Send + Sync + 'static>() {}
         shared::<Requester>();
     }

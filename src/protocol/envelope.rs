@@ -1,25 +1,83 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Conventions of the envelopes, the two messages the sides of the wire
-//! exchange. Every message carries an id, a request one its sender chose and
-//! a response the one of the request it answers, with an error in place of
-//! content on failure. Clients allocate odd ids and servers even ones, so the
-//! parity of an id tells a response to one's own request from a request of
-//! the peer's.
+//! Encoding and decoding `HostToArk` and `ArkToHost` envelopes.
+//!
+//! A request carries an ID chosen by its sender; the response echoes that ID.
+//! Clients choose odd request IDs and servers choose even ones. An incoming ID
+//! of our parity is a response; the other parity means a request from the peer.
+//! Every envelope contains either message content or an error. Only responses
+//! may contain errors.
 
 use crate::protocol::{ArkToHost, HostToArk, RemoteError, ark_to_host, host_to_ark};
 use prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Role in the protocol, deciding request parity and whether the mux serves
-/// successive sessions. Independent of the transport's implementation roles.
+use super::{Error, Message as Body};
+
+/// Role deciding envelope direction and request parity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Side {
-    /// Host requests have odd IDs and its mux serves one session.
+    /// Host requests have odd IDs and its connection serves one session.
     Client,
-    /// Ark requests have even IDs and its mux accepts successive sessions.
+    /// Ark requests have even IDs and its endpoint accepts successive sessions.
     Server,
+}
+
+impl Side {
+    /// Encodes a body in this side's envelope, refusing invalid directions and
+    /// oversize messages before allocating the final protobuf byte buffer.
+    pub(super) fn encode(
+        &self,
+        id: u64,
+        body: Result<Body, RemoteError>,
+    ) -> Result<Vec<u8>, Error> {
+        match self {
+            Self::Client => encode::<HostToArk>(id, body),
+            Self::Server => encode::<ArkToHost>(id, body),
+        }
+    }
+
+    /// Decodes the peer's envelope, requiring exactly one of content or error.
+    /// `Shared::received()` then uses the ID to distinguish requests from
+    /// responses and rejects requests containing errors.
+    pub(super) fn decode(&self, bytes: &[u8]) -> Result<(u64, Result<Body, RemoteError>), Error> {
+        match self {
+            Self::Client => decode::<ArkToHost>(bytes),
+            Self::Server => decode::<HostToArk>(bytes),
+        }
+    }
+}
+
+/// Builds an envelope and checks its size before allocating the encoded bytes.
+fn encode<E: Envelope>(id: u64, body: Result<Body, RemoteError>) -> Result<Vec<u8>, Error>
+where
+    E::Content: TryFrom<Body, Error = Error>,
+{
+    let envelope = match body {
+        Ok(body) => E::response(id, Some(body.try_into()?), None),
+        Err(error) => E::response(id, None, Some(error)),
+    };
+    let size = envelope.encoded_len();
+    if size > crate::transport::MAX_MESSAGE_SIZE {
+        return Err(Error::TooLarge(size));
+    }
+    Ok(envelope.encode_to_vec())
+}
+
+/// Decodes an envelope, rejecting invalid protobuf or anything other than
+/// exactly one of content or error.
+fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Body, RemoteError>), Error>
+where
+    Body: From<E::Content>,
+{
+    let (id, error, content) = E::decode(bytes).map_err(|_| Error::Malformed)?.into_parts();
+    let body = match (content, error) {
+        (Some(content), None) => Ok(content.into()),
+        (None, Some(error)) => Err(error),
+        _ => return Err(Error::Malformed),
+    };
+    Ok((id, body))
 }
 
 /// Parity of the ids a side allocates, telling its own requests from the
@@ -39,7 +97,7 @@ impl Parity {
     }
 
     /// Lowest positive id of the parity, the first one allocated.
-    fn first(self) -> u64 {
+    pub(super) fn first(self) -> u64 {
         match self {
             Self::Odd => 1,
             Self::Even => 2,
@@ -57,25 +115,24 @@ impl From<Side> for Parity {
     }
 }
 
-/// One of the two messages traveling the wire. Sealed, the two being the
-/// only envelopes there are.
+/// Common methods for `HostToArk` and `ArkToHost`. Only these two generated
+/// protobuf types can implement this trait.
 pub trait Envelope: Message + Default + sealed::Sealed + 'static {
-    /// Content of the direction, its requests and responses, handed between
-    /// the threads of a multiplexer.
+    /// Generated content enum for this envelope's requests and responses.
     type Content: Send + 'static;
 
-    /// A request with the id.
+    /// Creates a request with the given ID and content.
     fn request(id: u64, content: Self::Content) -> Self;
 
-    /// A response to the request with the id, content on success and an
-    /// error on failure.
+    /// Creates a response with the original request's ID. Supply content for
+    /// success or an error for failure; this method does not validate that choice.
     fn response(id: u64, content: Option<Self::Content>, err: Option<RemoteError>) -> Self;
 
     /// Takes the envelope apart into its id, its error and its content.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>);
 }
 
-/// Supertrait nobody outside the crate can implement, closing the envelopes.
+/// Prevents other crates from implementing `Envelope` for additional types.
 mod sealed {
     /// Restricts envelope implementations to the two generated wire messages.
     pub trait Sealed {}
@@ -128,18 +185,18 @@ impl Envelope for ArkToHost {
     }
 }
 
-/// What an incoming envelope is to the side receiving it.
+/// Whether an incoming envelope is a peer request or a response to our request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// A request of the peer's, to be answered with its id.
+    /// Peer request whose response must echo this ID.
     Request(u64),
-    /// A response to a request of one's own, the id naming it.
+    /// Response carrying the ID of one of our requests.
     Response(u64),
 }
 
 impl Kind {
-    /// Classifies an incoming id on the side allocating ids of the parity,
-    /// its own parity meaning a response, the other a request.
+    /// Uses our request parity to classify an incoming ID: matching parity
+    /// means a response, opposite parity means a request.
     pub(crate) fn of(id: u64, parity: Parity) -> Self {
         if Parity::of(id) == parity {
             Self::Response(id)
@@ -149,8 +206,8 @@ impl Kind {
     }
 }
 
-/// Allocator of the request ids of one side, handing out the ids of its
-/// parity in order, from any thread.
+/// Atomic request ID allocator used by the legacy protocol. Hands out IDs of
+/// one parity in order, starting at the lowest positive ID.
 pub(crate) struct Ids {
     /// Next ID to hand out, incremented atomically by two to preserve parity.
     next: AtomicU64,
@@ -165,8 +222,8 @@ impl Ids {
         }
     }
 
-    /// Hands out the next ID. The counter wraps on overflow; this allocator does
-    /// not detect reuse or enforce a session's request-ID exhaustion policy.
+    /// Hands out the next ID, wrapping on overflow. The new protocol uses
+    /// `State::Open.next_id` instead and panics when it runs out of IDs.
     pub(crate) fn next(&self) -> u64 {
         self.next.fetch_add(2, Ordering::Relaxed)
     }
@@ -184,7 +241,7 @@ mod tests {
     fn test_kinds() {
         /// One received ID and its expected interpretation for the receiving side.
         struct TestCase {
-            /// Incoming envelope ID, including legacy zero and boundary examples.
+            /// Incoming envelope ID, including zero and the largest IDs.
             id: u64,
             /// Parity allocated by the side receiving this envelope.
             parity: Parity,

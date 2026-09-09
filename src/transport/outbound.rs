@@ -86,6 +86,17 @@ impl<W: Write> Outbound<W> {
         self.lock().end(sealer);
     }
 
+    /// Ends the session identified by `sealer` and, on the server, sends Dropped.
+    /// Both happen under the writer lock, so a new handshake cannot start between
+    /// removing the binding and sending the notification. An old sealer does nothing.
+    pub(crate) fn disconnect(&self, sealer: &Arc<Mutex<xhpke::Sender>>) -> Result<(), Error> {
+        let mut writer = self.lock();
+        if writer.end(sealer) && self.side == Side::Server {
+            writer.framer.send_dropped(Instant::now() + self.timeout)?;
+        }
+        Ok(())
+    }
+
     /// Removes any binding, waiting for earlier writes.
     pub(super) fn unbind(&self) {
         self.lock().unbind();

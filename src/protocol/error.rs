@@ -1,7 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Cloneable operation failures shared by retirement and promise completion.
+//! Errors returned by protocol methods and promises.
 
 use super::RemoteError;
 use crate::transport;
@@ -28,9 +28,8 @@ pub enum Error {
     #[error("wire peer failed the request, code {}: {}", .0.code, .0.msg)]
     Remote(RemoteError),
 
-    /// The answer's content variant differed from the caller's selected type.
-    /// Only this operation fails; decoding the same bytes as another protobuf
-    /// message is not used as a substitute for checking the variant.
+    /// The response's `Message` variant does not match the type requested by
+    /// `Promise::wait()`. This does not end the session.
     #[error("wire response type mismatch: expected {expected}, received {received}")]
     UnexpectedResponse {
         /// Expected protobuf message type.
@@ -54,21 +53,21 @@ pub enum Error {
 }
 
 impl From<transport::Error> for Error {
-    /// Shares a transport failure so every affected operation can retain its cause.
+    /// Wraps a transport error in an `Arc` so pending promises can share it.
     fn from(error: transport::Error) -> Self {
         Self::Transport(Arc::new(error))
     }
 }
 
 impl From<RemoteError> for Error {
-    /// Preserves a peer application's error without classifying it as session loss.
+    /// Wraps the peer's error code and message in `Error::Remote`.
     fn from(error: RemoteError) -> Self {
         Self::Remote(error)
     }
 }
 
 impl From<Infallible> for Error {
-    /// Supports taking `Message` directly through its infallible identity conversion.
+    /// Allows `Promise::wait()` to return `Message` without extracting a variant.
     fn from(error: Infallible) -> Self {
         match error {}
     }

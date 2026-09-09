@@ -3,32 +3,31 @@
 
 //! Bidirectional requests over the transport, with pipelining and explicit sessions.
 //!
-//! **Work in progress:** session ownership, local retirement, receive wakeups,
-//! operation registration, promises and deadline settlement are implemented.
-//! Connection construction still contains `todo!` skeletons. Internal fixtures
-//! currently supply sessions, input, output completion and deadline servicing;
-//! real transport integration and its independent workers come later.
-//! The working previous implementation and its scenario runners live in [`legacy`].
-//! Protobuf bindings and message/content conversions are implemented.
+//! A reader receives messages from each connection. Each session also has a writer
+//! that sends queued messages and a deadline worker that times out operations.
+//! Flow control and memory limits are not implemented yet; the outgoing queue is
+//! currently unbounded. The previous implementation lives in [`legacy`].
 //!
 //! The application opens a [`crate::transport::Stream`]; this layer constructs and
 //! owns its transport. [`connect`] establishes one client session. [`Server`] owns
 //! a persistent endpoint and accepts successive server sessions. Each [`Session`]
-//! owns its lifetime and receive queue. Its [`Requester`] and [`Responder`] handles
-//! always target that session, including after a replacement connects.
+//! owns its receive queue and closes when dropped. Its [`Requester`] and
+//! [`Responder`] handles always target that session, even after it closes and
+//! another session connects.
 //! Both sides use the same concrete handle types and [`Message`] enum; the role and
 //! wire envelope direction are internal details. Callers select response types when
 //! waiting on [`Promise<Message>`].
 //!
-//! Requests and replies return eager promises without waiting for capacity or I/O.
-//! Their supplied deadlines cover capacity waits and I/O; `wait()` never restarts
-//! them. I/O progresses independently of application dispatch. Applications must keep
-//! receiving requests while jobs wait for reverse requests. All waiting is blocking;
-//! no async runtime is required. Notification-like requests receive a reply too.
+//! Requests and replies return promises without waiting for I/O. Their deadlines
+//! include time in the outgoing queue; `wait()` does not restart the timeout.
+//! Transport write timeouts are independent: a request can still reach the peer
+//! after its promise expires. The reader and writer run independently of the
+//! application, but the application must keep receiving and answering requests
+//! while its own requests wait for replies. All waiting is blocking; no async
+//! runtime is required. Every request expects a reply, including notifications.
 //!
-//! Closing retires unresolved operations instead of draining RPCs. Already-admitted
-//! transport I/O may still return. Configuration and resource limits remain to be
-//! specified before their implementation.
+//! Closing a session fails its pending promises and discards queued messages.
+//! A write already in progress may still reach the peer.
 
 mod closer;
 mod envelope;
@@ -41,6 +40,7 @@ mod requester;
 mod responder;
 mod server;
 mod session;
+mod worker;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -58,7 +58,15 @@ pub use responder::Responder;
 pub use server::Server;
 pub use session::{Session, connect};
 
-/// The generated bindings, kept out of the lints the crate holds itself to.
+use std::time::Duration;
+
+/// Default timeout for sending an automatic `UNANSWERED` reply. Starts when the
+/// responder is dropped and includes time in the outgoing queue. Configure it
+/// with [`Session::set_abandonment_timeout`].
+/// Transport write timeouts are independent.
+pub const DEFAULT_ABANDONMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Generated protobuf bindings, excluded from checks for handwritten code.
 #[allow(clippy::all)]
 #[allow(rustdoc::broken_intra_doc_links)]
 mod generated {

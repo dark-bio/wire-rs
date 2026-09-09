@@ -1,14 +1,14 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Weak capabilities for retiring a particular session or persistent endpoint.
+//! Handles for closing a session or server from another thread.
 
 use super::{Error, server, session};
 use std::sync::Weak;
 
-/// Clonable capability to close its original owner from any thread.
+/// Clonable handle for closing the session or server that created it.
 ///
-/// From [`super::Session::closer`], it retires that session, with the semantics of
+/// From [`super::Session::closer`], it closes that session, with the semantics of
 /// [`super::Session::close`]. From [`super::Server::closer`], it closes the server
 /// endpoint and its active session, with the semantics of [`super::Server::close`].
 /// Its target never changes: a session's closer cannot affect a successor session.
@@ -16,14 +16,14 @@ use std::sync::Weak;
 /// This handle does not keep its owner open. Dropping it does not close anything.
 #[derive(Clone)]
 pub struct Closer {
-    /// Fixed destination chosen when the owner creates this capability.
+    /// Session or server to close.
     target: Target,
 }
 
-/// The two ownership boundaries exposed through the same public close capability.
+/// The session or server targeted by a `Closer`.
 #[derive(Clone)]
 enum Target {
-    /// One session allocation, unaffected by endpoint session replacement.
+    /// One session, even after another session connects to the same server.
     Session(Weak<session::Shared>),
     /// One persistent endpoint and whichever session it has attached at closure.
     Server(Weak<server::Shared>),
@@ -35,25 +35,25 @@ impl Closer {
         match &self.target {
             Target::Session(target) => {
                 if let Some(session) = target.upgrade() {
-                    session.retire(Error::Closed);
+                    session.close(Error::Closed);
                 }
             }
             Target::Server(target) => {
                 if let Some(server) = target.upgrade() {
-                    server.retire(Error::Closed);
+                    server.close(Error::Closed);
                 }
             }
         }
     }
 
-    /// Binds closure to one session without retaining its owner.
+    /// Creates a closer for one session using a weak reference.
     pub(super) fn session(target: Weak<session::Shared>) -> Self {
         Self {
             target: Target::Session(target),
         }
     }
 
-    /// Binds closure to one endpoint without retaining its owner.
+    /// Creates a closer for one server using a weak reference.
     pub(super) fn server(target: Weak<server::Shared>) -> Self {
         Self {
             target: Target::Server(target),
@@ -61,13 +61,13 @@ impl Closer {
     }
 }
 
-/// Checks closer sharing and compiles closure of both ownership boundaries.
+/// Checks that the same closer type works for sessions and servers.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::protocol::{Closer, Server, Session};
 
-    /// Checks that both owners expose the same clonable cross-thread close capability.
+    /// Compiles closing sessions and servers through cloned handles on other threads.
     #[allow(dead_code)]
     fn cross_thread_close(session: &Session, server: &Server) {
         let session_closer: Closer = session.closer();
@@ -80,10 +80,10 @@ mod tests {
         server.close();
     }
 
-    /// Checks the clone, send and sync bounds required for a shared capability.
+    /// Checks that `Closer` implements `Clone`, `Send`, and `Sync`.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires a capability to be clonable and usable by multiple threads.
+        /// Requires a handle to be clonable and usable by multiple threads.
         fn shared<T: Clone + Send + Sync + 'static>() {}
         shared::<Closer>();
     }

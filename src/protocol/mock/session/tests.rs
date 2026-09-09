@@ -107,7 +107,7 @@ fn test_replacement_keeps_old_handles_bound() {
     ]);
 }
 
-/// Capabilities retain neither owner and cannot keep a dropped session operational.
+/// Requesters, responders and closers do not keep a dropped session or server alive.
 #[test]
 fn test_owner_drop_with_retained_handles() {
     use Failure::*;
@@ -134,7 +134,8 @@ fn test_owner_drop_with_retained_handles() {
     ]);
 }
 
-/// Acceptance wakes for publication and retirement; only the newest pending owner stays.
+/// `accept()` wakes when a session is attached or the server closes. If several
+/// sessions connect before acceptance, only the newest one remains available.
 #[test]
 fn test_acceptance_and_endpoint_retirement() {
     use Failure::*;
@@ -180,7 +181,7 @@ fn test_acceptance_and_endpoint_retirement() {
     ]);
 }
 
-/// Concurrent publication cannot leave a usable session behind endpoint closure.
+/// Attaching a session concurrently with server closure leaves that session closed.
 #[test]
 fn test_publication_races_endpoint_close() {
     use Failure::*;
@@ -199,8 +200,9 @@ fn test_publication_races_endpoint_close() {
     ]);
 }
 
-/// Requests settle on answers, replies on local flush, and callers select response
-/// types when waiting. Completed observations survive closure and owner destruction.
+/// Request promises complete on peer answers and reply promises on local flush.
+/// `wait()` checks the requested response type. Completed promises keep their
+/// results after closing or dropping the session.
 #[test]
 fn test_operation_results() {
     use super::Sent;
@@ -243,8 +245,8 @@ fn test_operation_results() {
     ]);
 }
 
-/// Completion accepted strictly before the deadline wins, even with late observation.
-/// At or after the boundary it times out even when no timer has serviced expiry.
+/// A result accepted before the deadline survives a later `wait()`. Results at or
+/// after the deadline produce `Timeout`, even before the timer processes expiry.
 #[test]
 fn test_completion_deadline_boundary() {
     use super::Sent;
@@ -285,8 +287,8 @@ fn test_completion_deadline_boundary() {
     ]);
 }
 
-/// Deadline service runs without observers and while output is held. Queued work
-/// expires without transmission; later live work can still use the same session.
+/// Expiry works without a waiting caller and while a write result is withheld.
+/// Expired queued messages are discarded; new requests can still use the session.
 #[test]
 fn test_deadlines_without_output_progress() {
     use super::Sent;
@@ -327,7 +329,7 @@ fn test_deadlines_without_output_progress() {
         WaitWrite(1, Err(Timeout)),
         NoOutput(1),
     ]);
-    // Taking output also rejects elapsed work when the deadline service is late.
+    // Taking a queued message checks its deadline even before expire() runs.
     run(vec![
         Open(1),
         Accept(1),
@@ -337,7 +339,7 @@ fn test_deadlines_without_output_progress() {
         Wait(0, Err(Timeout)),
         Deadline(1, None),
     ]);
-    // Starting observation after expiry uses the original absolute deadline.
+    // Calling wait() after expiry still uses the original deadline.
     run(vec![
         Open(1),
         Accept(1),
@@ -349,8 +351,8 @@ fn test_deadlines_without_output_progress() {
     ]);
 }
 
-/// Retirement settles every unresolved promise. Earlier closure stays Closed;
-/// closure at or beyond an unresolved operation's deadline produces Timeout.
+/// Closing fails every pending promise. Closure before its deadline produces
+/// `Closed`; closure at or after its deadline produces `Timeout`.
 #[test]
 fn test_retirement_settles_operations() {
     use super::Sent;
@@ -396,8 +398,8 @@ fn test_retirement_settles_operations() {
     }
 }
 
-/// Dropping either promise only releases observation. Requests and replies still
-/// reach output and settle; a consumed responder cannot enqueue a second response.
+/// Dropping a promise leaves its request or reply queued. Write results and answers
+/// can still arrive; consuming a responder cannot enqueue a second response.
 #[test]
 fn test_observer_drop_keeps_operations() {
     use super::Sent;
@@ -434,70 +436,104 @@ fn test_observer_drop_keeps_operations() {
     ]);
 }
 
-/// Abandonment uses the configured stream budget starting at drop, including
+/// Abandonment uses its own configured budget starting at drop, including
 /// queueing. Failed or expired automatic replies do not retry with a fresh budget.
 #[test]
-fn test_abandonment_write_budget() {
-    use super::{Sent, run_with_timeout};
+fn test_abandonment_timeout() {
+    use super::Sent;
     use Failure::*;
     use Step::*;
     use std::time::Duration;
-    run_with_timeout(
-        Duration::from_millis(30),
-        vec![
-            Open(1),
-            Accept(1),
-            Request(1, 0, 10, 200),
-            Output(1, 0, Sent::Request(10), 200), // Hold unrelated output throughout.
-            Deliver(1, 7, 30),
-            Receive(1, 30, 0),
-            Time(20),
-            DropReply(0),
-            Deadline(1, Some(50)),
-            Time(49),
-            Output(1, 1, Sent::Reply(7, Err(1)), 50),
-            Time(50),
-            Written(1, Ok(())),
-            Deadline(1, Some(200)),
-            NoOutput(1),
-            Deliver(1, 8, 31),
-            Receive(1, 31, 1),
-            DropReply(1),
-            Output(1, 2, Sent::Reply(8, Err(1)), 80),
-            Written(2, Err(Terminated)),
-            NoOutput(1),
-            Deadline(1, Some(200)),
-            Deliver(1, 9, 32),
-            Receive(1, 32, 2),
-            DropReply(2),
-            Time(80),
-            Expire(1),
-            NoOutput(1),
-            Deadline(1, Some(200)),
-            Answer(0, Ok(20)),
-            Wait(0, Ok(20)),
-            Deadline(1, None),
-        ],
-    );
+    run(vec![
+        Open(1),
+        Accept(1),
+        AbandonmentTimeout(1, Duration::from_millis(30)),
+        Request(1, 0, 10, 200),
+        Output(1, 0, Sent::Request(10), 200), // Hold unrelated output throughout.
+        Deliver(1, 7, 30),
+        Receive(1, 30, 0),
+        Time(20),
+        DropReply(0),
+        Deadline(1, Some(50)),
+        Time(49),
+        Output(1, 1, Sent::Reply(7, Err(1)), 50),
+        Time(50),
+        Written(1, Ok(())),
+        Deadline(1, Some(200)),
+        NoOutput(1),
+        Deliver(1, 8, 31),
+        Receive(1, 31, 1),
+        DropReply(1),
+        Output(1, 2, Sent::Reply(8, Err(1)), 80),
+        Written(2, Err(Terminated)),
+        NoOutput(1),
+        Deadline(1, Some(200)),
+        Deliver(1, 9, 32),
+        Receive(1, 32, 2),
+        DropReply(2),
+        Time(80),
+        Expire(1),
+        NoOutput(1),
+        Deadline(1, Some(200)),
+        Answer(0, Ok(20)),
+        Wait(0, Ok(20)),
+        Deadline(1, None),
+    ]);
     // An unrepresentable automatic deadline must not panic from Responder::drop.
     for budget in [Duration::ZERO, Duration::MAX] {
-        run_with_timeout(
-            budget,
-            vec![
-                Open(1),
-                Accept(1),
-                Deliver(1, 7, 30),
-                Receive(1, 30, 0),
-                DropReply(0),
-                NoOutput(1),
-                Deadline(1, None),
-            ],
-        );
+        run(vec![
+            Open(1),
+            Accept(1),
+            AbandonmentTimeout(1, budget),
+            Deliver(1, 7, 30),
+            Receive(1, 30, 0),
+            DropReply(0),
+            NoOutput(1),
+            Deadline(1, None),
+        ]);
     }
 }
 
-/// Late output and answers target the original allocation even after replacement,
-/// and retained promises/completions do not keep a dropped session allocation alive.
+/// Drops use current configuration, queued replies keep their deadlines, and
+/// replacement sessions start with the default.
+#[test]
+fn test_abandonment_timeout_updates() {
+    use super::Sent;
+    use Step::*;
+    use std::time::Duration;
+    run(vec![
+        Open(1),
+        Accept(1),
+        Deliver(1, 7, 30),
+        Receive(1, 30, 0),
+        Deliver(1, 8, 31),
+        Receive(1, 31, 1),
+        Deliver(1, 9, 32),
+        Receive(1, 32, 2),
+        Time(20),
+        DropReply(0), // Uses the five-second default.
+        AbandonmentTimeout(1, Duration::from_millis(30)),
+        Output(1, 0, Sent::Reply(7, Err(1)), 5020),
+        Written(0, Ok(())),
+        DropReply(1), // Held since before reconfiguration, now uses 30ms.
+        AbandonmentTimeout(1, Duration::from_millis(90)),
+        Output(1, 1, Sent::Reply(8, Err(1)), 50),
+        Written(1, Ok(())),
+        DropReply(2),
+        Output(1, 2, Sent::Reply(9, Err(1)), 110),
+        Written(2, Ok(())),
+        Open(2),
+        Accept(2),
+        Deliver(2, 10, 33),
+        Receive(2, 33, 3),
+        DropReply(3),
+        Output(2, 3, Sent::Reply(10, Err(1)), 5020),
+        Written(3, Ok(())),
+    ]);
+}
+
+/// Late write results and answers target the original session after replacement.
+/// Keeping promises and completion handles does not keep that session alive.
 #[test]
 fn test_replacement_keeps_completions_bound() {
     use super::Sent;
@@ -536,8 +572,8 @@ fn test_replacement_keeps_completions_bound() {
     ]);
 }
 
-/// Concurrent registration cannot escape retirement, and completion races choose
-/// one result under the same lock. Both sides of each ordering are covered above.
+/// Racing `request()` with `close()` leaves the request failed. Racing an answer
+/// with `close()` gives the promise either result once, without overwriting it.
 #[test]
 fn test_operation_retirement_races() {
     use super::Sent;
@@ -561,8 +597,8 @@ fn test_operation_retirement_races() {
     }
 }
 
-/// Waiters enforce their deadline using the wall clock even before the independent
-/// timer worker is integrated. The watchdog detects a parked waiter without sleeps.
+/// `Promise::wait()` enforces its deadline even without a deadline worker.
+/// The watchdog fails the test if the call remains blocked.
 #[test]
 fn test_real_wait_deadlines() {
     use Failure::*;
@@ -583,8 +619,8 @@ fn test_real_wait_deadlines() {
     ]);
 }
 
-/// Explicit replies are consumed once even when output fails. Failure settles the
-/// corresponding local observer and cannot trigger an extra abandonment response.
+/// A failed reply write fails its promise and does not queue an extra `UNANSWERED`
+/// response: `reply()` already consumed the responder.
 #[test]
 fn test_output_failure_settlement() {
     use super::Sent;
@@ -614,7 +650,8 @@ fn test_output_failure_settlement() {
     ]);
 }
 
-/// Reply registration and write settlement also share the retirement boundary.
+/// Racing `reply()` with `close()` leaves the reply failed. Racing its write result
+/// with `close()` completes the promise once with either result.
 #[test]
 fn test_reply_retirement_races() {
     use super::Sent;
