@@ -53,7 +53,9 @@ impl Duplex {
 ///
 /// Closing or dropping an endpoint wakes blocked I/O on both sides. Its unread
 /// input is discarded; the peer can drain its accepted output before receiving
-/// EOF. Further nonempty writes fail with [`io::ErrorKind::BrokenPipe`].
+/// EOF. Further nonempty writes fail with [`io::ErrorKind::BrokenPipe`]. A flush
+/// fails the same way only if the peer closed with accepted output still unread.
+/// Output the peer had consumed before closing flushes fine afterwards.
 ///
 /// Both peers must run concurrently when exchanging data. Allow enough capacity
 /// for the handshake's initial output; `64 * 1024` is a useful starting point.
@@ -166,7 +168,7 @@ impl io::Write for Writer {
     fn flush(&mut self) -> io::Result<()> {
         let state = self.pipe.lock();
         time_left(self.deadline)?;
-        if !state.reader_open || !state.writer_open {
+        if !state.writer_open || state.lost {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         Ok(())
@@ -199,6 +201,7 @@ struct State {
     bytes: VecDeque<u8>,
     reader_open: bool,
     writer_open: bool,
+    lost: bool, // Accepted output the reader closed without consuming
     #[cfg(test)]
     waiting: usize,
 }
@@ -211,6 +214,7 @@ impl Pipe {
                 bytes: VecDeque::with_capacity(capacity),
                 reader_open: true,
                 writer_open: true,
+                lost: false,
                 #[cfg(test)]
                 waiting: 0,
             }),
@@ -259,6 +263,7 @@ impl Pipe {
     fn close_reader(&self) {
         let mut state = self.lock();
         state.reader_open = false;
+        state.lost |= !state.bytes.is_empty();
         state.bytes.clear();
         drop(state);
         self.changed.notify_all();
@@ -535,6 +540,24 @@ mod tests {
                 io::ErrorKind::BrokenPipe
             );
         }
+    }
+
+    // A peer that consumed every accepted byte before closing does not fail a
+    // later flush. Only output it closed without reading is reported as lost.
+    #[test]
+    fn test_flush_after_peer_drained_and_closed() {
+        let (host, ark) = duplex(4);
+        let (_host_read, mut host_write) = host.into_halves();
+        let (mut ark_read, _ark_write) = ark.into_halves();
+        host_write.write_all(b"ab").unwrap();
+        let mut bytes = [0; 2];
+        ark_read.read_exact(&mut bytes).unwrap();
+        drop(ark_read);
+        host_write.flush().unwrap();
+        assert_eq!(
+            host_write.write(b"c").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     // Splitting drops the stream's closer and output budget without closing
