@@ -27,6 +27,7 @@ fn main() {
     // A body appears once even if it travels both ways (such as develop bytes).
     let mut messages = BTreeSet::new();
     let mut conversions = String::new();
+    let mut envelope_names = String::new();
     for message in descriptors.file.iter().flat_map(|file| &file.message_type) {
         if !matches!(message.name(), "HostToArk" | "ArkToHost") {
             continue;
@@ -42,6 +43,12 @@ fn main() {
             _ => unreachable!(),
         };
         writeln!(conversions, "contents! {{ {module},").unwrap();
+        // Log field names from the schema without inspecting payload bytes.
+        writeln!(
+            envelope_names,
+            "impl opaque::{module}::Content {{\n    fn name(&self) -> &'static str {{\n        match self {{"
+        )
+        .unwrap();
         for field in &message.field {
             if field.oneof_index != Some(oneof as i32) {
                 continue;
@@ -74,8 +81,15 @@ fn main() {
                 })
                 .collect();
             writeln!(conversions, "    {field_variant} => {variant},").unwrap();
+            writeln!(
+                envelope_names,
+                "            Self::{field_variant}(..) => {:?},",
+                field.name()
+            )
+            .unwrap();
         }
         writeln!(conversions, "}}").unwrap();
+        writeln!(envelope_names, "        }}\n    }}\n}}").unwrap();
     }
     let mut content = String::from("messages! {\n");
     for (variant, payload) in messages {
@@ -85,6 +99,8 @@ fn main() {
     content.push_str(&conversions);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
     fs::write(out_dir.join("message.rs"), content).expect("write message enum and conversions");
+    fs::write(out_dir.join("darkbio.wire.names.rs"), envelope_names)
+        .expect("write envelope field names");
 
     // Generate a second view of the envelopes with nested messages left as bytes.
     // Field numbers, oneofs and optional presence stay the same. The reader uses

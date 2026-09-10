@@ -37,7 +37,7 @@ fn check(client: bool, bytes: &[u8]) -> bool {
     };
     let header = header.expect("every fully valid envelope has valid routing metadata");
     assert_eq!(header.id, id);
-    assert_eq!(header.is_error, body.is_err());
+    assert_eq!(header.failed, body.is_err());
     // Measure the received schema directly, independently of the Message-to-wire
     // conversion. Unknown fields and noncanonical varints can change its size.
     let size = match client {

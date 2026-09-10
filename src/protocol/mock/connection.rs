@@ -500,11 +500,10 @@ impl Driver {
                 assert!(matches!(message, Message::DeviceInfoRequest(_)));
                 let write = responder
                     .reply(
-                        Ok(protocol::DeviceInfoResponse {
+                        protocol::DeviceInfoResponse {
                             version_id: 42,
                             ..Default::default()
-                        }
-                        .into()),
+                        },
                         Instant::now() + BUDGET,
                     )
                     .unwrap();
@@ -567,20 +566,13 @@ impl Driver {
                 self.sessions.insert(label, session);
             }
             Step::Reply(slot, promise, body, ms) => {
-                let body =
-                    body.map(|tag| Message::Develop(vec![tag]))
-                        .map_err(|code| RemoteError {
-                            code,
-                            msg: "refused".into(),
-                        });
-                self.writes.insert(
-                    promise,
-                    self.responders
-                        .remove(&slot)
-                        .unwrap()
-                        .reply(body, Instant::now() + Duration::from_millis(ms))
-                        .unwrap(),
-                );
+                let responder = self.responders.remove(&slot).unwrap();
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                let result = match body {
+                    Ok(tag) => responder.reply(vec![tag], deadline),
+                    Err(code) => responder.fail(RemoteError::new(code, "refused"), deadline),
+                };
+                self.writes.insert(promise, result.unwrap());
             }
             Step::WrongDirectionReply(session, slot, promise) => {
                 let body: Message = if session == 0 {
@@ -593,7 +585,7 @@ impl Driver {
                     self.responders
                         .remove(&slot)
                         .unwrap()
-                        .reply(Ok(body), Instant::now() + BUDGET)
+                        .reply(body, Instant::now() + BUDGET)
                         .unwrap(),
                 );
             }
@@ -604,7 +596,7 @@ impl Driver {
                         .remove(&slot)
                         .unwrap()
                         .reply(
-                            Ok(vec![0; transport::MAX_MESSAGE_SIZE + 1].into()),
+                            vec![0; transport::MAX_MESSAGE_SIZE + 1],
                             Instant::now() + BUDGET,
                         )
                         .unwrap(),

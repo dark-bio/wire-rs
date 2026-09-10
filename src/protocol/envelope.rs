@@ -32,29 +32,45 @@ impl Side {
     /// The caller keeps the original bytes for full decoding later.
     pub(super) fn decode_header(&self, bytes: Bytes) -> Result<Header, Error> {
         // Parse out the message shape for request or response routing
-        let (id, is_error, has_content) = match self {
+        let length = bytes.len();
+        let invalid = |error| self.malformed(None, length, "envelope", error);
+        let (id, failed, payload) = match self {
             Self::Client => {
-                let envelope = opaque::ArkToHost::decode(bytes).map_err(|_| Error::Malformed)?;
+                let envelope = opaque::ArkToHost::decode(bytes).map_err(invalid)?;
                 (
                     envelope.id,
                     envelope.err.is_some(),
-                    envelope.content.is_some(),
+                    envelope.content.as_ref().map(|content| content.name()),
                 )
             }
             Self::Server => {
-                let envelope = opaque::HostToArk::decode(bytes).map_err(|_| Error::Malformed)?;
+                let envelope = opaque::HostToArk::decode(bytes).map_err(invalid)?;
                 (
                     envelope.id,
                     envelope.err.is_some(),
-                    envelope.content.is_some(),
+                    envelope.content.as_ref().map(|content| content.name()),
                 )
             }
         };
+        let header = Header {
+            id,
+            failed,
+            payload: payload.or(failed.then_some("err")),
+        };
         // Require exactly one body; presence is preserved even for empty bytes.
-        if has_content == is_error {
-            return Err(Error::Malformed);
+        if payload.is_some() == failed {
+            return Err(self.malformed(
+                Some(header),
+                length,
+                "envelope",
+                if failed {
+                    "envelope contains both content and error"
+                } else {
+                    "envelope has neither content nor error"
+                },
+            ));
         }
-        Ok(Header { id, is_error })
+        Ok(header)
     }
 
     /// Encodes a body in this side's envelope, refusing invalid directions and
@@ -72,24 +88,52 @@ impl Side {
 
     /// Decodes the peer's envelope, requiring exactly one of content or error.
     /// `SessionInner::handle_message()` classifies the ID and rejects requests
-    /// containing errors.
+    /// containing errors. Keeps decoder errors for the warning at the call site.
     pub(super) fn decode(
         &self,
         bytes: &[u8],
-    ) -> Result<(u64, Result<Message, RemoteError>), Error> {
+    ) -> Result<(u64, Result<Message, RemoteError>), DecodeError> {
         match self {
             Self::Client => decode::<ArkToHost>(bytes),
             Self::Server => decode::<HostToArk>(bytes),
         }
     }
+
+    /// Logs one rejection with the metadata available at that point. Leaves ID
+    /// and kind absent if the outer envelope could not be parsed.
+    pub(super) fn malformed(
+        &self,
+        header: Option<Header>,
+        length: usize,
+        stage: &'static str,
+        reason: impl std::fmt::Display,
+    ) -> Error {
+        if let Some(header) = header {
+            let kind = match MessageKind::from_id(header.id, (*self).into()) {
+                MessageKind::Request => "request",
+                MessageKind::Response => "response",
+            };
+            tracing::warn!(
+                "malformed protocol {stage} (id: {}, kind: {kind}, payload: {}, length: {length}): {reason}",
+                header.id,
+                header.payload.unwrap_or("none"),
+            );
+        } else {
+            tracing::warn!("malformed protocol {stage} (length: {length}): {reason}");
+        }
+        Error::Malformed
+    }
 }
 
 /// Routing fields of an envelope whose nested body has not been decoded yet.
+#[derive(Clone, Copy)]
 pub(super) struct Header {
     /// Final scalar ID, including Protobuf's default of zero.
     pub(super) id: u64,
     /// Whether the envelope carries an error instead of content.
-    pub(super) is_error: bool,
+    pub(super) failed: bool,
+    /// Payload field name for warnings. Absent if the envelope has no body.
+    payload: Option<&'static str>,
 }
 
 /// One encoded envelope held by the request queue or a completed response promise.
@@ -97,6 +141,8 @@ pub(super) struct IncomingEnvelope {
     /// Original protobuf bytes, including repeated and unknown fields. Keeping
     /// these intact preserves nested message merging when decoded later.
     bytes: Bytes,
+    /// Parsed metadata for warnings if deferred decoding fails.
+    header: Header,
     /// Returns byte capacity to the original session when dropped.
     charge: ByteCharge,
     /// Wire direction used only when the application retrieves this message.
@@ -110,6 +156,7 @@ impl IncomingEnvelope {
     /// full encoded length against the session's shared byte limit.
     pub(super) fn new(
         bytes: Bytes,
+        header: Header,
         retained_bytes: &Arc<AtomicUsize>,
         limit: usize,
         side: Side,
@@ -118,6 +165,7 @@ impl IncomingEnvelope {
         let charge = ByteCharge::reserve(retained_bytes, bytes.len(), limit)?;
         Ok(Self {
             bytes,
+            header,
             charge,
             side,
             session,
@@ -129,6 +177,7 @@ impl IncomingEnvelope {
     pub(super) fn decode(self) -> Result<Message, Error> {
         let Self {
             bytes,
+            header,
             charge,
             side,
             session,
@@ -137,6 +186,7 @@ impl IncomingEnvelope {
         match side.decode(&bytes) {
             Ok((_, body)) => body.map_err(Error::Remote),
             Err(error) => {
+                let error = side.malformed(Some(header), bytes.len(), "payload", error);
                 if let Some(session) = session.upgrade() {
                     session.close(error.clone());
                 }
@@ -161,10 +211,15 @@ impl ByteCharge {
     fn reserve(used: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self, Error> {
         // This atomic only tracks usage. The session lock and result channels
         // synchronize access to the messages themselves.
-        used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        used.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(bytes).filter(|total| *total <= limit)
         })
-        .map_err(|_| Error::InboundByteLimitExceeded(limit))?;
+        .map_err(|used| {
+            tracing::warn!(
+                "inbound byte limit exceeded (used: {used}, incoming: {bytes}, limit: {limit})"
+            );
+            Error::InboundByteLimitExceeded(limit)
+        })?;
         Ok(Self {
             used: used.clone(),
             bytes,
@@ -198,17 +253,28 @@ where
 
 /// Decodes an envelope, rejecting invalid protobuf or anything other than
 /// exactly one of content or error.
-fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Message, RemoteError>), Error>
+fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Message, RemoteError>), DecodeError>
 where
     Message: From<E::Content>,
 {
-    let (id, error, content) = E::decode(bytes).map_err(|_| Error::Malformed)?.into_parts();
+    let (id, error, content) = E::decode(bytes)?.into_parts();
     let body = match (content, error) {
         (Some(content), None) => Ok(content.into()),
         (None, Some(error)) => Err(error),
-        _ => return Err(Error::Malformed),
+        _ => return Err(DecodeError::Body),
     };
     Ok((id, body))
+}
+
+/// Keeps the decoder's reason until the caller logs it and returns `Malformed`.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum DecodeError {
+    /// Invalid protobuf, including a malformed nested payload.
+    #[error("{0}")]
+    Protobuf(#[from] prost::DecodeError),
+    /// Missing body, or both a message and an error.
+    #[error("expected exactly one of content or error")]
+    Body,
 }
 
 /// Parity of the IDs a side allocates, distinguishing its requests from the peer's.
@@ -380,3 +446,6 @@ mod tests {
 pub(super) mod opaque {
     include!(concat!(env!("OUT_DIR"), "/darkbio.wire.opaque.rs"));
 }
+
+// Payload names follow the schema alongside the generated envelope views.
+include!(concat!(env!("OUT_DIR"), "/darkbio.wire.names.rs"));

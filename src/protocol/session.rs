@@ -3,7 +3,7 @@
 
 //! Session state, request queues, and the reader, writer, and deadline workers.
 
-use super::envelope::{IncomingEnvelope, MessageKind, Parity, Side};
+use super::envelope::{Header, IncomingEnvelope, MessageKind, Parity, Side};
 use super::operation::{
     OperationHandle, OperationKey, OutgoingBody, OutgoingMessage, PendingOperation, ResultSender,
 };
@@ -327,10 +327,12 @@ impl SessionInner {
     fn retain_incoming(
         self: &Arc<Self>,
         bytes: Bytes,
+        header: Header,
         limit: usize,
     ) -> Result<IncomingEnvelope, Error> {
         IncomingEnvelope::new(
             bytes,
+            header,
             &self.retained_bytes,
             limit,
             self.side,
@@ -414,10 +416,10 @@ impl SessionInner {
         let deadline = now.checked_add(timeout).unwrap_or(now);
         let _ = self.reply(
             id,
-            Err(RemoteError {
-                code: ReservedErrors::Unanswered as u64,
-                msg: "request left unanswered".into(),
-            }),
+            Err(RemoteError::reserved(
+                ReservedErrors::Unanswered,
+                "request left unanswered",
+            )),
             deadline,
         );
     }
@@ -602,8 +604,13 @@ impl SessionInner {
         let bytes = peer
             .encode(0, result)
             .expect("fixture response belongs to the peer");
+        let bytes = Bytes::from(bytes.into_boxed_slice());
+        let header = self
+            .side
+            .decode_header(bytes.clone())
+            .expect("fixture response has a valid envelope");
         let result = operation.complete_response(self.now(), || {
-            self.retain_incoming(Bytes::from(bytes.into_boxed_slice()), *max_inbound_bytes)
+            self.retain_incoming(bytes, header, *max_inbound_bytes)
         });
         drop(state);
         if let Err(error) = result {
@@ -631,10 +638,15 @@ impl SessionInner {
             let mut state = self.state.lock().expect("session state not poisoned");
             match MessageKind::from_id(header.id, self.side.into()) {
                 MessageKind::Request => {
-                    if header.is_error {
-                        return Err(Error::Malformed);
+                    if header.failed {
+                        return Err(self.side.malformed(
+                            Some(header),
+                            bytes.len(),
+                            "envelope",
+                            "request contains an error",
+                        ));
                     }
-                    self.queue_request(&mut state, header.id, bytes)?;
+                    self.queue_request(&mut state, header, bytes)?;
                 }
                 MessageKind::Response => {
                     let State::Open {
@@ -653,7 +665,7 @@ impl SessionInner {
                         && let Some(operation) = operations.remove(&key)
                     {
                         operation.complete_response(self.now(), || {
-                            self.retain_incoming(bytes, *max_inbound_bytes)
+                            self.retain_incoming(bytes, header, *max_inbound_bytes)
                         })?;
                     }
                 }
@@ -668,7 +680,7 @@ impl SessionInner {
     fn queue_request(
         self: &Arc<Self>,
         state: &mut State,
-        id: u64,
+        header: Header,
         bytes: Bytes,
     ) -> Result<(), Error> {
         let State::Open {
@@ -684,13 +696,23 @@ impl SessionInner {
             };
             return Err(error.clone());
         };
+        let id = header.id;
         if reserved_ids.contains(&id) {
-            return Err(Error::Malformed);
+            return Err(self.side.malformed(
+                Some(header),
+                bytes.len(),
+                "envelope",
+                "duplicate request ID",
+            ));
         }
         if reserved_ids.len() >= *max_inbound_requests {
+            tracing::warn!(
+                "inbound request limit exceeded (id: {id}, used: {}, limit: {max_inbound_requests})",
+                reserved_ids.len(),
+            );
             return Err(Error::InboundRequestLimitExceeded(*max_inbound_requests));
         }
-        let message = self.retain_incoming(bytes, *max_inbound_bytes)?;
+        let message = self.retain_incoming(bytes, header, *max_inbound_bytes)?;
         reserved_ids.insert(id);
         incoming.push_back((id, message));
         Ok(())
@@ -786,7 +808,7 @@ impl SessionInner {
         // Disconnect the session this sender belongs to. The transport ignores
         // this call if a new handshake has already replaced that session.
         if let Err(error) = sender.disconnect() {
-            tracing::debug!(%error, "could not send protocol session disconnect");
+            tracing::debug!("could not send protocol session disconnect: {error}");
         }
     }
 
@@ -1002,9 +1024,11 @@ impl SessionInner {
         let bytes = peer
             .encode(id, Ok(message))
             .expect("fixture request belongs to peer");
+        let bytes = Bytes::from(bytes.into_boxed_slice());
+        let header = self.side.decode_header(bytes.clone())?;
         let result = {
             let mut state = self.state.lock().expect("session state not poisoned");
-            self.queue_request(&mut state, id, Bytes::from(bytes.into_boxed_slice()))
+            self.queue_request(&mut state, header, bytes)
         };
         self.changed.notify_all();
         if let Err(error) = &result {

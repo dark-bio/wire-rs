@@ -22,15 +22,15 @@ use std::time::Instant;
 /// reply keeps that slot until the writer takes it or the reply is discarded.
 /// See [`super::Session::set_inbound_limits`].
 ///
-/// Replying consumes the responder, so it cannot be reused:
+/// Both [`Self::reply`] and [`Self::fail`] consume the responder, so it cannot be reused:
 ///
 /// ```compile_fail,E0382
-/// use darkbio_wire::protocol::{DeviceInfoResponse, Responder};
+/// use darkbio_wire::protocol::{DeviceInfoResponse, RemoteError, Responder};
 /// use std::time::Instant;
 ///
 /// fn answer_twice(responder: Responder, deadline: Instant) {
-///     let _ = responder.reply(Ok(DeviceInfoResponse::default().into()), deadline);
-///     let _ = responder.reply(Ok(DeviceInfoResponse::default().into()), deadline);
+///     let _ = responder.reply(DeviceInfoResponse::default(), deadline);
+///     let _ = responder.fail(RemoteError::new(0x100, "refused"), deadline);
 /// }
 /// ```
 ///
@@ -48,15 +48,35 @@ pub struct Responder {
 }
 
 impl Responder {
-    /// Consumes the responder and returns a promise for writing and flushing
-    /// the reply. A closed session returns an error immediately. The deadline
-    /// includes time in the queue and I/O; waiting on the promise does not restart it.
+    /// Queues a successful response and consumes the responder. Returns a promise
+    /// for writing and flushing it. A closed session returns an error immediately.
+    /// The deadline includes time in the queue and I/O. Waiting on the promise
+    /// does not restart it.
+    ///
     /// A message invalid for this session's direction fails the promise with
     /// [`Error::WrongDirection`].
     ///
     /// A reply needs no further acknowledgment. Dropping its promise leaves it queued.
-    /// Use `.into()` to convert a protobuf response into `Message`.
+    /// Accepts a protobuf response or [`Message`] directly. Use [`Self::fail`] to
+    /// return an error instead.
     pub fn reply(
+        self,
+        response: impl Into<Message>,
+        deadline: Instant,
+    ) -> Result<Promise<()>, Error> {
+        self.enqueue(Ok(response.into()), deadline)
+    }
+
+    /// Queues an error response and consumes the responder. The deadline and write
+    /// promise work as in [`Self::reply`]. The error itself does not close the session.
+    /// Use [`RemoteError::reserved`] for a named protocol error or
+    /// [`RemoteError::new`] for a numeric error code.
+    pub fn fail(self, error: RemoteError, deadline: Instant) -> Result<Promise<()>, Error> {
+        self.enqueue(Err(error), deadline)
+    }
+
+    /// Queues either kind of response and marks this responder as answered.
+    fn enqueue(
         mut self,
         result: Result<Message, RemoteError>,
         deadline: Instant,
@@ -96,7 +116,8 @@ impl Drop for Responder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::protocol::{
-        DeviceInfoResponse, Error, Message, Promise, RemoteError, Responder, Session,
+        DeviceInfoResponse, Error, Message, Promise, RemoteError, ReservedErrors, Responder,
+        Session,
     };
     use std::time::Instant;
 
@@ -106,11 +127,8 @@ mod tests {
         let (request, responder): (Message, Responder) = session.recv()?;
         let _ = request;
         responder
-            .reply(
-                Err(RemoteError {
-                    code: 0x100,
-                    msg: "refused".into(),
-                }),
+            .fail(
+                RemoteError::reserved(ReservedErrors::Unspecified, "refused"),
                 deadline,
             )?
             .wait()
@@ -123,7 +141,7 @@ mod tests {
         match request {
             Message::DeviceInfoRequest(_) => {
                 let written: Promise<()> =
-                    responder.reply(Ok(DeviceInfoResponse::default().into()), deadline)?;
+                    responder.reply(DeviceInfoResponse::default(), deadline)?;
                 written.wait()?;
             }
             Message::Develop(bytes) => {
@@ -131,7 +149,7 @@ mod tests {
                 let requester = session.requester();
                 std::thread::spawn(move || -> Result<(), Error> {
                     let answer: Vec<u8> = requester.request(bytes, deadline)?.wait()?;
-                    drop(responder.reply(Ok(answer.into()), deadline)?);
+                    drop(responder.reply(answer, deadline)?);
                     Ok(())
                 });
             }

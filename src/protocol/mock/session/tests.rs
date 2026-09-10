@@ -1339,6 +1339,7 @@ fn test_observer_drop_during_response_completion() {
     for admit in [false, true] {
         for drop_observer in [false, true] {
             let bytes = incoming(2, 11);
+            let header = Side::Server.decode_header(bytes.clone().into()).unwrap();
             let limit = if admit { bytes.len() } else { 0 };
             let used = Arc::new(AtomicUsize::new(0));
             let counter = used.clone();
@@ -1355,6 +1356,7 @@ fn test_observer_drop_during_response_completion() {
                 pending.complete_response(now, || {
                     let result = IncomingEnvelope::new(
                         bytes.into(),
+                        header,
                         &counter,
                         limit,
                         Side::Server,
@@ -1471,7 +1473,7 @@ fn test_limits_race_consumers_and_reply_writes() {
         let (mut session, deadline) = fixture(1, 100);
         deliver(&session.inner, incoming(1, 11)).unwrap();
         let (_, responder) = session.recv().unwrap();
-        let promise = responder.reply(Ok(vec![12].into()), deadline).unwrap();
+        let promise = responder.reply(vec![12], deadline).unwrap();
         let state = session.inner.clone();
         let (written, session) = schedule(
             order,

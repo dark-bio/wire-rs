@@ -31,7 +31,7 @@ pub(super) fn spawn(
         drop(guard);
     });
     if let Err(error) = result {
-        tracing::error!(%error, "could not start protocol worker");
+        tracing::error!("could not start protocol worker: {error}");
         std::process::abort();
     }
 }

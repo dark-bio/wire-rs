@@ -42,6 +42,60 @@ fn test_bidirectional_exchange() {
     );
 }
 
+/// Both roles can fail a request without closing the session. Reserved and custom
+/// codes keep their values and messages, including zero and the largest code.
+#[test]
+fn test_error_replies() {
+    use crate::protocol::{RemoteError, ReservedErrors};
+    let mut driver = Driver::new(Mode::Both);
+    for local in [0, 1] {
+        for (error, code, text) in [
+            (
+                RemoteError::reserved(ReservedErrors::Unspecified, "not ready"),
+                0,
+                "not ready",
+            ),
+            (
+                RemoteError::reserved(ReservedErrors::Unanswered, "handler stopped"),
+                1,
+                "handler stopped",
+            ),
+            (
+                RemoteError::new(u64::MAX, String::from("request refused")),
+                u64::MAX,
+                "request refused",
+            ),
+        ] {
+            let deadline = Instant::now() + BUDGET;
+            let answer = driver.requesters[&(1 - local)]
+                .request(vec![11], deadline)
+                .unwrap();
+            let mut session = driver.sessions.remove(&local).unwrap();
+            let (session, written) = Job::start(move || {
+                let (message, responder) = session.recv().unwrap();
+                assert_eq!(message, Message::Develop(vec![11]));
+                let written = responder.fail(error, deadline).unwrap();
+                (session, written)
+            })
+            .finish();
+            let error = Job::start(move || answer.wait::<Vec<u8>>())
+                .finish()
+                .unwrap_err();
+            let Error::Remote(error) = error else {
+                panic!("expected remote error, got {error:?}");
+            };
+            assert_eq!(error.code, code);
+            assert_eq!(error.msg, text);
+            Job::start(move || written.wait()).finish().unwrap();
+            assert_eq!(session.inner.inbound_usage(), (0, 0));
+            driver.sessions.insert(local, session);
+        }
+    }
+    driver.step(Step::TypedExchange);
+    driver.step(Step::Shutdown);
+    driver.step(Step::Stopped);
+}
+
 /// Cloned requesters can submit concurrently without losing work or sharing IDs.
 /// Reversed answers must still reach each producer's original promise.
 #[test]
@@ -431,7 +485,7 @@ fn test_read_failure_wakes_callers() {
                     .responders
                     .remove(&0)
                     .unwrap()
-                    .reply(Ok(Message::Develop(vec![31])), Instant::now() + BUDGET)
+                    .reply(vec![31], Instant::now() + BUDGET)
                     .err()
                     .expect("reply must fail"),
             );

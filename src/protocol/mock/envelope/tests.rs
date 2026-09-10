@@ -232,7 +232,7 @@ fn test_opaque_header_defers_nested_validation() {
             let bytes = malformed_body(client, u64::MAX, error);
             let header = side.decode_header(bytes.clone().into()).unwrap();
             assert_eq!(header.id, u64::MAX);
-            assert_eq!(header.is_error, error);
+            assert_eq!(header.failed, error);
             let mut input = vec![u8::from(client)];
             input.extend(bytes);
             assert!(!run(&input));

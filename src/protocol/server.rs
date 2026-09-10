@@ -187,7 +187,7 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
             Err(transport::Error::RecvFailed(error))
                 if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(transport::Error::SendFailed(error)) => {
-                tracing::debug!(%error, "server handshake output failed");
+                tracing::debug!("server handshake output failed: {error}");
             }
             Err(error) => {
                 server.close(error.into());

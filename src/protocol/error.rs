@@ -3,7 +3,7 @@
 
 //! Errors returned by protocol methods and promises.
 
-use super::RemoteError;
+use super::{RemoteError, ReservedErrors};
 use crate::transport;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -84,5 +84,22 @@ impl From<Infallible> for Error {
     /// Allows `Promise::wait()` to return `Message` without extracting a variant.
     fn from(error: Infallible) -> Self {
         match error {}
+    }
+}
+
+impl RemoteError {
+    /// Builds an error with a numeric code and a human-readable message.
+    /// Codes from 0x100 are request-specific. Use [`Self::reserved`] for named
+    /// protocol errors.
+    pub fn new(code: u64, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+        }
+    }
+
+    /// Builds an error from a reserved protocol code and a human-readable message.
+    pub fn reserved(code: ReservedErrors, msg: impl Into<String>) -> Self {
+        Self::new(code as u64, msg)
     }
 }

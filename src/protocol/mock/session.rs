@@ -77,10 +77,7 @@ fn write_error(error: Failure) -> Error {
 fn response(result: Result<u8, u64>) -> Result<Message, RemoteError> {
     result
         .map(|tag| vec![tag].into())
-        .map_err(|code| RemoteError {
-            code,
-            msg: "refused".into(),
-        })
+        .map_err(|code| RemoteError::new(code, "refused"))
 }
 
 /// Expected outgoing content, specified independently of the runtime queue types.
@@ -465,9 +462,12 @@ impl Driver {
             Step::Reply(responder, slot, result, deadline) => {
                 let responder = self.responders.remove(&responder).unwrap();
                 let deadline = self.at(deadline);
-                let promise = Job::start(move || responder.reply(response(result), deadline))
-                    .finish()
-                    .unwrap();
+                let promise = Job::start(move || match response(result) {
+                    Ok(message) => responder.reply(message, deadline),
+                    Err(error) => responder.fail(error, deadline),
+                })
+                .finish()
+                .unwrap();
                 assert!(self.writes.insert(slot, promise).is_none());
             }
             Step::Outgoing(id, slot, expected, deadline) => {
@@ -601,10 +601,7 @@ impl Driver {
             Step::RealReply(responder, slot, budget) => {
                 let responder = self.responders.remove(&responder).unwrap();
                 let promise = responder
-                    .reply(
-                        response(Ok(2)),
-                        Instant::now() + Duration::from_millis(budget),
-                    )
+                    .reply(vec![2], Instant::now() + Duration::from_millis(budget))
                     .unwrap();
                 assert!(self.writes.insert(slot, promise).is_none());
             }
@@ -617,7 +614,7 @@ impl Driver {
                     let gate = gate.clone();
                     Job::start(move || {
                         gate.wait();
-                        responder.reply(response(Ok(42)), deadline)
+                        responder.reply(vec![42], deadline)
                     })
                 };
                 let closed = {
@@ -833,7 +830,7 @@ impl Driver {
                     self.responders
                         .remove(&slot)
                         .unwrap()
-                        .reply(Ok(vec![1].into()), Instant::now()),
+                        .reply(vec![1], Instant::now()),
                     expected,
                 );
             }
