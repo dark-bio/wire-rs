@@ -5,7 +5,7 @@
 
 use super::{Failure, Job, PATIENCE, Step, run};
 use crate::protocol::envelope::{IncomingEnvelope, Side, opaque};
-use crate::protocol::operation::{PendingOperation, ResultSender};
+use crate::protocol::operation::PendingOperation;
 use crate::protocol::session::SessionInner;
 use crate::protocol::{
     DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS, Error, HostToArk, Message, Promise,
@@ -16,6 +16,150 @@ use prost::bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Weak, mpsc};
 use std::time::{Duration, Instant};
+
+/// Shared tokens identify out-of-order completions. Successful request writing
+/// is not terminal; notification receipt and late registration retain responses.
+#[test]
+fn test_notifications() {
+    use super::ExpectedMessage;
+    use Step::*;
+    let size = incoming(0, 20).len();
+    run(vec![
+        Open(1),
+        Accept(1),
+        Request(1, 0, 10, 100),
+        Notify(0, 10),
+        Request(1, 1, 11, 100),
+        Notify(1, 11),
+        Request(1, 2, 12, 100),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 100),
+        Outgoing(1, 1, ExpectedMessage::Request(11), 100),
+        Outgoing(1, 2, ExpectedMessage::Request(12), 100),
+        Written(0, Ok(())),
+        Notifications(vec![]),
+        Answer(1, Ok(21)),
+        Notifications(vec![11]),
+        Usage(1, 0, size),
+        Answer(0, Ok(20)),
+        Notifications(vec![10]),
+        Usage(1, 0, 2 * size),
+        Answer(2, Ok(22)),
+        Notifications(vec![]),
+        Deliver(1, 7, 30),
+        Receive(1, 30, 0),
+        Reply(0, 0, Ok(40), 100),
+        NotifyWrite(0, 12),
+        Outgoing(1, 3, ExpectedMessage::Reply(7, Ok(40)), 100),
+        Notifications(vec![]),
+        Written(3, Ok(())),
+        Notifications(vec![12]),
+        Written(3, Err(Failure::Terminated)),
+        Notifications(vec![]),
+        Deliver(1, 8, 31),
+        Receive(1, 31, 1),
+        Reply(1, 1, Ok(41), 100),
+        Outgoing(1, 4, ExpectedMessage::Reply(8, Ok(41)), 100),
+        Written(4, Ok(())),
+        Time(200),
+        Expire(1),
+        Usage(1, 0, 3 * size),
+        DropSession(1),
+        Released(1),
+        Notify(2, 13),
+        NotifyWrite(1, 14),
+        Notifications(vec![13, 14]),
+        Wait(0, Ok(20)),
+        Wait(1, Ok(21)),
+        Wait(2, Ok(22)),
+        WaitWrite(0, Ok(())),
+        WaitWrite(1, Ok(())),
+        Notifications(vec![]),
+    ]);
+}
+
+/// Every terminal failure notifies both kinds. Clearing hooks on drop suppresses
+/// later events without cancelling the queued operation or changing its deadline.
+#[test]
+fn test_notification_endings() {
+    use super::ExpectedMessage;
+    use Step::*;
+    for dropped in [false, true] {
+        for (ending, expected) in [
+            (Expire(1), Failure::Timeout),
+            (CloseSession(1), Failure::Closed),
+            (Open(2), Failure::Reset),
+            (DropSource, Failure::Terminated),
+        ] {
+            let mut steps = vec![
+                Open(1),
+                Accept(1),
+                Request(1, 0, 10, 100),
+                Notify(0, 1),
+                Outgoing(1, 0, ExpectedMessage::Request(10), 100),
+                Deliver(1, 7, 30),
+                Receive(1, 30, 0),
+                Reply(0, 0, Ok(40), 100),
+                NotifyWrite(0, 2),
+                Outgoing(1, 1, ExpectedMessage::Reply(7, Ok(40)), 100),
+            ];
+            if dropped {
+                steps.extend([DropPromise(0), DropWritePromise(0)]);
+            }
+            if expected == Failure::Timeout {
+                steps.push(Time(100));
+            }
+            steps.push(ending);
+            steps.push(Notifications(if dropped { vec![] } else { vec![1, 2] }));
+            steps.extend([Answer(0, Ok(20)), Written(1, Ok(())), Notifications(vec![])]);
+            if !dropped {
+                steps.extend([Wait(0, Err(expected)), WaitWrite(0, Err(expected))]);
+            }
+            run(steps);
+        }
+    }
+}
+
+/// Registration and completion share one linearization point. Drop before
+/// completion suppresses a token; concurrent drop permits at most one stale token.
+#[test]
+fn test_notification_races() {
+    for order in orders() {
+        let (session, deadline) = fixture(0, 1024);
+        let (id, mut promise) = request(&session, deadline);
+        let (events, receiver) = mpsc::channel();
+        let state = session.inner.clone();
+        let (promise, ()) = schedule(
+            order,
+            move || {
+                promise.notify(events, 1);
+                promise
+            },
+            move || deliver(&state, incoming(id, 11)).unwrap(),
+        );
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(promise.wait::<Vec<u8>>().unwrap(), vec![11]);
+    }
+    for order in orders() {
+        let (session, deadline) = fixture(0, 1024);
+        let (id, mut promise) = request(&session, deadline);
+        let (events, receiver) = mpsc::channel();
+        promise.notify(events, 1);
+        let state = session.inner.clone();
+        schedule(
+            order,
+            move || drop(promise),
+            move || deliver(&state, incoming(id, 11)).unwrap(),
+        );
+        let tokens: Vec<_> = receiver.try_iter().collect();
+        match order {
+            Order::LeftFirst => assert!(tokens.is_empty()),
+            Order::RightFirst => assert_eq!(tokens, vec![1]),
+            Order::Concurrent => assert!(tokens.is_empty() || tokens == [1]),
+        }
+        assert_eq!(session.inner.inbound_usage(), (0, 0));
+    }
+}
 
 /// Closure discards queued work, refuses later operations and remains repeatable.
 #[test]
@@ -1093,7 +1237,9 @@ fn test_inbound_deferred_validation() {
             Accept(0),
             Request(0, 0, 1, 10),
             SendNext(0, 0, 2),
+            Notify(0, 7),
             Raw(0, response.clone(), Ok(())),
+            Notifications(vec![7]),
             Usage(0, 0, response.len()),
             Wait(0, Err(Failure::Malformed)),
             ReceiveError(0, Failure::Malformed),
@@ -1345,10 +1491,10 @@ fn test_observer_drop_during_response_completion() {
             let counter = used.clone();
             let now = Instant::now();
             let (sender, promise) =
-                Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60));
+                Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60), true);
             let pending = PendingOperation {
                 deadline: now + Duration::from_secs(60),
-                sender: ResultSender::Response(sender),
+                sender,
             };
             let (entered, reserved) = mpsc::channel();
             let (release, released) = mpsc::channel();

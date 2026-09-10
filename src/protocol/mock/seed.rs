@@ -28,7 +28,7 @@ pub const ENVELOPE_TARGET: &str = "protocol-envelope";
 
 impl Seedable for session::Action {
     fn seed(&self, seed: &mut Seed) {
-        const COUNT: u32 = 19;
+        const COUNT: u32 = 20;
         seed.variant(self.kind as u32, COUNT);
         seed.byte(self.slot);
         seed.byte(self.value);

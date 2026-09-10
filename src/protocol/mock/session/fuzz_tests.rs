@@ -19,6 +19,70 @@ fn run_actions(actions: &[(Kind, u8, u8, u8)]) {
     run(&actions);
 }
 
+/// Notifications observe both kinds without consuming them. Repeated actions
+/// are filtered before reaching the public method's double-registration panic.
+#[test]
+fn test_notifications() {
+    use Kind::*;
+    for budget in [0, 10, 255] {
+        for value in [0, 1, 2, 7] {
+            run_actions(&[
+                (Request, 0, 10, budget),
+                (Notify, 0, 0, 0),
+                (Notify, 0, 0, 0),
+                (Receive, 0, 20, 0),
+                (Reply, 0, 30, budget),
+                (Notify, 1, 0, 0),
+                (Outgoing, 0, 0, 0),
+                (Outgoing, 0, 0, 0),
+                (Written, 0, 2, 0),
+                (Answer, 0, value, 0),
+                (Written, 1, value, 0),
+                (Notify, 0, 0, 0),
+                (Notify, 1, 0, 0),
+                (Wait, 0, 0, 0),
+                (Wait, 1, 0, 0),
+                (Notify, 0, 0, 0),
+            ]);
+        }
+    }
+}
+
+/// Completion before registration survives session destruction. Pending hooks
+/// notify parked waiters and are suppressed when the promise is dropped instead.
+#[test]
+fn test_notification_lifetimes() {
+    use Kind::*;
+    for ending in [Expire, Close, Drop, Open, CloseServer, DropSource] {
+        for observer in [Notify, Wait, DropPromise] {
+            run_actions(&[
+                (Request, 0, 10, 10),
+                (Request, 0, 11, 10),
+                (Receive, 0, 20, 0),
+                (Reply, 0, 30, 10),
+                (Notify, 0, 0, 0),
+                (Notify, 2, 0, 0),
+                (observer, 0, 0, 0),
+                (observer, 2, 0, 0),
+                (Advance, 0, 0, 10),
+                (ending, 0, 0, 0),
+                (Drop, 0, 0, 0),
+                (Notify, 1, 0, 0),
+                (Notify, 1, 0, 0),
+            ]);
+        }
+    }
+    run_actions(&[
+        (Request, 0, 10, 100),
+        (Notify, 0, 0, 0),
+        (Outgoing, 0, 0, 0),
+        (Answer, 0, 0, 0),
+        // Receiving a token did not release the buffered response budget.
+        (InboundLimits, 0, 0, 0),
+        (Wait, 0, 0, 0),
+    ]);
+}
+
 #[test]
 fn test_completion_orderings() {
     use Kind::*;

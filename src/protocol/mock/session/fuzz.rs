@@ -66,6 +66,9 @@ pub enum Kind {
     Drop,
     CloseServer,
     DropSource,
+
+    /// Observes completion through a token while retaining the promise and bytes.
+    Notify,
 }
 
 /// Default abandonment budget of a fresh session, in script milliseconds.
@@ -96,6 +99,10 @@ struct Operation {
     retained: bool,
     /// A waiting job owns the promise until a later action collects its result.
     parked: bool,
+    /// Registration is single-use; the generator must never trigger its panic.
+    notified: bool,
+    /// A completion token is queued but has not yet been checked by the driver.
+    notification: bool,
 }
 
 impl Operation {
@@ -117,6 +124,7 @@ impl Operation {
             } else {
                 result
             });
+            self.notification |= self.retained && self.notified;
         }
     }
 }
@@ -182,6 +190,19 @@ impl Model {
                 operation.retained = false;
             }
         }
+    }
+
+    /// Checks completion events separately from waits so observation keeps bytes.
+    fn collect_notifications(&mut self) {
+        let tokens = self
+            .operations
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(id, operation)| {
+                std::mem::take(&mut operation.notification).then_some(id as u8)
+            })
+            .collect();
+        self.steps.push(Step::Notifications(tokens));
     }
 
     /// Queues a batch before receiving it, predicting overflow from original
@@ -267,6 +288,8 @@ impl Model {
             response_bytes: 0,
             retained,
             parked: false,
+            notified: false,
+            notification: false,
         });
     }
 
@@ -288,6 +311,9 @@ impl Model {
     /// Releases an operation whose promise and queued message a race consumed.
     fn consume(&mut self, operation: usize) {
         let operation = &mut self.operations[operation];
+        // Race steps settle and wait on the promise before returning, so its
+        // registered event is sent even though the model releases ownership now.
+        operation.notification = operation.notified;
         operation.retained = false;
         operation.queued = false;
         operation.writing = false;
@@ -551,6 +577,21 @@ impl Model {
                     }
                 }
             }
+            Kind::Notify
+                if !self.operations.is_empty()
+                    && self.operations[operation].retained
+                    && !self.operations[operation].parked
+                    && !self.operations[operation].notified =>
+            {
+                let pending = &mut self.operations[operation];
+                pending.notified = true;
+                pending.notification = pending.result.is_some();
+                self.steps.push(if pending.request() {
+                    Step::Notify(operation as u8, operation as u8)
+                } else {
+                    Step::NotifyWrite(operation as u8, operation as u8)
+                });
+            }
             Kind::Wait
                 if !self.operations.is_empty()
                     && self.operations[operation].retained
@@ -662,6 +703,7 @@ impl Model {
             _ => {}
         }
         self.collect_waiters();
+        self.collect_notifications();
         for (session, state) in self.sessions.iter().enumerate() {
             if state.owner {
                 let next = self

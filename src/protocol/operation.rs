@@ -4,11 +4,11 @@
 //! Pending operations, queued messages, and reporting their results to promises.
 
 use super::envelope::IncomingEnvelope;
-use super::promise::PromiseResult;
+use super::promise::{PromiseResult, ResultSender};
 use super::session::SessionInner;
 use super::{Error, Message, RemoteError};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak, mpsc};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 /// Key for one entry in the session's `operations` map. Equality compares the
@@ -50,15 +50,6 @@ pub(super) struct PendingOperation {
     pub(super) sender: ResultSender,
 }
 
-/// Result channel for a request or reply promise. Each has one slot and receives
-/// one result, so sending never needs to wait for `Promise::wait()`.
-pub(super) enum ResultSender {
-    /// Sends a peer answer or error to `Promise<Message>`.
-    Response(mpsc::SyncSender<Result<PromiseResult, Error>>),
-    /// Sends a write result or error to `Promise<()>`.
-    Write(mpsc::SyncSender<Result<PromiseResult, Error>>),
-}
-
 impl PendingOperation {
     /// Sends the answer to the promise, or `Timeout` if the deadline was reached.
     /// Only an on-time answer reserves bytes. If it exceeds the byte limit and
@@ -71,19 +62,17 @@ impl PendingOperation {
         if now >= self.deadline {
             self.fail(Error::Timeout, now);
         } else {
-            let ResultSender::Response(sender) = self.sender else {
-                unreachable!("only requests accept peer answers")
-            };
+            assert!(self.sender.response, "only requests accept peer answers");
             match retain() {
                 Ok(message) => {
                     // If the promise was dropped, the failed send releases the bytes.
-                    let _ = sender.send(Ok(PromiseResult::Response(message)));
+                    let _ = self.sender.send(Ok(PromiseResult::Response(message)));
                 }
                 Err(error) => {
                     // The send checks whether the promise still exists. If it was
                     // dropped, this response needs no space and must not close
                     // the session, even if other promises fill the byte limit.
-                    if sender.send(Err(error.clone())).is_ok() {
+                    if self.sender.send(Err(error.clone())).is_ok() {
                         return Err(error);
                     }
                 }
@@ -100,14 +89,7 @@ impl PendingOperation {
         } else {
             error
         };
-        match self.sender {
-            ResultSender::Response(result) => {
-                let _ = result.send(Err(error));
-            }
-            ResultSender::Write(result) => {
-                let _ = result.send(Err(error));
-            }
-        }
+        let _ = self.sender.send(Err(error));
     }
 }
 

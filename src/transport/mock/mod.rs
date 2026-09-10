@@ -23,7 +23,7 @@ use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use vector::{Event, Vector};
 
 /// Maximum steps run from one script, limiting the work in a fuzz iteration.
@@ -32,6 +32,11 @@ pub const MAX_STEPS: usize = 64;
 /// Fixed signing timestamp used by mocks and drivers to keep recorded output
 /// independent of the clock.
 pub const TIMESTAMP: i64 = 0;
+
+/// Handshake budget of the peer under test in the scripted runners. The models
+/// predict every result from the script alone. The clock must therefore never
+/// expire a handshake that a slow script is still feeding.
+pub const SCRIPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Message one byte past the send limit, used to assert refusal without advancing
 /// encryption or touching the writer. Shared so fuzz steps need no large allocation.

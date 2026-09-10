@@ -217,6 +217,12 @@ enum Step {
     AnswerOther(u8),
 
     // Promise completion.
+    /// Registers a request promise to send the supplied token on completion.
+    Notify(u8, u8),
+    /// Registers a reply promise to send the supplied token on completion.
+    NotifyWrite(u8, u8),
+    /// Drains notifications and checks the exact tokens without consuming promises.
+    Notifications(Vec<u8>),
     /// Waits for a request's byte-vector answer or its exact failure.
     Wait(u8, Result<u8, Failure>),
     /// Waits for a `Message` and checks its variant and body tag.
@@ -316,6 +322,8 @@ struct Driver {
     promises: HashMap<u8, Promise<Message>>,
     /// Reply promises saved for later wait or drop steps.
     writes: HashMap<u8, Promise<()>>,
+    /// Shared event channel; tokens do not own promises or release response bytes.
+    notifications: (mpsc::Sender<u8>, mpsc::Receiver<u8>),
     /// Messages taken from the queue whose write results and answers are supplied later.
     outgoing: HashMap<u8, OutgoingMessage>,
     /// Background calls waiting for request answers.
@@ -351,6 +359,7 @@ impl Driver {
             responders: HashMap::new(),
             promises: HashMap::new(),
             writes: HashMap::new(),
+            notifications: mpsc::channel(),
             outgoing: HashMap::new(),
             waiting: HashMap::new(),
             writing: HashMap::new(),
@@ -693,6 +702,22 @@ impl Driver {
                 outgoing
                     .operation
                     .record_response(Ok(crate::protocol::DeviceInfoRequest::default().into()));
+            }
+            Step::Notify(slot, token) => self
+                .promises
+                .get_mut(&slot)
+                .unwrap()
+                .notify(self.notifications.0.clone(), token),
+            Step::NotifyWrite(slot, token) => self
+                .writes
+                .get_mut(&slot)
+                .unwrap()
+                .notify(self.notifications.0.clone(), token),
+            Step::Notifications(mut expected) => {
+                let mut received: Vec<_> = self.notifications.1.try_iter().collect();
+                received.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(received, expected);
             }
             Step::Wait(slot, expected) => {
                 let promise = self.promises.remove(&slot).unwrap();
