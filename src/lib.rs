@@ -10,16 +10,6 @@ pub mod memory;
 pub mod protocol;
 pub mod transport;
 
-#[cfg(any(test, feature = "fuzz"))]
-#[doc(hidden)]
-pub use transport::mock;
-
-pub use protocol::{ArkToHost, HostToArk};
-pub use transport::{
-    Attestation, Attester, Client, Closer, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT, Error,
-    MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Read, Roots, Sender, Server, Stream, Verifier, Write,
-};
-
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 

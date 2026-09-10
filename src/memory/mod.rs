@@ -6,7 +6,7 @@
 //! These streams use only standard Rust synchronization, with no sockets or
 //! worker threads. Split an endpoint with [`Duplex::into_halves`] for plain I/O.
 
-use crate::{Read, Stream, Write};
+use crate::transport::{Read, Stream, Write};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -20,14 +20,15 @@ impl Duplex {
     ///
     /// Each half closes its own direction on drop. Dropping the writer lets the
     /// peer drain accepted output before EOF; dropping the reader refuses further
-    /// peer writes. Obtain a [`crate::Closer`] with [`Self::closer`] before splitting
+    /// peer writes. Obtain a [`crate::transport::Closer`] with [`Self::closer`] before splitting
     /// if you need to shut down both halves from another thread.
     ///
     /// The stream's write timeout is discarded. Any deadlines already installed
     /// on the halves are retained; new halves have no deadline until configured.
     ///
     /// ```
-    /// use darkbio_wire::{Client, memory};
+    /// use darkbio_wire::memory;
+    /// use darkbio_wire::transport::Client;
     ///
     /// let (host, bus) = memory::duplex(64 * 1024);
     /// let (reader, writer) = bus.into_halves();
@@ -291,7 +292,7 @@ fn time_left(deadline: Option<Instant>) -> io::Result<Option<Duration>> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::Closer;
+    use crate::transport::Closer;
     use std::io::{Read as _, Write as _};
     use std::sync::mpsc;
     use std::thread;

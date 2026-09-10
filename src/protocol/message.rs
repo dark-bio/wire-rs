@@ -4,22 +4,24 @@
 //! Shared message bodies, generated from both protobuf content oneofs.
 
 use super::Error;
-use super::generated::*;
+use super::schema::*;
 
 /// Defines the shared body enum and conversions from the schema-derived payload list.
 /// The build script invokes this once with the union of both envelope directions.
 macro_rules! messages {
     ($($variant:ident($payload:ty),)*) => {
-        /// A request or successful response body, shared by hosts and servers.
-        /// Variants and typed conversions are generated from the protobuf schema.
-        /// Request IDs, wire envelopes and direction selection remain internal to
-        /// the session API. The session checks whether it can send this message
-        /// in its direction.
+        /// A request or successful response body from either direction. Variants
+        /// are named by their body type, so a request and its response stay apart.
+        /// Request IDs and wire envelopes remain internal to the session API. The
+        /// session checks whether it can send this message in its direction.
         ///
-        /// Use `From`/`.into()` to submit a protobuf message, match variants to
-        /// dispatch incoming work, and `TryFrom` to extract an expected body type.
-        /// Extraction checks the variant and returns [`Error::UnexpectedResponse`]
-        /// on mismatch. There is no static request/response pairing table.
+        /// Use `From`/`.into()` to submit a body and `TryFrom` to extract an expected
+        /// body type. Extraction checks the variant and returns
+        /// [`Error::UnexpectedResponse`] on mismatch. There is no static
+        /// request/response pairing table. Convert into [`host_to_ark::Content`]
+        /// or [`ark_to_host::Content`] to dispatch on one direction exhaustively.
+        /// A body from the other direction fails that conversion with
+        /// [`Error::WrongDirection`].
         #[derive(Clone, Debug, PartialEq)]
         pub enum Message {
             $(
@@ -98,7 +100,8 @@ include!(concat!(env!("OUT_DIR"), "/message.rs"));
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::protocol::{self, DeviceInfoRequest, DeviceInfoResponse, Error, Message};
+    use crate::protocol::schema::{self, DeviceInfoRequest, DeviceInfoResponse};
+    use crate::protocol::{Error, Message};
 
     /// Rejects a different `Message` variant even when its protobuf fields could
     /// be decoded as the requested type.
@@ -106,7 +109,7 @@ mod tests {
     fn response_extraction_checks_the_variant() {
         use prost::Message as _;
 
-        let other = protocol::OnboardingResponse {};
+        let other = schema::OnboardingResponse {};
         assert!(DeviceInfoResponse::decode(other.encode_to_vec().as_slice()).is_ok());
         let message: Message = other.into();
         assert!(matches!(

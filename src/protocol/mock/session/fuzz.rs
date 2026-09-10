@@ -10,10 +10,8 @@
 //! runner instead. Everything here stays on the simulated clock.
 
 use super::{ExpectedMessage, Failure, Step};
-use crate::protocol::{
-    DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS, HostToArk, RemoteError,
-    ReservedErrors, host_to_ark,
-};
+use crate::protocol::schema::{self, HostToArk, host_to_ark};
+use crate::protocol::{DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS};
 use crate::transport::mock::MAX_STEPS;
 use prost::Message as _;
 use std::time::Duration;
@@ -113,7 +111,7 @@ impl Operation {
     fn abandonment(&self) -> bool {
         matches!(
             self.body,
-            ExpectedMessage::Reply(_, Err(code)) if code == ReservedErrors::Unanswered as u64
+            ExpectedMessage::Reply(_, Err(code)) if code == schema::ReservedErrors::Unanswered as u64
         )
     }
 
@@ -426,7 +424,7 @@ impl Model {
                                 session,
                                 ExpectedMessage::Reply(
                                     responder as u64,
-                                    Err(ReservedErrors::Unanswered as u64),
+                                    Err(schema::ReservedErrors::Unanswered as u64),
                                 ),
                                 self.time + self.sessions[session].abandonment,
                                 false,
@@ -729,7 +727,7 @@ fn answer_size(result: Result<u8, Failure>) -> usize {
     let (err, content) = match result {
         Ok(tag) => (None, Some(host_to_ark::Content::Develop(vec![tag]))),
         Err(Failure::Remote(code)) => (
-            Some(RemoteError {
+            Some(schema::Error {
                 code,
                 msg: "refused".into(),
             }),

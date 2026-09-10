@@ -46,22 +46,22 @@ fn test_bidirectional_exchange() {
 /// codes keep their values and messages, including zero and the largest code.
 #[test]
 fn test_error_replies() {
-    use crate::protocol::{RemoteError, ReservedErrors};
+    use crate::protocol::schema;
     let mut driver = Driver::new(Mode::Both);
     for local in [0, 1] {
         for (error, code, text) in [
             (
-                RemoteError::reserved(ReservedErrors::Unspecified, "not ready"),
+                schema::Error::reserved(schema::ReservedErrors::Unspecified, "not ready"),
                 0,
                 "not ready",
             ),
             (
-                RemoteError::reserved(ReservedErrors::Unanswered, "handler stopped"),
+                schema::Error::reserved(schema::ReservedErrors::Unanswered, "handler stopped"),
                 1,
                 "handler stopped",
             ),
             (
-                RemoteError::new(u64::MAX, String::from("request refused")),
+                schema::Error::new(u64::MAX, String::from("request refused")),
                 u64::MAX,
                 "request refused",
             ),
@@ -477,7 +477,7 @@ fn test_read_failure_wakes_callers() {
             let accepting = driver.server.take().map(|mut server| {
                 let waiting = server.inner.watch_accept_wait();
                 let job = Job::start(move || {
-                    let error = server.accept().err().expect("accept must fail");
+                    let error = server.accept().expect_err("accept must fail");
                     (server, error)
                 });
                 waiting.recv_timeout(BUDGET).unwrap();
@@ -500,7 +500,7 @@ fn test_read_failure_wakes_callers() {
                 );
             }
             let (session, result) = driver.receiving.remove(&local).unwrap().finish();
-            errors.push(result.err().expect("receive must fail"));
+            errors.push(result.expect_err("receive must fail"));
             driver.sessions.insert(local, session);
             if let Some(accepting) = accepting {
                 let (server, error) = accepting.finish();
@@ -510,8 +510,7 @@ fn test_read_failure_wakes_callers() {
             errors.push(
                 driver.requesters[&local]
                     .request(vec![12], Instant::now() + BUDGET)
-                    .err()
-                    .expect("request must fail"),
+                    .expect_err("request must fail"),
             );
             errors.push(
                 driver
@@ -519,8 +518,7 @@ fn test_read_failure_wakes_callers() {
                     .remove(&0)
                     .unwrap()
                     .reply(vec![31], Instant::now() + BUDGET)
-                    .err()
-                    .expect("reply must fail"),
+                    .expect_err("reply must fail"),
             );
             for error in errors {
                 let Error::Transport(error) = error else {

@@ -4,8 +4,8 @@
 //! Envelope shapes accepted or refused by the decoder, also used as fuzz seeds.
 
 use super::*;
-use crate::protocol::{
-    ArkToHost, DeviceInfoRequest, HostToArk, RemoteError, ark_to_host, host_to_ark,
+use crate::protocol::schema::{
+    self, ArkToHost, DeviceInfoRequest, HostToArk, ark_to_host, host_to_ark,
 };
 
 /// The direction prefix selects one decoder, which consumes all remaining bytes.
@@ -43,7 +43,7 @@ fn test_envelope_shapes() {
         /// Expected acceptance of the body by the receiving side.
         accepted: bool,
     }
-    let error = RemoteError {
+    let error = schema::Error {
         code: 7,
         msg: "refused".into(),
     };
@@ -76,7 +76,7 @@ fn test_envelope_shapes() {
                 id: u64::MAX,
                 err: None,
                 content: Some(ark_to_host::Content::Onboard(
-                    crate::protocol::OnboardingResponse {},
+                    crate::protocol::schema::OnboardingResponse {},
                 )),
             }
             .encode_to_vec(),
@@ -183,7 +183,7 @@ fn test_envelope_normalization() {
 fn test_encoded_size_boundaries() {
     /// Builds a peer envelope through the schema, without the protocol encoder.
     fn envelope(client: bool, id: u64, len: usize, error: bool) -> Vec<u8> {
-        let err = error.then(|| RemoteError {
+        let err = error.then(|| schema::Error {
             code: u64::MAX,
             msg: "x".repeat(len),
         });

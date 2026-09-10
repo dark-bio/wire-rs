@@ -11,7 +11,7 @@ use std::time::Instant;
 /// Clonable handle for sending requests through the session that created it.
 /// Does not keep the session open or follow a replacement session. Dropping a
 /// requester does not close the session or cancel operations it already submitted.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Requester {
     /// Session that created this requester, even after a replacement connects.
     session: Weak<SessionInner>,
@@ -50,9 +50,9 @@ impl Requester {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::protocol::{
-        DeviceInfoRequest, DeviceInfoResponse, Error, Message, Promise, Requester, Session,
-    };
+    use crate::protocol::schema::{DeviceInfoRequest, DeviceInfoResponse};
+    use crate::protocol::{Error, Message, Promise, Requester, Session};
+    use std::fmt::Debug;
     use std::time::Instant;
 
     /// Compiles sending several requests before waiting, dropping promises, and
@@ -75,11 +75,11 @@ mod tests {
         Ok(())
     }
 
-    /// Checks that `Requester` implements `Clone`, `Send`, and `Sync`.
+    /// Checks that `Requester` implements `Clone`, `Debug`, `Send`, and `Sync`.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires a handle to be clonable and usable by multiple threads.
-        fn shared<T: Clone + Send + Sync + 'static>() {}
+        /// Requires a handle to be clonable, printable and usable by multiple threads.
+        fn shared<T: Clone + Debug + Send + Sync + 'static>() {}
         shared::<Requester>();
     }
 }

@@ -15,6 +15,7 @@ use crate::transport::{
 };
 use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -47,6 +48,15 @@ impl Attestation {
     }
 }
 
+impl fmt::Debug for Attestation {
+    /// Shows the size of the CWT, never its bytes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Attestation")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Supplies the server's device attestation on every handshake. This lets the
 /// server pick up a new attestation after onboarding without recreating transport.
 pub trait Attester {
@@ -66,7 +76,6 @@ impl Attester for Attestation {
 /// A decrypted message or encrypted session transition returned by [`Server::recv`].
 /// Events arrive in receive order and refer to sessions over the existing byte
 /// stream. Permanent stream closure is observed through I/O results.
-#[derive(Debug)]
 pub enum Event<W: Write> {
     /// A handshake completed and established an encrypted session. The sender
     /// belongs to that session and cannot send into a later replacement.
@@ -82,6 +91,17 @@ pub enum Event<W: Write> {
 
     /// A decrypted message from the client.
     Message(Vec<u8>),
+}
+
+impl<W: Write> fmt::Debug for Event<W> {
+    /// Names the event, showing the sender or the message length.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connected(sender) => f.debug_tuple("Connected").field(sender).finish(),
+            Self::Disconnected => f.write_str("Disconnected"),
+            Self::Message(message) => f.debug_tuple("Message").field(&message.len()).finish(),
+        }
+    }
 }
 
 /// Server side of the wire, accepting encrypted sessions over a supplied byte
@@ -502,6 +522,18 @@ impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
     fn drop(&mut self) {
         self.outbound.close();
         self.end_session();
+    }
+}
+
+impl<R: Read, W: Write, A: Attester> fmt::Debug for Server<R, W, A> {
+    /// Shows the session label, whether a session is established and the
+    /// handshake budget, never the adapters, the keys or the encryption contexts.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("session", &self.log_id)
+            .field("connected", &self.sealer.is_some())
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish_non_exhaustive()
     }
 }
 

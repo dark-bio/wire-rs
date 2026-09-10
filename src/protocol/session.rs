@@ -11,12 +11,13 @@ use super::promise::PromiseResult;
 use super::worker;
 use super::{
     Closer, DEFAULT_ABANDONMENT_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
-    Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder,
+    Error, Message, Promise, Requester, Responder, schema,
 };
 use crate::LogId;
 use crate::transport::{self, Read, Stream, Verifier, Write};
 use prost::bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -175,6 +176,19 @@ impl Drop for Session {
     /// Closes the session even when requesters, responders or closers remain.
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+impl fmt::Debug for Session {
+    /// Shows the session label and whether the session is still open. A state
+    /// lock held elsewhere leaves the state out.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut session = f.debug_struct("Session");
+        session.field("id", &self.inner.log_id);
+        if let Ok(state) = self.inner.state.try_lock() {
+            session.field("open", &matches!(*state, State::Open { .. }));
+        }
+        session.finish_non_exhaustive()
     }
 }
 
@@ -467,8 +481,8 @@ impl SessionInner {
         let deadline = now.checked_add(timeout).unwrap_or(now);
         let _ = self.reply(
             id,
-            Err(RemoteError::reserved(
-                ReservedErrors::Unanswered,
+            Err(schema::Error::reserved(
+                schema::ReservedErrors::Unanswered,
                 "request left unanswered",
             )),
             deadline,
@@ -499,7 +513,7 @@ impl SessionInner {
     pub(super) fn reply(
         self: &Arc<Self>,
         id: u64,
-        result: Result<Message, RemoteError>,
+        result: Result<Message, schema::Error>,
         deadline: Instant,
     ) -> Result<Promise<()>, Error> {
         let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, false);
@@ -1203,6 +1217,7 @@ impl Drop for SessionInner {
 mod tests {
     use crate::protocol::{self, Error, Session};
     use crate::transport::{Read, Stream, Verifier, Write};
+    use std::fmt::Debug;
 
     /// Compiles client construction with verifier-specific information in the result.
     #[allow(dead_code)]
@@ -1215,11 +1230,12 @@ mod tests {
         protocol::connect(stream, verifier)
     }
 
-    /// Checks the send bound required to transfer ownership to an application thread.
+    /// Checks the bounds required to move the session to an application thread
+    /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be transferable to a background thread.
-        fn movable<T: Send + 'static>() {}
+        /// Requires an owned value to be printable and transferable to a background thread.
+        fn movable<T: Debug + Send + 'static>() {}
         movable::<Session>();
     }
 }

@@ -5,8 +5,9 @@
 //! Envelopes are the only protocol surface that parses peer bytes, and checking
 //! them needs no session or stream, so these runs stay pure and fast.
 
+use crate::protocol::Error;
 use crate::protocol::envelope::{Side, opaque};
-use crate::protocol::{ArkToHost, Error, HostToArk};
+use crate::protocol::schema::{ArkToHost, HostToArk};
 use crate::transport::MAX_MESSAGE_SIZE;
 use prost::Message as _;
 use prost::bytes::Bytes;

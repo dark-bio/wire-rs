@@ -9,7 +9,7 @@
 //! Every envelope contains either message content or an error. Only responses
 //! may contain errors.
 
-use crate::protocol::{ArkToHost, HostToArk, RemoteError, ark_to_host, host_to_ark};
+use crate::protocol::schema::{self, ArkToHost, HostToArk, ark_to_host, host_to_ark};
 use prost::Message as ProtobufMessage;
 use prost::bytes::Bytes;
 
@@ -78,7 +78,7 @@ impl Side {
     pub(super) fn encode(
         &self,
         id: u64,
-        body: Result<Message, RemoteError>,
+        body: Result<Message, schema::Error>,
     ) -> Result<Vec<u8>, Error> {
         match self {
             Self::Client => encode::<HostToArk>(id, body),
@@ -92,7 +92,7 @@ impl Side {
     pub(super) fn decode(
         &self,
         bytes: &[u8],
-    ) -> Result<(u64, Result<Message, RemoteError>), DecodeError> {
+    ) -> Result<(u64, Result<Message, schema::Error>), DecodeError> {
         match self {
             Self::Client => decode::<ArkToHost>(bytes),
             Self::Server => decode::<HostToArk>(bytes),
@@ -248,7 +248,7 @@ impl Drop for ByteCharge {
 }
 
 /// Builds an envelope and checks its size before allocating the encoded bytes.
-fn encode<E: Envelope>(id: u64, body: Result<Message, RemoteError>) -> Result<Vec<u8>, Error>
+fn encode<E: Envelope>(id: u64, body: Result<Message, schema::Error>) -> Result<Vec<u8>, Error>
 where
     E::Content: TryFrom<Message, Error = Error>,
 {
@@ -265,7 +265,7 @@ where
 
 /// Decodes an envelope, rejecting invalid protobuf or anything other than
 /// exactly one of content or error.
-fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Message, RemoteError>), DecodeError>
+fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Message, schema::Error>), DecodeError>
 where
     Message: From<E::Content>,
 {
@@ -331,10 +331,10 @@ trait Envelope: ProtobufMessage + Default {
     /// Assembles the ID, error and content in the order returned by
     /// [`Self::into_parts`]. This does not validate the field combination or
     /// classify the envelope as a request or response.
-    fn from_parts(id: u64, err: Option<RemoteError>, content: Option<Self::Content>) -> Self;
+    fn from_parts(id: u64, err: Option<schema::Error>, content: Option<Self::Content>) -> Self;
 
     /// Takes the envelope apart into its ID, error and content.
-    fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>);
+    fn into_parts(self) -> (u64, Option<schema::Error>, Option<Self::Content>);
 }
 
 impl Envelope for HostToArk {
@@ -342,12 +342,12 @@ impl Envelope for HostToArk {
     type Content = host_to_ark::Content;
 
     /// Assembles a host-to-Ark envelope without validating its fields.
-    fn from_parts(id: u64, err: Option<RemoteError>, content: Option<Self::Content>) -> Self {
+    fn from_parts(id: u64, err: Option<schema::Error>, content: Option<Self::Content>) -> Self {
         Self { id, err, content }
     }
 
     /// Takes the host-to-Ark envelope apart without validating its field combination.
-    fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
+    fn into_parts(self) -> (u64, Option<schema::Error>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }
@@ -357,12 +357,12 @@ impl Envelope for ArkToHost {
     type Content = ark_to_host::Content;
 
     /// Assembles an Ark-to-host envelope without validating its fields.
-    fn from_parts(id: u64, err: Option<RemoteError>, content: Option<Self::Content>) -> Self {
+    fn from_parts(id: u64, err: Option<schema::Error>, content: Option<Self::Content>) -> Self {
         Self { id, err, content }
     }
 
     /// Takes the Ark-to-host envelope apart without validating its field combination.
-    fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>) {
+    fn into_parts(self) -> (u64, Option<schema::Error>, Option<Self::Content>) {
         (self.id, self.err, self.content)
     }
 }

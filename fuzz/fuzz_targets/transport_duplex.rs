@@ -3,7 +3,7 @@
 
 #![no_main]
 
-use darkbio_wire::mock::duplex::{Scenario, run};
+use darkbio_wire::transport::mock::duplex::{Scenario, run};
 use libfuzzer_sys::fuzz_target;
 
 // Exercises two real transport peers with bounded buffers and actual deadline
@@ -11,7 +11,7 @@ use libfuzzer_sys::fuzz_target;
 // the native scheduler varies the interleaving on repeated executions.
 fuzz_target!(|scenarios: Vec<Scenario>| {
     #[cfg(getrandom_backend = "custom")]
-    darkbio_wire::mock::random::reseed("duplex-fuzz");
+    darkbio_wire::transport::mock::random::reseed("duplex-fuzz");
 
     // Deadline cases intentionally wait, so bound the work in each fuzz input.
     for scenario in scenarios.into_iter().take(2) {

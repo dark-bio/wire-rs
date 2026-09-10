@@ -9,8 +9,7 @@ use crate::protocol::operation::{OutgoingBody, OutgoingMessage};
 use crate::protocol::server::{ServerInner, SessionSource};
 use crate::protocol::session::SessionInner;
 use crate::protocol::{
-    Closer, Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder, Server,
-    Session,
+    Closer, Error, Message, Promise, Requester, Responder, Server, Session, schema,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Weak, mpsc};
@@ -74,10 +73,10 @@ fn write_error(error: Failure) -> Error {
 }
 
 /// Builds an application response from a body tag or an application error code.
-fn response(result: Result<u8, u64>) -> Result<Message, RemoteError> {
+fn response(result: Result<u8, u64>) -> Result<Message, schema::Error> {
     result
         .map(|tag| vec![tag].into())
-        .map_err(|code| RemoteError::new(code, "refused"))
+        .map_err(|code| schema::Error::new(code, "refused"))
 }
 
 /// Expected outgoing content, specified independently of the runtime queue types.
@@ -626,7 +625,7 @@ impl Driver {
                         panic!("expected an abandonment reply");
                     };
                     assert_eq!(actual, id);
-                    assert_eq!(error.code, ReservedErrors::Unanswered as u64);
+                    assert_eq!(error.code, schema::ReservedErrors::Unanswered as u64);
                     assert_eq!(error.msg, "request left unanswered");
                     outgoing.operation.record_write(Ok(()));
                 }
@@ -659,7 +658,7 @@ impl Driver {
                                 assert_eq!(error.code, code);
                                 assert_eq!(
                                     error.msg,
-                                    if code == ReservedErrors::Unanswered as u64 {
+                                    if code == schema::ReservedErrors::Unanswered as u64 {
                                         "request left unanswered"
                                     } else {
                                         "refused"
@@ -699,9 +698,9 @@ impl Driver {
             Step::AnswerOther(slot) => {
                 let outgoing = self.outgoing.remove(&slot).unwrap();
                 assert!(matches!(outgoing.body, OutgoingBody::Request(_)));
-                outgoing
-                    .operation
-                    .record_response(Ok(crate::protocol::DeviceInfoRequest::default().into()));
+                outgoing.operation.record_response(Ok(
+                    crate::protocol::schema::DeviceInfoRequest::default().into(),
+                ));
             }
             Step::Notify(slot, token) => self
                 .promises
