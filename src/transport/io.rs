@@ -22,8 +22,10 @@ pub trait Read: io::Read {
     /// Installs the deadline for subsequent reads until replaced; `None` clears
     /// it. Returns promptly, transfers no bytes and leaves the write deadline
     /// unchanged.
-    /// Reads attempted after expiration return `TimedOut`. If this setter fails,
-    /// transport returns the error without attempting a read.
+    /// Reads attempted after expiration must not wait. Adapters may return
+    /// immediately available bytes, EOF or an empty read, or report `TimedOut`.
+    /// Transport enforces its own deadline before calling the adapter. If this
+    /// setter fails, transport returns the error without attempting a read.
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()>;
 }
 

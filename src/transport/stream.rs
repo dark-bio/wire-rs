@@ -321,6 +321,31 @@ mod tests {
 
     const PATIENCE: Duration = Duration::from_secs(5);
 
+    // A memory reader can deliver ready bytes after its own deadline, but the
+    // transport must reject an expired attempt before consuming those bytes.
+    #[test]
+    fn test_memory_reader_keeps_transport_deadline() {
+        let (host, ark) = crate::memory::duplex(4);
+        let (_ark_read, mut ark_write) = ark.into_halves();
+        std::io::Write::write_all(&mut ark_write, b"abc").unwrap();
+        let (reader, _writer, closer, _) = host.into_parts();
+        let mut reader = ReadHalf {
+            inner: reader,
+            closer,
+        };
+        let mut bytes = [0; 3];
+        assert_eq!(
+            reader
+                .read(&mut bytes, Some(Instant::now()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(bytes, [0; 3]);
+        assert_eq!(reader.read(&mut bytes, None).unwrap(), 3);
+        assert_eq!(&bytes, b"abc");
+    }
+
     /// Adapter holding an admitted call until shutdown has been requested,
     /// then returning the result selected by the test.
     struct Adapter {

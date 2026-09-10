@@ -453,12 +453,12 @@ impl<R: Read, W: Write> Drop for Client<R, W> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::testing;
     use crate::transport::DEFAULT_WRITE_TIMEOUT;
     use crate::transport::framing::FrameWriter;
     use crate::transport::mock::{payload, self_attestation};
     use crate::transport::server::Server;
     use crate::transport::testing::Memory;
+    use crate::{memory, testing};
     use std::io::{self, Read as _};
     use std::sync::mpsc;
     use std::thread;
@@ -652,26 +652,21 @@ mod tests {
     fn test_senders() {
         testing::init_tracing();
 
-        // Echo every request over pipes, then hang up
-        let (ark_reader, host_writer) = testing::pipe();
-        let (host_reader, ark_writer) = testing::pipe();
+        // Echo every request over a bounded in-memory stream, then hang up
+        let (host, ark_stream) = memory::duplex(64 * 1024);
 
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
         let ark = thread::spawn(move || {
-            let mut server = Server::new(
-                Stream::new(ark_reader, ark_writer, || {}),
-                signer,
-                attestation,
-            );
+            let mut server = Server::new(ark_stream, signer, attestation);
             let mut sender = None;
             for _ in 0..100 {
                 let req = testing::served(&mut server, &mut sender).unwrap();
                 sender.as_ref().unwrap().send(&req).unwrap();
             }
         });
-        let mut client = Client::new(Stream::new(host_reader, host_writer, || {}));
+        let mut client = Client::new(host);
         let (sender, _) = client.connect(&identity).unwrap();
 
         // Send from a few threads at once while reading the echoes on this one
