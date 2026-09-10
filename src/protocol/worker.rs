@@ -31,7 +31,7 @@ pub(super) fn spawn(
         drop(guard);
     });
     if let Err(error) = result {
-        tracing::error!("could not start protocol worker: {error}");
+        tracing::error!("could not start protocol worker: {}", error);
         std::process::abort();
     }
 }
@@ -47,6 +47,7 @@ impl Drop for WorkerGuard {
     /// Aborts on panic; otherwise records exit after the task released its state.
     fn drop(&mut self) {
         if thread::panicking() {
+            tracing::error!("protocol worker panicked, aborting");
             std::process::abort();
         }
         #[cfg(any(test, feature = "fuzz"))]

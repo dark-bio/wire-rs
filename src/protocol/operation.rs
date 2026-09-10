@@ -7,6 +7,7 @@ use super::envelope::IncomingEnvelope;
 use super::promise::{PromiseResult, ResultSender};
 use super::session::SessionInner;
 use super::{Error, Message, RemoteError};
+use crate::LogId;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -48,6 +49,9 @@ pub(super) struct PendingOperation {
     pub(super) deadline: Instant,
     /// Channel that sends the result to this operation's promise.
     pub(super) sender: ResultSender,
+    /// Wire ID as a log label, distinct from the operation key. A reply has it
+    /// from queueing, a request from the moment the writer takes it.
+    pub(super) log_id: Option<LogId>,
 }
 
 impl PendingOperation {
@@ -82,13 +86,25 @@ impl PendingOperation {
     }
 
     /// Fails either a request or a reply promise, using `Timeout` if its deadline
-    /// has passed. If the promise was dropped, the result is discarded.
+    /// has passed. If the promise was dropped, the result is discarded. Timeouts
+    /// are logged here, whichever path detected them.
     pub(super) fn fail(self, error: Error, now: Instant) {
         let error = if now >= self.deadline {
             Error::Timeout
         } else {
             error
         };
+        if matches!(error, Error::Timeout) {
+            let kind = if self.sender.response {
+                "request"
+            } else {
+                "reply"
+            };
+            match self.log_id {
+                Some(id) => tracing::debug!("{} {} timed out", kind, id),
+                None => tracing::debug!("{} timed out before sending", kind),
+            }
+        }
         let _ = self.sender.send(Err(error));
     }
 }

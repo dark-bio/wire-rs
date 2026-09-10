@@ -7,6 +7,7 @@
 
 use super::framing::FrameWriter;
 use super::{Closer, Error, Sender, Write};
+use crate::LogId;
 use darkbio_crypto::xhpke;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -68,10 +69,15 @@ impl<W: Write> Outbound<W> {
     /// be written or accepted. The caller retains the context. The binding and
     /// idle senders hold weak references. This performs no crypto or stream I/O.
     /// Each handshake must supply a fresh allocation. Rebinding an ended context
-    /// would revive its old sender handles and is forbidden.
+    /// would revive its old sender handles and is forbidden. Every binding takes
+    /// the next log label, which the sender carries for its log lines.
     pub(crate) fn bind(self: &Arc<Self>, sealer: &Arc<Mutex<xhpke::Sender>>) -> Sender<W> {
         self.lock().bind(sealer);
-        Sender::new(Arc::downgrade(self), Arc::downgrade(sealer))
+        Sender::new(
+            Arc::downgrade(self),
+            Arc::downgrade(sealer),
+            crate::next_log_id(),
+        )
     }
 
     /// Ends this context's session while leaving any replacement session alone.
@@ -261,6 +267,7 @@ impl<W: Write> Writer<'_, W> {
         &mut self,
         sealer: &Arc<Mutex<xhpke::Sender>>,
         packet: &[u8],
+        log_id: LogId,
     ) -> Result<(), Error> {
         {
             let binding = self
@@ -275,6 +282,7 @@ impl<W: Write> Writer<'_, W> {
         let deadline = Instant::now() + self.outbound.timeout;
         if let Err(err) = self.framer.send_packet(packet, deadline) {
             if self.end(sealer) {
+                warn!("ending session {}: {}", log_id, err);
                 self.notify_failure(&err, deadline);
             }
             return Err(err);
@@ -297,7 +305,7 @@ impl<W: Write> Writer<'_, W> {
             && !matches!(error, Error::SendFailed(err) if err.kind() == io::ErrorKind::TimedOut)
             && let Err(err) = self.framer.send_dropped(deadline)
         {
-            warn!("failed to notify client of ended session: {}", err);
+            warn!("failed to signal dropped session: {}", err);
         }
     }
 }

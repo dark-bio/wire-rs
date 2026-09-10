@@ -1,6 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
+use crate::LogId;
 use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
@@ -16,7 +17,7 @@ use darkbio_crypto::{cbor, cose, cwt, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Device attestation presented during the handshake. The CWT must contain
 /// hardware or emulator claims as defined by darkbio-trust. Construction checks
@@ -111,6 +112,7 @@ pub struct Server<R: Read, W: Write, A: Attester> {
 
     handshake_timeout: Duration, // Budget for each new handshake attempt
     handshake_deadline: Option<Instant>, // Deadline of the handshake requested by a reset
+    log_id: LogId, // Label of the current session in log lines, unset before the first
 
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     timestamp: Option<i64>, // Test signing time for ArkHello; otherwise use the clock
@@ -133,6 +135,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             sealer: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             handshake_deadline: None,
+            log_id: LogId::default(),
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
         }
@@ -230,7 +233,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 
                     // Tell the client that the handshake did not establish a session
                     Err(err) => {
-                        warn!("wire handshake failed: {}", err);
+                        warn!("dropping wire handshake: {}", err);
                         if let Err(err) = self.outbound.send_dropped(Some(deadline)) {
                             warn!("failed to signal dropped handshake: {}", err);
                         }
@@ -241,8 +244,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // Report the completed handshake before reading messages.
                     // The caller can now send without waiting for a client request.
                     Ok((sender, receiver)) => {
-                        info!("new wire session established");
                         let sender = self.new_session(sender, receiver);
+                        info!("wire session {} established", self.log_id);
                         return Ok(Event::Connected(sender));
                     }
                 }
@@ -260,9 +263,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Err(err) => {
                     let ended = self.end_session();
                     if ended {
-                        warn!("invalid frame, resetting session: {}", err);
+                        warn!("ending session {}: {}", self.log_id, err);
                     } else {
-                        warn!("invalid frame: {}", err);
+                        debug!("discarding invalid frame outside session: {}", err);
                     }
                     self.send_dropped();
                     if ended {
@@ -275,8 +278,10 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 Ok(None) => {
                     self.handshake_deadline = Some(Instant::now() + self.handshake_timeout);
                     if self.end_session() {
+                        info!("wire session {} reset by host", self.log_id);
                         return Ok(Event::Disconnected);
                     }
+                    debug!("wire reset received, awaiting handshake");
                     continue;
                 }
                 // Valid COBS packet
@@ -284,7 +289,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             };
             let receiver = match self.receiver.as_mut() {
                 None => {
-                    warn!("dropping data outside session");
+                    debug!("discarding data outside session");
                     self.send_dropped();
                     continue;
                 }
@@ -297,19 +302,24 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 .as_ref()
                 .expect("receiver has a sending context");
             let opened = sealing::open(receiver, packet);
+            let undecryptable = opened.is_err();
             let message = match self.outbound.finish_receive(sealer, opened) {
                 Err(err) => {
-                    warn!("session receive failed, resetting session: {}", err);
+                    if undecryptable {
+                        warn!("ending session {}: {}", self.log_id, err);
+                    } else {
+                        debug!(
+                            "discarding message read after session {} ended",
+                            self.log_id
+                        );
+                    }
                     self.end_session();
                     self.send_dropped();
                     return Ok(Event::Disconnected);
                 }
                 Ok(message) => message,
             };
-            trace!(
-                "read host-to-ark message ({} bytes encrypted)",
-                packet.len()
-            );
+            trace!("received host-to-ark message ({} bytes)", packet.len());
             return Ok(Event::Message(message));
         }
     }
@@ -326,6 +336,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     fn new_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) -> Sender<W> {
         let sealer = Arc::new(Mutex::new(sender));
         let sender = self.outbound.bind(&sealer);
+        self.log_id = sender.log_id();
         self.receiver = Some(receiver);
         self.sealer = Some(sealer);
         sender
@@ -369,7 +380,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// The notification gets its own frame budget. Another thread can use the
     /// Closer to cancel output earlier.
     pub fn disconnect(&mut self) {
-        self.end_session();
+        if self.end_session() {
+            debug!("wire session {} dropped locally", self.log_id);
+        }
         self.send_dropped();
     }
 
@@ -447,7 +460,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             // Message 3: Read and open HostAck. An empty frame is another reset;
             // discard this attempt and wait for the next HostHello.
             let Some(packet) = self.reader.next_packet(Some(deadline))? else {
-                warn!("session reset during handshake");
+                debug!("wire reset received during handshake");
                 continue;
             };
             let host_ack: handshake::HostAck = cose::open(

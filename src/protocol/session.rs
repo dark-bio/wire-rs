@@ -13,6 +13,7 @@ use super::{
     Closer, DEFAULT_ABANDONMENT_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
     Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder,
 };
+use crate::LogId;
 use crate::transport::{self, Read, Stream, Verifier, Write};
 use prost::bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -190,6 +191,8 @@ pub(super) struct SessionInner {
     retained_bytes: Arc<AtomicUsize>,
     /// Envelope direction and request parity, fixed for the whole session.
     side: Side,
+    /// Label of the transport session in log lines, unset without a transport.
+    pub(super) log_id: LogId,
     /// Closes the client's stream. Server sessions and tests without a stream
     /// leave this empty; a server's stream is closed by `Server`.
     stream_closer: Option<transport::Closer>,
@@ -254,6 +257,7 @@ impl SessionInner {
     /// Creates empty queues and pending-operation maps before starting workers.
     fn new(
         side: Side,
+        log_id: LogId,
         stream_closer: Option<transport::Closer>,
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
@@ -277,6 +281,7 @@ impl SessionInner {
             changed: Condvar::new(),
             retained_bytes: Arc::new(AtomicUsize::new(0)),
             side,
+            log_id,
             stream_closer,
             #[cfg(any(test, feature = "fuzz"))]
             workers,
@@ -321,7 +326,14 @@ impl SessionInner {
             } else {
                 None
             };
-            error.and_then(|error| state.close(error, self.now()))
+            error.and_then(|error| {
+                let (pending, queued) = state.workload();
+                let removed = state.close(error.clone(), self.now());
+                if removed.is_some() {
+                    self.log_closed(&error, pending, queued);
+                }
+                removed
+            })
         };
         if removed.is_some() {
             self.finish_close(removed);
@@ -383,11 +395,42 @@ impl SessionInner {
     /// Expired operations receive `Timeout`; the rest receive the closing error.
     /// Every call wakes `changed` and finishes any required stream shutdown.
     pub(super) fn close(&self, error: Error) {
-        let removed = {
+        let (removed, pending, queued) = {
             let mut state = self.state.lock().expect("session state not poisoned");
-            state.close(error, self.now())
+            let (pending, queued) = state.workload();
+            (state.close(error.clone(), self.now()), pending, queued)
         };
+        if removed.is_some() {
+            self.log_closed(&error, pending, queued);
+        }
         self.finish_close(removed);
+    }
+
+    /// Logs the end of the session with its reason, the operations it failed
+    /// and the messages it dropped. Orderly endings are informational.
+    fn log_closed(&self, error: &Error, pending: usize, queued: usize) {
+        match error {
+            Error::Closed => tracing::info!(
+                "wire session {} closed locally (pending {}, queued {})",
+                self.log_id,
+                pending,
+                queued
+            ),
+            _ if error.orderly() => tracing::info!(
+                "wire session {} closed: {} (pending {}, queued {})",
+                self.log_id,
+                error.reason(),
+                pending,
+                queued
+            ),
+            _ => tracing::warn!(
+                "wire session {} failed: {} (pending {}, queued {})",
+                self.log_id,
+                error.reason(),
+                pending,
+                queued
+            ),
+        }
     }
 
     /// Drops queued work and wakes waiters outside the session lock.
@@ -417,6 +460,8 @@ impl SessionInner {
                 State::Closed(_) => return,
             }
         };
+        tracing::debug!("answering request {} as unanswered", id);
+
         // Fix this reply's deadline at drop. Later changes to the session's
         // configuration do not retime already submitted work.
         let deadline = now.checked_add(timeout).unwrap_or(now);
@@ -440,7 +485,11 @@ impl SessionInner {
         let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, true);
         self.enqueue(
             OutgoingBody::Request(request),
-            PendingOperation { deadline, sender },
+            PendingOperation {
+                deadline,
+                sender,
+                log_id: None,
+            },
         )?;
         Ok(promise)
     }
@@ -456,7 +505,11 @@ impl SessionInner {
         let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, false);
         self.enqueue(
             OutgoingBody::Reply { id, result },
-            PendingOperation { deadline, sender },
+            PendingOperation {
+                deadline,
+                sender,
+                log_id: Some(LogId::from(id)),
+            },
         )?;
         Ok(promise)
     }
@@ -658,14 +711,23 @@ impl SessionInner {
                         };
                         return Err(error.clone());
                     };
-                    if let Some(key) = outstanding.remove(&header.id)
-                        && let Some(operation) = operations.remove(&key)
-                    {
-                        operation.complete_response(self.now(), || {
-                            self.retain_incoming(bytes, header, *max_inbound_bytes)
-                        })?;
+                    // A sent request keeps its ID here until answered, so an ID
+                    // without an operation belongs to a request that timed out
+                    if let Some(key) = outstanding.remove(&header.id) {
+                        if let Some(operation) = operations.remove(&key) {
+                            tracing::trace!(
+                                "received response {} ({})",
+                                header.id,
+                                header.payload.unwrap_or("none")
+                            );
+                            operation.complete_response(self.now(), || {
+                                self.retain_incoming(bytes, header, *max_inbound_bytes)
+                            })?;
+                        } else {
+                            tracing::debug!("discarding late response {}", header.id);
+                        }
                     } else {
-                        tracing::warn!("discarding unmatched response (id: {})", header.id);
+                        tracing::warn!("discarding unmatched response {}", header.id);
                     }
                 }
             }
@@ -706,14 +768,18 @@ impl SessionInner {
         }
         if reserved_ids.len() >= *max_inbound_requests {
             tracing::warn!(
-                "inbound request limit exceeded (id: {id}, used: {}, limit: {max_inbound_requests})",
+                "inbound request limit exceeded (id: {}, used: {}, limit: {})",
+                id,
                 reserved_ids.len(),
+                max_inbound_requests
             );
             return Err(Error::InboundRequestLimitExceeded(*max_inbound_requests));
         }
+        let payload = header.payload.unwrap_or("none");
         let message = self.retain_incoming(bytes, header, *max_inbound_bytes)?;
         reserved_ids.insert(id);
         incoming.push_back((id, message));
+        tracing::trace!("received request {} ({})", id, payload);
         Ok(())
     }
 
@@ -730,6 +796,7 @@ impl SessionInner {
                 outgoing,
                 next_id,
                 outstanding,
+                operations,
                 reserved_ids,
                 ..
             } = &mut *state
@@ -744,6 +811,9 @@ impl SessionInner {
                         // Store the ID before releasing the lock: a response can
                         // arrive before the outgoing send finishes locally.
                         outstanding.insert(id, outgoing.operation.key.clone());
+                        if let Some(operation) = operations.get_mut(&outgoing.operation.key) {
+                            operation.log_id = Some(LogId::from(id));
+                        }
                         id
                     }
                     OutgoingBody::Reply { id, .. } => {
@@ -770,19 +840,30 @@ impl SessionInner {
             // next_outgoing() released the state lock. The reader and deadline
             // worker can continue while encoding or sending this message blocks.
             let request = matches!(outgoing.body, OutgoingBody::Request(_));
+            let kind = if request { "request" } else { "reply" };
             let body = match outgoing.body {
                 OutgoingBody::Request(body) => Ok(body),
                 OutgoingBody::Reply { result, .. } => result,
             };
-            let result = self
-                .side
-                .encode(id, body)
-                .and_then(|bytes| sender.send(&bytes).map_err(Error::from));
-            if let Err(Error::Transport(error)) = &result {
-                // Wire failure ends the session even if this operation's promise
-                // has already timed out while the transport write was blocked.
-                self.close(Error::Transport(error.clone()));
-                break;
+            let payload = match &body {
+                Ok(message) => message.field_name(),
+                Err(_) => "err",
+            };
+            let result = self.side.encode(id, body).and_then(|bytes| {
+                // Announced before the transport confirms the write, so a
+                // message reads top down in the log
+                tracing::trace!("sending {} {} ({})", kind, id, payload);
+                sender.send(&bytes).map_err(Error::from)
+            });
+            match &result {
+                Ok(()) => {}
+                Err(Error::Transport(error)) => {
+                    // Wire failure ends the session even if this operation's promise
+                    // has already timed out while the transport write was blocked.
+                    self.close(Error::Transport(error.clone()));
+                    break;
+                }
+                Err(error) => tracing::debug!("not sending {} {}: {}", kind, id, error),
             }
             {
                 // Remaining failures are local encoding refusals. No request was
@@ -807,7 +888,11 @@ impl SessionInner {
         // Disconnect the session this sender belongs to. The transport ignores
         // this call if a new handshake has already replaced that session.
         if let Err(error) = sender.disconnect() {
-            tracing::debug!("could not send protocol session disconnect: {error}");
+            tracing::debug!(
+                "failed to signal dropped session {}: {}",
+                sender.log_id(),
+                error
+            );
         }
     }
 
@@ -854,6 +939,7 @@ impl Session {
         let session = Self {
             inner: Arc::new(SessionInner::new(
                 side,
+                sender.log_id(),
                 stream_closer,
                 #[cfg(any(test, feature = "fuzz"))]
                 workers.clone(),
@@ -878,6 +964,19 @@ impl Session {
 }
 
 impl State {
+    /// Counts the pending operations and the queued messages of an open session.
+    fn workload(&self) -> (usize, usize) {
+        match self {
+            Self::Open {
+                operations,
+                outgoing,
+                incoming,
+                ..
+            } => (operations.len(), outgoing.len() + incoming.len()),
+            Self::Closed(_) => (0, 0),
+        }
+    }
+
     /// Stops accepting messages and fails pending operations under the session lock.
     /// Returns the old queues to be dropped after releasing the lock.
     fn close(&mut self, error: Error, now: Instant) -> Option<Self> {
@@ -940,6 +1039,7 @@ impl Session {
         Self {
             inner: Arc::new(SessionInner::new(
                 side,
+                LogId::default(),
                 None,
                 Arc::new(worker::Tracker::default()),
             )),
