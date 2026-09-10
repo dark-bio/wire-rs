@@ -125,6 +125,7 @@ pub fn run(actions: &[Action]) {
                 let count = budget % 8 + 1;
                 for id in 0..count {
                     steps.push(Step::Request(local, id, value.wrapping_add(id), 3000));
+                    steps.push(Step::Notify(id, id));
                 }
                 for id in 0..count {
                     steps.push(Step::Read(
@@ -149,6 +150,7 @@ pub fn run(actions: &[Action]) {
                     };
                     steps.extend([
                         Step::Send(wire, body),
+                        Step::Notified(id),
                         Step::Answer(id, result),
                         Step::Send(wire, content.clone()),
                     ]);
@@ -174,7 +176,9 @@ pub fn run(actions: &[Action]) {
                     } else {
                         steps.extend([
                             Step::Reply(id, id, Ok(value), 3000),
+                            Step::NotifyWrite(id, id),
                             Step::Read(wire, content.clone()),
+                            Step::Notified(id),
                             Step::Written(id, Ok(())),
                         ]);
                     }
@@ -187,6 +191,8 @@ pub fn run(actions: &[Action]) {
                     } else {
                         Step::Oversized(local, 0)
                     },
+                    Step::Notify(0, 0),
+                    Step::Notified(0),
                     Step::Answer(
                         0,
                         Err(if value & 1 == 0 {
@@ -208,6 +214,8 @@ pub fn run(actions: &[Action]) {
                     } else {
                         Step::OversizedReply(0, 0)
                     },
+                    Step::NotifyWrite(0, 0),
+                    Step::Notified(0),
                     Step::Written(
                         0,
                         Err(if value & 1 == 0 {
@@ -243,9 +251,11 @@ pub fn run(actions: &[Action]) {
                         },
                     ),
                     Step::Blocked(outgoing, op),
+                    Step::Notify(0, 0),
                 ]);
                 if timeout {
                     steps.extend([
+                        Step::Notified(0),
                         Step::Answer(0, Err(Failure::Timeout)),
                         Step::Pause(outgoing, op, false),
                     ]);
@@ -256,6 +266,7 @@ pub fn run(actions: &[Action]) {
                 ]);
                 if !timeout {
                     steps.extend([
+                        Step::Notified(0),
                         Step::Answer(0, Ok(value.wrapping_add(1))),
                         Step::Pause(outgoing, op, false),
                     ]);
@@ -269,6 +280,8 @@ pub fn run(actions: &[Action]) {
                     Step::Pause(outgoing, Operation::Flush, true),
                     Step::Reply(0, 0, Ok(value.wrapping_add(1)), 50 + u64::from(budget % 10)),
                     Step::Blocked(outgoing, Operation::Flush),
+                    Step::NotifyWrite(0, 0),
+                    Step::Notified(0),
                     Step::Written(0, Err(Failure::Timeout)),
                     Step::Read(peer, answer.clone()),
                     Step::Pause(outgoing, Operation::Flush, false),

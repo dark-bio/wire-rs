@@ -11,8 +11,8 @@
 //! against those predictions. Any difference panics.
 
 use super::{
-    CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, TIMESTAMP, frame, self_attestation, unframe,
-    would_block,
+    CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, SCRIPT_HANDSHAKE_TIMEOUT, TIMESTAMP, frame,
+    self_attestation, unframe, would_block,
 };
 use crate::transport::Read;
 use crate::transport::handshake;
@@ -1030,7 +1030,8 @@ pub fn run(steps: &[Step]) -> Summary {
         signer,
         attestation,
         TIMESTAMP,
-    );
+    )
+    .set_handshake_timeout(SCRIPT_HANDSHAKE_TIMEOUT);
 
     let mut sender = None;
     let mut retained = None;

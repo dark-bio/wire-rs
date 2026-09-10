@@ -8,9 +8,13 @@ FUZZ_TIME ?= 180
 FUZZ_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 FUZZ_SANITIZER ?= none
 
-# Routes every random draw through the seeded backend of the mocks, see
-# src/transport/mock/random.rs, for reproducible vectors and deterministic fuzzing.
-SEEDED = RUSTFLAGS='--cfg getrandom_backend="custom"'
+# Environment of the fuzz feature builds. Every random draw goes through the
+# seeded backend of the mocks, see src/transport/mock/random.rs, for reproducible
+# vectors and deterministic fuzzing. A musl host also links dynamically, as
+# libFuzzer's interceptors resolve the real libc functions with dlsym, which a
+# static musl binary cannot do.
+HOST_MUSL = $(findstring musl,$(shell rustc -vV | sed -n 's/^host: //p'))
+FUZZ_ENV = RUSTFLAGS='--cfg getrandom_backend="custom"$(if $(HOST_MUSL), -C target-feature=-crt-static)'
 
 # check runs the gates CI holds a push to, the formatting, clippy, the docs and
 # the tests of every feature combination.
@@ -45,14 +49,14 @@ fuzz-seeds:
 fuzz:
 	for target in $$(cargo +nightly fuzz list); do \
 		mkdir -p fuzz/corpus/$$target; \
-		$(SEEDED) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
+		$(FUZZ_ENV) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
 # fuzz-minimize uses set cover to retain coverage features with fewer inputs,
 # keeping a corpus grown by fuzz runs small before it is committed.
 fuzz-minimize:
 	for target in $$(cargo +nightly fuzz list); do \
-		$(SEEDED) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target -- -set_cover_merge=1 || exit 1; \
+		$(FUZZ_ENV) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target -- -set_cover_merge=1 || exit 1; \
 	done
 
 # fuzz-loop runs the fuzz targets round robin until a finding stops it or the
@@ -68,5 +72,5 @@ fuzz-loop:
 # directory.
 vectors:
 	rm -rf vectors/client
-	$(SEEDED) CARGO_TARGET_DIR=target/vectors \
+	$(FUZZ_ENV) CARGO_TARGET_DIR=target/vectors \
 		WIRE_VECTORS=$(CURDIR)/vectors cargo test --quiet --features fuzz mock::server

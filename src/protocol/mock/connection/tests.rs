@@ -294,7 +294,9 @@ fn test_deadline_during_write() {
             &[
                 Pause(outgoing, Operation::Write, true),
                 Request(local, 0, 10, 50),
+                Notify(0, 7),
                 Blocked(outgoing, Operation::Write),
+                Notified(7),
                 Answer(0, Err(Failure::Timeout)),
                 Outstanding(local, vec![id]),
                 Pause(outgoing, Operation::Write, false),
@@ -323,7 +325,9 @@ fn test_reply_deadline_during_flush() {
                 Receive(local, 10, 0),
                 Pause(outgoing, Operation::Flush, true),
                 Reply(0, 0, Ok(20), 50),
+                NotifyWrite(0, 7),
                 Blocked(outgoing, Operation::Flush),
+                Notified(7),
                 Written(0, Err(Failure::Timeout)),
                 Read(request, EnvelopeShape::Content(20)),
                 Pause(outgoing, Operation::Flush, false),
@@ -346,11 +350,40 @@ fn test_response_before_send_completion() {
             &[
                 Pause(outgoing, Operation::Flush, true),
                 Request(local, 0, 10, 3000),
+                Notify(0, 7),
                 Blocked(outgoing, Operation::Flush),
                 Read(id, EnvelopeShape::Content(10)),
+                NoNotifications,
                 Send(id, EnvelopeShape::Content(20)),
+                Notified(7),
                 Answer(0, Ok(20)),
+                NoNotifications,
                 Pause(outgoing, Operation::Flush, false),
+            ],
+        );
+    }
+}
+
+/// A reply notifies only once the writer flushes, without any promise waiter.
+#[test]
+fn test_writer_notifications() {
+    use Step::*;
+    for (mode, local, request, outgoing) in [(Mode::Client, 0, 2, 0), (Mode::Server, 1, 1, 1)] {
+        run(
+            mode,
+            &[
+                Send(request, EnvelopeShape::Content(10)),
+                Receive(local, 10, 0),
+                Pause(outgoing, Operation::Flush, true),
+                Reply(0, 0, Ok(20), 3000),
+                NotifyWrite(0, 7),
+                Blocked(outgoing, Operation::Flush),
+                Read(request, EnvelopeShape::Content(20)),
+                NoNotifications,
+                Pause(outgoing, Operation::Flush, false),
+                Notified(7),
+                Written(0, Ok(())),
+                NoNotifications,
             ],
         );
     }

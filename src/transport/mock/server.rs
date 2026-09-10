@@ -11,8 +11,8 @@
 
 use super::vector::{Event, ReadError, Vector};
 use super::{
-    CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, Recorder, TIMESTAMP, cloud_attestation, frame,
-    self_attestation, trace, unframe, would_block,
+    CutPoint, MAX_STEPS, OVERSIZED_MESSAGE, Outbox, Recorder, SCRIPT_HANDSHAKE_TIMEOUT, TIMESTAMP,
+    cloud_attestation, frame, self_attestation, trace, unframe, would_block,
 };
 use crate::transport::handshake;
 use crate::transport::mock::payload;
@@ -1055,7 +1055,8 @@ pub fn run(steps: &[Step]) -> Summary {
         },
         outbox,
         || {},
-    ));
+    ))
+    .set_handshake_timeout(SCRIPT_HANDSHAKE_TIMEOUT);
 
     // Record the script for other client implementations to replay. Flag
     // intentional output failures for consumers that cannot inject them.

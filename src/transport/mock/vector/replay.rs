@@ -8,7 +8,7 @@
 
 use super::{Event, ReadError, Vector};
 use crate::transport::mock::server::check_session;
-use crate::transport::mock::{TIMESTAMP, unframe};
+use crate::transport::mock::{SCRIPT_HANDSHAKE_TIMEOUT, TIMESTAMP, unframe};
 use crate::transport::{
     CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Client, Error, handshake,
 };
@@ -132,7 +132,8 @@ pub fn run(vector: &Vector) {
             pending_error: None,
         },
         || {},
-    ));
+    ))
+    .set_handshake_timeout(SCRIPT_HANDSHAKE_TIMEOUT);
     let mut peer = Peer::new(vector);
     let mut sender = None;
     let mut retained = None;

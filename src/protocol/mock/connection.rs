@@ -143,6 +143,14 @@ enum Step {
     Abandon(u8),
 
     // Promise completion.
+    /// Registers a request promise to send a token without consuming its result.
+    Notify(u8, u8),
+    /// Registers a reply promise to send a token without consuming its result.
+    NotifyWrite(u8, u8),
+    /// Waits for a completion token without servicing deadlines or taking bytes.
+    Notified(u8),
+    /// Checks that no additional completion tokens have been queued.
+    NoNotifications,
     /// Waits for response delivery without consuming its buffered bytes.
     ResponseReceived(u8, u64),
     /// Reads the request's result channel directly, so its deadline worker must
@@ -331,6 +339,8 @@ struct Driver {
     promises: HashMap<u8, Promise<Message>>,
     /// Reply promises saved for later steps.
     writes: HashMap<u8, Promise<()>>,
+    /// Shared completion events, observed independently of the saved promises.
+    notifications: (mpsc::Sender<u8>, mpsc::Receiver<u8>),
 
     /// Gates that pause old writers before `Sender::disconnect()` while a new
     /// session connects.
@@ -401,6 +411,7 @@ impl Driver {
             responders: HashMap::new(),
             promises: HashMap::new(),
             writes: HashMap::new(),
+            notifications: mpsc::channel(),
 
             disconnects: HashMap::new(),
             workers: Vec::new(),
@@ -645,6 +656,20 @@ impl Driver {
             Step::Abandon(slot) => {
                 drop(self.responders.remove(&slot).unwrap());
             }
+            Step::Notify(slot, token) => self
+                .promises
+                .get_mut(&slot)
+                .unwrap()
+                .notify(self.notifications.0.clone(), token),
+            Step::NotifyWrite(slot, token) => self
+                .writes
+                .get_mut(&slot)
+                .unwrap()
+                .notify(self.notifications.0.clone(), token),
+            Step::Notified(token) => {
+                assert_eq!(self.notifications.1.recv_timeout(BUDGET).unwrap(), token)
+            }
+            Step::NoNotifications => assert!(self.notifications.1.try_recv().is_err()),
             Step::ResponseReceived(label, id) => {
                 self.states[&label].upgrade().unwrap().wait_response(id)
             }

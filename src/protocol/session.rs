@@ -5,7 +5,7 @@
 
 use super::envelope::{Header, IncomingEnvelope, MessageKind, Parity, Side};
 use super::operation::{
-    OperationHandle, OperationKey, OutgoingBody, OutgoingMessage, PendingOperation, ResultSender,
+    OperationHandle, OperationKey, OutgoingBody, OutgoingMessage, PendingOperation,
 };
 use super::promise::PromiseResult;
 use super::worker;
@@ -437,13 +437,10 @@ impl SessionInner {
         request: Message,
         deadline: Instant,
     ) -> Result<Promise<Message>, Error> {
-        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline);
+        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, true);
         self.enqueue(
             OutgoingBody::Request(request),
-            PendingOperation {
-                deadline,
-                sender: ResultSender::Response(sender),
-            },
+            PendingOperation { deadline, sender },
         )?;
         Ok(promise)
     }
@@ -456,13 +453,10 @@ impl SessionInner {
         result: Result<Message, RemoteError>,
         deadline: Instant,
     ) -> Result<Promise<()>, Error> {
-        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline);
+        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, false);
         self.enqueue(
             OutgoingBody::Reply { id, result },
-            PendingOperation {
-                deadline,
-                sender: ResultSender::Write(sender),
-            },
+            PendingOperation { deadline, sender },
         )?;
         Ok(promise)
     }
@@ -566,12 +560,9 @@ impl SessionInner {
         if now >= operation.deadline || result.is_err() {
             let operation = operations.remove(key).expect("operation held under lock");
             operation.fail(result.err().unwrap_or(Error::Timeout), now);
-        } else if matches!(operation.sender, ResultSender::Write(_)) {
+        } else if !operation.sender.response {
             let operation = operations.remove(key).expect("operation held under lock");
-            let ResultSender::Write(sender) = operation.sender else {
-                unreachable!()
-            };
-            let _ = sender.send(Ok(PromiseResult::Written));
+            let _ = operation.sender.send(Ok(PromiseResult::Written));
         }
     }
 
@@ -673,6 +664,8 @@ impl SessionInner {
                         operation.complete_response(self.now(), || {
                             self.retain_incoming(bytes, header, *max_inbound_bytes)
                         })?;
+                    } else {
+                        tracing::warn!("discarding unmatched response (id: {})", header.id);
                     }
                 }
             }
