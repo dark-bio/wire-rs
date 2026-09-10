@@ -515,14 +515,20 @@ pub fn run(actions: &[Action]) {
         if ended && !server {
             break;
         }
-        // A round trip fences previous inbound answers and proves that recoverable
-        // errors, late completions and stale handles left the current session usable.
+        // Round trips in both directions fence prior input and output. A request
+        // answer can arrive before its local flush returns; the reply's Written
+        // step also drains that flush before the next action arms an I/O gate.
         for step in [
             Step::Request(local, 0, value, 3000),
-            Step::Read(next, content),
-            Step::Send(next, answer),
+            Step::Read(next, content.clone()),
+            Step::Send(next, answer.clone()),
             Step::Answer(0, Ok(value.wrapping_add(1))),
             Step::Outstanding(local, vec![]),
+            Step::Send(peer, content),
+            Step::Receive(local, value, 0),
+            Step::Reply(0, 0, Ok(value.wrapping_add(1)), 3000),
+            Step::Read(peer, answer),
+            Step::Written(0, Ok(())),
         ] {
             script.push(step);
         }

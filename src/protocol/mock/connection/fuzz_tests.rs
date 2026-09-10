@@ -6,6 +6,35 @@
 use super::*;
 
 #[test]
+fn test_connection_fuzz_repeated_handshake_timeouts() {
+    // CI crash-448f502ce99548911982fe206e1b63f888716b00: a new flush gate must
+    // not catch the preceding action's output while injecting an ACK timeout.
+    let mut actions = vec![Action {
+        kind: Kind::ResponseBeforeFailure,
+        slot: 0,
+        value: 0,
+        budget: 173,
+    }];
+    actions.extend(
+        [
+            (255, 255, 173),
+            (255, 255, 255),
+            (173, 173, 173),
+            (0, 33, 173),
+            (173, 173, 173),
+            (173, 173, 173),
+        ]
+        .map(|(slot, value, budget)| Action {
+            kind: Kind::HandshakeFailure,
+            slot,
+            value,
+            budget,
+        }),
+    );
+    run(&actions);
+}
+
+#[test]
 fn test_connection_fuzz_sequences() {
     use Kind::*;
     for slot in 0..2 {
