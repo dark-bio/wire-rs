@@ -492,17 +492,20 @@ impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::testing;
+    #[cfg(unix)]
     use crate::testing::Socket;
     use crate::transport::mock::payload;
     use crate::transport::testing::Memory;
     use crate::transport::{Client, MAX_FRAME_SIZE, Verifier};
+    use crate::{memory, testing};
     use darkbio_cobs as cobs;
+    #[cfg(unix)]
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
 
     /// Self-signed attestation for a device that has not been onboarded.
@@ -568,6 +571,7 @@ mod tests {
     // response. The server's signal for a dropped session then surfaces on the
     // client as a reset, which a fresh handshake recovers from.
     #[test]
+    #[cfg(unix)]
     fn test_message_round_trip() {
         testing::init_tracing();
 
@@ -652,29 +656,19 @@ mod tests {
 
         let signer_key = xdsa::SecretKey::generate();
 
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
-        let ark_writer = Socket::new(ark_sock);
+        let (host, ark) = memory::duplex(64 * 1024);
 
         // Server side: serve handshakes until the transport drops. The client aborts
         // mid-handshake, so the server never delivers a message.
         let ark_thread = std::thread::spawn(move || {
             let attestation = self_attestation(&signer_key);
-            let mut server = Server::new(
-                Stream::new(ark_reader, ark_writer, || {}),
-                signer_key,
-                attestation,
-            );
+            let mut server = Server::new(ark, signer_key, attestation);
             let mut sender = None;
             testing::served(&mut server, &mut sender)
         });
 
         // Client side: refuse the attestation in the verifier.
-        let mut client = Client::new(Stream::new(
-            Socket::new(host_sock.try_clone().unwrap()),
-            Socket::new(host_sock),
-            || {},
-        ));
+        let mut client = Client::new(host);
         let result = client.connect(&Untrusting);
         assert!(result.is_err());
 
@@ -710,24 +704,14 @@ mod tests {
             hardware: &[xdsa::PublicKey],
             emulator: &[xdsa::PublicKey],
         ) -> Result<darkbio_trust::device::Device, Error> {
-            let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-            let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
-            let ark_writer = Socket::new(ark_sock);
+            let (host, ark) = memory::duplex(64 * 1024);
 
             let ark_thread = std::thread::spawn(move || {
-                let mut server = Server::new(
-                    Stream::new(ark_reader, ark_writer, || {}),
-                    signer_key,
-                    attestation,
-                );
+                let mut server = Server::new(ark, signer_key, attestation);
                 let mut sender = None;
                 testing::served(&mut server, &mut sender)
             });
-            let mut client = Client::new(Stream::new(
-                Socket::new(host_sock.try_clone().unwrap()),
-                Socket::new(host_sock),
-                || {},
-            ));
+            let mut client = Client::new(host);
             let result = client
                 .connect(&Roots { hardware, emulator })
                 .map(|(_, info)| info);
@@ -871,18 +855,12 @@ mod tests {
         let signer_pub = signer_key.public_key();
         let attestation = self_attestation(&signer_key);
 
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
-        let ark_writer = Socket::new(ark_sock);
+        let (host, ark) = memory::duplex(64 * 1024);
 
         // Server side: on the first request, push messages from a few threads
         // while waiting for the second request.
         let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(
-                Stream::new(ark_reader, ark_writer, || {}),
-                signer_key,
-                attestation,
-            );
+            let mut server = Server::new(ark, signer_key, attestation);
             let mut sender = None;
             testing::served(&mut server, &mut sender).unwrap();
 
@@ -904,11 +882,7 @@ mod tests {
         });
 
         // Client side: request the push, receive it all, then request the stop.
-        let mut client = Client::new(Stream::new(
-            Socket::new(host_sock.try_clone().unwrap()),
-            Socket::new(host_sock),
-            || {},
-        ));
+        let mut client = Client::new(host);
         let (sender, _) = client.connect(&signer_pub).unwrap();
         sender.send(&payload(1)).unwrap();
 

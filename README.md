@@ -15,7 +15,7 @@ This repository implements the wire protocol between an [Ark](https://dark.bio) 
 
 The wire keeps trust policy at its edges. The server takes an `Attester` producing the attestation to present to the client; the client takes a `Verifier` checking the attestation it received. A `Roots` verifier built on [darkbio-trust](https://github.com/dark-bio/trust-rs) accepts the Arks attested under a given set of hardware and emulator roots; which roots to trust, self-signing rules and recovery overrides stay with the consumer.
 
-This package does not concern itself with the underlying transport. Genuine Ark devices use USB bulk endpoints, emulators use websockets and tests use Unix sockets. Creating the underlying data-stream is the caller's task.
+This package does not concern itself with the underlying transport. Genuine Ark devices use USB bulk endpoints, emulators use websockets and tests use memory sockets. Creating the underlying data-stream is the caller's task.
 
 ## Stream assumptions
 
