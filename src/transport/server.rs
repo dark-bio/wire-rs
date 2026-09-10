@@ -131,8 +131,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             attester,
             receiver: None,
             sealer: None,
-            handshake_deadline: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            handshake_deadline: None,
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
         }

@@ -33,12 +33,23 @@ use std::time::Instant;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Step {
+    // Calls through the client and its senders.
     /// The client runs a handshake.
     Handshake,
     /// The client sends a request tagged by the byte.
     Send(u8),
+    /// Sends a message one byte over the conservative send limit.
+    SendOversized,
     /// The client reads the next message.
     Recv,
+    /// Retains the current sender separately, replacing any previously retained
+    /// handle. With no sender, clears the retained slot.
+    Retain,
+    /// Sends through the retained handle, which may belong to an earlier session.
+    /// Without a retained sender, the driver models refusal before any I/O.
+    SendRetained(u8),
+
+    // Handshake input.
     /// A valid ArkHello answering the latest HostHello. Junk if there was none.
     Hello,
     /// An ArkHello sealed to a key the client never had. Junk without a HostHello.
@@ -64,6 +75,8 @@ pub enum Step {
     /// An ArkHello carrying a cloud attestation instead of a device attestation.
     /// Junk without a HostHello to answer.
     HelloBadAttest,
+
+    // Session input.
     /// A sealed reply tagged by the byte. Junk without a session.
     Reply(u8),
     /// The last sealed reply, repeated. Nothing if none was sent yet.
@@ -74,6 +87,8 @@ pub enum Step {
     Garbage,
     /// The empty frame signaling a dropped session.
     Dropped,
+
+    // Malformed and partial frames.
     /// The bytes COBS encoded into a frame, decodable but meaningless.
     Junk(Vec<u8>),
     /// A frame failing COBS decoding.
@@ -88,10 +103,21 @@ pub enum Step {
     /// session; a handshake drains it and continues waiting for its ArkHello.
     /// Any preceding partial ArkHello belongs to the same oversized frame.
     Oversized,
+
+    // Read scheduling and faults.
+    /// Limits each read to this many bytes. Zero removes the limit.
+    Chunk(u8),
+    /// Batches up to this many frames into one read. Stops when a frame determines
+    /// the current call's result, or the next step needs a separate action.
+    Batch(u8),
     /// The read fails with `WouldBlock`.
     Yield,
     /// The read returns `Interrupted`. Framing retries without ending the call.
     Interrupt,
+    /// An adapter read returns an early timeout. Receiving retries without ending the session.
+    ReadTimeout,
+
+    // Write faults.
     /// The client's writes fail until a Heal step.
     Break,
     /// The client's writes work again.
@@ -99,24 +125,9 @@ pub enum Step {
     /// Cuts the next matching client write. If requested, all later writes fail
     /// until a Heal step.
     Cut { point: CutPoint, then_broken: bool },
-    /// Limits each read to this many bytes. Zero removes the limit.
-    Chunk(u8),
-    /// Batches up to this many frames into one read. Stops when a frame determines
-    /// the current call's result, or the next step needs a separate action.
-    Batch(u8),
-    /// Retains the current sender separately, replacing any previously retained
-    /// handle. With no sender, clears the retained slot.
-    Retain,
-    /// Sends through the retained handle, which may belong to an earlier session.
-    /// Without a retained sender, the driver models refusal before any I/O.
-    SendRetained(u8),
-    /// Sends a message one byte over the conservative send limit.
-    SendOversized,
     /// The next matching output operation expires after the selected prefix.
     /// The stream remains reusable after the failed send or handshake.
     Timeout(CutPoint),
-    /// An adapter read returns an early timeout. Receiving retries without ending the session.
-    ReadTimeout,
 }
 
 impl Step {
@@ -421,6 +432,14 @@ impl Server {
                 bytes.push(0x00);
                 (bytes, Frame::Oversized)
             }
+            Step::Chunk(n) => {
+                self.chunk = n as usize;
+                return;
+            }
+            Step::Batch(n) => {
+                self.batch = n as usize;
+                return;
+            }
             Step::Break => {
                 self.set_broken(true);
                 return;
@@ -440,14 +459,6 @@ impl Server {
             Step::Timeout(point) => {
                 self.cut = Some(point);
                 self.outbox.set_timeout(point);
-                return;
-            }
-            Step::Chunk(n) => {
-                self.chunk = n as usize;
-                return;
-            }
-            Step::Batch(n) => {
-                self.batch = n as usize;
                 return;
             }
             Step::Handshake

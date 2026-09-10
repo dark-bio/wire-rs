@@ -38,27 +38,34 @@ pub struct Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Kind {
+    // Session setup and policy.
     Open,
+    /// Changes both inbound limits, including below live usage.
+    InboundLimits,
+    AbandonmentTimeout,
+
+    // Requests and replies.
     Request,
     Receive,
+    /// Queues several requests before retrieving any of their bodies.
+    IncomingBatch,
     Reply,
     Abandon,
-    AbandonmentTimeout,
     Outgoing,
     Written,
     Answer,
-    Advance,
-    Expire,
+
+    // Promise completion and deadlines.
     Wait,
     DropPromise,
+    Advance,
+    Expire,
+
+    // Closure.
     Close,
     Drop,
     CloseServer,
     DropSource,
-    /// Changes both inbound limits, including below live usage.
-    InboundLimits,
-    /// Queues several requests before retrieving any of their bodies.
-    IncomingBatch,
 }
 
 /// Default abandonment budget of a fresh session, in script milliseconds.
@@ -78,15 +85,17 @@ struct Operation {
     session: usize,
     body: ExpectedMessage,
     deadline: u64,
+
+    queued: bool,
+    writing: bool,
+
     result: Option<Result<u8, Failure>>,
+    /// Encoded bytes held by this response until its promise is read or dropped.
+    response_bytes: usize,
     /// The driver still owns the promise, either directly or in a waiting job.
     retained: bool,
     /// A waiting job owns the promise until a later action collects its result.
     parked: bool,
-    queued: bool,
-    writing: bool,
-    /// Encoded bytes held by this response until its promise is read or dropped.
-    response_bytes: usize,
 }
 
 impl Operation {
@@ -114,16 +123,18 @@ impl Operation {
 
 #[derive(Default)]
 struct Model {
-    time: u64,
-    sessions: Vec<Session>,
-    operations: Vec<Operation>,
-    responders: Vec<Option<usize>>,
     server: Option<Failure>,
     source: bool,
     /// Acceptance owns the server until an attach or closure wakes it.
     accepting: bool,
     /// The server owner was dropped; its weak closer and source may remain.
     server_dropped: bool,
+
+    sessions: Vec<Session>,
+    responders: Vec<Option<usize>>,
+    operations: Vec<Operation>,
+
+    time: u64,
     steps: Vec<Step>,
 }
 
@@ -248,12 +259,14 @@ impl Model {
             session,
             body,
             deadline,
-            result: (deadline <= self.time).then_some(Err(Failure::Timeout)),
-            retained,
-            parked: false,
+
             queued: deadline > self.time,
             writing: false,
+
+            result: (deadline <= self.time).then_some(Err(Failure::Timeout)),
             response_bytes: 0,
+            retained,
+            parked: false,
         });
     }
 
@@ -324,6 +337,28 @@ impl Model {
                     });
                 }
             }
+            Kind::InboundLimits if !self.sessions.is_empty() && self.sessions[session].owner => {
+                let requests = usize::from(value);
+                let bytes = usize::from(budget);
+                self.sessions[session].max_requests = requests;
+                self.sessions[session].max_bytes = bytes;
+                self.steps
+                    .push(Step::InboundLimits(session as u8, requests, bytes));
+                if self.request_usage(session) > requests {
+                    self.close(session, Failure::Requests);
+                } else if self.byte_usage(session) > bytes {
+                    self.close(session, Failure::Bytes);
+                }
+            }
+            Kind::AbandonmentTimeout
+                if !self.sessions.is_empty() && self.sessions[session].owner =>
+            {
+                self.steps.push(Step::AbandonmentTimeout(
+                    session as u8,
+                    Duration::from_millis(u64::from(budget)),
+                ));
+                self.sessions[session].abandonment = u64::from(budget);
+            }
             Kind::Request if !self.sessions.is_empty() => {
                 if let Some(reason) = self.sessions[session].reason {
                     self.steps.push(Step::RefuseRequest(session as u8, reason));
@@ -355,19 +390,6 @@ impl Model {
                     && self.sessions[session].reason.is_none() =>
             {
                 self.incoming(session, budget % 4 + 1, value, false);
-            }
-            Kind::InboundLimits if !self.sessions.is_empty() && self.sessions[session].owner => {
-                let requests = usize::from(value);
-                let bytes = usize::from(budget);
-                self.sessions[session].max_requests = requests;
-                self.sessions[session].max_bytes = bytes;
-                self.steps
-                    .push(Step::InboundLimits(session as u8, requests, bytes));
-                if self.request_usage(session) > requests {
-                    self.close(session, Failure::Requests);
-                } else if self.byte_usage(session) > bytes {
-                    self.close(session, Failure::Bytes);
-                }
             }
             Kind::Reply | Kind::Abandon if !self.responders.is_empty() => {
                 if let Some(session) = self.responders[responder].take() {
@@ -411,15 +433,6 @@ impl Model {
                         );
                     }
                 }
-            }
-            Kind::AbandonmentTimeout
-                if !self.sessions.is_empty() && self.sessions[session].owner =>
-            {
-                self.steps.push(Step::AbandonmentTimeout(
-                    session as u8,
-                    Duration::from_millis(u64::from(budget)),
-                ));
-                self.sessions[session].abandonment = u64::from(budget);
             }
             Kind::Outgoing if !self.sessions.is_empty() && self.sessions[session].owner => {
                 self.expire(session);
@@ -538,14 +551,6 @@ impl Model {
                     }
                 }
             }
-            Kind::Advance => {
-                self.time += u64::from(budget);
-                self.steps.push(Step::Time(self.time));
-            }
-            Kind::Expire if !self.sessions.is_empty() && self.sessions[session].owner => {
-                self.expire(session);
-                self.steps.push(Step::Expire(session as u8));
-            }
             Kind::Wait
                 if !self.operations.is_empty()
                     && self.operations[operation].retained
@@ -573,6 +578,14 @@ impl Model {
                 } else {
                     Step::DropWritePromise(operation as u8)
                 });
+            }
+            Kind::Advance => {
+                self.time += u64::from(budget);
+                self.steps.push(Step::Time(self.time));
+            }
+            Kind::Expire if !self.sessions.is_empty() && self.sessions[session].owner => {
+                self.expire(session);
+                self.steps.push(Step::Expire(session as u8));
             }
             Kind::Close | Kind::Drop if !self.sessions.is_empty() => {
                 if kind == Kind::Drop && self.sessions[session].owner {

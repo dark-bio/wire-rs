@@ -116,12 +116,12 @@ impl PendingOperation {
 pub(super) struct OutgoingMessage {
     /// Request or reply to encode and send.
     pub(super) body: OutgoingBody,
+    /// Reports the write result to this message's operation.
+    pub(super) operation: OperationHandle,
     /// Deadline checked by scenarios. The live deadline worker reads the
     /// corresponding entry in the session's `operations` map instead.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) deadline: Instant,
-    /// Reports the write result to this message's operation.
-    pub(super) operation: OperationHandle,
 }
 
 /// Outgoing message before `Side::encode()` puts it in a wire envelope.

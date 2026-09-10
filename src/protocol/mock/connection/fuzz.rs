@@ -28,26 +28,33 @@ pub struct Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Kind {
+    // Requests, replies and local refusal.
     Pipeline,
     Incoming,
     Refusal,
+    ReplyRefusal,
+
+    // Deadlines and write completion.
     ResponseDuringFlush,
     RequestTimeout,
     ReplyTimeout,
+    QueuedTimeout,
+    ResponseBeforeFailure,
     ReuseDuringFlush,
+
+    // Invalid input and limits.
     Duplicate,
     Malformed,
+    /// Inbound limit or deferred decode failure, optionally with blocked output.
+    InboundFailure,
     Exhaust,
+
+    // Connection lifecycle and I/O failure.
     Replace,
     Disconnect,
     HandshakeFailure,
     Close,
     Fault,
-    ReplyRefusal,
-    QueuedTimeout,
-    ResponseBeforeFailure,
-    /// Inbound limit or deferred decode failure, optionally with blocked output.
-    InboundFailure,
 }
 
 /// Maximum actions run from one input, each driving several live exchanges.
@@ -216,6 +223,57 @@ pub fn run(actions: &[Action]) {
                     Step::Written(1, Ok(())),
                 ]);
             }
+            Kind::ResponseDuringFlush | Kind::RequestTimeout => {
+                let timeout = kind == Kind::RequestTimeout;
+                let op = if timeout && slot & 2 == 0 {
+                    Operation::Write
+                } else {
+                    Operation::Flush
+                };
+                steps.extend([
+                    Step::Pause(outgoing, op, true),
+                    Step::Request(
+                        local,
+                        0,
+                        value,
+                        if timeout {
+                            50 + u64::from(budget % 10)
+                        } else {
+                            3000
+                        },
+                    ),
+                    Step::Blocked(outgoing, op),
+                ]);
+                if timeout {
+                    steps.extend([
+                        Step::Answer(0, Err(Failure::Timeout)),
+                        Step::Pause(outgoing, op, false),
+                    ]);
+                }
+                steps.extend([
+                    Step::Read(next, content.clone()),
+                    Step::Send(next, answer.clone()),
+                ]);
+                if !timeout {
+                    steps.extend([
+                        Step::Answer(0, Ok(value.wrapping_add(1))),
+                        Step::Pause(outgoing, op, false),
+                    ]);
+                }
+                next += 2;
+            }
+            Kind::ReplyTimeout => {
+                steps.extend([
+                    Step::Send(peer, content.clone()),
+                    Step::Receive(local, value, 0),
+                    Step::Pause(outgoing, Operation::Flush, true),
+                    Step::Reply(0, 0, Ok(value.wrapping_add(1)), 50 + u64::from(budget % 10)),
+                    Step::Blocked(outgoing, Operation::Flush),
+                    Step::Written(0, Err(Failure::Timeout)),
+                    Step::Read(peer, answer.clone()),
+                    Step::Pause(outgoing, Operation::Flush, false),
+                ]);
+            }
             Kind::QueuedTimeout => {
                 // The blocked writer leaves both messages queued until expiry.
                 // Reusing the peer ID and the next local ID checks their cleanup.
@@ -273,57 +331,6 @@ pub fn run(actions: &[Action]) {
                     Step::Written(0, Err(Failure::Transport)),
                 ]);
                 ended = true;
-            }
-            Kind::ResponseDuringFlush | Kind::RequestTimeout => {
-                let timeout = kind == Kind::RequestTimeout;
-                let op = if timeout && slot & 2 == 0 {
-                    Operation::Write
-                } else {
-                    Operation::Flush
-                };
-                steps.extend([
-                    Step::Pause(outgoing, op, true),
-                    Step::Request(
-                        local,
-                        0,
-                        value,
-                        if timeout {
-                            50 + u64::from(budget % 10)
-                        } else {
-                            3000
-                        },
-                    ),
-                    Step::Blocked(outgoing, op),
-                ]);
-                if timeout {
-                    steps.extend([
-                        Step::Answer(0, Err(Failure::Timeout)),
-                        Step::Pause(outgoing, op, false),
-                    ]);
-                }
-                steps.extend([
-                    Step::Read(next, content.clone()),
-                    Step::Send(next, answer.clone()),
-                ]);
-                if !timeout {
-                    steps.extend([
-                        Step::Answer(0, Ok(value.wrapping_add(1))),
-                        Step::Pause(outgoing, op, false),
-                    ]);
-                }
-                next += 2;
-            }
-            Kind::ReplyTimeout => {
-                steps.extend([
-                    Step::Send(peer, content.clone()),
-                    Step::Receive(local, value, 0),
-                    Step::Pause(outgoing, Operation::Flush, true),
-                    Step::Reply(0, 0, Ok(value.wrapping_add(1)), 50 + u64::from(budget % 10)),
-                    Step::Blocked(outgoing, Operation::Flush),
-                    Step::Written(0, Err(Failure::Timeout)),
-                    Step::Read(peer, answer.clone()),
-                    Step::Pause(outgoing, Operation::Flush, false),
-                ]);
             }
             Kind::ReuseDuringFlush => {
                 steps.extend([
@@ -509,6 +516,24 @@ pub fn run(actions: &[Action]) {
                 ]);
                 ended = true;
             }
+            Kind::Replace if server => {
+                // Retain an unanswered request and a responder across replacement.
+                steps.extend([
+                    Step::Send(peer, content.clone()),
+                    Step::Receive(local, value, 0),
+                    Step::Request(local, 0, value, 3000),
+                    Step::Read(next, content.clone()),
+                    Step::Reconnect(local + 1),
+                    Step::Answer(0, Err(Failure::Transport)),
+                    Step::Abandon(0),
+                    Step::Close(local),
+                    Step::Refused(local),
+                    Step::Drop(local),
+                    Step::Released(local),
+                ]);
+                local += 1;
+                next = 2;
+            }
             Kind::Disconnect if server => {
                 // A writer paused before its disconnect must leave the session
                 // that replaced it connected.
@@ -544,24 +569,6 @@ pub fn run(actions: &[Action]) {
                 }
                 steps.extend([
                     Step::Reconnect(local + 1),
-                    Step::Close(local),
-                    Step::Refused(local),
-                    Step::Drop(local),
-                    Step::Released(local),
-                ]);
-                local += 1;
-                next = 2;
-            }
-            Kind::Replace if server => {
-                // Retain an unanswered request and a responder across replacement.
-                steps.extend([
-                    Step::Send(peer, content.clone()),
-                    Step::Receive(local, value, 0),
-                    Step::Request(local, 0, value, 3000),
-                    Step::Read(next, content.clone()),
-                    Step::Reconnect(local + 1),
-                    Step::Answer(0, Err(Failure::Transport)),
-                    Step::Abandon(0),
                     Step::Close(local),
                     Step::Refused(local),
                     Step::Drop(local),

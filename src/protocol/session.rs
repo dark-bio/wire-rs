@@ -182,12 +182,12 @@ impl Drop for Session {
 pub(super) struct SessionInner {
     /// Protects the queues, pending operations, and transition to `State::Closed`.
     state: Mutex<State>,
+    /// Wakes `recv()`, the writer, and the deadline worker when `state` changes.
+    changed: Condvar,
     /// Incoming bytes held by queued requests and unread responses. Accepting
     /// messages and changing limits hold `state`. Consumers can release bytes
     /// without that lock. Unread promises keep this counter alive after closure.
     retained_bytes: Arc<AtomicUsize>,
-    /// Wakes `recv()`, the writer, and the deadline worker when `state` changes.
-    changed: Condvar,
     /// Envelope direction and request parity, fixed for the whole session.
     side: Side,
     /// Closes the client's stream. Server sessions and tests without a stream
@@ -221,11 +221,16 @@ enum State {
         max_inbound_bytes: usize,
         /// Automatic reply lifetime selected when a responder is dropped.
         abandonment: Duration,
+
         /// Peer requests awaiting application receipt, paired with their request IDs.
         incoming: VecDeque<(u64, IncomingEnvelope)>,
-        /// Operations waiting to send a result to their promise. Each is removed
-        /// before sending that result, so a promise is completed only once.
-        operations: HashMap<OperationKey, PendingOperation>,
+        /// Rejects duplicate incoming IDs while the receive queue, responder,
+        /// or queued reply holds them. Taking a reply into the writer or
+        /// discarding an expired reply releases its ID. Release happens before
+        /// writing: the peer can receive the reply and reuse its ID before our
+        /// local flush returns.
+        reserved_ids: HashSet<u64>,
+
         /// Requests and replies waiting for the writer to take them.
         outgoing: VecDeque<OutgoingMessage>,
         /// Next locally allocated ID, or exhaustion. Never wraps or reuses an ID.
@@ -233,12 +238,10 @@ enum State {
         /// Maps outgoing request IDs to operation keys. Entries remain after
         /// a promise times out, until the peer responds or the session closes.
         outstanding: HashMap<u64, OperationKey>,
-        /// Rejects duplicate incoming IDs while the receive queue, responder,
-        /// or queued reply holds them. Taking a reply into the writer or
-        /// discarding an expired reply releases its ID. Release happens before
-        /// writing: the peer can receive the reply and reuse its ID before our
-        /// local flush returns.
-        reserved_ids: HashSet<u64>,
+        /// Operations waiting to send a result to their promise. Each is removed
+        /// before sending that result, so a promise is completed only once.
+        operations: HashMap<OperationKey, PendingOperation>,
+
         /// One-shot test notification sent under the state lock before waiting.
         #[cfg(any(test, feature = "fuzz"))]
         wait_hook: Option<std::sync::mpsc::Sender<()>>,
@@ -255,21 +258,24 @@ impl SessionInner {
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
         Self {
-            retained_bytes: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
                 abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
+
                 incoming: VecDeque::new(),
-                operations: HashMap::new(),
+                reserved_ids: HashSet::new(),
+
                 outgoing: VecDeque::new(),
                 next_id: Some(Parity::from(side).first()),
                 outstanding: HashMap::new(),
-                reserved_ids: HashSet::new(),
+                operations: HashMap::new(),
+
                 #[cfg(any(test, feature = "fuzz"))]
                 wait_hook: None,
             }),
             changed: Condvar::new(),
+            retained_bytes: Arc::new(AtomicUsize::new(0)),
             side,
             stream_closer,
             #[cfg(any(test, feature = "fuzz"))]
@@ -491,12 +497,12 @@ impl SessionInner {
             let key = OperationKey::new();
             outgoing.push_back(OutgoingMessage {
                 body,
-                #[cfg(any(test, feature = "fuzz"))]
-                deadline: operation.deadline,
                 operation: OperationHandle {
                     session: Arc::downgrade(self),
                     key: key.clone(),
                 },
+                #[cfg(any(test, feature = "fuzz"))]
+                deadline: operation.deadline,
             });
             operations.insert(key, operation);
         }

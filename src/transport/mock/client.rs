@@ -37,6 +37,7 @@ const PROBE_ID: u64 = u64::MAX;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Step {
+    // Handshake input.
     /// A lone zero, one empty frame.
     Reset,
     /// Two zeros, matching [`Client::connect`](crate::transport::Client::connect).
@@ -65,6 +66,8 @@ pub enum Step {
     /// A HostAck for the ArkHello last received with an encapsulated key of
     /// the wrong size. Junk if there is none.
     AckBadEncap,
+
+    // Session input.
     /// A sealed request tagged by the byte. Junk without a session.
     Request(u8),
     /// The last sealed request sent, repeated. Nothing if none was sent yet.
@@ -74,6 +77,8 @@ pub enum Step {
     RequestTampered,
     /// A sealed packet that is not a protobuf message. Junk without a session.
     Garbage,
+
+    // Malformed and partial frames.
     /// Arbitrary frame bytes, with zeros replaced and an empty input padded.
     /// The model expects rejection during framing, key validation, or decryption.
     Junk(Vec<u8>),
@@ -87,23 +92,8 @@ pub enum Step {
     /// as soon as the limit is exceeded, ending any session or handshake. Its
     /// remaining bytes and any partial hello in front are discarded together.
     Oversized,
-    /// The read fails with `WouldBlock`, handing control back to the driver.
-    Yield,
-    /// The read returns `Interrupted`. Framing retries without a server event.
-    Interrupt,
-    /// The server's writes fail until a Heal step.
-    Break,
-    /// The server's writes work again.
-    Heal,
-    /// Cuts the next matching server write. If requested, all later writes fail
-    /// until a Heal step.
-    Cut { point: CutPoint, then_broken: bool },
-    /// Limits each read to this many bytes. Zero removes the limit.
-    Chunk(u8),
-    /// Batches up to this many steps into one read. Stops at a step that produces
-    /// a receive event, so the driver handles it before the model advances again.
-    /// A step that queues no frames also ends the batch.
-    Batch(u8),
+
+    // Calls through the server and its senders.
     /// Retains the server's current sender separately, replacing any previously
     /// retained handle. Without a current sender, clears the retained slot.
     Retain,
@@ -117,11 +107,32 @@ pub enum Step {
     /// Ends the server's session locally and signals the client. No local
     /// disconnection event is expected; the stream can establish another session.
     Disconnect,
+
+    // Read scheduling and faults.
+    /// Limits each read to this many bytes. Zero removes the limit.
+    Chunk(u8),
+    /// Batches up to this many steps into one read. Stops at a step that produces
+    /// a receive event, so the driver handles it before the model advances again.
+    /// A step that queues no frames also ends the batch.
+    Batch(u8),
+    /// The read fails with `WouldBlock`, handing control back to the driver.
+    Yield,
+    /// The read returns `Interrupted`. Framing retries without a server event.
+    Interrupt,
+    /// An adapter read returns an early timeout; the server keeps waiting without a transition.
+    ReadTimeout,
+
+    // Write faults.
+    /// The server's writes fail until a Heal step.
+    Break,
+    /// The server's writes work again.
+    Heal,
+    /// Cuts the next matching server write. If requested, all later writes fail
+    /// until a Heal step.
+    Cut { point: CutPoint, then_broken: bool },
     /// The next matching output operation expires after the selected prefix,
     /// leaving no budget for a failure notification on that operation.
     Timeout(CutPoint),
-    /// An adapter read returns an early timeout; the server keeps waiting without a transition.
-    ReadTimeout,
 }
 
 impl Step {
@@ -606,16 +617,8 @@ impl Client {
                 self.bytes.resize(self.bytes.len() + MAX_FRAME_SIZE + 1, 1);
                 self.bytes.push(0x00);
             }
-            Step::Yield
-            | Step::Interrupt
-            | Step::ReadTimeout
-            | Step::Retain
-            | Step::Send(_)
-            | Step::SendRetained(_)
-            | Step::SendOversized
-            | Step::Disconnect => {
-                unreachable!("control steps are handled by the reader and driver")
-            }
+            Step::Chunk(n) => self.chunk = n as usize,
+            Step::Batch(n) => self.batch = n as usize,
             Step::Break => self.set_broken(true),
             Step::Heal => self.set_broken(false),
             Step::Cut { point, then_broken } => {
@@ -631,8 +634,16 @@ impl Client {
                 self.timeout = true;
                 self.outbox.set_timeout(point);
             }
-            Step::Chunk(n) => self.chunk = n as usize,
-            Step::Batch(n) => self.batch = n as usize,
+            Step::Yield
+            | Step::Interrupt
+            | Step::ReadTimeout
+            | Step::Retain
+            | Step::Send(_)
+            | Step::SendRetained(_)
+            | Step::SendOversized
+            | Step::Disconnect => {
+                unreachable!("control steps are handled by the reader and driver")
+            }
         }
     }
 

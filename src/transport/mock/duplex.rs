@@ -35,13 +35,10 @@ const HANDSHAKE_CAPACITY: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Scenario {
-    /// Reconnect while server output is blocked, optionally with client output
-    /// blocked too. Old writes may time out before the sequential handshake.
-    Reconnect { both_directions: bool },
-    /// Drain at least 33 legitimate old messages before a new handshake.
-    Backlog(u8),
-    /// A server message times out during its write or flush, then the stream recovers.
-    ServerTimeout { flush: bool },
+    // Handshake failures and recovery.
+    /// Fail reset output or the following reply read, then retry on the same
+    /// stream. Each phase runs sequentially without a companion operation.
+    FailedPrelude { read: bool },
     /// Fail ArkHello or HostAck output, then retry. Lost replies must expire
     /// the client's handshake without another fault to rescue its read.
     HandshakeFailure {
@@ -49,9 +46,6 @@ pub enum Scenario {
         flush: bool,
         timeout: bool,
     },
-    /// Fail reset output or the following reply read, then retry on the same
-    /// stream. Each phase runs sequentially without a companion operation.
-    FailedPrelude { read: bool },
     /// Alternate read and write failures across reconnect attempts.
     RepeatedAttempts(u8),
     /// Retry an abandoned handshake while its old ArkHello is still blocked,
@@ -62,6 +56,16 @@ pub enum Scenario {
     /// Continuous resets on the server or junk on the client must not refresh
     /// the handshake deadline. Stop the noise and recover on the same stream.
     HandshakeNoise { server: bool },
+
+    // Established sessions and reconnects.
+    /// Reconnect while server output is blocked, optionally with client output
+    /// blocked too. Old writes may time out before the sequential handshake.
+    Reconnect { both_directions: bool },
+    /// Drain at least 33 legitimate old messages before a new handshake.
+    Backlog(u8),
+    /// A server message times out during its write or flush, then the stream recovers.
+    ServerTimeout { flush: bool },
+
     /// Either peer closes while both are reading, during a handshake or session.
     Shutdown { handshake: bool, server: bool },
 }
@@ -592,6 +596,194 @@ pub fn run(scenario: Scenario) {
     super::seed::seed(super::seed::TRANSPORT_DUPLEX, &[scenario]);
 
     match scenario {
+        Scenario::FailedPrelude { read } => {
+            let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, FAULT_TIMEOUT);
+            peers.fail_prelude(read);
+            let (client, server) = peers.connect();
+            peers.round_trip(&client, &server);
+        }
+        Scenario::HandshakeFailure {
+            ack,
+            flush,
+            timeout,
+        } => {
+            let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
+            let (client, server) = peers.connect();
+            let mut old = vec![client, server];
+            let operation = if flush {
+                Operation::Flush
+            } else {
+                Operation::Write
+            };
+            let pipe = if ack {
+                &peers.outgoing
+            } else {
+                &peers.incoming
+            };
+            let after_flushes = pipe.state.lock().unwrap().flushes + if ack { 2 } else { 0 };
+            let kind = if timeout {
+                FaultKind::Timeout
+            } else {
+                FaultKind::Error(io::ErrorKind::Other)
+            };
+            pipe.fault(operation, after_flushes, kind);
+            if timeout && !ack {
+                // Model a reply the client cannot read, even if all bytes were
+                // accepted before flush failed. Only its own deadline releases it.
+                peers.incoming.pause(Operation::Read, true);
+            }
+            let first = peers.client.connect(&peers.identity);
+            if ack {
+                let expected = if timeout {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::Other
+                };
+                assert!(matches!(first, Err(Error::SendFailed(ref err)) if err.kind() == expected));
+            } else if timeout || !flush {
+                assert!(
+                    matches!(first, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
+                );
+            } else {
+                // ArkHello can arrive before its flush fails; local connect
+                // success does not imply that the server accepted the ACK.
+                assert!(
+                    first.is_ok()
+                        || matches!(first, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
+                );
+            }
+            if let Ok((sender, _)) = first {
+                old.push(sender);
+            }
+            assert!(matches!(peers.event(), Event::Disconnected));
+            if !ack {
+                let expected = if timeout {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::Other
+                };
+                assert!(matches!(
+                    peers.events.recv_timeout(PATIENCE).unwrap(),
+                    Err(Error::SendFailed(err)) if err.kind() == expected
+                ));
+            }
+            peers.incoming.pause(Operation::Read, false);
+            peers.recover(&old);
+        }
+        Scenario::RepeatedAttempts(count) => {
+            let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, FAULT_TIMEOUT);
+            for attempt in 0..2 + usize::from(count % 3) {
+                peers.fail_prelude(attempt % 2 == 0);
+                let (client, server) = peers.connect();
+                peers.round_trip(&client, &server);
+            }
+        }
+        Scenario::AbandonedHello => {
+            let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, WRITE_TIMEOUT);
+            peers.incoming.pause(Operation::Read, true);
+            let client = &mut peers.client;
+            let identity = &peers.identity;
+            let incoming = &peers.incoming;
+            thread::scope(|scope| {
+                let connecting = scope.spawn(|| client.connect(identity));
+                incoming.wait_blocked(Operation::Write);
+                incoming.fault(Operation::Read, 0, FaultKind::Error(io::ErrorKind::Other));
+                incoming.pause(Operation::Read, false);
+                assert!(matches!(
+                    connecting.join().unwrap(),
+                    Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::Other
+                ));
+            });
+
+            // The server is still sending ArkHello to the abandoned client keys.
+            // That output must drain before the server can read the new hello.
+            let (client, server) = peers.connect();
+            assert_eq!(peers.incoming.state.lock().unwrap().flushes, 2);
+            peers.round_trip(&client, &server);
+        }
+        Scenario::SilentHandshake { ack } => {
+            let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
+            let (client, server) = peers.connect();
+            let started = Instant::now();
+            if ack {
+                let after_flushes = peers.outgoing.state.lock().unwrap().flushes + 2;
+                peers.outgoing.fault(
+                    Operation::Write,
+                    after_flushes,
+                    FaultKind::Error(io::ErrorKind::Other),
+                );
+                assert!(matches!(
+                    peers.client.connect(&peers.identity),
+                    Err(Error::SendFailed(_))
+                ));
+            } else {
+                peers.client.send_frame_blob(&[]).unwrap();
+            }
+            assert!(matches!(peers.event(), Event::Disconnected));
+            assert!(
+                matches!(peers.events.recv_timeout(PATIENCE).unwrap(), Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
+            );
+            assert!(
+                (HANDSHAKE_TIMEOUT..HANDSHAKE_TIMEOUT + Duration::from_secs(2))
+                    .contains(&started.elapsed()),
+                "server did not use its configured handshake budget"
+            );
+            peers.recover(&[client, server]);
+        }
+        Scenario::HandshakeNoise { server } => {
+            let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
+            let (old_client, old_server) = peers.connect();
+            let stopped = AtomicBool::new(false);
+            let started = Instant::now();
+            if server {
+                peers.client.send_frame_blob(&[]).unwrap();
+                assert!(matches!(peers.event(), Event::Disconnected));
+                let client = &mut peers.client;
+                let events = &peers.events;
+                thread::scope(|scope| {
+                    let sending = scope.spawn(|| {
+                        while !stopped.load(Ordering::Relaxed) {
+                            client.send_frame_blob(&[]).unwrap();
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    });
+                    let result = events.recv_timeout(PATIENCE);
+                    stopped.store(true, Ordering::Relaxed);
+                    sending.join().unwrap();
+                    assert!(
+                        matches!(result.unwrap(), Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
+                    );
+                });
+            } else {
+                // Hold the real server before it can read reset/Hello, while a
+                // raw peer supplies notifications and malformed stale packets.
+                peers.outgoing.pause(Operation::Read, true);
+                let mut junk = Adapter::new(peers.incoming.clone());
+                thread::scope(|scope| {
+                    let sending = scope.spawn(|| {
+                        while !stopped.load(Ordering::Relaxed) {
+                            junk.set_write_deadline(Instant::now() + FAULT_TIMEOUT)
+                                .unwrap();
+                            io::Write::write_all(&mut junk, &[0, 1, 0, 2, 42, 0]).unwrap();
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    });
+                    let result = peers.client.connect(&peers.identity);
+                    stopped.store(true, Ordering::Relaxed);
+                    sending.join().unwrap();
+                    assert!(
+                        matches!(result, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
+                    );
+                });
+                peers.outgoing.pause(Operation::Read, false);
+            }
+            assert!(
+                (HANDSHAKE_TIMEOUT..HANDSHAKE_TIMEOUT + Duration::from_secs(2))
+                    .contains(&started.elapsed()),
+                "noise changed the configured handshake budget"
+            );
+            peers.recover(&[old_client, old_server]);
+        }
         Scenario::Reconnect { both_directions } => {
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
             let (old_client, old_server) = peers.connect();
@@ -684,171 +876,6 @@ pub fn run(scenario: Scenario) {
             let (client, server) = peers.connect();
             peers.round_trip(&client, &server);
         }
-        Scenario::HandshakeFailure {
-            ack,
-            flush,
-            timeout,
-        } => {
-            let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
-            let (client, server) = peers.connect();
-            let mut old = vec![client, server];
-            let operation = if flush {
-                Operation::Flush
-            } else {
-                Operation::Write
-            };
-            let pipe = if ack {
-                &peers.outgoing
-            } else {
-                &peers.incoming
-            };
-            let after_flushes = pipe.state.lock().unwrap().flushes + if ack { 2 } else { 0 };
-            let kind = if timeout {
-                FaultKind::Timeout
-            } else {
-                FaultKind::Error(io::ErrorKind::Other)
-            };
-            pipe.fault(operation, after_flushes, kind);
-            if timeout && !ack {
-                // Model a reply the client cannot read, even if all bytes were
-                // accepted before flush failed. Only its own deadline releases it.
-                peers.incoming.pause(Operation::Read, true);
-            }
-            let first = peers.client.connect(&peers.identity);
-            if ack {
-                let expected = if timeout {
-                    io::ErrorKind::TimedOut
-                } else {
-                    io::ErrorKind::Other
-                };
-                assert!(matches!(first, Err(Error::SendFailed(ref err)) if err.kind() == expected));
-            } else if timeout || !flush {
-                assert!(
-                    matches!(first, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
-                );
-            } else {
-                // ArkHello can arrive before its flush fails; local connect
-                // success does not imply that the server accepted the ACK.
-                assert!(
-                    first.is_ok()
-                        || matches!(first, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
-                );
-            }
-            if let Ok((sender, _)) = first {
-                old.push(sender);
-            }
-            assert!(matches!(peers.event(), Event::Disconnected));
-            if !ack {
-                let expected = if timeout {
-                    io::ErrorKind::TimedOut
-                } else {
-                    io::ErrorKind::Other
-                };
-                assert!(matches!(
-                    peers.events.recv_timeout(PATIENCE).unwrap(),
-                    Err(Error::SendFailed(err)) if err.kind() == expected
-                ));
-            }
-            peers.incoming.pause(Operation::Read, false);
-            peers.recover(&old);
-        }
-        Scenario::FailedPrelude { read } => {
-            let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, FAULT_TIMEOUT);
-            peers.fail_prelude(read);
-            let (client, server) = peers.connect();
-            peers.round_trip(&client, &server);
-        }
-        Scenario::RepeatedAttempts(count) => {
-            let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, FAULT_TIMEOUT);
-            for attempt in 0..2 + usize::from(count % 3) {
-                peers.fail_prelude(attempt % 2 == 0);
-                let (client, server) = peers.connect();
-                peers.round_trip(&client, &server);
-            }
-        }
-        Scenario::SilentHandshake { ack } => {
-            let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
-            let (client, server) = peers.connect();
-            let started = Instant::now();
-            if ack {
-                let after_flushes = peers.outgoing.state.lock().unwrap().flushes + 2;
-                peers.outgoing.fault(
-                    Operation::Write,
-                    after_flushes,
-                    FaultKind::Error(io::ErrorKind::Other),
-                );
-                assert!(matches!(
-                    peers.client.connect(&peers.identity),
-                    Err(Error::SendFailed(_))
-                ));
-            } else {
-                peers.client.send_frame_blob(&[]).unwrap();
-            }
-            assert!(matches!(peers.event(), Event::Disconnected));
-            assert!(
-                matches!(peers.events.recv_timeout(PATIENCE).unwrap(), Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
-            );
-            assert!(
-                (HANDSHAKE_TIMEOUT..HANDSHAKE_TIMEOUT + Duration::from_secs(2))
-                    .contains(&started.elapsed()),
-                "server did not use its configured handshake budget"
-            );
-            peers.recover(&[client, server]);
-        }
-        Scenario::HandshakeNoise { server } => {
-            let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
-            let (old_client, old_server) = peers.connect();
-            let stopped = AtomicBool::new(false);
-            let started = Instant::now();
-            if server {
-                peers.client.send_frame_blob(&[]).unwrap();
-                assert!(matches!(peers.event(), Event::Disconnected));
-                let client = &mut peers.client;
-                let events = &peers.events;
-                thread::scope(|scope| {
-                    let sending = scope.spawn(|| {
-                        while !stopped.load(Ordering::Relaxed) {
-                            client.send_frame_blob(&[]).unwrap();
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    });
-                    let result = events.recv_timeout(PATIENCE);
-                    stopped.store(true, Ordering::Relaxed);
-                    sending.join().unwrap();
-                    assert!(
-                        matches!(result.unwrap(), Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
-                    );
-                });
-            } else {
-                // Hold the real server before it can read reset/Hello, while a
-                // raw peer supplies notifications and malformed stale packets.
-                peers.outgoing.pause(Operation::Read, true);
-                let mut junk = Adapter::new(peers.incoming.clone());
-                thread::scope(|scope| {
-                    let sending = scope.spawn(|| {
-                        while !stopped.load(Ordering::Relaxed) {
-                            junk.set_write_deadline(Instant::now() + FAULT_TIMEOUT)
-                                .unwrap();
-                            io::Write::write_all(&mut junk, &[0, 1, 0, 2, 42, 0]).unwrap();
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    });
-                    let result = peers.client.connect(&peers.identity);
-                    stopped.store(true, Ordering::Relaxed);
-                    sending.join().unwrap();
-                    assert!(
-                        matches!(result, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
-                    );
-                });
-                peers.outgoing.pause(Operation::Read, false);
-            }
-            assert!(
-                (HANDSHAKE_TIMEOUT..HANDSHAKE_TIMEOUT + Duration::from_secs(2))
-                    .contains(&started.elapsed()),
-                "noise changed the configured handshake budget"
-            );
-            peers.recover(&[old_client, old_server]);
-        }
         Scenario::Shutdown { handshake, server } => {
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, WRITE_TIMEOUT);
             let (old_client, old_server) = peers.connect();
@@ -903,29 +930,6 @@ pub fn run(scenario: Scenario) {
             assert!(old_client.send(b"old").is_err());
             assert!(old_server.send(b"old").is_err());
             assert!(!peers.expired.load(Ordering::Acquire));
-        }
-        Scenario::AbandonedHello => {
-            let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, WRITE_TIMEOUT);
-            peers.incoming.pause(Operation::Read, true);
-            let client = &mut peers.client;
-            let identity = &peers.identity;
-            let incoming = &peers.incoming;
-            thread::scope(|scope| {
-                let connecting = scope.spawn(|| client.connect(identity));
-                incoming.wait_blocked(Operation::Write);
-                incoming.fault(Operation::Read, 0, FaultKind::Error(io::ErrorKind::Other));
-                incoming.pause(Operation::Read, false);
-                assert!(matches!(
-                    connecting.join().unwrap(),
-                    Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::Other
-                ));
-            });
-
-            // The server is still sending ArkHello to the abandoned client keys.
-            // That output must drain before the server can read the new hello.
-            let (client, server) = peers.connect();
-            assert_eq!(peers.incoming.state.lock().unwrap().flushes, 2);
-            peers.round_trip(&client, &server);
         }
     }
 }

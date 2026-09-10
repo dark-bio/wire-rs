@@ -126,44 +126,44 @@ impl Seedable for duplex::Scenario {
 
         const COUNT: u32 = 10;
         match self {
-            Scenario::Reconnect { both_directions } => {
+            Scenario::FailedPrelude { read } => {
                 seed.variant(0, COUNT);
-                seed.flag(*both_directions);
-            }
-            Scenario::Backlog(count) => {
-                seed.variant(1, COUNT);
-                seed.byte(*count);
-            }
-            Scenario::ServerTimeout { flush } => {
-                seed.variant(2, COUNT);
-                seed.flag(*flush);
+                seed.flag(*read);
             }
             Scenario::HandshakeFailure {
                 ack,
                 flush,
                 timeout,
             } => {
-                seed.variant(3, COUNT);
+                seed.variant(1, COUNT);
                 seed.flag(*ack);
                 seed.flag(*flush);
                 seed.flag(*timeout);
             }
-            Scenario::FailedPrelude { read } => {
-                seed.variant(4, COUNT);
-                seed.flag(*read);
-            }
             Scenario::RepeatedAttempts(count) => {
-                seed.variant(5, COUNT);
+                seed.variant(2, COUNT);
                 seed.byte(*count);
             }
-            Scenario::AbandonedHello => seed.variant(6, COUNT),
+            Scenario::AbandonedHello => seed.variant(3, COUNT),
             Scenario::SilentHandshake { ack } => {
-                seed.variant(7, COUNT);
+                seed.variant(4, COUNT);
                 seed.flag(*ack);
             }
             Scenario::HandshakeNoise { server } => {
-                seed.variant(8, COUNT);
+                seed.variant(5, COUNT);
                 seed.flag(*server);
+            }
+            Scenario::Reconnect { both_directions } => {
+                seed.variant(6, COUNT);
+                seed.flag(*both_directions);
+            }
+            Scenario::Backlog(count) => {
+                seed.variant(7, COUNT);
+                seed.byte(*count);
+            }
+            Scenario::ServerTimeout { flush } => {
+                seed.variant(8, COUNT);
+                seed.flag(*flush);
             }
             Scenario::Shutdown { handshake, server } => {
                 seed.variant(9, COUNT);
@@ -209,15 +209,17 @@ impl Seedable for client::Step {
             }
             Step::Partial => seed.variant(18, COUNT),
             Step::Oversized => seed.variant(19, COUNT),
-            Step::Yield => seed.variant(20, COUNT),
-            Step::Interrupt => seed.variant(21, COUNT),
-            Step::Break => seed.variant(22, COUNT),
-            Step::Heal => seed.variant(23, COUNT),
-            Step::Cut { point, then_broken } => {
-                seed.variant(24, COUNT);
-                point.seed(seed);
-                seed.flag(*then_broken);
+            Step::Retain => seed.variant(20, COUNT),
+            Step::Send(tag) => {
+                seed.variant(21, COUNT);
+                seed.byte(*tag);
             }
+            Step::SendRetained(tag) => {
+                seed.variant(22, COUNT);
+                seed.byte(*tag);
+            }
+            Step::SendOversized => seed.variant(23, COUNT),
+            Step::Disconnect => seed.variant(24, COUNT),
             Step::Chunk(n) => {
                 seed.variant(25, COUNT);
                 seed.byte(*n);
@@ -226,22 +228,20 @@ impl Seedable for client::Step {
                 seed.variant(26, COUNT);
                 seed.byte(*n);
             }
-            Step::Retain => seed.variant(27, COUNT),
-            Step::Send(tag) => {
-                seed.variant(28, COUNT);
-                seed.byte(*tag);
-            }
-            Step::SendRetained(tag) => {
-                seed.variant(29, COUNT);
-                seed.byte(*tag);
-            }
-            Step::SendOversized => seed.variant(30, COUNT),
-            Step::Disconnect => seed.variant(31, COUNT),
-            Step::Timeout(point) => {
+            Step::Yield => seed.variant(27, COUNT),
+            Step::Interrupt => seed.variant(28, COUNT),
+            Step::ReadTimeout => seed.variant(29, COUNT),
+            Step::Break => seed.variant(30, COUNT),
+            Step::Heal => seed.variant(31, COUNT),
+            Step::Cut { point, then_broken } => {
                 seed.variant(32, COUNT);
                 point.seed(seed);
+                seed.flag(*then_broken);
             }
-            Step::ReadTimeout => seed.variant(33, COUNT),
+            Step::Timeout(point) => {
+                seed.variant(33, COUNT);
+                point.seed(seed);
+            }
         }
     }
 }
@@ -257,63 +257,63 @@ impl Seedable for server::Step {
                 seed.variant(1, COUNT);
                 seed.byte(*tag);
             }
-            Step::Recv => seed.variant(2, COUNT),
-            Step::Hello => seed.variant(3, COUNT),
-            Step::HelloStale => seed.variant(4, COUNT),
-            Step::HelloTampered => seed.variant(5, COUNT),
-            Step::HelloBadAuth => seed.variant(6, COUNT),
-            Step::HelloBadSigner => seed.variant(7, COUNT),
-            Step::HelloBadPayload => seed.variant(8, COUNT),
-            Step::HelloBadKey => seed.variant(9, COUNT),
-            Step::HelloBadEncap => seed.variant(10, COUNT),
-            Step::HelloBadAttest => seed.variant(11, COUNT),
-            Step::Reply(tag) => {
-                seed.variant(12, COUNT);
+            Step::SendOversized => seed.variant(2, COUNT),
+            Step::Recv => seed.variant(3, COUNT),
+            Step::Retain => seed.variant(4, COUNT),
+            Step::SendRetained(tag) => {
+                seed.variant(5, COUNT);
                 seed.byte(*tag);
             }
-            Step::ReplyReplay => seed.variant(13, COUNT),
-            Step::ReplyTampered => seed.variant(14, COUNT),
-            Step::Garbage => seed.variant(15, COUNT),
-            Step::Dropped => seed.variant(16, COUNT),
+            Step::Hello => seed.variant(6, COUNT),
+            Step::HelloStale => seed.variant(7, COUNT),
+            Step::HelloTampered => seed.variant(8, COUNT),
+            Step::HelloBadAuth => seed.variant(9, COUNT),
+            Step::HelloBadSigner => seed.variant(10, COUNT),
+            Step::HelloBadPayload => seed.variant(11, COUNT),
+            Step::HelloBadKey => seed.variant(12, COUNT),
+            Step::HelloBadEncap => seed.variant(13, COUNT),
+            Step::HelloBadAttest => seed.variant(14, COUNT),
+            Step::Reply(tag) => {
+                seed.variant(15, COUNT);
+                seed.byte(*tag);
+            }
+            Step::ReplyReplay => seed.variant(16, COUNT),
+            Step::ReplyTampered => seed.variant(17, COUNT),
+            Step::Garbage => seed.variant(18, COUNT),
+            Step::Dropped => seed.variant(19, COUNT),
             Step::Junk(bytes) => {
-                seed.variant(17, COUNT);
+                seed.variant(20, COUNT);
                 seed.bytes(bytes);
             }
-            Step::Undecodable => seed.variant(18, COUNT),
+            Step::Undecodable => seed.variant(21, COUNT),
             Step::Truncated(n) => {
-                seed.variant(19, COUNT);
+                seed.variant(22, COUNT);
                 seed.byte(*n);
             }
-            Step::Partial => seed.variant(20, COUNT),
-            Step::Oversized => seed.variant(21, COUNT),
-            Step::Yield => seed.variant(22, COUNT),
-            Step::Interrupt => seed.variant(23, COUNT),
-            Step::Break => seed.variant(24, COUNT),
-            Step::Heal => seed.variant(25, COUNT),
-            Step::Cut { point, then_broken } => {
-                seed.variant(26, COUNT);
-                point.seed(seed);
-                seed.flag(*then_broken);
-            }
+            Step::Partial => seed.variant(23, COUNT),
+            Step::Oversized => seed.variant(24, COUNT),
             Step::Chunk(n) => {
-                seed.variant(27, COUNT);
+                seed.variant(25, COUNT);
                 seed.byte(*n);
             }
             Step::Batch(n) => {
-                seed.variant(28, COUNT);
+                seed.variant(26, COUNT);
                 seed.byte(*n);
             }
-            Step::Retain => seed.variant(29, COUNT),
-            Step::SendRetained(tag) => {
-                seed.variant(30, COUNT);
-                seed.byte(*tag);
-            }
-            Step::SendOversized => seed.variant(31, COUNT),
-            Step::Timeout(point) => {
+            Step::Yield => seed.variant(27, COUNT),
+            Step::Interrupt => seed.variant(28, COUNT),
+            Step::ReadTimeout => seed.variant(29, COUNT),
+            Step::Break => seed.variant(30, COUNT),
+            Step::Heal => seed.variant(31, COUNT),
+            Step::Cut { point, then_broken } => {
                 seed.variant(32, COUNT);
                 point.seed(seed);
+                seed.flag(*then_broken);
             }
-            Step::ReadTimeout => seed.variant(33, COUNT),
+            Step::Timeout(point) => {
+                seed.variant(33, COUNT);
+                point.seed(seed);
+            }
         }
     }
 }

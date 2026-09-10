@@ -57,9 +57,9 @@ impl<W: Write> Outbound<W> {
         Self {
             writer: Mutex::new(FrameWriter::new(writer, closer.clone())),
             binding: Mutex::new(Weak::new()),
+            timeout,
             side,
             closer,
-            timeout,
         }
     }
 

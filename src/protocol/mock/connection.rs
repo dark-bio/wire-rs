@@ -47,16 +47,16 @@ enum Failure {
     Closed,
     /// The operation's protocol deadline expired.
     Timeout,
-    /// Invalid peer envelope or duplicate outstanding request ID.
-    Malformed,
     /// An adapter or encrypted session failed.
     Transport,
+    /// A peer application error.
+    Remote(u64),
     /// A submitted body has no field in this wire direction.
     Direction,
     /// A submitted envelope exceeds the transport's plaintext limit.
     Large,
-    /// A peer application error.
-    Remote(u64),
+    /// Invalid peer envelope or duplicate outstanding request ID.
+    Malformed,
     /// The inbound request limit closed the session.
     Requests,
     /// The inbound byte limit closed the session.
@@ -67,14 +67,14 @@ enum Failure {
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
-        Error::InboundRequestLimitExceeded(_) => Failure::Requests,
-        Error::InboundByteLimitExceeded(_) => Failure::Bytes,
         Error::Timeout => Failure::Timeout,
-        Error::Malformed => Failure::Malformed,
         Error::Transport(_) => Failure::Transport,
+        Error::Remote(error) => Failure::Remote(error.code),
         Error::WrongDirection(_) => Failure::Direction,
         Error::TooLarge(_) => Failure::Large,
-        Error::Remote(error) => Failure::Remote(error.code),
+        Error::Malformed => Failure::Malformed,
+        Error::InboundRequestLimitExceeded(_) => Failure::Requests,
+        Error::InboundByteLimitExceeded(_) => Failure::Bytes,
         other => panic!("unexpected protocol failure: {other}"),
     }
 }
@@ -102,17 +102,21 @@ enum EnvelopeShape {
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step {
-    /// Receives a queued request and requires a specific failure without a wait hook.
-    ReceiveError(u8, Failure),
-    /// Checks accepted requests and retained bytes after earlier work has completed.
-    Usage(u8, usize, usize),
-    /// Waits for response delivery without consuming its buffered bytes.
-    ResponseReceived(u8, u64),
+    // Session setup and limits.
+    /// Reconnect the raw client and accept a replacement under this label.
+    Reconnect(u8),
+    /// Require a failed raw handshake before testing another attempt.
+    FailedReconnect,
+    /// Inject a read timeout after ArkHello, while the server awaits HostAck.
+    HandshakeReadTimeout,
     /// Changes both inbound limits through the public session setter.
     InboundLimits(u8, usize, usize),
     /// Changes both server limits for the current and future sessions.
     ServerInboundLimits(usize, usize),
+    /// Checks accepted requests and retained bytes after earlier work has completed.
+    Usage(u8, usize, usize),
 
+    // Requests and replies.
     /// Round-trip a concrete schema body through the public typed waiting API.
     TypedExchange,
     /// Request from session label, save promise in slot, payload tag, deadline ms.
@@ -123,6 +127,8 @@ enum Step {
     Oversized(u8, u8),
     /// Receive a request and retain its responder in the given slot.
     Receive(u8, u8, u8),
+    /// Receives a queued request and requires a specific failure without a wait hook.
+    ReceiveError(u8, Failure),
     /// Begin a blocked receive on the labeled session.
     StartReceive(u8),
     /// Require the blocked receive to finish with this failure.
@@ -135,15 +141,21 @@ enum Step {
     OversizedReply(u8, u8),
     /// Drop a responder to queue the automatic error.
     Abandon(u8),
+
+    // Promise completion.
+    /// Waits for response delivery without consuming its buffered bytes.
+    ResponseReceived(u8, u64),
     /// Reads the request's result channel directly, so its deadline worker must
     /// deliver any timeout without help from `Promise::wait()`.
     Answer(u8, Result<u8, Failure>),
     /// The promise may fail from local closure or from the peer closing its stream.
     AnswerClosed(u8),
-    /// Reads the reply's result channel directly, without calling `Promise::wait()`.
-    Written(u8, Result<(), Failure>),
     /// Drops the promise, leaving the request in progress.
     DropPromise(u8),
+    /// Reads the reply's result channel directly, without calling `Promise::wait()`.
+    Written(u8, Result<(), Failure>),
+
+    // Raw peer traffic and request IDs.
     /// Send a chosen ID and shape from the raw peer.
     Send(u64, EnvelopeShape),
     /// Send invalid traffic; peer shutdown may race the sender's final flush.
@@ -151,42 +163,40 @@ enum Step {
     Reject(u64, EnvelopeShape),
     /// Inspect a raw received ID and shape.
     Read(u64, EnvelopeShape),
+    /// Start the local allocator at its final valid ID.
+    LastId(u8),
+    /// Check the request IDs still awaiting peer responses.
+    Outstanding(u8, Vec<u64>),
+
+    // I/O faults and gates.
     /// Pause or resume one physical direction (0 host output, 1 Ark output).
     Pause(u8, Operation, bool),
     /// Wait until the selected adapter operation is actually blocked.
     Blocked(u8, Operation),
     /// Fail the next matching adapter operation.
     Fault(u8, Operation, io::ErrorKind),
-    /// Close this session through its saved `Closer`.
-    Close(u8),
-    /// Drop a session owner with its worker and handle references still alive.
-    Drop(u8),
-    /// Reconnect the raw client and accept a replacement under this label.
-    Reconnect(u8),
-    /// Require a failed raw handshake before testing another attempt.
-    FailedReconnect,
-    /// Inject a read timeout after ArkHello, while the server awaits HostAck.
-    HandshakeReadTimeout,
     /// Pause the session writer just before it calls `Sender::disconnect()`.
     PauseDisconnect(u8),
     /// Wait until the writer is paused before `Sender::disconnect()`.
     DisconnectPaused(u8),
     /// Let the paused writer call `Sender::disconnect()`.
     ResumeDisconnect(u8),
+
+    // Closure and release.
+    /// Close this session through its saved `Closer`.
+    Close(u8),
+    /// Drop a session owner with its worker and handle references still alive.
+    Drop(u8),
     /// Require a request through an old `Requester` to fail.
     Refused(u8),
     /// Check that the session's weak reference stops upgrading after its workers exit.
     Released(u8),
     /// Close the server and all protocol connections.
     Shutdown,
-    /// Start a protocol worker that panics to test that the process aborts.
-    WorkerPanic(u8),
-    /// Start the local allocator at its final valid ID.
-    LastId(u8),
-    /// Check the request IDs still awaiting peer responses.
-    Outstanding(u8, Vec<u64>),
     /// Require all threads to exit after physical shutdown.
     Stopped,
+    /// Start a protocol worker that panics to test that the process aborts.
+    WorkerPanic(u8),
 }
 
 /// Transport owner and bound sender retained by the scripted remote peer.
@@ -303,27 +313,30 @@ struct Driver {
     identity: xdsa::PublicKey,
     /// Host-to-Ark and Ark-to-host pipes.
     pipes: [Arc<Pipe>; 2],
+
     /// Owners keyed by script labels, including retained predecessors.
     sessions: HashMap<u8, Session>,
+    /// Weak references used to check that closed sessions are freed.
+    states: HashMap<u8, Weak<SessionInner>>,
     /// Requester handles kept after dropping their sessions.
     requesters: HashMap<u8, Requester>,
     /// Closer handles saved for each session.
     closers: HashMap<u8, Closer>,
-    /// Weak references used to check that closed sessions are freed.
-    states: HashMap<u8, Weak<SessionInner>>,
-    /// Trackers used to wait for each connection's workers to finish.
-    workers: Vec<Arc<Tracker>>,
+    /// Calls left blocked while later script steps change state.
+    receiving: HashMap<u8, ReceiveJob>,
+
+    /// Responders saved for reply or drop steps.
+    responders: HashMap<u8, Responder>,
     /// Request promises saved for later steps.
     promises: HashMap<u8, Promise<Message>>,
     /// Reply promises saved for later steps.
     writes: HashMap<u8, Promise<()>>,
-    /// Responders saved for reply or drop steps.
-    responders: HashMap<u8, Responder>,
-    /// Calls left blocked while later script steps change state.
-    receiving: HashMap<u8, ReceiveJob>,
+
     /// Gates that pause old writers before `Sender::disconnect()` while a new
     /// session connects.
     disconnects: HashMap<u8, (mpsc::Receiver<()>, mpsc::Sender<()>)>,
+    /// Trackers used to wait for each connection's workers to finish.
+    workers: Vec<Arc<Tracker>>,
     /// Physical closers used on normal cleanup and watchdog expiry.
     shutdown: [transport::Closer; 2],
     /// Stops the watchdog once all workers and calls have been released.
@@ -378,16 +391,19 @@ impl Driver {
             raw: None,
             identity: identity.clone(),
             pipes,
+
             sessions: HashMap::new(),
+            states: HashMap::new(),
             requesters: HashMap::new(),
             closers: HashMap::new(),
-            states: HashMap::new(),
-            workers: Vec::new(),
+            receiving: HashMap::new(),
+
+            responders: HashMap::new(),
             promises: HashMap::new(),
             writes: HashMap::new(),
-            responders: HashMap::new(),
-            receiving: HashMap::new(),
+
             disconnects: HashMap::new(),
+            workers: Vec::new(),
             shutdown,
             stop: Some(stop),
             watchdog: Some(watchdog),
@@ -455,26 +471,35 @@ impl Driver {
     /// Runs one scripted action using public calls and controlled adapter events.
     fn step(&mut self, step: Step) {
         match step {
-            Step::ReceiveError(label, expected) => {
-                let mut session = self.sessions.remove(&label).unwrap();
-                let (session, result) = Job::start(move || {
-                    let result = session.recv();
-                    (session, result)
-                })
-                .finish();
-                assert_eq!(failure(result.err().expect("receive must fail")), expected);
-                self.sessions.insert(label, session);
+            Step::Reconnect(label) => {
+                let Some(RawPeer::Client(client, sender)) = &mut self.raw else {
+                    panic!("raw client required")
+                };
+                *sender = client.connect(&self.identity).unwrap().0;
+                let session = self.server.as_mut().unwrap().accept().unwrap();
+                self.save(label, session);
             }
-            Step::Usage(label, requests, bytes) => {
-                assert_eq!(
-                    self.states[&label].upgrade().unwrap().inbound_usage(),
-                    (requests, bytes)
-                );
+            Step::FailedReconnect => {
+                let Some(RawPeer::Client(client, _)) = &mut self.raw else {
+                    panic!("raw client required")
+                };
+                assert!(client.connect(&self.identity).is_err());
             }
-            Step::ResponseReceived(label, id) => {
-                self.states[&label].upgrade().unwrap().wait_response(id)
+            Step::HandshakeReadTimeout => {
+                let incoming = self.pipes[0].clone();
+                let outgoing = self.pipes[1].clone();
+                outgoing.pause(Operation::Flush, true);
+                let gate = Job::start(move || {
+                    outgoing.wait_blocked(Operation::Flush);
+                    incoming.fail_read_deadline(io::ErrorKind::TimedOut);
+                    outgoing.pause(Operation::Flush, false);
+                });
+                let Some(RawPeer::Client(client, _)) = &mut self.raw else {
+                    panic!("raw client required")
+                };
+                let _ = client.connect(&self.identity);
+                gate.finish();
             }
-
             Step::InboundLimits(id, requests, bytes) => {
                 let session = self
                     .sessions
@@ -491,7 +516,12 @@ impl Driver {
                         .set_inbound_limits(requests, bytes),
                 );
             }
-
+            Step::Usage(label, requests, bytes) => {
+                assert_eq!(
+                    self.states[&label].upgrade().unwrap().inbound_usage(),
+                    (requests, bytes)
+                );
+            }
             Step::TypedExchange => {
                 let promise = self.requesters[&0]
                     .request(protocol::DeviceInfoRequest {}, Instant::now() + BUDGET)
@@ -547,6 +577,16 @@ impl Driver {
                 let (message, responder) = self.sessions.get_mut(&session).unwrap().recv().unwrap();
                 assert_eq!(message, Message::Develop(vec![tag]));
                 self.responders.insert(slot, responder);
+            }
+            Step::ReceiveError(label, expected) => {
+                let mut session = self.sessions.remove(&label).unwrap();
+                let (session, result) = Job::start(move || {
+                    let result = session.recv();
+                    (session, result)
+                })
+                .finish();
+                assert_eq!(failure(result.err().expect("receive must fail")), expected);
+                self.sessions.insert(label, session);
             }
             Step::StartReceive(label) => {
                 let mut session = self.sessions.remove(&label).unwrap();
@@ -605,6 +645,9 @@ impl Driver {
             Step::Abandon(slot) => {
                 drop(self.responders.remove(&slot).unwrap());
             }
+            Step::ResponseReceived(label, id) => {
+                self.states[&label].upgrade().unwrap().wait_response(id)
+            }
             Step::Answer(slot, expected) => {
                 let result = self
                     .promises
@@ -621,6 +664,9 @@ impl Driver {
                     Err(Error::Closed | Error::Transport(_))
                 ));
             }
+            Step::DropPromise(slot) => {
+                drop(self.promises.remove(&slot).unwrap());
+            }
             Step::Written(slot, expected) => {
                 assert_eq!(
                     self.writes
@@ -631,51 +677,22 @@ impl Driver {
                     expected
                 );
             }
-            Step::DropPromise(slot) => {
-                drop(self.promises.remove(&slot).unwrap());
-            }
             Step::Send(id, body) => self.raw.as_ref().unwrap().send(id, body).unwrap(),
             Step::Reject(id, body) => {
                 let _ = self.raw.as_ref().unwrap().send(id, body);
             }
             Step::Read(id, body) => assert_eq!(self.raw.as_mut().unwrap().read(), (id, body)),
+            Step::LastId(label) => self.states[&label].upgrade().unwrap().use_last_request_id(),
+            Step::Outstanding(label, ids) => {
+                assert_eq!(
+                    self.states[&label].upgrade().unwrap().outstanding_ids(),
+                    ids
+                )
+            }
             Step::Pause(side, op, paused) => self.pipes[side as usize].pause(op, paused),
             Step::Blocked(side, op) => self.pipes[side as usize].wait_blocked(op),
             Step::Fault(side, op, error) => {
                 self.pipes[side as usize].fault(op, 0, FaultKind::Error(error))
-            }
-            Step::Close(label) => self.closers[&label].close(),
-            Step::Drop(label) => {
-                drop(self.sessions.remove(&label).unwrap());
-            }
-            Step::Reconnect(label) => {
-                let Some(RawPeer::Client(client, sender)) = &mut self.raw else {
-                    panic!("raw client required")
-                };
-                *sender = client.connect(&self.identity).unwrap().0;
-                let session = self.server.as_mut().unwrap().accept().unwrap();
-                self.save(label, session);
-            }
-            Step::FailedReconnect => {
-                let Some(RawPeer::Client(client, _)) = &mut self.raw else {
-                    panic!("raw client required")
-                };
-                assert!(client.connect(&self.identity).is_err());
-            }
-            Step::HandshakeReadTimeout => {
-                let incoming = self.pipes[0].clone();
-                let outgoing = self.pipes[1].clone();
-                outgoing.pause(Operation::Flush, true);
-                let gate = Job::start(move || {
-                    outgoing.wait_blocked(Operation::Flush);
-                    incoming.fail_read_deadline(io::ErrorKind::TimedOut);
-                    outgoing.pause(Operation::Flush, false);
-                });
-                let Some(RawPeer::Client(client, _)) = &mut self.raw else {
-                    panic!("raw client required")
-                };
-                let _ = client.connect(&self.identity);
-                gate.finish();
             }
             Step::PauseDisconnect(label) => {
                 self.disconnects.insert(
@@ -688,6 +705,10 @@ impl Driver {
             }
             Step::ResumeDisconnect(label) => {
                 self.disconnects.remove(&label).unwrap().1.send(()).unwrap();
+            }
+            Step::Close(label) => self.closers[&label].close(),
+            Step::Drop(label) => {
+                drop(self.sessions.remove(&label).unwrap());
             }
             Step::Refused(label) => {
                 assert!(
@@ -707,24 +728,17 @@ impl Driver {
                 assert!(self.states[&label].upgrade().is_none());
             }
             Step::Shutdown => self.shutdown(),
+            Step::Stopped => {
+                for workers in &self.workers {
+                    workers.wait_stopped();
+                }
+            }
             Step::WorkerPanic(label) => {
                 worker::spawn(
                     "wire-test-failure",
                     &self.states[&label].upgrade().unwrap().workers,
                     || panic!("scripted worker failure"),
                 );
-            }
-            Step::LastId(label) => self.states[&label].upgrade().unwrap().use_last_request_id(),
-            Step::Outstanding(label, ids) => {
-                assert_eq!(
-                    self.states[&label].upgrade().unwrap().outstanding_ids(),
-                    ids
-                )
-            }
-            Step::Stopped => {
-                for workers in &self.workers {
-                    workers.wait_stopped();
-                }
             }
         }
     }

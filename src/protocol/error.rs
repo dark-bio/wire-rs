@@ -12,13 +12,13 @@ use std::sync::Arc;
 /// [`Error::Remote`]; it does not by itself end the session.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
-    /// The operation's absolute deadline expired. Remote work may still run.
-    #[error("wire operation timed out")]
-    Timeout,
-
     /// The session or server was closed locally, including by dropping its owner.
     #[error("wire protocol closed")]
     Closed,
+
+    /// The operation's absolute deadline expired. Remote work may still run.
+    #[error("wire operation timed out")]
+    Timeout,
 
     /// The underlying transport failed or the peer reset the session.
     #[error("wire transport failed: {0}")]
@@ -43,15 +43,15 @@ pub enum Error {
     #[error("wire message cannot be sent in this direction: {0}")]
     WrongDirection(&'static str),
 
+    /// The encoded message exceeds the transport's sending limit.
+    #[error("wire message too large: {0} bytes")]
+    TooLarge(usize),
+
     /// The peer sent an invalid envelope or payload. The session closes when this
     /// is detected. Nested payloads are checked only when `recv()` or `wait()`
     /// reads them.
     #[error("wire peer sent a malformed message")]
     Malformed,
-
-    /// The encoded message exceeds the transport's sending limit.
-    #[error("wire message too large: {0} bytes")]
-    TooLarge(usize),
 
     /// A peer request would exceed the session's request limit. Also returned if
     /// the limit is lowered below usage. Carries the configured request limit.
