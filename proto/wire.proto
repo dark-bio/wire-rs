@@ -7,9 +7,15 @@ package darkbio.wire;
 
 // HostToArk represents a message sent from the host to the Ark via the USB
 // connection. It embeds all possible message types to keep the protocol simple.
+//
+// Every message carries an id and is either a request, its id chosen by the
+// host, or the host's response to a request of the Ark, echoing the Ark's id.
+// To avoid id collisions, hosts allocate odd ids and Arks even ones, so a
+// receiver can tell a response from a request by the parity of the id alone.
 message HostToArk {
   // Enveloping fields, reserved range 0x001-0x0ff
-  optional uint64 id = 1;
+  uint64 id = 1;           // Request identifier, the host's own or responded to
+  optional Error err = 2;  // Error encountered while serving the Ark's request (if any)
 
   oneof content {
     // Special factory message
@@ -69,10 +75,15 @@ message HostToArk {
 
 // ArkToHost represents a message sent from the Ark to the host via the USB
 // connection. It embeds all possible message types to keep the protocol simple.
+//
+// Every message carries an id and is either a request, its id chosen by the
+// Ark, or the Ark's response to a request of the host, echoing the host's id.
+// To avoid id collisions, hosts allocate odd ids and Arks even ones, so a
+// receiver can tell a response from a request by the parity of the id alone.
 message ArkToHost {
-  // Response enveloping fields, reserved range 0x001-0xff
-  optional uint64 id = 1; // Request identifier responding to (if any)
-  optional Error err = 2; // Error encountered while serving (if any)
+  // Enveloping fields, reserved range 0x001-0x0ff
+  uint64 id = 1;           // Request identifier, responded to or the Ark's own
+  optional Error err = 2;  // Error encountered while serving the host's request (if any)
 
   oneof content {
     // Special factory message
@@ -133,11 +144,25 @@ message ArkToHost {
 
 // Error is sent along a response to a failed request.
 //
-// Note, the code is unique per request type or perhaps per request category.
-// There is no attempt to keep them globally unique.
+// Codes 0x00 through 0xff (inclusive) are reserved for protocol-wide errors.
+// Codes 0x100 and above are defined by the request type and may be reused
+// with different meanings for different requests. The message text is human,
+// readable error, not a stable code.
 message Error {
   uint64 code = 1; // Error code for programmatic interpretation
   string msg = 2;  // Error message for user interfacing
+}
+
+// ReservedErrors names the assigned protocol-wide errors in the reserved range
+// 0x00 to 0xff (inclusive). No code in this range may be assigned a request
+// specific meaning. Assigned codes must not be repurposed.
+enum ReservedErrors {
+  // A failure without a standardized reason. Zero does not indicate success;
+  // the presence of an Error in the response indicates failure.
+  RESERVED_ERRORS_UNSPECIFIED = 0;
+
+  // The request's responder was released without providing an application reply.
+  RESERVED_ERRORS_UNANSWERED = 1;
 }
 
 

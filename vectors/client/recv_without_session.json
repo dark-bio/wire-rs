@@ -10,7 +10,6 @@
   },
   "trace": [
     {"event": "recv"},
-    {"event": "read", "bytes": "AgEA"},
     {"event": "error", "kind": "EncryptionFailed"},
     {"event": "session", "established": false}
   ]

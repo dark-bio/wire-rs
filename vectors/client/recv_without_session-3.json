@@ -10,8 +10,7 @@
   },
   "trace": [
     {"event": "recv"},
-    {"event": "read", "error": "eof"},
-    {"event": "error", "kind": "Terminated"},
+    {"event": "error", "kind": "EncryptionFailed"},
     {"event": "session", "established": false}
   ]
 }

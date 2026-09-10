@@ -10,8 +10,7 @@
   },
   "trace": [
     {"event": "recv"},
-    {"event": "read", "bytes": "/wEA"},
-    {"event": "error", "kind": "FrameDecodingFailed"},
+    {"event": "error", "kind": "EncryptionFailed"},
     {"event": "session", "established": false}
   ]
 }

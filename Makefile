@@ -9,7 +9,7 @@ FUZZ_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 FUZZ_SANITIZER ?= none
 
 # Routes every random draw through the seeded backend of the mocks, see
-# src/mock/random.rs, for reproducible vectors and deterministic fuzzing.
+# src/transport/mock/random.rs, for reproducible vectors and deterministic fuzzing.
 SEEDED = RUSTFLAGS='--cfg getrandom_backend="custom"'
 
 # check runs the gates CI holds a push to, the formatting, clippy, the docs and
@@ -44,14 +44,15 @@ fuzz-seeds:
 # and the seeds, stopping at the first finding.
 fuzz:
 	for target in $$(cargo +nightly fuzz list); do \
+		mkdir -p fuzz/corpus/$$target; \
 		$(SEEDED) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
-# fuzz-minimize drops the inputs of every fuzz corpus that add no coverage,
+# fuzz-minimize uses set cover to retain coverage features with fewer inputs,
 # keeping a corpus grown by fuzz runs small before it is committed.
 fuzz-minimize:
 	for target in $$(cargo +nightly fuzz list); do \
-		$(SEEDED) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target || exit 1; \
+		$(SEEDED) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target -- -set_cover_merge=1 || exit 1; \
 	done
 
 # fuzz-loop runs the fuzz targets round robin until a finding stops it or the
@@ -59,8 +60,8 @@ fuzz-minimize:
 fuzz-loop:
 	while true; do $(MAKE) --no-print-directory fuzz || exit 1; done
 
-# vectors transcribes the client scenario tests for other implementations of
-# the client to replay, the format documented in vectors/README.md. The build
+# vectors transcribes the client scenario tests for other client implementations
+# to replay. src/transport/mock/vector.rs defines the recorded events. The build
 # routes all randomness through getrandom's custom backend, which the recorder
 # seeds per scenario, so the transcripts regenerate unchanged for a given
 # version of the crypto. The flag rebuilds every crate, hence its own target

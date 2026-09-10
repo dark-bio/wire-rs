@@ -7,105 +7,204 @@
 #![doc = include_str!("../README.md")]
 
 pub mod protocol;
-
-mod client;
-mod emitter;
-mod framing;
-mod handshake;
-mod sealing;
-mod server;
+pub mod transport;
 
 #[cfg(any(test, feature = "fuzz"))]
 #[doc(hidden)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub mod mock;
+pub use transport::mock;
 
-pub use client::{Client, Roots, Verifier};
-pub use emitter::Emitter;
 pub use protocol::{ArkToHost, HostToArk};
-pub use server::{Attestation, Attester, Server};
-
-use std::io;
-
-/// Maximum limit for a frame size, above which it will be discarded from the
-/// wire protocol.
-pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
-
-/// Largest protobuf message the wire carries, being what still fits a frame
-/// after the session's sealing and the COBS framing overheads are added.
-pub const MAX_MESSAGE_SIZE: usize = {
-    let mut size = MAX_FRAME_SIZE;
-    while darkbio_cobs::encode_buffer(size + sealing::OVERHEAD) > MAX_FRAME_SIZE {
-        size -= 1;
-    }
-    size
+pub use transport::{
+    Attestation, Attester, Client, Closer, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT, Error,
+    MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, Read, Roots, Sender, Server, Stream, Verifier, Write,
 };
-
-/// Domain separator for the COSE envelopes of the handshake, sealing the server's
-/// hello and the client's ack (the client's hello is plain CBOR). It binds their
-/// signatures and encryption to the wire, so a handshake signed by the server's
-/// identity key cannot be replayed into other protocols using the same key.
-pub(crate) const CRYPTO_DOMAIN_WIRE: &[u8] = b"wire-v1";
-
-/// HPKE info string for the ark-to-host encryption context of an established
-/// session (message traffic after the handshake, not the handshake itself).
-pub(crate) const CRYPTO_DOMAIN_WIRE_ARK_TO_HOST: &[u8] = b"wire-v1:ark-to-host";
-
-/// HPKE info string for the host-to-ark encryption context of an established
-/// session (message traffic after the handshake, not the handshake itself).
-pub(crate) const CRYPTO_DOMAIN_WIRE_HOST_TO_ARK: &[u8] = b"wire-v1:host-to-ark";
-
-/// Things that can go wrong in the wire transport.
-#[derive(Debug, thiserror::Error)]
-// The mocks name the variants in their transcripts
-#[cfg_attr(
-    all(any(test, feature = "fuzz"), not(docsrs)),
-    derive(strum::IntoStaticStr)
-)]
-pub enum Error {
-    #[error("wire packet too large: {0} bytes, max {MAX_MESSAGE_SIZE} bytes")]
-    PacketTooLarge(usize),
-
-    #[error("wire packet encode failed: {0}")]
-    PacketEncodingFailed(prost::EncodeError),
-
-    #[error("wire packet decode failed: {0}")]
-    PacketDecodingFailed(prost::DecodeError),
-
-    #[error("wire frame too large: {0} bytes, max {MAX_FRAME_SIZE} bytes")]
-    FrameTooLarge(usize),
-
-    #[error("wire frame decode failed: {0}")]
-    FrameDecodingFailed(darkbio_cobs::DecodeError),
-
-    #[error("wire send failed: {0}")]
-    SendFailed(io::Error),
-
-    #[error("wire receive failed: {0}")]
-    RecvFailed(io::Error),
-
-    #[error("wire terminated")]
-    Terminated,
-
-    #[error("wire session reset by the server")]
-    SessionReset,
-
-    #[error("attestation is not for a hardware or emulator")]
-    InvalidAttestation,
-
-    #[error("wire handshake failed: {0}")]
-    HandshakeFailed(String),
-
-    #[error("wire encryption failed: {0}")]
-    EncryptionFailed(String),
-}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod testing {
-    use std::sync::Once;
+    use crate::transport::{Attester, Error, Event, Read, Sender, Server, Write};
+    use std::io;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Once, mpsc};
+    use std::time::{Duration, Instant};
 
     static INIT: Once = Once::new();
+
+    /// Receiving end of a test pipe, retaining unread bytes across bounded reads.
+    pub struct PipeReader {
+        incoming: mpsc::Receiver<Vec<u8>>,
+        buffered: io::Cursor<Vec<u8>>,
+        deadline: Option<Instant>,
+    }
+
+    /// Sending end of an unbounded test pipe, closed when its owner is dropped.
+    pub struct PipeWriter {
+        outgoing: mpsc::Sender<Vec<u8>>,
+        deadline: Option<Instant>,
+    }
+
+    /// Creates an in-memory pipe whose configured deadlines bound reads and whose
+    /// output never waits for the reader. Dropping the writer delivers EOF after
+    /// its bytes. Direct standard I/O is unlimited until a deadline is configured.
+    pub fn pipe() -> (PipeReader, PipeWriter) {
+        let (outgoing, incoming) = mpsc::channel();
+        (
+            PipeReader {
+                incoming,
+                buffered: io::Cursor::new(Vec::new()),
+                deadline: None,
+            },
+            PipeWriter {
+                outgoing,
+                deadline: None,
+            },
+        )
+    }
+
+    impl io::Read for PipeReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(deadline) = self.deadline {
+                remaining(deadline)?;
+            }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.buffered.position() == self.buffered.get_ref().len() as u64 {
+                let incoming = match self.deadline {
+                    Some(deadline) => self.incoming.recv_timeout(remaining(deadline)?),
+                    None => self
+                        .incoming
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                self.buffered = match incoming {
+                    Ok(bytes) => io::Cursor::new(bytes),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                };
+            }
+            io::Read::read(&mut self.buffered, buf)
+        }
+    }
+
+    impl Read for PipeReader {
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.deadline = deadline;
+            Ok(())
+        }
+    }
+
+    impl io::Write for PipeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(deadline) = self.deadline {
+                remaining(deadline)?;
+            }
+            if !buf.is_empty() {
+                self.outgoing
+                    .send(buf.to_vec())
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(deadline) = self.deadline {
+                remaining(deadline)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Write for PipeWriter {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    /// Test socket adapter with independent absolute deadlines. Every standard
+    /// I/O call recomputes its relative socket timeout so partial progress never
+    /// restarts the budget and an expired deadline leaves the socket reusable.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    pub struct Socket {
+        inner: UnixStream,
+        read_deadline: Option<Instant>,
+        write_deadline: Option<Instant>,
+    }
+
+    #[cfg(unix)]
+    impl Socket {
+        /// Wraps a test socket without configuring either direction's deadline.
+        pub fn new(inner: UnixStream) -> Self {
+            Self {
+                inner,
+                read_deadline: None,
+                write_deadline: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl io::Read for Socket {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner
+                .set_read_timeout(self.read_deadline.map(remaining).transpose()?)?;
+            io::Read::read(&mut self.inner, buf).map_err(socket_error)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Read for Socket {
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.read_deadline = deadline;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl io::Write for Socket {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner
+                .set_write_timeout(self.write_deadline.map(remaining).transpose()?)?;
+            io::Write::write(&mut self.inner, buf).map_err(socket_error)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner
+                .set_write_timeout(self.write_deadline.map(remaining).transpose()?)?;
+            io::Write::flush(&mut self.inner).map_err(socket_error)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Write for Socket {
+        fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.write_deadline = Some(deadline);
+            Ok(())
+        }
+    }
+
+    /// Returns the nonzero part of a deadline still available for an adapter call.
+    pub fn remaining(deadline: Instant) -> io::Result<Duration> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    }
+
+    /// Normalizes the platform-specific socket timeout result for transport.
+    #[cfg(unix)]
+    fn socket_error(error: io::Error) -> io::Error {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::ErrorKind::TimedOut.into()
+        } else {
+            error
+        }
+    }
 
     // init_tracing sets up a test logger to push log messages to stderr.
     pub fn init_tracing() {
@@ -119,5 +218,20 @@ pub(crate) mod testing {
                 .with_test_writer()
                 .init();
         });
+    }
+
+    // served reads the next message and retains the sender delivered by the
+    // latest Connected event, for tests exchanging messages across sessions.
+    pub fn served<R: Read, W: Write, A: Attester>(
+        server: &mut Server<R, W, A>,
+        sender: &mut Option<Sender<W>>,
+    ) -> Result<Vec<u8>, Error> {
+        loop {
+            match server.recv()? {
+                Event::Connected(opened) => *sender = Some(opened),
+                Event::Disconnected => *sender = None,
+                Event::Message(message) => return Ok(message),
+            }
+        }
     }
 }

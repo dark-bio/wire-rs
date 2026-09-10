@@ -19,15 +19,43 @@ path = ".."
 features = ["fuzz"]
 
 [[bin]]
-name = "server-protocol"
-path = "fuzz_targets/server_protocol.rs"
+name = "transport-server"
+path = "fuzz_targets/transport_server.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "client-protocol"
-path = "fuzz_targets/client_protocol.rs"
+name = "transport-client"
+path = "fuzz_targets/transport_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport-duplex"
+path = "fuzz_targets/transport_duplex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol-session"
+path = "fuzz_targets/protocol_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol-connection"
+path = "fuzz_targets/protocol_connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol-envelope"
+path = "fuzz_targets/protocol_envelope.rs"
 test = false
 doc = false
 bench = false

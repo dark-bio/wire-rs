@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-wire"
-version = "0.4.1"
+version = "0.5.0"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Encrypted protocol between Ark and host"
 repository = "https://github.com/dark-bio/wire-rs"
@@ -50,6 +50,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] } # Keep >=
 
 [build-dependencies]
 prost-build = "0.14.1"
+prost-types = "0.14"
 protoc-bin-vendored = "3.2.0"
 
 [lib]
@@ -59,3 +60,9 @@ bench = false
 name = "main"
 harness = false
 required-features = ["bench"]
+
+# The tests push megabytes through the crypto, which crawls unoptimized, so the
+# dependencies build optimized under the dev profile too. The crate itself stays
+# unoptimized for debugging.
+[profile.dev.package."*"]
+opt-level = 2

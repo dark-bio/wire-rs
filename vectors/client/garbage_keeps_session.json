@@ -18,10 +18,10 @@
     {"event": "ok"},
     {"event": "recv"},
     {"event": "read", "bytes": "ElxyM9E51P8eGcSbdvS9WBV3AA=="},
-    {"event": "error", "kind": "PacketDecodingFailed"},
+    {"event": "ok", "message": "Bw=="},
     {"event": "recv"},
-    {"event": "read", "bytes": "ExqnpL6OBzdWar13oo+gsIfPmQA="},
-    {"event": "ok", "message": "CAI="},
+    {"event": "read", "bytes": "GRKlFN+no1mT8TPQUe1oJDkHMEUxODpM9QA="},
+    {"event": "ok", "message": "AAAAAAAAAAI="},
     {"event": "session", "established": true}
   ]
 }

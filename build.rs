@@ -1,9 +1,15 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
+use prost_types::field_descriptor_proto::Type;
+use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
+/// Generates protobuf bindings and schema-derived message/direction conversions.
 fn main() {
     // Use vendored protoc so no system dependency is needed.
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
@@ -12,7 +18,116 @@ fn main() {
 
     // Generate the protobuf bindings for the wire protocol
     println!("cargo::rerun-if-changed=proto/wire.proto");
-    prost_build::compile_protos(&["proto/wire.proto"], &["proto/"])
+    let mut config = prost_build::Config::new();
+    let descriptors = config
+        .load_fds(&["proto/wire.proto"], &["proto/"])
+        .expect("failed to load wire.proto");
+
+    // Collect the union of both envelopes' bodies for the public message enum.
+    // A body appears once even if it travels both ways (such as develop bytes).
+    let mut messages = BTreeSet::new();
+    let mut conversions = String::new();
+    let mut envelope_names = String::new();
+    for message in descriptors.file.iter().flat_map(|file| &file.message_type) {
+        if !matches!(message.name(), "HostToArk" | "ArkToHost") {
+            continue;
+        }
+        let oneof = message
+            .oneof_decl
+            .iter()
+            .position(|oneof| oneof.name() == "content")
+            .expect("envelope content oneof");
+        let module = match message.name() {
+            "HostToArk" => "host_to_ark",
+            "ArkToHost" => "ark_to_host",
+            _ => unreachable!(),
+        };
+        writeln!(conversions, "contents! {{ {module},").unwrap();
+        // Log field names from the schema without inspecting payload bytes.
+        writeln!(
+            envelope_names,
+            "impl opaque::{module}::Content {{\n    fn name(&self) -> &'static str {{\n        match self {{"
+        )
+        .unwrap();
+        for field in &message.field {
+            if field.oneof_index != Some(oneof as i32) {
+                continue;
+            }
+            // Full body names distinguish requests and responses even when their
+            // two wire envelopes use the same content field name and tag.
+            let (variant, payload) = match field.type_name.as_deref() {
+                Some(name) => {
+                    let name = name.rsplit('.').next().expect("protobuf message name");
+                    (name, name)
+                }
+                None => {
+                    assert_eq!(field.r#type().as_str_name(), "TYPE_BYTES");
+                    assert_eq!(field.name(), "develop");
+                    ("Develop", "Vec<u8>")
+                }
+            };
+            messages.insert((variant, payload));
+            let field_variant: String = field
+                .name()
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    chars
+                        .next()
+                        .expect("nonempty schema identifier")
+                        .to_uppercase()
+                        .collect::<String>()
+                        + chars.as_str()
+                })
+                .collect();
+            writeln!(conversions, "    {field_variant} => {variant},").unwrap();
+            writeln!(
+                envelope_names,
+                "            Self::{field_variant}(..) => {:?},",
+                field.name()
+            )
+            .unwrap();
+        }
+        writeln!(conversions, "}}").unwrap();
+        writeln!(envelope_names, "        }}\n    }}\n}}").unwrap();
+    }
+    let mut content = String::from("messages! {\n");
+    for (variant, payload) in messages {
+        writeln!(content, "    {variant}({payload}),").unwrap();
+    }
+    writeln!(content, "}}").unwrap();
+    content.push_str(&conversions);
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
+    fs::write(out_dir.join("message.rs"), content).expect("write message enum and conversions");
+    fs::write(out_dir.join("darkbio.wire.names.rs"), envelope_names)
+        .expect("write envelope field names");
+
+    // Generate a second view of the envelopes with nested messages left as bytes.
+    // Field numbers, oneofs and optional presence stay the same. The reader uses
+    // this view for routing. Full decoding uses the original envelope bytes so
+    // repeated message fields still merge as protobuf expects.
+    let mut opaque = descriptors.clone();
+    for file in &mut opaque.file {
+        file.package = Some("darkbio.wire.opaque".into());
+        file.enum_type.clear();
+        file.message_type
+            .retain(|message| matches!(message.name(), "HostToArk" | "ArkToHost"));
+        for message in &mut file.message_type {
+            for field in &mut message.field {
+                if field.r#type() == Type::Message {
+                    field.r#type = Some(Type::Bytes as i32);
+                    field.type_name = None;
+                }
+            }
+        }
+    }
+    let mut opaque_config = prost_build::Config::new();
+    opaque_config.bytes(["."]);
+    opaque_config
+        .compile_fds(opaque)
+        .expect("generate opaque envelope views");
+    config
+        .compile_fds(descriptors)
         .expect("failed to compile wire.proto");
 
     // Expose the compiler version for the benchmark environment report
