@@ -5,11 +5,11 @@
 //! Scripts can run both protocol peers or inspect one peer through a raw transport.
 
 use super::session::Job;
+use crate::protocol::schema::{self, ArkToHost, HostToArk, ark_to_host, host_to_ark};
 use crate::protocol::session::SessionInner;
 use crate::protocol::worker::{self, Tracker};
 use crate::protocol::{
-    self, ArkToHost, Closer, Error, HostToArk, Message, Promise, RemoteError, Requester, Responder,
-    Server, Session, ark_to_host, host_to_ark,
+    self, Closer, Error, Message, Promise, Requester, Responder, Server, Session,
 };
 use crate::transport::mock::{
     duplex::{Adapter, FaultKind, Operation, Pipe},
@@ -241,14 +241,14 @@ impl RawPeer {
             EnvelopeShape::Content(tag) => (Some(tag), None),
             EnvelopeShape::Error(code) => (
                 None,
-                Some(RemoteError {
+                Some(schema::Error {
                     code,
                     msg: "remote failure".into(),
                 }),
             ),
             EnvelopeShape::Both => (
                 Some(1),
-                Some(RemoteError {
+                Some(schema::Error {
                     code: 1,
                     msg: "invalid".into(),
                 }),
@@ -535,20 +535,20 @@ impl Driver {
             }
             Step::TypedExchange => {
                 let promise = self.requesters[&0]
-                    .request(protocol::DeviceInfoRequest {}, Instant::now() + BUDGET)
+                    .request(schema::DeviceInfoRequest {}, Instant::now() + BUDGET)
                     .unwrap();
                 let (message, responder) = self.sessions.get_mut(&1).unwrap().recv().unwrap();
                 assert!(matches!(message, Message::DeviceInfoRequest(_)));
                 let write = responder
                     .reply(
-                        protocol::DeviceInfoResponse {
+                        schema::DeviceInfoResponse {
                             version_id: 42,
                             ..Default::default()
                         },
                         Instant::now() + BUDGET,
                     )
                     .unwrap();
-                let reply: protocol::DeviceInfoResponse = promise.wait().unwrap();
+                let reply: schema::DeviceInfoResponse = promise.wait().unwrap();
                 assert_eq!(reply.version_id, 42);
                 write.wait().unwrap();
             }
@@ -562,9 +562,9 @@ impl Driver {
             }
             Step::WrongDirection(session, slot) => {
                 let body: Message = if session == 0 {
-                    protocol::DeviceInfoResponse::default().into()
+                    schema::DeviceInfoResponse::default().into()
                 } else {
-                    protocol::DeviceInfoRequest {}.into()
+                    schema::DeviceInfoRequest {}.into()
                 };
                 self.promises.insert(
                     slot,
@@ -596,7 +596,7 @@ impl Driver {
                     (session, result)
                 })
                 .finish();
-                assert_eq!(failure(result.err().expect("receive must fail")), expected);
+                assert_eq!(failure(result.expect_err("receive must fail")), expected);
                 self.sessions.insert(label, session);
             }
             Step::StartReceive(label) => {
@@ -613,7 +613,7 @@ impl Driver {
             }
             Step::ReceiveFailed(label, expected) => {
                 let (session, result) = self.receiving.remove(&label).unwrap().finish();
-                assert_eq!(failure(result.err().expect("receive must fail")), expected);
+                assert_eq!(failure(result.expect_err("receive must fail")), expected);
                 self.sessions.insert(label, session);
             }
             Step::Reply(slot, promise, body, ms) => {
@@ -621,15 +621,15 @@ impl Driver {
                 let deadline = Instant::now() + Duration::from_millis(ms);
                 let result = match body {
                     Ok(tag) => responder.reply(vec![tag], deadline),
-                    Err(code) => responder.fail(RemoteError::new(code, "refused"), deadline),
+                    Err(code) => responder.fail(schema::Error::new(code, "refused"), deadline),
                 };
                 self.writes.insert(promise, result.unwrap());
             }
             Step::WrongDirectionReply(session, slot, promise) => {
                 let body: Message = if session == 0 {
-                    protocol::DeviceInfoResponse::default().into()
+                    schema::DeviceInfoResponse::default().into()
                 } else {
-                    protocol::DeviceInfoRequest {}.into()
+                    schema::DeviceInfoRequest {}.into()
                 };
                 self.writes.insert(
                     promise,

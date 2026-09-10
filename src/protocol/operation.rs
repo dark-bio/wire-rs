@@ -6,7 +6,7 @@
 use super::envelope::IncomingEnvelope;
 use super::promise::{PromiseResult, ResultSender};
 use super::session::SessionInner;
-use super::{Error, Message, RemoteError};
+use super::{Error, Message, schema};
 use crate::LogId;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
@@ -131,7 +131,7 @@ pub(super) enum OutgoingBody {
         /// Original peer request ID.
         id: u64,
         /// Application response or the standard unanswered error.
-        result: Result<Message, RemoteError>,
+        result: Result<Message, schema::Error>,
     },
 }
 
@@ -156,7 +156,7 @@ impl OperationHandle {
 
     /// Supplies a request answer in tests that replace the transport reader.
     #[cfg(any(test, feature = "fuzz"))]
-    pub(super) fn record_response(self, result: Result<Message, RemoteError>) {
+    pub(super) fn record_response(self, result: Result<Message, schema::Error>) {
         if let Some(session) = self.session.upgrade() {
             session.record_response(&self.key, result.map_err(Error::Remote));
         }

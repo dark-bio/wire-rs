@@ -4,7 +4,7 @@
 //! Sending one reply to a received request, or `UNANSWERED` when dropped.
 
 use super::session::SessionInner;
-use super::{Error, Message, Promise, RemoteError};
+use super::{Error, Message, Promise, schema};
 use std::sync::Weak;
 use std::time::Instant;
 
@@ -25,12 +25,12 @@ use std::time::Instant;
 /// Both [`Self::reply`] and [`Self::fail`] consume the responder, so it cannot be reused:
 ///
 /// ```compile_fail,E0382
-/// use darkbio_wire::protocol::{DeviceInfoResponse, RemoteError, Responder};
+/// use darkbio_wire::protocol::{Responder, schema};
 /// use std::time::Instant;
 ///
 /// fn answer_twice(responder: Responder, deadline: Instant) {
-///     let _ = responder.reply(DeviceInfoResponse::default(), deadline);
-///     let _ = responder.fail(RemoteError::new(0x100, "refused"), deadline);
+///     let _ = responder.reply(schema::DeviceInfoResponse::default(), deadline);
+///     let _ = responder.fail(schema::Error::new(0x100, "refused"), deadline);
 /// }
 /// ```
 ///
@@ -40,6 +40,7 @@ use std::time::Instant;
 /// use darkbio_wire::protocol::Responder;
 /// fn duplicate(responder: Responder) { let _ = responder.clone(); }
 /// ```
+#[derive(Debug)]
 pub struct Responder {
     /// Session that received the request; holding a responder cannot keep it open.
     session: Weak<SessionInner>,
@@ -69,16 +70,16 @@ impl Responder {
 
     /// Queues an error response and consumes the responder. The deadline and write
     /// promise work as in [`Self::reply`]. The error itself does not close the session.
-    /// Use [`RemoteError::reserved`] for a named protocol error or
-    /// [`RemoteError::new`] for a numeric error code.
-    pub fn fail(self, error: RemoteError, deadline: Instant) -> Result<Promise<()>, Error> {
+    /// Use [`schema::Error::reserved`] for a named protocol error or
+    /// [`schema::Error::new`] for a numeric error code.
+    pub fn fail(self, error: schema::Error, deadline: Instant) -> Result<Promise<()>, Error> {
         self.enqueue(Err(error), deadline)
     }
 
     /// Queues either kind of response and marks this responder as answered.
     fn enqueue(
         mut self,
-        result: Result<Message, RemoteError>,
+        result: Result<Message, schema::Error>,
         deadline: Instant,
     ) -> Result<Promise<()>, Error> {
         let promise = self.session.upgrade().ok_or(Error::Closed)?.reply(
@@ -115,10 +116,9 @@ impl Drop for Responder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::protocol::{
-        DeviceInfoResponse, Error, Message, Promise, RemoteError, ReservedErrors, Responder,
-        Session,
-    };
+    use crate::protocol::schema::DeviceInfoResponse;
+    use crate::protocol::{Error, Message, Promise, Responder, Session, schema};
+    use std::fmt::Debug;
     use std::time::Instant;
 
     /// Compiles receiving a host-side request and returning an application error.
@@ -128,7 +128,7 @@ mod tests {
         let _ = request;
         responder
             .fail(
-                RemoteError::reserved(ReservedErrors::Unspecified, "refused"),
+                schema::Error::reserved(schema::ReservedErrors::Unspecified, "refused"),
                 deadline,
             )?
             .wait()
@@ -158,11 +158,12 @@ mod tests {
         Ok(())
     }
 
-    /// Checks the send bound required to transfer ownership to an application thread.
+    /// Checks the bounds required to move the responder to an application thread
+    /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be transferable to a background thread.
-        fn movable<T: Send + 'static>() {}
+        /// Requires an owned value to be printable and transferable to a background thread.
+        fn movable<T: Debug + Send + 'static>() {}
         movable::<Responder>();
     }
 }

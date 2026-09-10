@@ -20,9 +20,11 @@
 //! owns its receive queue and closes when dropped. Its [`Requester`] and
 //! [`Responder`] handles always target that session, even after it closes and
 //! another session connects.
-//! Both sides use the same concrete handle types and [`Message`] enum; the role and
-//! wire envelope direction are internal details. Callers select response types when
-//! waiting on [`Promise<Message>`].
+//! Both sides use the same handle types. Sessions exchange [`Message`], the union
+//! of every body in the [`schema`]. The [`schema::host_to_ark::Content`] and
+//! [`schema::ark_to_host::Content`] oneofs hold what each side may send. Convert
+//! a received [`Message`] into the peer's oneof to dispatch on it exhaustively.
+//! Callers select response types when waiting on [`Promise<Message>`].
 //!
 //! Requests and replies return promises without waiting for I/O. Their deadlines
 //! include time in the outgoing queue; `wait()` does not restart the timeout.
@@ -55,8 +57,6 @@ pub mod mock;
 
 pub use closer::Closer;
 pub use error::Error;
-pub use generated::Error as RemoteError;
-pub use generated::*;
 pub use message::Message;
 pub use promise::Promise;
 pub use requester::Requester;
@@ -87,9 +87,14 @@ pub const DEFAULT_MAX_INBOUND_REQUESTS: usize = 1024;
 /// [`Server::set_inbound_limits`]. Zero permits no retained envelope bytes.
 pub const DEFAULT_MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 
-/// Generated protobuf bindings, excluded from checks for handwritten code.
+/// Protobuf bindings of the protocol, generated from `proto/wire.proto` and
+/// excluded from the lints of handwritten code. Every message implements
+/// `prost::Message` for raw encoding. Applications exchange the bodies through
+/// [`Message`], converting to the `host_to_ark` and `ark_to_host` oneofs to
+/// dispatch on one direction. The `HostToArk` and `ArkToHost` envelopes are the
+/// wire form, handled by the session internally.
 #[allow(clippy::all)]
 #[allow(rustdoc::broken_intra_doc_links)]
-mod generated {
+pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/darkbio.wire.rs"));
 }

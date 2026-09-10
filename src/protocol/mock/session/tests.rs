@@ -6,10 +6,10 @@
 use super::{Failure, Job, PATIENCE, Step, run};
 use crate::protocol::envelope::{IncomingEnvelope, Side, opaque};
 use crate::protocol::operation::PendingOperation;
+use crate::protocol::schema::{self, HostToArk, host_to_ark};
 use crate::protocol::session::SessionInner;
 use crate::protocol::{
-    DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS, Error, HostToArk, Message, Promise,
-    RemoteError, Session, host_to_ark,
+    DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS, Error, Message, Promise, Session,
 };
 use prost::Message as _;
 use prost::bytes::Bytes;
@@ -1265,7 +1265,7 @@ fn test_inbound_deferred_validation() {
 /// Retaining the original envelope preserves protobuf's nested message merging.
 #[test]
 fn test_inbound_preserves_nested_merges() {
-    use crate::protocol::{HostToArk, PairingSetAppIdentityRequest, host_to_ark};
+    use crate::protocol::schema::{HostToArk, PairingSetAppIdentityRequest, host_to_ark};
     use Step::*;
     use prost::Message as _;
     let first = PairingSetAppIdentityRequest { identity: vec![42] };
@@ -1740,7 +1740,7 @@ fn test_malformed_response_observation_and_deadlines() {
 fn test_repeated_payload_fields() {
     let mut error = HostToArk {
         id: 2,
-        err: Some(RemoteError {
+        err: Some(schema::Error {
             code: 123,
             msg: String::new(),
         }),
@@ -1750,7 +1750,7 @@ fn test_repeated_payload_fields() {
     error.extend(
         HostToArk {
             id: 0,
-            err: Some(RemoteError {
+            err: Some(schema::Error {
                 code: 0,
                 msg: "reason".into(),
             }),
@@ -1779,7 +1779,7 @@ fn test_repeated_payload_fields() {
         id: 1,
         err: None,
         content: Some(host_to_ark::Content::PairingSetAppId(
-            crate::protocol::PairingSetAppIdentityRequest { identity: vec![42] },
+            crate::protocol::schema::PairingSetAppIdentityRequest { identity: vec![42] },
         )),
     }
     .encode_to_vec();
@@ -1830,7 +1830,7 @@ fn test_repeated_id_changes_routing() {
                     content: None,
                 }
                 .encode_to_vec(),
-                Side::Server => crate::protocol::ArkToHost {
+                Side::Server => crate::protocol::schema::ArkToHost {
                     id: last,
                     err: None,
                     content: None,
@@ -1873,7 +1873,7 @@ fn test_repeated_id_changes_routing() {
 fn large_envelope(peer: Side, id: u64, error: bool) -> (Vec<u8>, usize) {
     let body = |len| {
         if error {
-            Err(RemoteError {
+            Err(schema::Error {
                 code: 123,
                 msg: "x".repeat(len),
             })

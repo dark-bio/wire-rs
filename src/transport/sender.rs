@@ -9,6 +9,7 @@ use super::outbound::Outbound;
 use super::{Error, sealing};
 use crate::LogId;
 use darkbio_crypto::xhpke;
+use std::fmt;
 use std::sync::{Mutex, Weak};
 use tracing::{debug, warn};
 
@@ -26,7 +27,6 @@ use tracing::{debug, warn};
 /// references and do not extend either lifetime. An active send temporarily
 /// retains both, but can write only while its session remains current.
 /// Dropping a sender does not end the session.
-#[derive(Debug)]
 pub struct Sender<W: Write> {
     outbound: Weak<Outbound<W>>, // Writer retained by the client/server and active sends
     sealer: Weak<Mutex<xhpke::Sender>>, // Encryption context whose allocation identifies the session
@@ -121,6 +121,16 @@ impl<W: Write> Sender<W> {
 impl<W: Write> Clone for Sender<W> {
     fn clone(&self) -> Self {
         Self::new(self.outbound.clone(), self.sealer.clone(), self.log_id)
+    }
+}
+
+impl<W: Write> fmt::Debug for Sender<W> {
+    /// Shows the session label and whether the session still accepts sends.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sender")
+            .field("session", &self.log_id)
+            .field("valid", &(self.sealer.strong_count() > 0))
+            .finish()
     }
 }
 

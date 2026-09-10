@@ -5,6 +5,7 @@
 
 use super::io::check_deadline;
 use super::{DEFAULT_WRITE_TIMEOUT, Read, Write};
+use std::fmt;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -84,6 +85,16 @@ impl<R: Read, W: Write> Drop for Stream<R, W> {
     }
 }
 
+impl<R: Read, W: Write> fmt::Debug for Stream<R, W> {
+    /// Shows the write budget and the shutdown state, never the adapters.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stream")
+            .field("timeout", &self.timeout)
+            .field("closer", &self.closer)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A cloneable handle that permanently closes a byte stream.
 #[derive(Clone)]
 pub struct Closer(Arc<Shutdown>);
@@ -98,7 +109,7 @@ struct Shutdown {
 
 /// Lifecycle of a byte stream. Closing refuses new adapter operations. Closed
 /// additionally guarantees that shutdown and all admitted operations have finished.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// Adapter I/O may be admitted and shutdown has not been requested.
     Open,
@@ -193,6 +204,21 @@ impl Closer {
         }
         state.active += 1;
         Some(Activity(self))
+    }
+}
+
+impl fmt::Debug for Closer {
+    /// Shows the lifecycle phase and the admitted adapter operations. A state
+    /// lock held elsewhere is reported instead of waited for.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut closer = f.debug_struct("Closer");
+        match self.0.state.try_lock() {
+            Ok(state) => closer
+                .field("phase", &state.phase)
+                .field("active", &state.active),
+            Err(_) => closer.field("state", &format_args!("<locked>")),
+        };
+        closer.finish()
     }
 }
 
@@ -322,6 +348,24 @@ mod tests {
     use std::time::Duration;
 
     const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// Checks that the transport's owners and handles print without printable
+    /// adapters, which hosts may box as trait objects.
+    #[test]
+    fn test_debug_capabilities() {
+        use crate::transport::{Attestation, Event, Roots, Sender, Server};
+
+        /// Requires a value to be printable.
+        fn printable<T: fmt::Debug>() {}
+        printable::<Stream<Box<dyn Read>, Box<dyn Write>>>();
+        printable::<Closer>();
+        printable::<Client<Box<dyn Read>, Box<dyn Write>>>();
+        printable::<Server<Box<dyn Read>, Box<dyn Write>, Attestation>>();
+        printable::<Sender<Box<dyn Write>>>();
+        printable::<Event<Box<dyn Write>>>();
+        printable::<Attestation>();
+        printable::<Roots<'static>>();
+    }
 
     // A memory reader can deliver ready bytes after its own deadline, but the
     // transport must reject an expired attempt before consuming those bytes.

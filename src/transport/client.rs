@@ -16,6 +16,7 @@ use crate::transport::{
 };
 use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
@@ -47,6 +48,7 @@ impl Verifier for xdsa::PublicKey {
 /// Roots trusted to attest Arks. Hardware and emulator roots are checked
 /// separately, and attestations must be valid at the current time. Self-signed
 /// attestations from devices that have not been onboarded are rejected.
+#[derive(Debug)]
 pub struct Roots<'a> {
     pub hardware: &'a [xdsa::PublicKey], // Roots attesting hardware Arks
     pub emulator: &'a [xdsa::PublicKey], // Roots attesting emulated Arks
@@ -466,6 +468,18 @@ impl<R: Read, W: Write> Drop for Client<R, W> {
     fn drop(&mut self) {
         self.outbound.close();
         self.end_session();
+    }
+}
+
+impl<R: Read, W: Write> fmt::Debug for Client<R, W> {
+    /// Shows the session label, whether a session is established and the
+    /// handshake budget, never the adapters or the encryption contexts.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("session", &self.log_id)
+            .field("connected", &self.sealer.is_some())
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish_non_exhaustive()
     }
 }
 

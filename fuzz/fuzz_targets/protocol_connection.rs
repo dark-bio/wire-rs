@@ -19,7 +19,7 @@ fuzz_target!(
     },
     |actions: Vec<Action>| {
         #[cfg(getrandom_backend = "custom")]
-        darkbio_wire::mock::random::reseed("protocol-fuzz");
+        darkbio_wire::transport::mock::random::reseed("protocol-fuzz");
 
         fuzz(&actions);
     }

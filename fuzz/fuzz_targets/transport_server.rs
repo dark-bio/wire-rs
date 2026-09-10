@@ -3,7 +3,7 @@
 
 #![no_main]
 
-use darkbio_wire::mock::client::{Step, run};
+use darkbio_wire::transport::mock::client::{Step, run};
 use libfuzzer_sys::fuzz_target;
 
 // Drives a real server side through an arbitrary sequence of client frames, the
@@ -27,7 +27,7 @@ fuzz_target!(
         // Restart the randomness from the same seed for every input, so an
         // input covers the same features on every execution
         #[cfg(getrandom_backend = "custom")]
-        darkbio_wire::mock::random::reseed("fuzz");
+        darkbio_wire::transport::mock::random::reseed("fuzz");
 
         run(&steps);
     }

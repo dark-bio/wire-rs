@@ -3,7 +3,7 @@
 
 //! Errors returned by protocol methods and promises.
 
-use super::{RemoteError, ReservedErrors};
+use super::schema;
 use crate::transport;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub enum Error {
 
     /// The peer returned an application error for this request.
     #[error("wire peer failed the request, code {}: {}", .0.code, .0.msg)]
-    Remote(RemoteError),
+    Remote(schema::Error),
 
     /// The response's `Message` variant does not match the type requested by
     /// `Promise::wait()`. This does not end the session.
@@ -73,9 +73,9 @@ impl From<transport::Error> for Error {
     }
 }
 
-impl From<RemoteError> for Error {
+impl From<schema::Error> for Error {
     /// Wraps the peer's error code and message in `Error::Remote`.
-    fn from(error: RemoteError) -> Self {
+    fn from(error: schema::Error) -> Self {
         Self::Remote(error)
     }
 }
@@ -111,7 +111,7 @@ impl Error {
     }
 }
 
-impl RemoteError {
+impl schema::Error {
     /// Builds an error with a numeric code and a human-readable message.
     /// Codes from 0x100 are request-specific. Use [`Self::reserved`] for named
     /// protocol errors.
@@ -123,7 +123,7 @@ impl RemoteError {
     }
 
     /// Builds an error from a reserved protocol code and a human-readable message.
-    pub fn reserved(code: ReservedErrors, msg: impl Into<String>) -> Self {
+    pub fn reserved(code: schema::ReservedErrors, msg: impl Into<String>) -> Self {
         Self::new(code as u64, msg)
     }
 }

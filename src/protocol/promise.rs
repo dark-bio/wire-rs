@@ -6,6 +6,7 @@
 use super::envelope::IncomingEnvelope;
 use super::session::SessionInner;
 use super::{Error, Message};
+use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, Weak, mpsc};
 #[cfg(any(test, feature = "fuzz"))]
@@ -30,7 +31,8 @@ use std::time::Instant;
 /// Each promise returns its result once:
 ///
 /// ```compile_fail,E0382
-/// use darkbio_wire::protocol::{DeviceInfoResponse, Message, Promise};
+/// use darkbio_wire::protocol::schema::DeviceInfoResponse;
+/// use darkbio_wire::protocol::{Message, Promise};
 /// fn take_twice(promise: Promise<Message>) {
 ///     let _ = promise.wait::<DeviceInfoResponse>();
 ///     let _ = promise.wait::<DeviceInfoResponse>();
@@ -227,6 +229,22 @@ impl<T> Drop for Promise<T> {
     }
 }
 
+impl<T> fmt::Debug for Promise<T> {
+    /// Shows the deadline, whether a notification is registered and whether
+    /// the result has been published. A notification lock held elsewhere
+    /// leaves the completion out.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut promise = f.debug_struct("Promise");
+        promise
+            .field("deadline", &self.deadline)
+            .field("registered", &self.registered);
+        if let Ok(notification) = self.notification.try_lock() {
+            promise.field("done", &notification.done);
+        }
+        promise.finish_non_exhaustive()
+    }
+}
+
 /// Shared notification state survives the session without retaining it.
 #[derive(Default)]
 struct NotificationState {
@@ -296,6 +314,7 @@ impl PromiseResult {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{Error, Message, Promise, PromiseResult};
+    use std::fmt::Debug;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Weak, mpsc};
     use std::time::{Duration, Instant};
@@ -373,11 +392,12 @@ mod tests {
         }
     }
 
-    /// Checks the send bound required to transfer ownership to an application thread.
+    /// Checks the bounds required to move a promise to an application thread
+    /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be transferable to a background thread.
-        fn movable<T: Send + 'static>() {}
+        /// Requires an owned value to be printable and transferable to a background thread.
+        fn movable<T: Debug + Send + 'static>() {}
         movable::<Promise<Message>>();
         movable::<Promise<()>>();
     }

@@ -12,6 +12,7 @@ use super::{
 };
 use crate::transport::{self, Attester, Read, Stream, Write};
 use darkbio_crypto::xdsa;
+use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -204,6 +205,18 @@ impl Drop for Server {
     /// Ends the server and its attached session even when handles remain.
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+impl fmt::Debug for Server {
+    /// Shows whether the server still accepts sessions. A state lock held
+    /// elsewhere leaves the state out.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut server = f.debug_struct("Server");
+        if let Ok(state) = self.inner.state.try_lock() {
+            server.field("open", &matches!(*state, State::Open { .. }));
+        }
+        server.finish_non_exhaustive()
     }
 }
 
@@ -465,6 +478,7 @@ mod tests {
     use crate::protocol::{Error, Server, Session};
     use crate::transport::{Attester, Read, Stream, Write};
     use darkbio_crypto::xdsa;
+    use std::fmt::Debug;
 
     /// Compiles server construction from a caller-owned stream, signer and attester.
     #[allow(dead_code)]
@@ -483,11 +497,12 @@ mod tests {
         server.accept()
     }
 
-    /// Checks the send bound required to transfer ownership to an application thread.
+    /// Checks the bounds required to move the server to an application thread
+    /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be transferable to a background thread.
-        fn movable<T: Send + 'static>() {}
+        /// Requires an owned value to be printable and transferable to a background thread.
+        fn movable<T: Debug + Send + 'static>() {}
         movable::<Server>();
     }
 }

@@ -14,14 +14,14 @@ use std::sync::Weak;
 /// Its target never changes: a session's closer cannot affect a successor session.
 ///
 /// This handle does not keep its owner open. Dropping it does not close anything.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Closer {
     /// Session or server to close.
     target: Target,
 }
 
 /// The session or server targeted by a `Closer`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Target {
     /// One session, even after another session connects to the same server.
     Session(Weak<SessionInner>),
@@ -66,6 +66,7 @@ impl Closer {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::protocol::{Closer, Server, Session};
+    use std::fmt::Debug;
 
     /// Compiles closing sessions and servers through cloned handles on other threads.
     #[allow(dead_code)]
@@ -80,11 +81,11 @@ mod tests {
         server.close();
     }
 
-    /// Checks that `Closer` implements `Clone`, `Send`, and `Sync`.
+    /// Checks that `Closer` implements `Clone`, `Debug`, `Send`, and `Sync`.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires a handle to be clonable and usable by multiple threads.
-        fn shared<T: Clone + Send + Sync + 'static>() {}
+        /// Requires a handle to be clonable, printable and usable by multiple threads.
+        fn shared<T: Clone + Debug + Send + Sync + 'static>() {}
         shared::<Closer>();
     }
 }
