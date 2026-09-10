@@ -57,12 +57,18 @@ enum Failure {
     Large,
     /// A peer application error.
     Remote(u64),
+    /// The inbound request limit closed the session.
+    Requests,
+    /// The inbound byte limit closed the session.
+    Bytes,
 }
 
 /// Maps public errors into the script's expected outcomes.
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
+        Error::InboundRequestLimitExceeded(_) => Failure::Requests,
+        Error::InboundByteLimitExceeded(_) => Failure::Bytes,
         Error::Timeout => Failure::Timeout,
         Error::Malformed => Failure::Malformed,
         Error::Transport(_) => Failure::Transport,
@@ -80,6 +86,10 @@ enum EnvelopeShape {
     Content(u8),
     /// Error-only response.
     Error(u64),
+    /// A valid envelope containing a truncated nested protobuf body.
+    MalformedBody,
+    /// A valid envelope containing a truncated nested protobuf error.
+    MalformedError,
     /// Both content and error, invalid in the protocol.
     Both,
     /// Neither content nor error, invalid in the protocol.
@@ -92,6 +102,17 @@ enum EnvelopeShape {
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step {
+    /// Receives a queued request and requires a specific failure without a wait hook.
+    ReceiveError(u8, Failure),
+    /// Checks accepted requests and retained bytes after earlier work has completed.
+    Usage(u8, usize, usize),
+    /// Waits for response delivery without consuming its buffered bytes.
+    ResponseReceived(u8, u64),
+    /// Changes both inbound limits through the public session setter.
+    InboundLimits(u8, usize, usize),
+    /// Changes both server limits for the current and future sessions.
+    ServerInboundLimits(usize, usize),
+
     /// Round-trip a concrete schema body through the public typed waiting API.
     TypedExchange,
     /// Request from session label, save promise in slot, payload tag, deadline ms.
@@ -185,6 +206,19 @@ enum RawPeer {
 impl RawPeer {
     /// Sends an envelope without applying the protocol's validation rules.
     fn send(&self, id: u64, body: EnvelopeShape) -> Result<(), transport::Error> {
+        if matches!(
+            body,
+            EnvelopeShape::MalformedBody | EnvelopeShape::MalformedError
+        ) {
+            let bytes = super::envelope::malformed_body(
+                matches!(self, Self::Server(..)),
+                id,
+                body == EnvelopeShape::MalformedError,
+            );
+            return match self {
+                Self::Client(_, sender) | Self::Server(_, sender) => sender.send(&bytes),
+            };
+        }
         let (tag, error) = match body {
             EnvelopeShape::Content(tag) => (Some(tag), None),
             EnvelopeShape::Error(code) => (
@@ -202,6 +236,7 @@ impl RawPeer {
                 }),
             ),
             EnvelopeShape::Neither | EnvelopeShape::Invalid => (None, None),
+            EnvelopeShape::MalformedBody | EnvelopeShape::MalformedError => unreachable!(),
         };
         let bytes = if body == EnvelopeShape::Invalid {
             vec![0x80]
@@ -420,6 +455,43 @@ impl Driver {
     /// Runs one scripted action using public calls and controlled adapter events.
     fn step(&mut self, step: Step) {
         match step {
+            Step::ReceiveError(label, expected) => {
+                let mut session = self.sessions.remove(&label).unwrap();
+                let (session, result) = Job::start(move || {
+                    let result = session.recv();
+                    (session, result)
+                })
+                .finish();
+                assert_eq!(failure(result.err().expect("receive must fail")), expected);
+                self.sessions.insert(label, session);
+            }
+            Step::Usage(label, requests, bytes) => {
+                assert_eq!(
+                    self.states[&label].upgrade().unwrap().inbound_usage(),
+                    (requests, bytes)
+                );
+            }
+            Step::ResponseReceived(label, id) => {
+                self.states[&label].upgrade().unwrap().wait_response(id)
+            }
+
+            Step::InboundLimits(id, requests, bytes) => {
+                let session = self
+                    .sessions
+                    .remove(&id)
+                    .unwrap()
+                    .set_inbound_limits(requests, bytes);
+                self.sessions.insert(id, session);
+            }
+            Step::ServerInboundLimits(requests, bytes) => {
+                self.server = Some(
+                    self.server
+                        .take()
+                        .unwrap()
+                        .set_inbound_limits(requests, bytes),
+                );
+            }
+
             Step::TypedExchange => {
                 let promise = self.requesters[&0]
                     .request(protocol::DeviceInfoRequest {}, Instant::now() + BUDGET)
@@ -683,6 +755,64 @@ impl Drop for Driver {
             assert!(!expired, "connection scenario exceeded watchdog");
         }
     }
+}
+
+/// Keeps one write in flight and both explicit and automatic replies queued
+/// while inbound admission or deferred decoding closes the session.
+fn blocked_inbound_steps(
+    local: u8,
+    own: u64,
+    peer: u64,
+    outgoing: u8,
+    phase: Operation,
+    reason: Failure,
+) -> Vec<Step> {
+    use EnvelopeShape::*;
+    use Step::*;
+    let mut steps = vec![
+        InboundLimits(local, 3, 100),
+        Pause(outgoing, phase, true),
+        Request(local, 0, 10, 3000),
+        Blocked(outgoing, phase),
+    ];
+    if phase == Operation::Flush {
+        steps.push(Read(own, Content(10)));
+    }
+    if reason == Failure::Malformed {
+        steps.extend([Send(own, MalformedBody), ResponseReceived(local, own)]);
+    }
+    steps.extend([
+        Send(peer, Content(11)),
+        Receive(local, 11, 0),
+        Send(peer.wrapping_add(2), Content(12)),
+        Receive(local, 12, 1),
+        Reply(0, 0, Ok(13), 3000),
+        Abandon(1),
+        Request(local, 1, 14, 3000),
+    ]);
+    match reason {
+        Failure::Requests => steps.push(InboundLimits(local, 2, 100)),
+        Failure::Bytes => steps.push(InboundLimits(local, 3, 0)),
+        Failure::Malformed => {}
+        _ => unreachable!("inbound closing reason required"),
+    }
+    steps.push(StartReceive(local));
+    if reason == Failure::Malformed {
+        steps.push(Answer(0, Err(reason)));
+    } else {
+        steps.push(Reject(peer.wrapping_add(4), Content(15)));
+    }
+    steps.push(ReceiveFailed(local, reason));
+    if reason != Failure::Malformed {
+        steps.push(Answer(0, Err(reason)));
+    }
+    steps.extend([
+        Answer(1, Err(reason)),
+        Written(0, Err(reason)),
+        Usage(local, 0, 0),
+        Pause(outgoing, phase, false),
+    ]);
+    steps
 }
 
 /// Runs a script with automatic cleanup and step diagnostics on failure.

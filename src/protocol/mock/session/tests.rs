@@ -1,9 +1,21 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Session lifecycle regressions expressed through the shared scenario runner.
+//! Session lifecycle, inbound accounting, and concurrency regressions.
 
-use super::{Failure, Step, run};
+use super::{Failure, Job, PATIENCE, Step, run};
+use crate::protocol::envelope::{IncomingEnvelope, Side, opaque};
+use crate::protocol::operation::{PendingOperation, ResultSender};
+use crate::protocol::session::SessionInner;
+use crate::protocol::{
+    DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS, Error, HostToArk, Message, Promise,
+    RemoteError, Session, host_to_ark,
+};
+use prost::Message as _;
+use prost::bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Weak, mpsc};
+use std::time::{Duration, Instant};
 
 /// Closure discards queued work, refuses later operations and remains repeatable.
 #[test]
@@ -495,7 +507,7 @@ fn test_abandonment_timeout() {
 }
 
 /// Drops use current configuration, queued replies keep their deadlines, and
-/// replacement sessions start with the default.
+/// replacement sessions start with the server's default.
 #[test]
 fn test_abandonment_timeout_updates() {
     use super::ExpectedMessage;
@@ -530,6 +542,144 @@ fn test_abandonment_timeout_updates() {
         Outgoing(2, 3, ExpectedMessage::Reply(10, Err(1)), 5020),
         Written(3, Ok(())),
     ]);
+}
+
+/// Server timeouts reach pending, accepted and future sessions. Queued replies
+/// keep their deadlines, and a session override does not change the server default.
+#[test]
+fn test_server_abandonment_timeout() {
+    use super::ExpectedMessage;
+    use Step::*;
+    run(vec![
+        ServerInboundLimits(2, 100),
+        ServerAbandonmentTimeout(Duration::from_millis(30)),
+        Open(1),
+        Accept(1),
+        Deliver(1, 7, 11),
+        Receive(1, 11, 0),
+        Time(20),
+        DropReply(0),
+        ServerAbandonmentTimeout(Duration::from_millis(40)),
+        Deliver(1, 8, 12),
+        Receive(1, 12, 1),
+        DropReply(1),
+        Usage(1, 2, 0),
+        Outgoing(1, 0, ExpectedMessage::Reply(7, Err(1)), 50),
+        Written(0, Ok(())),
+        Outgoing(1, 1, ExpectedMessage::Reply(8, Err(1)), 60),
+        Written(1, Ok(())),
+        Usage(1, 0, 0),
+        AbandonmentTimeout(1, Duration::from_millis(90)),
+        Deliver(1, 9, 13),
+        Receive(1, 13, 2),
+        DropReply(2),
+        Outgoing(1, 2, ExpectedMessage::Reply(9, Err(1)), 110),
+        Written(2, Ok(())),
+        Open(2),
+        Accept(2),
+        Deliver(2, 7, 14),
+        Receive(2, 14, 3),
+        DropReply(3),
+        Outgoing(2, 3, ExpectedMessage::Reply(7, Err(1)), 60),
+        Written(3, Ok(())),
+        Deliver(2, 8, 15),
+        Receive(2, 15, 4),
+        AbandonmentTimeout(2, Duration::from_millis(90)),
+        ServerAbandonmentTimeout(Duration::from_millis(50)),
+        DropReply(4),
+        Outgoing(2, 4, ExpectedMessage::Reply(8, Err(1)), 70),
+        Written(4, Ok(())),
+        Open(3),
+        Deliver(3, 7, 16),
+        ServerAbandonmentTimeout(Duration::from_millis(60)),
+        Accept(3),
+        Receive(3, 16, 5),
+        DropReply(5),
+        Outgoing(3, 5, ExpectedMessage::Reply(7, Err(1)), 80),
+        Written(5, Ok(())),
+        CloseServer,
+        ServerAbandonmentTimeout(Duration::from_millis(70)),
+        RefuseOpen(Failure::Closed),
+        ReceiveError(3, Failure::Closed),
+    ]);
+    for timeout in [Duration::ZERO, Duration::MAX] {
+        run(vec![
+            ServerInboundLimits(1, 100),
+            ServerAbandonmentTimeout(timeout),
+            Open(1),
+            Accept(1),
+            Deliver(1, 7, 11),
+            Receive(1, 11, 0),
+            DropReply(0),
+            NoOutgoing(1),
+            Deadline(1, None),
+            Usage(1, 0, 0),
+            Open(2),
+            Accept(2),
+            Deliver(2, 7, 12),
+            Receive(2, 12, 1),
+            DropReply(1),
+            NoOutgoing(2),
+            Deadline(2, None),
+            Usage(2, 0, 0),
+        ]);
+    }
+}
+
+/// Attachment cannot miss a timeout update. A concurrent responder drop uses
+/// either the old or new timeout, and its queued reply is never retimed.
+#[test]
+fn test_server_abandonment_races() {
+    use crate::protocol::Server;
+    let timeout = Duration::from_millis(30);
+    for order in orders() {
+        let (server, mut source) = Server::fixture();
+        let (mut server, (_source, state)) = schedule(
+            order,
+            move || server.set_abandonment_timeout(timeout),
+            move || {
+                let state = source.open().unwrap().upgrade().unwrap();
+                (source, state)
+            },
+        );
+        let mut session = server.accept().unwrap();
+        let now = Instant::now() + Duration::from_secs(60);
+        state.set_time(now);
+        state.inject_request(1, vec![11].into()).unwrap();
+        let (session, responder) = Job::start(move || {
+            let (_, responder) = session.recv().unwrap();
+            (session, responder)
+        })
+        .finish();
+        Job::start(move || drop(responder)).finish();
+        let outgoing = state.take_outgoing().unwrap();
+        assert_eq!(outgoing.deadline, now + timeout);
+        outgoing.operation.record_write(Ok(()));
+
+        state.inject_request(3, vec![12].into()).unwrap();
+        let mut session = session;
+        let (session, responder) = Job::start(move || {
+            let (_, responder) = session.recv().unwrap();
+            (session, responder)
+        })
+        .finish();
+        let (_server, ()) = schedule(
+            order,
+            move || server.set_abandonment_timeout(2 * timeout),
+            move || drop(responder),
+        );
+        let outgoing = state.take_outgoing().unwrap();
+        match order {
+            Order::LeftFirst => assert_eq!(outgoing.deadline, now + 2 * timeout),
+            Order::RightFirst => assert_eq!(outgoing.deadline, now + timeout),
+            Order::Concurrent => assert!(
+                outgoing.deadline == now + timeout || outgoing.deadline == now + 2 * timeout
+            ),
+        }
+        outgoing.operation.record_write(Ok(()));
+        assert_eq!(state.inbound_usage(), (0, 0));
+        drop(session);
+    }
 }
 
 /// Late write results and answers target the original session after replacement.
@@ -678,4 +828,986 @@ fn test_reply_close_races() {
             Deadline(1, None),
         ]);
     }
+}
+
+/// Builds incoming fixture envelopes without depending on their encoded size.
+fn incoming(id: u64, tag: u8) -> Vec<u8> {
+    Side::Client.encode(id, Ok(vec![tag].into())).unwrap()
+}
+
+/// A request slot follows the responder and queued reply, not just the inbox.
+#[test]
+fn test_inbound_request_accounting() {
+    use super::ExpectedMessage;
+    use Step::*;
+    let size = incoming(1, 11).len();
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 1, size),
+        Raw(0, incoming(1, 11), Ok(())),
+        Usage(0, 1, size),
+        Receive(0, 11, 0),
+        Usage(0, 1, 0),
+        Reply(0, 0, Ok(12), 10),
+        Usage(0, 1, 0),
+        Outgoing(0, 0, ExpectedMessage::Reply(1, Ok(12)), 10),
+        Usage(0, 0, 0),
+        Raw(0, incoming(1, 13), Ok(())),
+        Usage(0, 1, size),
+        Written(0, Ok(())),
+        WaitWrite(0, Ok(())),
+        Receive(0, 13, 1),
+        Reply(1, 1, Ok(14), 10),
+        Time(10),
+        Expire(0),
+        WaitWrite(1, Err(Failure::Timeout)),
+        Usage(0, 0, 0),
+        Raw(0, incoming(1, 15), Ok(())),
+        Receive(0, 15, 2),
+        AbandonmentTimeout(0, std::time::Duration::ZERO),
+        DropReply(2),
+        Usage(0, 0, 0),
+    ]);
+    // Holding a responder and waiting for the next request must wake on overflow.
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 1, DEFAULT_MAX_INBOUND_BYTES),
+        Raw(0, incoming(1, 11), Ok(())),
+        Receive(0, 11, 0),
+        StartReceive(0),
+        Raw(0, incoming(3, 12), Err(Failure::Requests)),
+        FinishReceiveError(0, Failure::Requests),
+        RefuseReply(0, Failure::Requests),
+        Usage(0, 0, 0),
+        Open(1),
+        Accept(1),
+        Raw(1, incoming(1, 13), Ok(())),
+        Receive(1, 13, 1),
+    ]);
+}
+
+/// Charge the original bytes, including unknown fields and repeated scalar IDs.
+#[test]
+fn test_inbound_original_byte_accounting() {
+    use Step::*;
+    let mut bytes = incoming(1, 11);
+    bytes.extend_from_slice(&[0x18, 0, 0x08, 0x81, 0]);
+    let size = bytes.len();
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, size),
+        Raw(0, bytes.clone(), Ok(())),
+        Usage(0, 1, size),
+        Receive(0, 11, 0),
+        Usage(0, 1, 0),
+        Raw(0, incoming(3, 12), Ok(())),
+        Usage(0, 2, incoming(3, 12).len()),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, incoming(3, 12).len() - 1),
+        ReceiveError(0, Failure::Bytes),
+        Usage(0, 0, 0),
+    ]);
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, size - 1),
+        StartReceive(0),
+        Raw(0, bytes, Err(Failure::Bytes)),
+        FinishReceiveError(0, Failure::Bytes),
+    ]);
+    for (limit, reason) in [
+        (
+            InboundLimits(0, 0, DEFAULT_MAX_INBOUND_BYTES),
+            Failure::Requests,
+        ),
+        (
+            InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, 0),
+            Failure::Bytes,
+        ),
+    ] {
+        run(vec![
+            Open(0),
+            Accept(0),
+            limit,
+            Raw(0, incoming(1, 1), Err(reason)),
+            ReceiveError(0, reason),
+        ]);
+    }
+}
+
+/// Unread responses keep their bytes counted until read or dropped, even after closure.
+#[test]
+fn test_inbound_response_accounting() {
+    use Step::*;
+    let bytes = incoming(2, 11).len();
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 0, bytes),
+        Request(0, 0, 1, 10),
+        SendNext(0, 0, 2),
+        Raw(0, incoming(2, 11), Ok(())),
+        Usage(0, 0, bytes),
+        Time(10),
+        Expire(0),
+        Wait(0, Ok(11)),
+        Usage(0, 0, 0),
+        Request(0, 1, 2, 20),
+        SendNext(0, 1, 4),
+        Raw(0, incoming(4, 12), Ok(())),
+        Usage(0, 0, bytes),
+        DropPromise(1),
+        Usage(0, 0, 0),
+        Request(0, 2, 3, 20),
+        SendNext(0, 2, 6),
+        Raw(0, incoming(6, 13), Ok(())),
+        CloseSession(0),
+        Usage(0, 0, bytes),
+        Open(1),
+        Accept(1),
+        Usage(1, 0, 0),
+        Wait(2, Ok(13)),
+        Usage(0, 0, 0),
+        Usage(1, 0, 0),
+    ]);
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, bytes),
+        Request(0, 0, 1, 10),
+        SendNext(0, 0, 2),
+        Raw(0, incoming(2, 11), Ok(())),
+        Request(0, 1, 2, 10),
+        SendNext(0, 1, 4),
+        StartReceive(0),
+        Raw(0, incoming(4, 12), Err(Failure::Bytes)),
+        FinishReceiveError(0, Failure::Bytes),
+        Wait(1, Err(Failure::Bytes)),
+        Usage(0, 0, bytes),
+        Wait(0, Ok(11)),
+        Usage(0, 0, 0),
+    ]);
+}
+
+/// Unknown, late and unobserved answers need no capacity and never decode a body.
+#[test]
+fn test_unobserved_inbound_responses() {
+    use Step::*;
+    let malformed = crate::protocol::mock::envelope::malformed_body(false, 4, false);
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, incoming(2, 11).len()),
+        Request(0, 0, 1, 10),
+        SendNext(0, 0, 2),
+        Raw(0, incoming(2, 11), Ok(())),
+        Request(0, 1, 2, 10),
+        SendNext(0, 1, 4),
+        DropPromise(1),
+        Raw(0, malformed.clone(), Ok(())),
+        Raw(0, malformed, Ok(())),
+        Request(0, 2, 3, 1),
+        SendNext(0, 2, 6),
+        Time(1),
+        Raw(0, incoming(6, 13), Ok(())),
+        Wait(2, Err(Failure::Timeout)),
+        Usage(0, 0, incoming(2, 11).len()),
+        Wait(0, Ok(11)),
+        Usage(0, 0, 0),
+        Raw(0, incoming(1, 14), Ok(())),
+        Receive(0, 14, 0),
+    ]);
+}
+
+/// Updates apply to already queued work and server sessions not yet accepted.
+#[test]
+fn test_inbound_limit_updates() {
+    use Step::*;
+    run(vec![
+        ServerInboundLimits(1, 100),
+        Open(0),
+        Raw(0, incoming(1, 11), Ok(())),
+        ServerInboundLimits(0, 100),
+        Accept(0),
+        ReceiveError(0, Failure::Requests),
+        InboundLimits(0, 100, DEFAULT_MAX_INBOUND_BYTES),
+        ReceiveError(0, Failure::Requests),
+        ServerInboundLimits(2, 100),
+        Open(1),
+        Accept(1),
+        Raw(1, incoming(1, 11), Ok(())),
+        Raw(1, incoming(3, 12), Ok(())),
+        Usage(1, 2, 2 * incoming(1, 11).len()),
+        ServerInboundLimits(2, 1),
+        ReceiveError(1, Failure::Bytes),
+        Open(2),
+        Accept(2),
+        Raw(2, incoming(1, 13), Err(Failure::Bytes)),
+        ServerInboundLimits(2, 100),
+        Open(3),
+        Accept(3),
+        InboundLimits(3, 1, 100),
+        Raw(3, incoming(1, 14), Ok(())),
+        InboundLimits(3, 2, 100),
+        Raw(3, incoming(3, 15), Ok(())),
+        Receive(3, 14, 0),
+        Receive(3, 15, 1),
+    ]);
+    let size = incoming(2, 11).len();
+    run(vec![
+        Open(0),
+        Accept(0),
+        Request(0, 0, 1, 10),
+        SendNext(0, 0, 2),
+        Raw(0, incoming(2, 11), Ok(())),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, size),
+        Usage(0, 0, size),
+        InboundLimits(0, DEFAULT_MAX_INBOUND_REQUESTS, size - 1),
+        ReceiveError(0, Failure::Bytes),
+        Wait(0, Ok(11)),
+        Usage(0, 0, 0),
+    ]);
+}
+
+/// Malformed nested data is discovered at retrieval, closing its original session.
+#[test]
+fn test_inbound_deferred_validation() {
+    use crate::protocol::mock::envelope::malformed_body;
+    use Step::*;
+    let request = malformed_body(false, 1, false);
+    run(vec![
+        Open(0),
+        Accept(0),
+        Raw(0, request.clone(), Ok(())),
+        Usage(0, 1, request.len()),
+        ReceiveError(0, Failure::Malformed),
+        Usage(0, 0, 0),
+        RefuseRequest(0, Failure::Malformed),
+    ]);
+    for error in [false, true] {
+        let response = malformed_body(false, 2, error);
+        run(vec![
+            Open(0),
+            Accept(0),
+            Request(0, 0, 1, 10),
+            SendNext(0, 0, 2),
+            Raw(0, response.clone(), Ok(())),
+            Usage(0, 0, response.len()),
+            Wait(0, Err(Failure::Malformed)),
+            ReceiveError(0, Failure::Malformed),
+            Usage(0, 0, 0),
+        ]);
+        run(vec![
+            Open(0),
+            Accept(0),
+            Request(0, 0, 1, 10),
+            SendNext(0, 0, 2),
+            Raw(0, response, Ok(())),
+            Open(1),
+            Accept(1),
+            Wait(0, Err(Failure::Malformed)),
+            Usage(0, 0, 0),
+            Usage(1, 0, 0),
+            Raw(1, incoming(1, 12), Ok(())),
+            Receive(1, 12, 0),
+        ]);
+    }
+}
+
+/// Retaining the original envelope preserves protobuf's nested message merging.
+#[test]
+fn test_inbound_preserves_nested_merges() {
+    use crate::protocol::{HostToArk, PairingSetAppIdentityRequest, host_to_ark};
+    use Step::*;
+    use prost::Message as _;
+    let first = PairingSetAppIdentityRequest { identity: vec![42] };
+    let mut bytes = HostToArk {
+        id: 1,
+        err: None,
+        content: Some(host_to_ark::Content::PairingSetAppId(first.clone())),
+    }
+    .encode_to_vec();
+    // An empty second occurrence must preserve the first nested field. Decoding
+    // only the opaque view's last payload would lose the identity.
+    bytes.extend(
+        HostToArk {
+            id: 1,
+            err: None,
+            content: Some(host_to_ark::Content::PairingSetAppId(Default::default())),
+        }
+        .encode_to_vec(),
+    );
+    run(vec![
+        Open(0),
+        Accept(0),
+        Raw(0, bytes, Ok(())),
+        ReceiveMessage(0, first.into(), 0),
+    ]);
+}
+
+/// Inbox entries and unread responses compete for the same original-byte budget.
+#[test]
+fn test_inbound_shared_byte_budget() {
+    use Step::*;
+    let size = incoming(1, 11).len();
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 2, 2 * size),
+        Request(0, 0, 10, 10),
+        SendNext(0, 0, 2),
+        Raw(0, incoming(2, 11), Ok(())),
+        Raw(0, incoming(1, 12), Ok(())),
+        Usage(0, 1, 2 * size),
+        // A full budget does not stop replies to an existing local request from
+        // being matched: the observer gets the capacity error and wakes up.
+        Request(0, 1, 20, 10),
+        SendNext(0, 1, 4),
+        Raw(0, incoming(4, 21), Err(Failure::Bytes)),
+        Wait(1, Err(Failure::Bytes)),
+        Usage(0, 0, size),
+        DropSession(0),
+        Released(0),
+        Wait(0, Ok(11)),
+    ]);
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 2, 2 * size),
+        Request(0, 0, 10, 10),
+        SendNext(0, 0, 2),
+        Raw(0, incoming(1, 11), Ok(())),
+        Raw(0, incoming(2, 12), Ok(())),
+        Usage(0, 1, 2 * size),
+        Raw(0, incoming(3, 13), Err(Failure::Bytes)),
+        ReceiveError(0, Failure::Bytes),
+        Usage(0, 0, size),
+        DropPromise(0),
+        Usage(0, 0, 0),
+    ]);
+}
+
+/// Limit updates apply whether they happen before or after session attachment.
+#[test]
+fn test_inbound_limits_during_attachment() {
+    use crate::protocol::Server;
+    use std::sync::{Arc, Barrier};
+    for (requests, bytes, reason) in [(0, 100, Failure::Requests), (1, 0, Failure::Bytes)] {
+        for _ in 0..16 {
+            let (server, mut source) = Server::fixture();
+            let barrier = Arc::new(Barrier::new(2));
+            let ready = barrier.clone();
+            let update = super::Job::start(move || {
+                ready.wait();
+                server.set_inbound_limits(requests, bytes)
+            });
+            barrier.wait();
+            let state = source.open().unwrap();
+            let mut server = update.finish();
+            let mut session = server.accept().unwrap();
+            let result = state.upgrade().unwrap().inject_request(1, vec![11].into());
+            assert_eq!(result.map_err(super::failure), Err(reason));
+            assert_eq!(super::failure(session.recv().err().unwrap()), reason);
+        }
+    }
+}
+
+/// Which of two calls runs first, or whether they compete.
+#[derive(Clone, Copy)]
+enum Order {
+    LeftFirst,
+    Concurrent,
+    RightFirst,
+}
+
+/// Runs both calls in the chosen order. Concurrent calls start at the same barrier.
+fn schedule<A: Send + 'static, B: Send + 'static>(
+    order: Order,
+    left: impl FnOnce() -> A + Send + 'static,
+    right: impl FnOnce() -> B + Send + 'static,
+) -> (A, B) {
+    match order {
+        Order::LeftFirst => (Job::start(left).finish(), Job::start(right).finish()),
+        Order::RightFirst => {
+            let right = Job::start(right).finish();
+            (Job::start(left).finish(), right)
+        }
+        Order::Concurrent => {
+            let gate = Arc::new(Barrier::new(3));
+            let a = gate.clone();
+            let b = gate.clone();
+            let left = Job::start(move || {
+                a.wait();
+                left()
+            });
+            let right = Job::start(move || {
+                b.wait();
+                right()
+            });
+            gate.wait();
+            (left.finish(), right.finish())
+        }
+    }
+}
+
+/// Checks both fixed orders, then repeats with the threads competing.
+fn orders() -> impl Iterator<Item = Order> {
+    [Order::LeftFirst, Order::RightFirst]
+        .into_iter()
+        .chain(std::iter::repeat_n(Order::Concurrent, 16))
+}
+
+/// Creates a session with the given limits and a controlled deadline.
+fn fixture(requests: usize, bytes: usize) -> (Session, Instant) {
+    let session = Session::fixture().set_inbound_limits(requests, bytes);
+    let now = Instant::now() + Duration::from_secs(60);
+    session.inner.set_time(now);
+    (session, now + Duration::from_secs(1))
+}
+
+/// Submits a request and assigns its wire ID without a transport writer.
+fn request(session: &Session, deadline: Instant) -> (u64, Promise<Message>) {
+    let promise = session.requester().request(vec![1], deadline).unwrap();
+    let (id, _) = session.inner.next_outgoing().unwrap();
+    (id, promise)
+}
+
+/// Mirrors reader failure handling, including the closing reason kept by waiters.
+fn deliver(session: &Arc<SessionInner>, bytes: Vec<u8>) -> Result<(), Error> {
+    let result = session.handle_message(bytes);
+    if let Err(error) = &result {
+        session.close(error.clone());
+    }
+    result
+}
+
+fn byte_error<T>(result: Result<T, Error>, limit: usize) {
+    assert!(matches!(result, Err(Error::InboundByteLimitExceeded(actual)) if actual == limit));
+}
+
+fn request_error<T>(result: Result<T, Error>, limit: usize) {
+    assert!(matches!(result, Err(Error::InboundRequestLimitExceeded(actual)) if actual == limit));
+}
+
+/// Releasing A before admitting B must permit B; the reverse order must close.
+/// Overlap permits either ordering, but never leaves a leaked charge or promise.
+#[test]
+fn test_release_races_response_admission() {
+    for consume in [false, true] {
+        for order in orders() {
+            let size = incoming(2, 11).len();
+            let (session, deadline) = fixture(0, size);
+            let (a, first) = request(&session, deadline);
+            let (b, second) = request(&session, deadline);
+            deliver(&session.inner, incoming(a, 11)).unwrap();
+            let state = session.inner.clone();
+            let (_, delivered) = schedule(
+                order,
+                move || {
+                    if consume {
+                        assert_eq!(first.wait::<Vec<u8>>().unwrap(), vec![11]);
+                    } else {
+                        drop(first);
+                    }
+                },
+                move || deliver(&state, incoming(b, 12)),
+            );
+            match order {
+                Order::LeftFirst => assert!(delivered.is_ok()),
+                Order::RightFirst => byte_error(delivered.as_ref().map_err(Clone::clone), size),
+                Order::Concurrent => {}
+            }
+            if delivered.is_ok() {
+                assert_eq!(session.inner.inbound_usage(), (0, size));
+                assert_eq!(second.wait::<Vec<u8>>().unwrap(), vec![12]);
+            } else {
+                byte_error(delivered, size);
+                byte_error(second.wait::<Message>(), size);
+                byte_error(session.requester().request(vec![1], deadline), size);
+            }
+            assert_eq!(session.inner.inbound_usage(), (0, 0));
+        }
+    }
+}
+
+/// Drop the promise between reserving bytes and delivering the result. A byte
+/// limit failure closes the session only if the promise still exists at delivery.
+#[test]
+fn test_observer_drop_during_response_completion() {
+    for admit in [false, true] {
+        for drop_observer in [false, true] {
+            let bytes = incoming(2, 11);
+            let limit = if admit { bytes.len() } else { 0 };
+            let used = Arc::new(AtomicUsize::new(0));
+            let counter = used.clone();
+            let now = Instant::now();
+            let (sender, promise) =
+                Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60));
+            let pending = PendingOperation {
+                deadline: now + Duration::from_secs(60),
+                sender: ResultSender::Response(sender),
+            };
+            let (entered, reserved) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let completed = Job::start(move || {
+                pending.complete_response(now, || {
+                    let result = IncomingEnvelope::new(
+                        bytes.into(),
+                        &counter,
+                        limit,
+                        Side::Server,
+                        Weak::new(),
+                    );
+                    entered.send(()).unwrap();
+                    released.recv_timeout(PATIENCE).unwrap();
+                    result
+                })
+            });
+            reserved.recv_timeout(PATIENCE).unwrap();
+            assert_eq!(used.load(Ordering::Relaxed), limit);
+            let promise = if drop_observer {
+                drop(promise);
+                None
+            } else {
+                Some(promise)
+            };
+            release.send(()).unwrap();
+            let result = completed.finish();
+            if !admit && !drop_observer {
+                byte_error(result, limit);
+            } else {
+                result.unwrap();
+            }
+            if let Some(promise) = promise {
+                if admit {
+                    assert_eq!(promise.wait::<Vec<u8>>().unwrap(), vec![11]);
+                } else {
+                    byte_error(promise.wait::<Message>(), limit);
+                }
+            }
+            assert_eq!(used.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+/// Changing limits and accepting messages use the same lock, in either order.
+#[test]
+fn test_limits_race_request_and_response_admission() {
+    for order in orders() {
+        let size = incoming(1, 11).len();
+        let (session, deadline) = fixture(2, 2 * size);
+        deliver(&session.inner, incoming(1, 11)).unwrap();
+        let (_, pending) = request(&session, deadline);
+        let state = session.inner.clone();
+        let (delivered, session) = schedule(
+            order,
+            move || deliver(&state, incoming(3, 12)),
+            move || session.set_inbound_limits(1, 2 * size),
+        );
+        match order {
+            Order::LeftFirst => assert!(delivered.is_ok()),
+            Order::RightFirst => request_error(delivered.as_ref().map_err(Clone::clone), 1),
+            Order::Concurrent => {}
+        }
+        if delivered.is_err() {
+            request_error(delivered, 1);
+        }
+        request_error(pending.wait::<Message>(), 1);
+        assert_eq!(session.inner.inbound_usage(), (0, 0));
+
+        let (session, deadline) = fixture(0, 2 * size);
+        let (a, first) = request(&session, deadline);
+        let (b, second) = request(&session, deadline);
+        deliver(&session.inner, incoming(a, 11)).unwrap();
+        let state = session.inner.clone();
+        let (delivered, session) = schedule(
+            order,
+            move || deliver(&state, incoming(b, 12)),
+            move || session.set_inbound_limits(0, size),
+        );
+        match order {
+            Order::LeftFirst => assert!(delivered.is_ok()),
+            Order::RightFirst => byte_error(delivered.as_ref().map_err(Clone::clone), size),
+            Order::Concurrent => {}
+        }
+        byte_error(session.requester().request(vec![1], deadline), size);
+        assert_eq!(first.wait::<Vec<u8>>().unwrap(), vec![11]);
+        if delivered.is_ok() {
+            assert_eq!(second.wait::<Vec<u8>>().unwrap(), vec![12]);
+        } else {
+            byte_error(second.wait::<Message>(), size);
+        }
+        assert_eq!(session.inner.inbound_usage(), (0, 0));
+    }
+}
+
+/// Lowering a limit after its last obligation is released keeps the session open.
+/// Lowering first closes it but cannot replace an already buffered response.
+#[test]
+fn test_limits_race_consumers_and_reply_writes() {
+    for order in orders() {
+        let (session, deadline) = fixture(1, 100);
+        let (id, promise) = request(&session, deadline);
+        deliver(&session.inner, incoming(id, 11)).unwrap();
+        let (answer, session) = schedule(
+            order,
+            move || promise.wait::<Vec<u8>>(),
+            move || session.set_inbound_limits(1, 0),
+        );
+        assert_eq!(answer.unwrap(), vec![11]);
+        let probe = session.requester().request(vec![1], deadline);
+        match order {
+            Order::LeftFirst => assert!(probe.is_ok()),
+            Order::RightFirst => byte_error(probe.as_ref().map_err(Clone::clone), 0),
+            Order::Concurrent => {}
+        }
+        if probe.is_err() {
+            byte_error(probe, 0);
+        }
+        assert_eq!(session.inner.inbound_usage(), (0, 0));
+
+        let (mut session, deadline) = fixture(1, 100);
+        deliver(&session.inner, incoming(1, 11)).unwrap();
+        let (_, responder) = session.recv().unwrap();
+        let promise = responder.reply(Ok(vec![12].into()), deadline).unwrap();
+        let state = session.inner.clone();
+        let (written, session) = schedule(
+            order,
+            move || {
+                if let Some((_, outgoing)) = state.next_outgoing() {
+                    outgoing.operation.record_write(Ok(()));
+                    true
+                } else {
+                    false
+                }
+            },
+            move || session.set_inbound_limits(0, 100),
+        );
+        let probe = session.requester().request(vec![1], deadline);
+        match order {
+            Order::LeftFirst => assert!(probe.is_ok()),
+            Order::RightFirst => request_error(probe.as_ref().map_err(Clone::clone), 0),
+            Order::Concurrent => {}
+        }
+        if probe.is_err() {
+            request_error(promise.wait(), 0);
+        } else {
+            assert!(written);
+            promise.wait().unwrap();
+        }
+        assert_eq!(session.inner.inbound_usage(), (0, 0));
+    }
+}
+
+/// Valid outer envelopes carrying truncated payloads or invalid error text.
+fn malformed(id: u64) -> Vec<Vec<u8>> {
+    vec![
+        super::super::envelope::malformed_body(false, id, false),
+        super::super::envelope::malformed_body(false, id, true),
+        opaque::HostToArk {
+            id,
+            err: Some(Bytes::from_static(&[0x12, 1, 0xff])),
+            content: None,
+        }
+        .encode_to_vec(),
+    ]
+}
+
+#[test]
+fn test_malformed_response_observation_and_deadlines() {
+    use Step::*;
+    for (shape, bytes) in malformed(2).into_iter().enumerate() {
+        // Exercise and seed the independent envelope decoder with the same input.
+        let mut input = vec![0];
+        input.extend_from_slice(&bytes);
+        assert!(!super::super::envelope::run(&input));
+        run(vec![
+            Open(0),
+            Accept(0),
+            Request(0, 0, 1, 10),
+            SendNext(0, 0, 2),
+            Raw(0, bytes.clone(), Ok(())),
+            Time(10),
+            Expire(0),
+            Wait(0, Err(Failure::Malformed)),
+            ReceiveError(0, Failure::Malformed),
+            Usage(0, 0, 0),
+        ]);
+        // Both exact-deadline and later arrivals bypass nested decoding, with
+        // and without the deadline worker having already removed the operation.
+        for time in [10, 11] {
+            for expired in [false, true] {
+                let mut steps = vec![
+                    Open(0),
+                    Accept(0),
+                    InboundLimits(0, 1, 0),
+                    Request(0, 0, 1, 10),
+                    SendNext(0, 0, 2),
+                    Time(time),
+                ];
+                if expired {
+                    steps.push(Expire(0));
+                }
+                steps.extend([
+                    Raw(0, bytes.clone(), Ok(())),
+                    Wait(0, Err(Failure::Timeout)),
+                    Usage(0, 0, 0),
+                    InboundLimits(0, 1, 100),
+                    Raw(0, incoming(1, 11), Ok(())),
+                    Receive(0, 11, 0),
+                ]);
+                run(steps);
+            }
+        }
+        run(vec![
+            Open(0),
+            Accept(0),
+            Request(0, 0, 1, 10),
+            SendNext(0, 0, 2),
+            Raw(0, bytes.clone(), Ok(())),
+            Usage(0, 0, bytes.len()),
+            DropPromise(0),
+            Usage(0, 0, 0),
+            InboundLimits(0, 1, 0),
+            // A duplicate, an unknown answer, and an unobserved answer all skip decoding.
+            Raw(0, bytes.clone(), Ok(())),
+            Request(0, 1, 2, 10),
+            SendNext(0, 1, 4),
+            DropPromise(1),
+            Raw(0, malformed(4)[shape].clone(), Ok(())),
+            Raw(0, malformed(6)[shape].clone(), Ok(())),
+            InboundLimits(0, 1, 100),
+            Raw(0, incoming(1, 11), Ok(())),
+            Receive(0, 11, 0),
+        ]);
+    }
+}
+
+/// Repeated errors merge their fields. Different content alternatives replace
+/// each other. Full decoding must still reject malformed earlier payloads.
+#[test]
+fn test_repeated_payload_fields() {
+    let mut error = HostToArk {
+        id: 2,
+        err: Some(RemoteError {
+            code: 123,
+            msg: String::new(),
+        }),
+        content: None,
+    }
+    .encode_to_vec();
+    error.extend(
+        HostToArk {
+            id: 0,
+            err: Some(RemoteError {
+                code: 0,
+                msg: "reason".into(),
+            }),
+            content: None,
+        }
+        .encode_to_vec(),
+    );
+    let (session, deadline) = fixture(1, 100);
+    let (_, promise) = request(&session, deadline);
+    let mut input = vec![0];
+    input.extend_from_slice(&error);
+    assert!(super::super::envelope::run(&input));
+    let size = error.len();
+    deliver(&session.inner, error).unwrap();
+    assert_eq!(session.inner.inbound_usage(), (0, size));
+    match promise.wait::<Message>() {
+        Err(Error::Remote(error)) => {
+            assert_eq!(error.code, 123);
+            assert_eq!(error.msg, "reason");
+        }
+        _ => panic!("merged remote error required"),
+    }
+    assert_eq!(session.inner.inbound_usage(), (0, 0));
+
+    let first = HostToArk {
+        id: 1,
+        err: None,
+        content: Some(host_to_ark::Content::PairingSetAppId(
+            crate::protocol::PairingSetAppIdentityRequest { identity: vec![42] },
+        )),
+    }
+    .encode_to_vec();
+    for (prefix, valid) in [(first, true), (malformed(1)[0].clone(), false)] {
+        let mut bytes = prefix;
+        bytes.extend(incoming(1, 11));
+        let mut input = vec![0];
+        input.extend_from_slice(&bytes);
+        assert_eq!(super::super::envelope::run(&input), valid);
+        let (mut session, _) = fixture(1, bytes.len());
+        deliver(&session.inner, bytes).unwrap();
+        let (session, result) = Job::start(move || {
+            let result = session.recv();
+            (session, result)
+        })
+        .finish();
+        if valid {
+            assert_eq!(result.unwrap().0, Message::Develop(vec![11]));
+        } else {
+            assert!(matches!(result, Err(Error::Malformed)));
+        }
+        assert_eq!(session.inner.inbound_usage().1, 0);
+    }
+}
+
+/// Only the final ID decides routing, even if an earlier ID has the other parity.
+#[test]
+fn test_repeated_id_changes_routing() {
+    for (side, peer, peer_id) in [
+        (Side::Server, Side::Client, 1),
+        (Side::Client, Side::Server, 2),
+    ] {
+        for is_response in [false, true] {
+            let session = Session::fixture_for(side).set_inbound_limits(1, 100);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let (own, promise) = request(&session, deadline);
+            let (first, last) = if is_response {
+                (peer_id, own)
+            } else {
+                (own, peer_id)
+            };
+            let mut bytes = peer.encode(first, Ok(vec![11].into())).unwrap();
+            // An ID-only envelope appends a scalar occurrence without replacing content.
+            bytes.extend(match peer {
+                Side::Client => HostToArk {
+                    id: last,
+                    err: None,
+                    content: None,
+                }
+                .encode_to_vec(),
+                Side::Server => crate::protocol::ArkToHost {
+                    id: last,
+                    err: None,
+                    content: None,
+                }
+                .encode_to_vec(),
+            });
+            let mut input = vec![u8::from(side == Side::Client)];
+            input.extend_from_slice(&bytes);
+            assert!(super::super::envelope::run(&input));
+            let size = bytes.len();
+            deliver(&session.inner, bytes).unwrap();
+            assert_eq!(
+                session.inner.inbound_usage(),
+                (usize::from(!is_response), size)
+            );
+            if is_response {
+                assert_eq!(promise.wait::<Vec<u8>>().unwrap(), vec![11]);
+            } else {
+                assert_eq!(session.inner.outstanding_ids(), vec![own]);
+                let state = session.inner.clone();
+                let mut session = session;
+                let (session, received) = Job::start(move || {
+                    let received = session.recv();
+                    (session, received)
+                })
+                .finish();
+                let (body, responder) = received.unwrap();
+                assert_eq!(body, Message::Develop(vec![11]));
+                deliver(&state, peer.encode(own, Ok(vec![12].into())).unwrap()).unwrap();
+                assert_eq!(promise.wait::<Vec<u8>>().unwrap(), vec![12]);
+                assert_eq!(state.inbound_usage(), (1, 0));
+                drop(responder);
+                drop(session);
+            }
+        }
+    }
+}
+
+/// Constructs an envelope exactly at the transport's maximum sending size.
+fn large_envelope(peer: Side, id: u64, error: bool) -> (Vec<u8>, usize) {
+    let body = |len| {
+        if error {
+            Err(RemoteError {
+                code: 123,
+                msg: "x".repeat(len),
+            })
+        } else {
+            Ok(Message::Develop(vec![42; len]))
+        }
+    };
+    let size = crate::transport::MAX_MESSAGE_SIZE;
+    let sample = size - 64;
+    let overhead = peer.encode(id, body(sample)).unwrap().len() - sample;
+    let bytes = peer.encode(id, body(size - overhead)).unwrap();
+    assert_eq!(bytes.len(), size);
+    (bytes, size - overhead)
+}
+
+/// Checks exact byte limits for queued requests and unread responses in both roles.
+/// Includes large error strings and development payloads.
+#[test]
+fn test_large_inbound_boundaries_and_error_values() {
+    let size = crate::transport::MAX_MESSAGE_SIZE;
+    for (side, peer, peer_id) in [
+        (Side::Server, Side::Client, 1),
+        (Side::Client, Side::Server, 2),
+    ] {
+        for response in [false, true] {
+            for error in [false, true] {
+                if error && !response {
+                    continue;
+                }
+                for limit in [size - 1, size, size + 1] {
+                    let mut session = Session::fixture_for(side).set_inbound_limits(1, limit);
+                    let (id, promise) = if response {
+                        let (id, promise) =
+                            request(&session, Instant::now() + Duration::from_secs(60));
+                        (id, Some(promise))
+                    } else {
+                        (peer_id, None)
+                    };
+                    let (bytes, payload) = large_envelope(peer, id, error);
+                    let result = deliver(&session.inner, bytes);
+                    if limit < size {
+                        byte_error(result, limit);
+                        byte_error(session.recv(), limit);
+                        if let Some(promise) = promise {
+                            byte_error(promise.wait::<Message>(), limit);
+                        }
+                        assert_eq!(session.inner.inbound_usage(), (0, 0));
+                    } else {
+                        result.unwrap();
+                        assert_eq!(
+                            session.inner.inbound_usage(),
+                            (usize::from(!response), size)
+                        );
+                        let result = match promise {
+                            Some(promise) => promise.wait::<Message>(),
+                            None => session.recv().map(|(message, _)| message),
+                        };
+                        match result {
+                            Ok(Message::Develop(bytes)) if !error => {
+                                assert_eq!(bytes.len(), payload);
+                                assert!(bytes.iter().all(|byte| *byte == 42));
+                            }
+                            Err(Error::Remote(remote)) if error => {
+                                assert_eq!(remote.code, 123);
+                                assert_eq!(remote.msg.len(), payload);
+                            }
+                            _ => panic!("expected large payload or remote error"),
+                        }
+                        assert_eq!(session.inner.inbound_usage().1, 0);
+                    }
+                }
+            }
+        }
+    }
+    // Lowering also reports the configured ceiling, with request limits taking
+    // precedence if both budgets become too small in the same update.
+    let (session, deadline) = fixture(3, 100);
+    deliver(&session.inner, incoming(1, 11)).unwrap();
+    deliver(&session.inner, incoming(3, 12)).unwrap();
+    let session = session.set_inbound_limits(1, 0);
+    request_error(session.requester().request(vec![1], deadline), 1);
+    let (session, deadline) = fixture(1, 100);
+    deliver(&session.inner, incoming(1, 11)).unwrap();
+    let session = session.set_inbound_limits(1, 3);
+    byte_error(session.requester().request(vec![1], deadline), 3);
 }

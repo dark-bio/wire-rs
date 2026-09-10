@@ -6,10 +6,14 @@
 use super::envelope::Side;
 use super::session::SessionInner;
 use super::worker;
-use super::{Closer, Error, Session};
+use super::{
+    Closer, DEFAULT_ABANDONMENT_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
+    Error, Session,
+};
 use crate::transport::{self, Attester, Read, Stream, Write};
 use darkbio_crypto::xdsa;
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::Duration;
 
 /// Owner of a persistent server stream, accepting successive sessions.
 /// Closing or dropping the server ends its active session and shuts down the
@@ -35,6 +39,9 @@ impl Server {
         let server = Self {
             inner: Arc::new(ServerInner {
                 state: Mutex::new(State::Open {
+                    max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
+                    max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
+                    abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
                     session: Weak::new(),
                     ready: None,
                     #[cfg(any(test, feature = "fuzz"))]
@@ -59,9 +66,38 @@ impl Server {
         server
     }
 
+    /// Sets the lifetime of automatic `UNANSWERED` replies for the current and
+    /// future sessions. Defaults to [`DEFAULT_ABANDONMENT_TIMEOUT`]. Applies even
+    /// before `accept()`. Replies already queued keep their deadlines.
+    ///
+    /// See [`Session::set_abandonment_timeout`] for when the timeout starts and
+    /// expires. Changing a session's timeout leaves the server's default unchanged.
+    /// This method also replaces a timeout set directly on the current session.
+    pub fn set_abandonment_timeout(self, timeout: Duration) -> Self {
+        self.inner.set_abandonment_timeout(timeout);
+        self
+    }
+
+    /// Sets both per-session inbound limits, initially
+    /// [`DEFAULT_MAX_INBOUND_REQUESTS`] and [`DEFAULT_MAX_INBOUND_BYTES`].
+    /// Applies to the current session, even before `accept()`, and future sessions.
+    /// Lowering either limit below usage closes that session. The server stays open.
+    ///
+    /// See [`Session::set_inbound_limits`] for what each limit counts. Changing a
+    /// session's limits leaves the server's defaults unchanged. This method also
+    /// replaces limits set directly on the current session.
+    pub fn set_inbound_limits(self, requests: usize, bytes: usize) -> Self {
+        self.inner.set_inbound_limits(requests, bytes);
+        self
+    }
+
     /// Blocks until a session is established or the server ends. Recoverable
     /// handshake failures leave the stream available for another attempt. A
     /// replacement session closes the previous one; old handles still refer to it.
+    ///
+    /// The reader runs before acceptance. A returned session may already have
+    /// queued requests or be closed, including from exceeding an inbound limit.
+    /// If several sessions arrive before acceptance, only the newest is returned.
     pub fn accept(&mut self) -> Result<Session, Error> {
         let mut state = self.inner.state.lock().expect("server state not poisoned");
         loop {
@@ -142,7 +178,7 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
             }
             Ok(transport::Event::Message(bytes)) => {
                 if let Some(session) = current.upgrade()
-                    && let Err(error) = session.handle_message(&bytes)
+                    && let Err(error) = session.handle_message(bytes)
                 {
                     session.close(error);
                 }
@@ -187,6 +223,12 @@ pub(super) struct ServerInner {
 enum State {
     /// Tracks the current session and keeps its owner until `accept()` takes it.
     Open {
+        /// Request ceiling applied to the attached session and future sessions.
+        max_inbound_requests: usize,
+        /// Encoded-byte ceiling applied independently to each session.
+        max_inbound_bytes: usize,
+        /// Automatic reply timeout applied to the current and future sessions.
+        abandonment: Duration,
         /// Lets server closure close the session after `accept()` returns it.
         session: Weak<SessionInner>,
         /// Session waiting for `accept()`. A new handshake replaces it.
@@ -206,6 +248,43 @@ enum State {
 }
 
 impl ServerInner {
+    /// Updates the current session and default under the attachment lock.
+    /// Lock order is server then session, as with inbound limit updates.
+    fn set_abandonment_timeout(&self, timeout: Duration) {
+        let mut state = self.state.lock().expect("server state not poisoned");
+        if let State::Open {
+            abandonment,
+            session,
+            ..
+        } = &mut *state
+        {
+            *abandonment = timeout;
+            if let Some(session) = session.upgrade() {
+                session.set_abandonment_timeout(timeout);
+            }
+        }
+    }
+
+    /// Serializes policy changes with attachment. Lock order is server then
+    /// session; session methods never acquire the server lock. Server sessions
+    /// have no stream closer, so applying their limits cannot wait for stream I/O.
+    fn set_inbound_limits(&self, requests: usize, bytes: usize) {
+        let mut state = self.state.lock().expect("server state not poisoned");
+        if let State::Open {
+            max_inbound_requests,
+            max_inbound_bytes,
+            session,
+            ..
+        } = &mut *state
+        {
+            *max_inbound_requests = requests;
+            *max_inbound_bytes = bytes;
+            if let Some(session) = session.upgrade() {
+                session.set_inbound_limits(requests, bytes);
+            }
+        }
+    }
+
     /// Refuses attachment/acceptance before closing the attached session.
     /// Releases the server lock before closing or dropping a `Session`, since
     /// those operations take the session's own lock.
@@ -262,9 +341,18 @@ impl ServerInner {
                 State::Closed { reason, .. } => return Err(reason.clone()),
                 State::Open {
                     session: attached,
+                    max_inbound_requests,
+                    max_inbound_bytes,
+                    abandonment,
                     ready,
                     ..
                 } => {
+                    // Apply the current policy before exposing this session or
+                    // letting the reader deliver its first message.
+                    session
+                        .inner
+                        .set_inbound_limits(*max_inbound_requests, *max_inbound_bytes);
+                    session.inner.set_abandonment_timeout(*abandonment);
                     *attached = Arc::downgrade(&session.inner);
                     ready.replace(session)
                 }
@@ -290,6 +378,9 @@ impl Server {
     pub(super) fn fixture() -> (Self, SessionSource) {
         let inner = Arc::new(ServerInner {
             state: Mutex::new(State::Open {
+                max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
+                max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
+                abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
                 session: Weak::new(),
                 ready: None,
                 wait_hook: None,

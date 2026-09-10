@@ -14,9 +14,13 @@ use std::time::Instant;
 ///
 /// Dropping an unanswered responder queues an `UNANSWERED` error without blocking
 /// on I/O, using the session's current abandonment timeout.
-/// Configure that budget with [`super::Session::set_abandonment_timeout`]. If the
-/// session has closed, no reply is queued. The handle always refers to that same
-/// session, including after a replacement connects.
+/// Configure it with [`super::Session::set_abandonment_timeout`] or
+/// [`super::Server::set_abandonment_timeout`]. If the session has closed, no reply
+/// is queued.
+///
+/// A held responder counts toward the session's inbound request limit. Queuing a
+/// reply keeps that slot until the writer takes it or the reply is discarded.
+/// See [`super::Session::set_inbound_limits`].
 ///
 /// Replying consumes the responder, so it cannot be reused:
 ///
@@ -51,9 +55,6 @@ impl Responder {
     /// [`Error::WrongDirection`].
     ///
     /// A reply needs no further acknowledgment. Dropping its promise leaves it queued.
-    /// Flow control is not implemented yet. The plan is to reserve room for a
-    /// reply when accepting a request, so replies can still be sent when the
-    /// outgoing request window is full.
     /// Use `.into()` to convert a protobuf response into `Message`.
     pub fn reply(
         mut self,

@@ -3,17 +3,20 @@
 
 //! Session state, request queues, and the reader, writer, and deadline workers.
 
-use super::envelope::{MessageKind, Parity, Side};
+use super::envelope::{IncomingEnvelope, MessageKind, Parity, Side};
 use super::operation::{
     OperationHandle, OperationKey, OutgoingBody, OutgoingMessage, PendingOperation, ResultSender,
 };
+use super::promise::PromiseResult;
 use super::worker;
 use super::{
-    Closer, DEFAULT_ABANDONMENT_TIMEOUT, Error, Message, Promise, RemoteError, Requester,
-    ReservedErrors, Responder,
+    Closer, DEFAULT_ABANDONMENT_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
+    Error, Message, Promise, RemoteError, Requester, ReservedErrors, Responder,
 };
 use crate::transport::{self, Read, Stream, Verifier, Write};
+use prost::bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,7 +62,7 @@ fn run_reader<R: Read, W: Write>(mut client: transport::Client<R, W>, session: A
         let result = client
             .recv()
             .map_err(Error::from)
-            .and_then(|bytes| session.handle_message(&bytes));
+            .and_then(|bytes| session.handle_message(bytes));
         if let Err(error) = result {
             // Receive and decode failures close this client session and its
             // stream, waking any other blocked transport I/O.
@@ -102,17 +105,32 @@ impl Session {
     /// Expiry discards a queued reply; a write already started still runs under the
     /// transport's independent timeout. Explicit request/reply deadlines are
     /// unaffected. Zero or an unrepresentable deadline expires immediately.
+    /// Use [`super::Server::set_abandonment_timeout`] to also set the timeout for
+    /// future server sessions.
     pub fn set_abandonment_timeout(self, timeout: Duration) -> Self {
-        {
-            let mut state = self.inner.state.lock().expect("session state not poisoned");
-            if let State::Open {
-                abandonment: abandonment_timeout,
-                ..
-            } = &mut *state
-            {
-                *abandonment_timeout = timeout;
-            }
-        }
+        self.inner.set_abandonment_timeout(timeout);
+        self
+    }
+
+    /// Sets the maximum accepted peer requests and buffered incoming bytes together.
+    /// Defaults to [`DEFAULT_MAX_INBOUND_REQUESTS`] and [`DEFAULT_MAX_INBOUND_BYTES`].
+    ///
+    /// `requests` counts queued requests, held responders and queued replies.
+    /// A slot is freed when the writer takes the reply or the reply is discarded.
+    /// Zero refuses all peer requests but still allows responses to our requests.
+    ///
+    /// `bytes` counts the full encoded envelopes of queued requests and unread
+    /// responses. `recv()`, `wait()` or dropping a response promise releases that
+    /// space in the budget. Zero allows no buffered envelopes. Decoded application
+    /// data, outgoing messages and transport buffers are excluded.
+    ///
+    /// Exceeding either limit closes this session with
+    /// [`Error::InboundRequestLimitExceeded`] or [`Error::InboundByteLimitExceeded`].
+    /// The reader never waits for space. Lowering a limit below usage also closes
+    /// the session. Completed promises keep their results and bytes until read or
+    /// dropped. Raising limits does not reopen a closed session.
+    pub fn set_inbound_limits(self, requests: usize, bytes: usize) -> Self {
+        self.inner.set_inbound_limits(requests, bytes);
         self
     }
 
@@ -124,6 +142,11 @@ impl Session {
     /// Blocks for the next peer request and its [`Responder`]. Closing the session
     /// wakes this call with the error that closed it. The caller decides how to
     /// handle each request; this method does not run application callbacks.
+    ///
+    /// Taking a request removes its bytes from the inbound byte count before
+    /// decoding it. The request still counts toward the inbound request limit
+    /// while its responder is held.
+    /// Invalid protobuf returns [`Error::Malformed`] and closes this session.
     ///
     /// If another thread closes the session after `recv()` takes a request from
     /// the queue, `recv()` can still return it. Replying after closure returns an error.
@@ -159,6 +182,10 @@ impl Drop for Session {
 pub(super) struct SessionInner {
     /// Protects the queues, pending operations, and transition to `State::Closed`.
     state: Mutex<State>,
+    /// Incoming bytes held by queued requests and unread responses. Accepting
+    /// messages and changing limits hold `state`. Consumers can release bytes
+    /// without that lock. Unread promises keep this counter alive after closure.
+    retained_bytes: Arc<AtomicUsize>,
     /// Wakes `recv()`, the writer, and the deadline worker when `state` changes.
     changed: Condvar,
     /// Envelope direction and request parity, fixed for the whole session.
@@ -188,10 +215,14 @@ enum State {
     /// Holds queued messages and pending operations. `close()` replaces this
     /// with `Closed`, then drops the queues after releasing the state lock.
     Open {
+        /// Ceiling for accepted requests, including application-held responders.
+        max_inbound_requests: usize,
+        /// Ceiling for encoded requests and unread response promises.
+        max_inbound_bytes: usize,
         /// Automatic reply lifetime selected when a responder is dropped.
         abandonment: Duration,
         /// Peer requests awaiting application receipt, paired with their request IDs.
-        incoming: VecDeque<(u64, Message)>,
+        incoming: VecDeque<(u64, IncomingEnvelope)>,
         /// Operations waiting to send a result to their promise. Each is removed
         /// before sending that result, so a promise is completed only once.
         operations: HashMap<OperationKey, PendingOperation>,
@@ -224,7 +255,10 @@ impl SessionInner {
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
         Self {
+            retained_bytes: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(State::Open {
+                max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
+                max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
                 abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
                 incoming: VecDeque::new(),
                 operations: HashMap::new(),
@@ -249,12 +283,68 @@ impl SessionInner {
         }
     }
 
+    /// Changes the timeout used when responders are dropped. Queued replies keep
+    /// their original deadlines.
+    pub(super) fn set_abandonment_timeout(&self, timeout: Duration) {
+        let mut state = self.state.lock().expect("session state not poisoned");
+        if let State::Open { abandonment, .. } = &mut *state {
+            *abandonment = timeout;
+        }
+    }
+
+    /// Updates both limits and closes the session if usage is too high. Holds the
+    /// same lock used to accept incoming messages.
+    pub(super) fn set_inbound_limits(&self, requests: usize, bytes: usize) {
+        let removed = {
+            let mut state = self.state.lock().expect("session state not poisoned");
+            let State::Open {
+                max_inbound_requests,
+                max_inbound_bytes,
+                reserved_ids,
+                ..
+            } = &mut *state
+            else {
+                return;
+            };
+            *max_inbound_requests = requests;
+            *max_inbound_bytes = bytes;
+            let error = if reserved_ids.len() > *max_inbound_requests {
+                Some(Error::InboundRequestLimitExceeded(*max_inbound_requests))
+            } else if self.retained_bytes.load(Ordering::Relaxed) > *max_inbound_bytes {
+                Some(Error::InboundByteLimitExceeded(*max_inbound_bytes))
+            } else {
+                None
+            };
+            error.and_then(|error| state.close(error, self.now()))
+        };
+        if removed.is_some() {
+            self.finish_close(removed);
+        }
+    }
+
+    /// Counts the envelope's original bytes under the session lock. Decoding or
+    /// dropping it later releases those bytes to this session's counter.
+    fn retain_incoming(
+        self: &Arc<Self>,
+        bytes: Bytes,
+        limit: usize,
+    ) -> Result<IncomingEnvelope, Error> {
+        IncomingEnvelope::new(
+            bytes,
+            &self.retained_bytes,
+            limit,
+            self.side,
+            Arc::downgrade(self),
+        )
+    }
+
     /// Takes the next request from `incoming` and creates its responder. If the
     /// queue is empty, waits on `changed`. Closing the session wakes the wait and
     /// returns the error stored in `State::Closed`.
+    /// Decodes after releasing the lock so the reader can keep receiving messages.
     fn recv(self: &Arc<Self>) -> Result<(Message, Responder), Error> {
         let mut state = self.state.lock().expect("session state not poisoned");
-        loop {
+        let (message, responder) = loop {
             match &mut *state {
                 State::Closed(error) => return Err(error.clone()),
                 State::Open {
@@ -264,7 +354,7 @@ impl SessionInner {
                     ..
                 } => {
                     if let Some((id, message)) = incoming.pop_front() {
-                        return Ok((message, Responder::new(Arc::downgrade(self), id)));
+                        break (message, Responder::new(Arc::downgrade(self), id));
                     }
                     #[cfg(any(test, feature = "fuzz"))]
                     if let Some(wait_hook) = wait_hook.take() {
@@ -276,31 +366,24 @@ impl SessionInner {
                         .expect("session state not poisoned");
                 }
             }
-        }
+        };
+        drop(state);
+        Ok((message.decode()?, responder))
     }
 
     /// Replaces `Open` with `Closed` and fails pending promises under the state lock.
     /// Expired operations receive `Timeout`; the rest receive the closing error.
     /// Every call wakes `changed` and finishes any required stream shutdown.
     pub(super) fn close(&self, error: Error) {
-        // Replace the state while holding the lock so no caller can add more work.
-        // Keep the first closing error when several threads call close().
         let removed = {
             let mut state = self.state.lock().expect("session state not poisoned");
-            match &*state {
-                State::Closed(_) => None,
-                State::Open { .. } => {
-                    let now = self.now();
-                    let mut removed = std::mem::replace(&mut *state, State::Closed(error.clone()));
-                    if let State::Open { operations, .. } = &mut removed {
-                        for (_, operation) in operations.drain() {
-                            operation.fail(error.clone(), now);
-                        }
-                    }
-                    Some(removed)
-                }
-            }
+            state.close(error, self.now())
         };
+        self.finish_close(removed);
+    }
+
+    /// Drops queued work and wakes waiters outside the session lock.
+    fn finish_close(&self, removed: Option<State>) {
         // Wake local waiters and drop queued work before adapter shutdown, which
         // may wait for transport I/O already running to return.
         self.changed.notify_all();
@@ -446,7 +529,17 @@ impl SessionInner {
         let mut state = self.state.lock().expect("session state not poisoned");
         state.expire(self.now());
         match &mut *state {
-            State::Open { outgoing, .. } => outgoing.pop_front(),
+            State::Open {
+                outgoing,
+                reserved_ids,
+                ..
+            } => {
+                let message = outgoing.pop_front()?;
+                if let OutgoingBody::Reply { id, .. } = &message.body {
+                    reserved_ids.remove(id);
+                }
+                Some(message)
+            }
             State::Closed(_) => None,
         }
     }
@@ -470,22 +563,52 @@ impl SessionInner {
             let ResultSender::Write(sender) = operation.sender else {
                 unreachable!()
             };
-            let _ = sender.send(Ok(()));
+            let _ = sender.send(Ok(PromiseResult::Written));
         }
     }
 
-    /// Supplies a peer answer in tests. If the operation is still pending,
-    /// `PendingOperation::complete_response()` checks its deadline and sends the result.
+    /// Supplies a response to a fixture operation without depending on wire IDs.
+    /// The fixture still encodes and retains bytes, matching real promise behavior.
     #[cfg(any(test, feature = "fuzz"))]
-    pub(super) fn record_response(&self, key: &OperationKey, result: Result<Message, Error>) {
+    pub(super) fn record_response(
+        self: &Arc<Self>,
+        key: &OperationKey,
+        result: Result<Message, Error>,
+    ) {
         let mut state = self.state.lock().expect("session state not poisoned");
-        let State::Open { operations, .. } = &mut *state else {
+        let State::Open {
+            operations,
+            max_inbound_bytes,
+            ..
+        } = &mut *state
+        else {
             return;
         };
         let Some(operation) = operations.remove(key) else {
             return;
         };
-        operation.complete_response(result, self.now());
+        let result = match result {
+            Ok(message) => Ok(message),
+            Err(Error::Remote(error)) => Err(error),
+            Err(error) => {
+                operation.fail(error, self.now());
+                return;
+            }
+        };
+        let peer = match self.side {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        };
+        let bytes = peer
+            .encode(0, result)
+            .expect("fixture response belongs to the peer");
+        let result = operation.complete_response(self.now(), || {
+            self.retain_incoming(Bytes::from(bytes.into_boxed_slice()), *max_inbound_bytes)
+        });
+        drop(state);
+        if let Err(error) = result {
+            self.close(error);
+        }
     }
 
     /// Returns `Instant::now()` or the test clock. Deadline checks use this while
@@ -498,43 +621,40 @@ impl SessionInner {
         Instant::now()
     }
 
-    /// Decodes outside the state lock, then matches an envelope only against this
-    /// session. Unknown responses have no effect; duplicate active requests fail.
-    pub(super) fn handle_message(&self, bytes: &[u8]) -> Result<(), Error> {
-        let (id, body) = self.side.decode(bytes)?;
+    /// Checks the outer envelope and routes its original bytes. `recv()` and
+    /// `wait()` decode nested payloads. Unknown and late responses are discarded
+    /// without decoding their bodies. The reader closes the session on error.
+    pub(super) fn handle_message(self: &Arc<Self>, bytes: Vec<u8>) -> Result<(), Error> {
+        let bytes = Bytes::from(bytes.into_boxed_slice());
+        let header = self.side.decode_header(bytes.clone())?;
         {
             let mut state = self.state.lock().expect("session state not poisoned");
-            let State::Open {
-                incoming,
-                operations,
-                outstanding,
-                reserved_ids,
-                ..
-            } = &mut *state
-            else {
-                let State::Closed(error) = &*state else {
-                    unreachable!()
-                };
-                return Err(error.clone());
-            };
-            match MessageKind::from_id(id, self.side.into()) {
+            match MessageKind::from_id(header.id, self.side.into()) {
                 MessageKind::Request => {
-                    // Errors are valid only in responses.
-                    let message = body.map_err(|_| Error::Malformed)?;
-
-                    // Reserve the request ID and reject duplicates.
-                    if !reserved_ids.insert(id) {
+                    if header.is_error {
                         return Err(Error::Malformed);
                     }
-                    incoming.push_back((id, message));
+                    self.queue_request(&mut state, header.id, bytes)?;
                 }
                 MessageKind::Response => {
-                    // Remove the matching request. Ignore unknown response IDs
-                    // and discard results for operations that already timed out.
-                    if let Some(key) = outstanding.remove(&id)
+                    let State::Open {
+                        operations,
+                        outstanding,
+                        max_inbound_bytes,
+                        ..
+                    } = &mut *state
+                    else {
+                        let State::Closed(error) = &*state else {
+                            unreachable!()
+                        };
+                        return Err(error.clone());
+                    };
+                    if let Some(key) = outstanding.remove(&header.id)
                         && let Some(operation) = operations.remove(&key)
                     {
-                        operation.complete_response(body.map_err(Error::Remote), self.now());
+                        operation.complete_response(self.now(), || {
+                            self.retain_incoming(bytes, *max_inbound_bytes)
+                        })?;
                     }
                 }
             }
@@ -543,11 +663,44 @@ impl SessionInner {
         Ok(())
     }
 
+    /// Reserves a request slot and bytes under the session lock. If either limit
+    /// is exceeded, the queue stays untouched. Never waits for the application.
+    fn queue_request(
+        self: &Arc<Self>,
+        state: &mut State,
+        id: u64,
+        bytes: Bytes,
+    ) -> Result<(), Error> {
+        let State::Open {
+            incoming,
+            reserved_ids,
+            max_inbound_requests,
+            max_inbound_bytes,
+            ..
+        } = state
+        else {
+            let State::Closed(error) = state else {
+                unreachable!()
+            };
+            return Err(error.clone());
+        };
+        if reserved_ids.contains(&id) {
+            return Err(Error::Malformed);
+        }
+        if reserved_ids.len() >= *max_inbound_requests {
+            return Err(Error::InboundRequestLimitExceeded(*max_inbound_requests));
+        }
+        let message = self.retain_incoming(bytes, *max_inbound_bytes)?;
+        reserved_ids.insert(id);
+        incoming.push_back((id, message));
+        Ok(())
+    }
+
     /// Waits for and takes the next queued message, or returns `None` on closure.
     /// Under the state lock, assigns each request an ID and records its operation
     /// key in `outstanding`, so `handle_message()` can match the peer's response
     /// even if it arrives before the write finishes.
-    fn next_outgoing(&self) -> Option<(u64, OutgoingMessage)> {
+    pub(super) fn next_outgoing(&self) -> Option<(u64, OutgoingMessage)> {
         let mut state = self.state.lock().expect("session state not poisoned");
         loop {
             // Remove expired messages before choosing the next one to send.
@@ -704,6 +857,21 @@ impl Session {
 }
 
 impl State {
+    /// Stops accepting messages and fails pending operations under the session lock.
+    /// Returns the old queues to be dropped after releasing the lock.
+    fn close(&mut self, error: Error, now: Instant) -> Option<Self> {
+        if let Self::Closed(_) = self {
+            return None;
+        }
+        let mut removed = std::mem::replace(self, Self::Closed(error.clone()));
+        if let Self::Open { operations, .. } = &mut removed {
+            for (_, operation) in operations.drain() {
+                operation.fail(error.clone(), now);
+            }
+        }
+        Some(removed)
+    }
+
     /// Removes expired entries from `operations`, sends `Timeout` to their
     /// promises, and discards any messages they still have in `outgoing`.
     fn expire(&mut self, now: Instant) {
@@ -743,9 +911,14 @@ impl State {
 impl Session {
     /// Creates a session without a stream or workers for lifecycle scenarios.
     pub(super) fn fixture() -> Self {
+        Self::fixture_for(Side::Server)
+    }
+
+    /// Creates either envelope direction without a stream or workers.
+    pub(super) fn fixture_for(side: Side) -> Self {
         Self {
             inner: Arc::new(SessionInner::new(
-                Side::Server,
+                side,
                 None,
                 Arc::new(worker::Tracker::default()),
             )),
@@ -792,6 +965,22 @@ impl SessionInner {
         });
     }
 
+    /// Waits for the reader to remove a previously sent request's ID. Tests use
+    /// this to leave a completed promise unread before changing limits or sessions.
+    pub(super) fn wait_response(&self, id: u64) {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self.changed.wait_timeout_while(state, Duration::from_secs(3), |state| {
+            matches!(state, State::Open { outstanding, .. } if outstanding.contains_key(&id))
+        }).unwrap();
+        let State::Open { outstanding, .. } = &*state else {
+            panic!("session closed before response fence");
+        };
+        assert!(
+            !outstanding.contains_key(&id),
+            "reader did not process response"
+        );
+    }
+
     /// Returns the sorted request IDs still waiting for peer responses.
     pub(super) fn outstanding_ids(&self) -> Vec<u64> {
         let state = self.state.lock().unwrap();
@@ -803,18 +992,35 @@ impl SessionInner {
         ids
     }
 
-    /// Supplies a peer request in place of the transport reader and wakes receive.
-    /// Holds `state` while checking for closure and inserting into `incoming`.
-    pub(super) fn inject_request(&self, id: u64, message: Message) -> Result<(), Error> {
-        {
+    /// Supplies a request directly to the fixture's admission path, independently
+    /// of parity (wire routing is covered by the connection scenarios).
+    pub(super) fn inject_request(self: &Arc<Self>, id: u64, message: Message) -> Result<(), Error> {
+        let peer = match self.side {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        };
+        let bytes = peer
+            .encode(id, Ok(message))
+            .expect("fixture request belongs to peer");
+        let result = {
             let mut state = self.state.lock().expect("session state not poisoned");
-            match &mut *state {
-                State::Open { incoming, .. } => incoming.push_back((id, message)),
-                State::Closed(error) => return Err(error.clone()),
-            }
+            self.queue_request(&mut state, id, Bytes::from(bytes.into_boxed_slice()))
+        };
+        self.changed.notify_all();
+        if let Err(error) = &result {
+            self.close(error.clone());
         }
-        self.changed.notify_one();
-        Ok(())
+        result
+    }
+
+    /// Returns the accepted request count and retained byte count for test checks.
+    pub(super) fn inbound_usage(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("session state not poisoned");
+        let requests = match &*state {
+            State::Open { reserved_ids, .. } => reserved_ids.len(),
+            State::Closed(_) => 0,
+        };
+        (requests, self.retained_bytes.load(Ordering::Relaxed))
     }
 
     /// Advances the test clock without calling `expire()`, so tests can deliver

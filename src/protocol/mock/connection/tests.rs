@@ -3,6 +3,8 @@
 
 //! Scenarios through public constructors, real crypto/framing, and gated adapters.
 
+use crate::protocol::{DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS};
+
 use super::{BUDGET, Driver, EnvelopeShape, Failure, Job, Mode, Step, run};
 use crate::protocol::{Error, Message};
 use crate::transport;
@@ -873,4 +875,161 @@ fn test_peer_id_reuse_before_local_flush() {
             run(mode, &steps);
         }
     }
+}
+
+/// Both roles close promptly on admission overflow, waking requests and receivers.
+#[test]
+fn test_inbound_overflow_wakes_workers() {
+    use EnvelopeShape::*;
+    use Step::*;
+    for (mode, local, peer, own) in [(Mode::Server, 1, 1, 2), (Mode::Client, 0, 2, 1)] {
+        for (limit, error) in [
+            (
+                InboundLimits(local, 0, DEFAULT_MAX_INBOUND_BYTES),
+                Failure::Requests,
+            ),
+            (
+                InboundLimits(local, DEFAULT_MAX_INBOUND_REQUESTS, 0),
+                Failure::Bytes,
+            ),
+        ] {
+            run(
+                mode,
+                &[
+                    limit,
+                    Request(local, 0, 11, 3000),
+                    Read(own, Content(11)),
+                    StartReceive(local),
+                    Reject(peer, Content(12)),
+                    ReceiveFailed(local, error),
+                    Answer(0, Err(error)),
+                    Shutdown,
+                    Stopped,
+                ],
+            );
+        }
+        run(
+            mode,
+            &[
+                InboundLimits(local, 1, DEFAULT_MAX_INBOUND_BYTES),
+                Send(peer, Content(11)),
+                Receive(local, 11, 0),
+                StartReceive(local),
+                Reject(peer + 2, Content(12)),
+                ReceiveFailed(local, Failure::Requests),
+                Shutdown,
+                Stopped,
+            ],
+        );
+    }
+    run(
+        Mode::Server,
+        &[
+            ServerInboundLimits(0, DEFAULT_MAX_INBOUND_BYTES),
+            Reject(1, Content(1)),
+            ReceiveError(1, Failure::Requests),
+            Reconnect(2),
+            Reject(1, Content(1)),
+            ReceiveError(2, Failure::Requests),
+            ServerInboundLimits(1, 0),
+            Reconnect(3),
+            Reject(1, Content(1)),
+            ReceiveError(3, Failure::Bytes),
+            ServerInboundLimits(1, 100),
+            Reconnect(4),
+            Send(1, Content(2)),
+            Receive(4, 2, 0),
+            Abandon(0),
+            Read(1, Error(1)),
+            Shutdown,
+            Stopped,
+        ],
+    );
+}
+
+/// A full byte budget still permits replies to requests whose observers were dropped.
+#[test]
+fn test_inbound_unread_response_budget() {
+    use EnvelopeShape::*;
+    use Step::*;
+    for (mode, local, own) in [(Mode::Server, 1, 2), (Mode::Client, 0, 1)] {
+        run(
+            mode,
+            &[
+                InboundLimits(local, DEFAULT_MAX_INBOUND_REQUESTS, 7),
+                Request(local, 0, 1, 3000),
+                Read(own, Content(1)),
+                Send(own, Content(2)),
+                ResponseReceived(local, own),
+                Usage(local, 0, 7),
+                Request(local, 1, 3, 3000),
+                Read(own + 2, Content(3)),
+                DropPromise(1),
+                Send(own + 2, MalformedBody),
+                ResponseReceived(local, own + 2),
+                Usage(local, 0, 7),
+                Request(local, 2, 4, 3000),
+                Read(own + 4, Content(4)),
+                StartReceive(local),
+                Reject(own + 4, Content(5)),
+                ReceiveFailed(local, Failure::Bytes),
+                Answer(2, Err(Failure::Bytes)),
+                Answer(0, Ok(2)),
+                Usage(local, 0, 0),
+                Shutdown,
+                Stopped,
+            ],
+        );
+    }
+}
+
+/// Payloads are decoded when read. A decode failure closes only the original session.
+#[test]
+fn test_inbound_deferred_payload_errors() {
+    use EnvelopeShape::*;
+    use Step::*;
+    for (mode, local, peer, own) in [(Mode::Server, 1, 1, 2), (Mode::Client, 0, 2, 1)] {
+        run(
+            mode,
+            &[
+                Send(peer, MalformedBody),
+                ReceiveError(local, Failure::Malformed),
+                Shutdown,
+                Stopped,
+            ],
+        );
+        for shape in [MalformedBody, MalformedError] {
+            run(
+                mode,
+                &[
+                    Request(local, 0, 1, 3000),
+                    Read(own, Content(1)),
+                    Send(own, shape),
+                    ResponseReceived(local, own),
+                    StartReceive(local),
+                    Answer(0, Err(Failure::Malformed)),
+                    ReceiveFailed(local, Failure::Malformed),
+                    Shutdown,
+                    Stopped,
+                ],
+            );
+        }
+    }
+    run(
+        Mode::Server,
+        &[
+            Request(1, 0, 1, 3000),
+            Read(2, Content(1)),
+            Send(2, MalformedBody),
+            ResponseReceived(1, 2),
+            Reconnect(2),
+            Answer(0, Err(Failure::Malformed)),
+            Send(1, Content(7)),
+            Receive(2, 7, 0),
+            Abandon(0),
+            Read(1, Error(1)),
+            Shutdown,
+            Stopped,
+        ],
+    );
 }

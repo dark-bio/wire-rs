@@ -1,6 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
 
+use prost_types::field_descriptor_proto::Type;
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write;
@@ -84,6 +85,31 @@ fn main() {
     content.push_str(&conversions);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
     fs::write(out_dir.join("message.rs"), content).expect("write message enum and conversions");
+
+    // Generate a second view of the envelopes with nested messages left as bytes.
+    // Field numbers, oneofs and optional presence stay the same. The reader uses
+    // this view for routing. Full decoding uses the original envelope bytes so
+    // repeated message fields still merge as protobuf expects.
+    let mut opaque = descriptors.clone();
+    for file in &mut opaque.file {
+        file.package = Some("darkbio.wire.opaque".into());
+        file.enum_type.clear();
+        file.message_type
+            .retain(|message| matches!(message.name(), "HostToArk" | "ArkToHost"));
+        for message in &mut file.message_type {
+            for field in &mut message.field {
+                if field.r#type() == Type::Message {
+                    field.r#type = Some(Type::Bytes as i32);
+                    field.type_name = None;
+                }
+            }
+        }
+    }
+    let mut opaque_config = prost_build::Config::new();
+    opaque_config.bytes(["."]);
+    opaque_config
+        .compile_fds(opaque)
+        .expect("generate opaque envelope views");
     config
         .compile_fds(descriptors)
         .expect("failed to compile wire.proto");

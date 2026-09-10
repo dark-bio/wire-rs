@@ -20,14 +20,14 @@ pub struct Requester {
 impl Requester {
     /// Queues a request and returns its promise without waiting for the writer or
     /// a reply. A closed session returns an error immediately; errors after queueing
-    /// are returned through the promise. Request-window limits are not implemented
-    /// yet; the planned limit delays queued requests when the window is full.
+    /// are returned through the promise. The outgoing queue has no capacity limit.
     /// A message invalid for this session's direction fails the promise with
     /// [`Error::WrongDirection`].
     ///
-    /// The deadline covers waiting for capacity, sending and receiving the reply.
+    /// The deadline covers time in the queue, sending and accepting the response.
     /// Waiting on the promise does not start or refresh it. Dropping the promise
     /// does not cancel the request. The peer may keep working after a timeout.
+    /// Decoding the response in `wait()` is outside this deadline.
     /// The expected response type is selected when waiting on [`Promise<Message>`].
     pub fn request(
         &self,

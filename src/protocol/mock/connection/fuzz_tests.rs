@@ -106,6 +106,7 @@ fn test_connection_fuzz_actions() {
             ReplyRefusal,
             QueuedTimeout,
             ResponseBeforeFailure,
+            InboundFailure,
         ] {
             for budget in 0..3 {
                 run(&[
@@ -123,6 +124,54 @@ fn test_connection_fuzz_actions() {
                     },
                 ]);
             }
+        }
+    }
+}
+
+/// Seed every deferred decoding path and both limits in each live role.
+#[test]
+fn test_connection_fuzz_inbound_limits() {
+    for slot in 0..2 {
+        for kind in [Kind::InboundFailure, Kind::Malformed] {
+            for value in 0..8 {
+                run(&[
+                    Action {
+                        kind,
+                        slot,
+                        value,
+                        budget: value,
+                    },
+                    Action {
+                        kind: Kind::Pipeline,
+                        slot,
+                        value: 42,
+                        budget: 1,
+                    },
+                ]);
+            }
+        }
+    }
+}
+
+/// Limit and decode failures must settle queued work even with no writer progress.
+#[test]
+fn test_inbound_failure_during_blocked_output() {
+    for slot in 0..4 {
+        for value in 0..3 {
+            run(&[
+                Action {
+                    kind: Kind::InboundFailure,
+                    slot,
+                    value,
+                    budget: 128,
+                },
+                Action {
+                    kind: Kind::Pipeline,
+                    slot,
+                    value: 42,
+                    budget: 0,
+                },
+            ]);
         }
     }
 }

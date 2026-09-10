@@ -5,8 +5,14 @@
 //!
 //! A reader receives messages from each connection. Each session also has a writer
 //! that sends queued messages and a deadline worker that times out operations.
-//! Flow control and memory limits are not implemented yet; the outgoing queue is
-//! currently unbounded.
+//! Incoming requests and unread responses stay encoded until `recv()` or `wait()`.
+//! Invalid payloads close their original session when decoded.
+//!
+//! Each session limits accepted peer requests and buffered incoming bytes. Set
+//! both with [`Session::set_inbound_limits`] or [`Server::set_inbound_limits`].
+//! Exceeding a limit closes the session. The reader never waits for the application
+//! to make room. These limits are local; no flow control is negotiated with the
+//! peer. The outgoing queue has no capacity limit.
 //!
 //! The application opens a [`crate::transport::Stream`]; this layer constructs and
 //! owns its transport. [`connect`] establishes one client session. [`Server`] owns
@@ -27,7 +33,8 @@
 //! runtime is required. Every request expects a reply, including notifications.
 //!
 //! Closing a session fails its pending promises and discards queued messages.
-//! A write already in progress may still reach the peer.
+//! Completed promises keep their results. A write already in progress may still
+//! reach the peer.
 
 mod closer;
 mod envelope;
@@ -47,7 +54,6 @@ mod worker;
 pub mod mock;
 
 pub use closer::Closer;
-pub use envelope::Envelope;
 pub use error::Error;
 pub use generated::Error as RemoteError;
 pub use generated::*;
@@ -62,9 +68,24 @@ use std::time::Duration;
 
 /// Default timeout for sending an automatic `UNANSWERED` reply. Starts when the
 /// responder is dropped and includes time in the outgoing queue. Configure it
-/// with [`Session::set_abandonment_timeout`].
+/// with [`Session::set_abandonment_timeout`] or [`Server::set_abandonment_timeout`].
 /// Transport write timeouts are independent.
 pub const DEFAULT_ABANDONMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default limit of 1,024 accepted peer requests per session. A request counts
+/// while queued, held by a responder, or waiting to send its reply. The slot is
+/// freed when the writer takes the reply or the reply is discarded.
+/// Configure it with [`Session::set_inbound_limits`] or
+/// [`Server::set_inbound_limits`]. Zero admits no peer requests.
+pub const DEFAULT_MAX_INBOUND_REQUESTS: usize = 1024;
+
+/// Default limit of 16 MiB for queued requests and unread response promises.
+/// Counts their full encoded envelopes. Taking or dropping an envelope reduces
+/// the byte count.
+/// Decoded application data, outgoing messages and transport buffers are excluded.
+/// Configure it with [`Session::set_inbound_limits`] or
+/// [`Server::set_inbound_limits`]. Zero permits no retained envelope bytes.
+pub const DEFAULT_MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 
 /// Generated protobuf bindings, excluded from checks for handwritten code.
 #[allow(clippy::all)]

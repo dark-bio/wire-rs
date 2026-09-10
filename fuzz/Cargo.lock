@@ -310,6 +310,7 @@ dependencies = [
  "memchr",
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "rand_chacha 0.10.0",
  "serde_json",

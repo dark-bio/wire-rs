@@ -35,12 +35,21 @@ enum Failure {
     Remote(u64),
     /// The answer variant did not match the requested Rust response type.
     WrongType,
+    /// The peer sent an invalid outer envelope or nested payload.
+    Malformed,
+    /// The inbound request limit closed the session.
+    Requests,
+    /// The inbound byte limit closed the session.
+    Bytes,
 }
 
 /// Converts an error to the script's `Failure`, panicking on unsupported errors.
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
+        Error::Malformed => Failure::Malformed,
+        Error::InboundRequestLimitExceeded(_) => Failure::Requests,
+        Error::InboundByteLimitExceeded(_) => Failure::Bytes,
         Error::Timeout => Failure::Timeout,
         Error::Remote(error) => Failure::Remote(error.code),
         Error::UnexpectedResponse { .. } => Failure::WrongType,
@@ -132,6 +141,22 @@ impl<T: Send + 'static> Job<T> {
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step {
+    /// Attempts fixture admission with an exact ID and expects a capacity failure.
+    RejectDelivery(u8, u64, u8, Failure),
+    /// Takes output using real wire-ID assignment and saves its completion handle.
+    SendNext(u8, u8, u64),
+    /// Receives a full typed message and retains its responder for later steps.
+    ReceiveMessage(u8, Message, u8),
+
+    /// Changes both inbound limits through the public session setter.
+    InboundLimits(u8, usize, usize),
+    /// Changes both server limits for the current and future sessions.
+    ServerInboundLimits(usize, usize),
+
+    /// Checks accepted requests and retained bytes from the original envelopes.
+    Usage(u8, usize, usize),
+    /// Passes original envelope bytes through the reader path and checks admission.
+    Raw(u8, Vec<u8>, Result<(), Failure>),
     /// Attaches a session under the given label, closing the previous session.
     Open(u8),
     /// Calls `accept()` and checks that it returns the labeled session.
@@ -170,6 +195,8 @@ enum Step {
     DropReply(u8),
     /// Sets the automatic reply budget for subsequent responder drops.
     AbandonmentTimeout(u8, Duration),
+    /// Sets the automatic reply timeout for the current and future server sessions.
+    ServerAbandonmentTimeout(Duration),
     /// Takes queued automatic replies and checks their request IDs.
     Abandoned(u8, Vec<u64>),
     /// Checks that the saved weak reference to this session cannot be upgraded.
@@ -359,6 +386,69 @@ impl Driver {
     /// Assertions also reject invalid scripts, such as overwriting an owned slot.
     fn step(&mut self, step: Step) {
         match step {
+            Step::RejectDelivery(id, request, tag, expected) => {
+                refused(
+                    self.session_refs[&id]
+                        .upgrade()
+                        .unwrap()
+                        .inject_request(request, vec![tag].into()),
+                    expected,
+                );
+            }
+
+            Step::SendNext(id, slot, wire_id) => {
+                let session = self.session_refs[&id].upgrade().unwrap();
+                let (actual, outgoing) = Job::start(move || session.next_outgoing())
+                    .finish()
+                    .unwrap();
+                assert_eq!(actual, wire_id);
+                assert!(self.outgoing.insert(slot, outgoing).is_none());
+            }
+            Step::ReceiveMessage(id, expected, slot) => {
+                let mut session = self.sessions.remove(&id).unwrap();
+                let (session, result) = Job::start(move || {
+                    let result = session.recv();
+                    (session, result)
+                })
+                .finish();
+                let (message, responder) = result.unwrap();
+                assert_eq!(message, expected);
+                assert!(self.responders.insert(slot, responder).is_none());
+                self.sessions.insert(id, session);
+            }
+
+            Step::InboundLimits(id, requests, bytes) => {
+                let session = self
+                    .sessions
+                    .remove(&id)
+                    .unwrap()
+                    .set_inbound_limits(requests, bytes);
+                self.sessions.insert(id, session);
+            }
+            Step::ServerInboundLimits(requests, bytes) => {
+                self.server = Some(
+                    self.server
+                        .take()
+                        .unwrap()
+                        .set_inbound_limits(requests, bytes),
+                );
+            }
+
+            Step::Usage(id, requests, bytes) => {
+                assert_eq!(
+                    self.session_refs[&id].upgrade().unwrap().inbound_usage(),
+                    (requests, bytes)
+                );
+            }
+            Step::Raw(id, bytes, expected) => {
+                let session = self.session_refs[&id].upgrade().unwrap();
+                let result = session.handle_message(bytes);
+                if let Err(error) = &result {
+                    session.close(error.clone());
+                }
+                assert_eq!(result.map_err(failure), expected);
+            }
+
             Step::Open(id) => {
                 let session = self.source.as_mut().unwrap().open().unwrap();
                 session.upgrade().unwrap().set_time(self.at(self.time));
@@ -438,7 +528,7 @@ impl Driver {
                 assert!(matches!(outgoing.body, OutgoingBody::Request(_)));
                 outgoing
                     .operation
-                    .record_response(Ok(crate::protocol::DeviceInfoResponse::default().into()));
+                    .record_response(Ok(crate::protocol::DeviceInfoRequest::default().into()));
             }
             Step::Wait(slot, expected) => {
                 let promise = self.promises.remove(&slot).unwrap();
@@ -755,6 +845,9 @@ impl Driver {
                 let session = self.sessions.remove(&id).unwrap();
                 self.sessions
                     .insert(id, session.set_abandonment_timeout(timeout));
+            }
+            Step::ServerAbandonmentTimeout(timeout) => {
+                self.server = Some(self.server.take().unwrap().set_abandonment_timeout(timeout));
             }
             Step::Abandoned(id, expected) => {
                 let session = self.session_refs[&id].upgrade().unwrap();

@@ -43,13 +43,27 @@ pub enum Error {
     #[error("wire message cannot be sent in this direction: {0}")]
     WrongDirection(&'static str),
 
-    /// The peer sent an invalid protocol envelope.
+    /// The peer sent an invalid envelope or payload. The session closes when this
+    /// is detected. Nested payloads are checked only when `recv()` or `wait()`
+    /// reads them.
     #[error("wire peer sent a malformed message")]
     Malformed,
 
     /// The encoded message exceeds the transport's sending limit.
     #[error("wire message too large: {0} bytes")]
     TooLarge(usize),
+
+    /// A peer request would exceed the session's request limit. Also returned if
+    /// the limit is lowered below usage. Carries the configured request limit.
+    /// This closes the session.
+    #[error("wire inbound request limit exceeded: {0}")]
+    InboundRequestLimitExceeded(usize),
+
+    /// Buffering an incoming envelope would exceed the session's byte limit.
+    /// Also returned if the limit is lowered below usage. Carries the configured
+    /// byte limit. This closes the session.
+    #[error("wire inbound byte limit exceeded: {0}")]
+    InboundByteLimitExceeded(usize),
 }
 
 impl From<transport::Error> for Error {

@@ -10,8 +10,12 @@
 //! runner instead. Everything here stays on the simulated clock.
 
 use super::{ExpectedMessage, Failure, Step};
-use crate::protocol::ReservedErrors;
+use crate::protocol::{
+    DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS, HostToArk, RemoteError,
+    ReservedErrors, host_to_ark,
+};
 use crate::transport::mock::MAX_STEPS;
+use prost::Message as _;
 use std::time::Duration;
 
 /// One mutation-friendly action. Selectors wrap over previously created objects,
@@ -23,9 +27,10 @@ pub struct Action {
     pub kind: Kind,
     /// Session, responder or operation selector, depending on the action.
     pub slot: u8,
-    /// Body tag, result selector or choice of concurrent execution.
+    /// Body tag, result selector, request limit or choice of concurrent execution.
     pub value: u8,
-    /// Relative deadline, clock advance or abandonment timeout in milliseconds.
+    /// Relative deadline, clock advance or abandonment timeout in milliseconds,
+    /// or the retained-byte limit.
     pub budget: u8,
 }
 
@@ -50,6 +55,10 @@ pub enum Kind {
     Drop,
     CloseServer,
     DropSource,
+    /// Changes both inbound limits, including below live usage.
+    InboundLimits,
+    /// Queues several requests before retrieving any of their bodies.
+    IncomingBatch,
 }
 
 /// Default abandonment budget of a fresh session, in script milliseconds.
@@ -59,6 +68,10 @@ struct Session {
     reason: Option<Failure>,
     owner: bool,
     abandonment: u64,
+    /// Current limit on accepted peer requests.
+    max_requests: usize,
+    /// Current limit on buffered incoming bytes.
+    max_bytes: usize,
 }
 
 struct Operation {
@@ -72,6 +85,8 @@ struct Operation {
     parked: bool,
     queued: bool,
     writing: bool,
+    /// Encoded bytes held by this response until its promise is read or dropped.
+    response_bytes: usize,
 }
 
 impl Operation {
@@ -113,6 +128,100 @@ struct Model {
 }
 
 impl Model {
+    /// Counts requests held by responders and queued replies.
+    fn request_usage(&self, session: usize) -> usize {
+        if self.sessions[session].reason.is_some() {
+            return 0;
+        }
+        self.responders
+            .iter()
+            .filter(|owner| **owner == Some(session))
+            .count()
+            + self
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation.session == session && operation.queued && !operation.request()
+                })
+                .count()
+    }
+
+    /// Counts buffered response bytes until their promises are read or dropped.
+    fn byte_usage(&self, session: usize) -> usize {
+        self.operations
+            .iter()
+            .filter(|operation| operation.session == session && operation.retained)
+            .map(|operation| operation.response_bytes)
+            .sum()
+    }
+
+    /// Joins completed waits before checking byte counts. Pending waits stay
+    /// blocked and can overlap later completions or session closure.
+    fn collect_waiters(&mut self) {
+        for (id, operation) in self.operations.iter_mut().enumerate() {
+            if operation.parked
+                && let Some(result) = operation.result
+            {
+                self.steps.push(if operation.request() {
+                    Step::FinishWait(id as u8, result)
+                } else {
+                    Step::FinishWaitWrite(id as u8, result.map(|_| ()))
+                });
+                operation.parked = false;
+                operation.retained = false;
+            }
+        }
+    }
+
+    /// Queues a batch before receiving it, predicting overflow from original
+    /// envelope lengths. Failed admission closes and discards the entire inbox.
+    fn incoming(&mut self, session: usize, count: u8, value: u8, parked: bool) {
+        let base = self.responders.len();
+        let mut bytes = self.byte_usage(session);
+        for offset in 0..usize::from(count) {
+            let id = (base + offset) as u64;
+            let tag = value.wrapping_add(offset as u8);
+            bytes += HostToArk {
+                id,
+                err: None,
+                content: Some(host_to_ark::Content::Develop(vec![tag])),
+            }
+            .encoded_len();
+            let reason =
+                if self.request_usage(session) + offset >= self.sessions[session].max_requests {
+                    Some(Failure::Requests)
+                } else if bytes > self.sessions[session].max_bytes {
+                    Some(Failure::Bytes)
+                } else {
+                    None
+                };
+            if parked {
+                self.steps.push(Step::StartReceive(session as u8));
+            }
+            if let Some(reason) = reason {
+                self.steps
+                    .push(Step::RejectDelivery(session as u8, id, tag, reason));
+                self.close(session, reason);
+                if parked {
+                    self.steps
+                        .push(Step::FinishReceiveError(session as u8, reason));
+                }
+                return;
+            }
+            self.steps.push(Step::Deliver(session as u8, id, tag));
+        }
+        for offset in 0..usize::from(count) {
+            let slot = (base + offset) as u8;
+            let tag = value.wrapping_add(offset as u8);
+            self.steps.push(if parked {
+                Step::FinishReceive(session as u8, tag, slot)
+            } else {
+                Step::Receive(session as u8, tag, slot)
+            });
+            self.responders.push(Some(session));
+        }
+    }
+
     fn close(&mut self, session: usize, reason: Failure) {
         if self.sessions[session].reason.is_none() {
             self.sessions[session].reason = Some(reason);
@@ -144,6 +253,7 @@ impl Model {
             parked: false,
             queued: deadline > self.time,
             writing: false,
+            response_bytes: 0,
         });
     }
 
@@ -158,6 +268,8 @@ impl Model {
             && self.time < operation.deadline
             && session.reason.is_none()
             && session.owner
+            && (!operation.request()
+                || self.byte_usage(operation.session) + answer_size(Ok(42)) <= session.max_bytes)
     }
 
     /// Releases an operation whose promise and queued message a race consumed.
@@ -207,6 +319,8 @@ impl Model {
                         reason: None,
                         owner: true,
                         abandonment: ABANDONMENT,
+                        max_requests: DEFAULT_MAX_INBOUND_REQUESTS,
+                        max_bytes: DEFAULT_MAX_INBOUND_BYTES,
                     });
                 }
             }
@@ -232,20 +346,27 @@ impl Model {
                         Step::ReceiveError(session as u8, reason)
                     });
                 } else {
-                    let slot = self.responders.len() as u8;
-                    if budget & 1 == 0 {
-                        self.steps.extend([
-                            Step::Deliver(session as u8, u64::from(slot), value),
-                            Step::Receive(session as u8, value, slot),
-                        ]);
-                    } else {
-                        self.steps.extend([
-                            Step::StartReceive(session as u8),
-                            Step::Deliver(session as u8, u64::from(slot), value),
-                            Step::FinishReceive(session as u8, value, slot),
-                        ]);
-                    }
-                    self.responders.push(Some(session));
+                    self.incoming(session, 1, value, budget & 1 != 0);
+                }
+            }
+            Kind::IncomingBatch
+                if !self.sessions.is_empty()
+                    && self.sessions[session].owner
+                    && self.sessions[session].reason.is_none() =>
+            {
+                self.incoming(session, budget % 4 + 1, value, false);
+            }
+            Kind::InboundLimits if !self.sessions.is_empty() && self.sessions[session].owner => {
+                let requests = usize::from(value);
+                let bytes = usize::from(budget);
+                self.sessions[session].max_requests = requests;
+                self.sessions[session].max_bytes = bytes;
+                self.steps
+                    .push(Step::InboundLimits(session as u8, requests, bytes));
+                if self.request_usage(session) > requests {
+                    self.close(session, Failure::Requests);
+                } else if self.byte_usage(session) > bytes {
+                    self.close(session, Failure::Bytes);
                 }
             }
             Kind::Reply | Kind::Abandon if !self.responders.is_empty() => {
@@ -392,10 +513,29 @@ impl Model {
                         Err(Failure::Remote(code)) => Step::Answer(operation as u8, Err(code)),
                         _ => Step::AnswerOther(operation as u8),
                     });
-                    let now = self.time;
+                    let bytes = answer_size(result);
+                    let pending = &self.operations[operation];
+                    let retain = pending.result.is_none()
+                        && self.time < pending.deadline
+                        && pending.retained;
+                    let overflow =
+                        retain && self.byte_usage(owner) + bytes > self.sessions[owner].max_bytes;
                     let pending = &mut self.operations[operation];
                     pending.writing = false;
-                    pending.complete(now, result);
+                    pending.complete(
+                        self.time,
+                        if overflow {
+                            Err(Failure::Bytes)
+                        } else {
+                            result
+                        },
+                    );
+                    if retain && !overflow {
+                        pending.response_bytes = bytes;
+                    }
+                    if overflow {
+                        self.close(owner, Failure::Bytes);
+                    }
                 }
             }
             Kind::Advance => {
@@ -406,34 +546,21 @@ impl Model {
                 self.expire(session);
                 self.steps.push(Step::Expire(session as u8));
             }
-            Kind::Wait if !self.operations.is_empty() && self.operations[operation].retained => {
+            Kind::Wait
+                if !self.operations.is_empty()
+                    && self.operations[operation].retained
+                    && !self.operations[operation].parked =>
+            {
                 let request = self.operations[operation].request();
-                match self.operations[operation].parked {
-                    // Collect a settled waiter while later actions can still use
-                    // its session.
-                    true => {
-                        if let Some(result) = self.operations[operation].result {
-                            self.operations[operation].parked = false;
-                            self.operations[operation].retained = false;
-                            self.steps.push(if request {
-                                Step::FinishWait(operation as u8, result)
-                            } else {
-                                Step::FinishWaitWrite(operation as u8, result.map(|_| ()))
-                            });
-                        }
-                    }
-                    // Waiting expires overdue operations in the same session
-                    // before blocking. Later actions supply the result.
-                    false => {
-                        self.expire(self.operations[operation].session);
-                        self.operations[operation].parked = true;
-                        self.steps.push(if request {
-                            Step::StartWait(operation as u8)
-                        } else {
-                            Step::StartWaitWrite(operation as u8)
-                        });
-                    }
-                }
+                // Waiting expires overdue operations in the same session before
+                // blocking. collect_waiters() joins it once a result is available.
+                self.expire(self.operations[operation].session);
+                self.operations[operation].parked = true;
+                self.steps.push(if request {
+                    Step::StartWait(operation as u8)
+                } else {
+                    Step::StartWaitWrite(operation as u8)
+                });
             }
             Kind::DropPromise
                 if !self.operations.is_empty()
@@ -521,6 +648,7 @@ impl Model {
             }
             _ => {}
         }
+        self.collect_waiters();
         for (session, state) in self.sessions.iter().enumerate() {
             if state.owner {
                 let next = self
@@ -530,9 +658,40 @@ impl Model {
                     .map(|operation| operation.deadline)
                     .min();
                 self.steps.push(Step::Deadline(session as u8, next));
+                self.steps.push(Step::Usage(
+                    session as u8,
+                    self.request_usage(session),
+                    self.byte_usage(session),
+                ));
             }
         }
     }
+}
+
+/// Measures the fixture's original answer encoding with the schema codec. The
+/// ledger stores this length; it never consults production budget counters.
+fn answer_size(result: Result<u8, Failure>) -> usize {
+    let (err, content) = match result {
+        Ok(tag) => (None, Some(host_to_ark::Content::Develop(vec![tag]))),
+        Err(Failure::Remote(code)) => (
+            Some(RemoteError {
+                code,
+                msg: "refused".into(),
+            }),
+            None,
+        ),
+        Err(Failure::WrongType) => (
+            None,
+            Some(host_to_ark::Content::DeviceInfo(Default::default())),
+        ),
+        _ => unreachable!("only peer result encodings have a byte charge"),
+    };
+    HostToArk {
+        id: 0,
+        err,
+        content,
+    }
+    .encoded_len()
 }
 
 /// Executes up to [`MAX_STEPS`] arbitrary actions, then closes all owners and
@@ -567,19 +726,20 @@ pub fn run(actions: &[Action]) {
         let result = operation
             .result
             .expect("closed session settles every operation");
-        model
-            .steps
-            .push(match (operation.request(), operation.parked) {
-                (true, true) => Step::FinishWait(id as u8, result),
-                // An answered request can also hand back the message enum itself,
-                // leaving the variant check to the application.
-                (true, false) => match result {
-                    Ok(tag) if id % 2 == 1 => Step::WaitMessage(id as u8, tag),
-                    result => Step::Wait(id as u8, result),
-                },
-                (false, true) => Step::FinishWaitWrite(id as u8, result.map(|_| ())),
-                (false, false) => Step::WaitWrite(id as u8, result.map(|_| ())),
-            });
+        assert!(
+            !operation.parked,
+            "completed waiters were already collected"
+        );
+        model.steps.push(if operation.request() {
+            // An answered request can also hand back the message enum itself,
+            // leaving the variant check to the application.
+            match result {
+                Ok(tag) if id % 2 == 1 => Step::WaitMessage(id as u8, tag),
+                result => Step::Wait(id as u8, result),
+            }
+        } else {
+            Step::WaitWrite(id as u8, result.map(|_| ()))
+        });
     }
     super::run(model.steps);
 }

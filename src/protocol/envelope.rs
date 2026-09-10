@@ -1,7 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
-//! Encoding and decoding `HostToArk` and `ArkToHost` envelopes.
+//! Encoding, retaining and decoding `HostToArk` and `ArkToHost` envelopes.
 //!
 //! A request carries an ID chosen by its sender; the response echoes that ID.
 //! Clients choose odd request IDs and servers choose even ones. An incoming ID
@@ -11,8 +11,12 @@
 
 use crate::protocol::{ArkToHost, HostToArk, RemoteError, ark_to_host, host_to_ark};
 use prost::Message as ProtobufMessage;
+use prost::bytes::Bytes;
 
+use super::session::SessionInner;
 use super::{Error, Message};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Role deciding envelope direction and request parity.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,35 @@ pub(super) enum Side {
 }
 
 impl Side {
+    /// Reads the envelope's routing fields without decoding its nested payload.
+    /// The caller keeps the original bytes for full decoding later.
+    pub(super) fn decode_header(&self, bytes: Bytes) -> Result<Header, Error> {
+        // Parse out the message shape for request or response routing
+        let (id, is_error, has_content) = match self {
+            Self::Client => {
+                let envelope = opaque::ArkToHost::decode(bytes).map_err(|_| Error::Malformed)?;
+                (
+                    envelope.id,
+                    envelope.err.is_some(),
+                    envelope.content.is_some(),
+                )
+            }
+            Self::Server => {
+                let envelope = opaque::HostToArk::decode(bytes).map_err(|_| Error::Malformed)?;
+                (
+                    envelope.id,
+                    envelope.err.is_some(),
+                    envelope.content.is_some(),
+                )
+            }
+        };
+        // Require exactly one body; presence is preserved even for empty bytes.
+        if has_content == is_error {
+            return Err(Error::Malformed);
+        }
+        Ok(Header { id, is_error })
+    }
+
     /// Encodes a body in this side's envelope, refusing invalid directions and
     /// oversize messages before allocating the final protobuf byte buffer.
     pub(super) fn encode(
@@ -48,6 +81,102 @@ impl Side {
             Self::Client => decode::<ArkToHost>(bytes),
             Self::Server => decode::<HostToArk>(bytes),
         }
+    }
+}
+
+/// Routing fields of an envelope whose nested body has not been decoded yet.
+pub(super) struct Header {
+    /// Final scalar ID, including Protobuf's default of zero.
+    pub(super) id: u64,
+    /// Whether the envelope carries an error instead of content.
+    pub(super) is_error: bool,
+}
+
+/// One encoded envelope held by the request queue or a completed response promise.
+pub(super) struct IncomingEnvelope {
+    /// Original protobuf bytes, including repeated and unknown fields. Keeping
+    /// these intact preserves nested message merging when decoded later.
+    bytes: Bytes,
+    /// Returns byte capacity to the original session when dropped.
+    charge: ByteCharge,
+    /// Wire direction used only when the application retrieves this message.
+    side: Side,
+    /// A malformed body closes its original session, never a replacement.
+    session: Weak<SessionInner>,
+}
+
+impl IncomingEnvelope {
+    /// Reserves bytes for an envelope that passed the outer checks. Counts its
+    /// full encoded length against the session's shared byte limit.
+    pub(super) fn new(
+        bytes: Bytes,
+        retained_bytes: &Arc<AtomicUsize>,
+        limit: usize,
+        side: Side,
+        session: Weak<SessionInner>,
+    ) -> Result<Self, Error> {
+        let charge = ByteCharge::reserve(retained_bytes, bytes.len(), limit)?;
+        Ok(Self {
+            bytes,
+            charge,
+            side,
+            session,
+        })
+    }
+
+    /// Releases the byte charge, then decodes the payload for the caller.
+    /// Decoding work and decoded data are outside the inbound byte limit.
+    pub(super) fn decode(self) -> Result<Message, Error> {
+        let Self {
+            bytes,
+            charge,
+            side,
+            session,
+        } = self;
+        drop(charge);
+        match side.decode(&bytes) {
+            Ok((_, body)) => body.map_err(Error::Remote),
+            Err(error) => {
+                if let Some(session) = session.upgrade() {
+                    session.close(error.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Returns an envelope's byte charge to its original session counter on drop.
+/// Keeps the counter alive while an unread response still holds bytes.
+struct ByteCharge {
+    /// Counter independent of the session lifetime and any replacement session.
+    used: Arc<AtomicUsize>,
+    /// Original encoded length; never recomputed from decoded or re-encoded data.
+    bytes: usize,
+}
+
+impl ByteCharge {
+    /// Adds to the byte count unless it would exceed the limit. Never waits for
+    /// a consumer to release bytes.
+    fn reserve(used: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self, Error> {
+        // This atomic only tracks usage. The session lock and result channels
+        // synchronize access to the messages themselves.
+        used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|total| *total <= limit)
+        })
+        .map_err(|_| Error::InboundByteLimitExceeded(limit))?;
+        Ok(Self {
+            used: used.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for ByteCharge {
+    /// Releases this envelope's bytes, including when delivery fails.
+    fn drop(&mut self) {
+        let previous = self.used.fetch_sub(self.bytes, Ordering::Relaxed);
+        debug_assert!(previous >= self.bytes, "incoming byte charge underflow");
     }
 }
 
@@ -116,11 +245,10 @@ impl From<Side> for Parity {
     }
 }
 
-/// Common methods for `HostToArk` and `ArkToHost`. Only these two generated
-/// protobuf types can implement this trait.
-pub trait Envelope: ProtobufMessage + Default + sealed::Sealed + 'static {
+/// Common encoding and decoding methods for the two wire envelopes.
+trait Envelope: ProtobufMessage + Default {
     /// Generated content enum for this envelope's requests and responses.
-    type Content: Send + 'static;
+    type Content;
 
     /// Assembles the ID, error and content in the order returned by
     /// [`Self::into_parts`]. This does not validate the field combination or
@@ -129,15 +257,6 @@ pub trait Envelope: ProtobufMessage + Default + sealed::Sealed + 'static {
 
     /// Takes the envelope apart into its ID, error and content.
     fn into_parts(self) -> (u64, Option<RemoteError>, Option<Self::Content>);
-}
-
-/// Prevents other crates from implementing `Envelope` for additional types.
-mod sealed {
-    /// Restricts envelope implementations to the two generated wire messages.
-    pub trait Sealed {}
-
-    impl Sealed for super::HostToArk {}
-    impl Sealed for super::ArkToHost {}
 }
 
 impl Envelope for HostToArk {
@@ -252,4 +371,12 @@ mod tests {
             assert_eq!(MessageKind::from_id(tt.id, tt.parity), tt.kind, "test {i}");
         }
     }
+}
+
+/// Generated envelope views with nested messages left as bytes. These use the
+/// same field numbers and oneofs as the full message bindings.
+#[allow(clippy::all)]
+#[allow(rustdoc::broken_intra_doc_links)]
+pub(super) mod opaque {
+    include!(concat!(env!("OUT_DIR"), "/darkbio.wire.opaque.rs"));
 }

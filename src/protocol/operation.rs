@@ -3,6 +3,8 @@
 
 //! Pending operations, queued messages, and reporting their results to promises.
 
+use super::envelope::IncomingEnvelope;
+use super::promise::PromiseResult;
 use super::session::SessionInner;
 use super::{Error, Message, RemoteError};
 use std::hash::{Hash, Hasher};
@@ -52,23 +54,42 @@ pub(super) struct PendingOperation {
 /// one result, so sending never needs to wait for `Promise::wait()`.
 pub(super) enum ResultSender {
     /// Sends a peer answer or error to `Promise<Message>`.
-    Response(mpsc::SyncSender<Result<Message, Error>>),
+    Response(mpsc::SyncSender<Result<PromiseResult, Error>>),
     /// Sends a write result or error to `Promise<()>`.
-    Write(mpsc::SyncSender<Result<(), Error>>),
+    Write(mpsc::SyncSender<Result<PromiseResult, Error>>),
 }
 
 impl PendingOperation {
-    /// Sends the answer to the promise, or `Timeout` if `now` is at or past the
-    /// deadline. Both the reader and the scenario runner use this check.
-    pub(super) fn complete_response(self, result: Result<Message, Error>, now: Instant) {
+    /// Sends the answer to the promise, or `Timeout` if the deadline was reached.
+    /// Only an on-time answer reserves bytes. If it exceeds the byte limit and
+    /// its promise still exists, returns that error to the reader to close the session.
+    pub(super) fn complete_response(
+        self,
+        now: Instant,
+        retain: impl FnOnce() -> Result<IncomingEnvelope, Error>,
+    ) -> Result<(), Error> {
         if now >= self.deadline {
             self.fail(Error::Timeout, now);
         } else {
             let ResultSender::Response(sender) = self.sender else {
                 unreachable!("only requests accept peer answers")
             };
-            let _ = sender.send(result);
+            match retain() {
+                Ok(message) => {
+                    // If the promise was dropped, the failed send releases the bytes.
+                    let _ = sender.send(Ok(PromiseResult::Response(message)));
+                }
+                Err(error) => {
+                    // The send checks whether the promise still exists. If it was
+                    // dropped, this response needs no space and must not close
+                    // the session, even if other promises fill the byte limit.
+                    if sender.send(Err(error.clone())).is_ok() {
+                        return Err(error);
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
     /// Fails either a request or a reply promise, using `Timeout` if its deadline

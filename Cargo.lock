@@ -455,6 +455,7 @@ dependencies = [
  "memchr",
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "rand 0.10.2",
  "rand_chacha 0.10.0",

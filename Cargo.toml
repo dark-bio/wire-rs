@@ -50,6 +50,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] } # Keep >=
 
 [build-dependencies]
 prost-build = "0.14.1"
+prost-types = "0.14"
 protoc-bin-vendored = "3.2.0"
 
 [lib]

@@ -239,3 +239,73 @@ fn test_batched_abandonment() {
         run_actions(&actions);
     }
 }
+
+/// Exercise both ceilings around exact usage, including queued request batches.
+#[test]
+fn test_inbound_request_limits() {
+    use Kind::*;
+    for requests in [0, 1, 2, 4] {
+        for bytes in [0, 4, 5, 7, 14, 255] {
+            run_actions(&[
+                (InboundLimits, 0, requests, bytes),
+                (IncomingBatch, 0, 10, 1),
+                (Reply, 0, 20, 10),
+                (Abandon, 1, 0, 0),
+                (Outgoing, 0, 0, 0),
+                (Receive, 0, 30, 1),
+                (Advance, 0, 0, 10),
+                (Expire, 0, 0, 0),
+                (InboundLimits, 0, 0, 0),
+                (Open, 0, 0, 0),
+                (Receive, 1, 40, 0),
+            ]);
+        }
+    }
+}
+
+/// Completed responses keep bytes until observation or drop, even after closure.
+#[test]
+fn test_inbound_response_limits() {
+    use Kind::*;
+    for result in 0..3 {
+        let bytes = answer_size(match result {
+            0 => Ok(0),
+            1 => Err(Failure::Remote(257)),
+            _ => Err(Failure::WrongType),
+        }) as u8;
+        for observer in [Wait, DropPromise, Advance] {
+            run_actions(&[
+                (InboundLimits, 0, 4, bytes),
+                (Request, 0, 10, 20),
+                (Outgoing, 0, 0, 0),
+                (Answer, 0, result, 0),
+                (InboundLimits, 0, 0, bytes),
+                (observer, 0, 0, 0),
+                (Request, 0, 20, 20),
+                (Outgoing, 0, 0, 0),
+                (Answer, 1, result, 0),
+                (InboundLimits, 0, 4, bytes - 1),
+                (Open, 0, 0, 0),
+                (Drop, 0, 0, 0),
+                (Wait, 0, 0, 0),
+                (Wait, 1, 0, 0),
+                (Receive, 1, 30, 0),
+            ]);
+        }
+        for observer in [Wait, DropPromise] {
+            run_actions(&[
+                (InboundLimits, 0, 0, bytes),
+                (Request, 0, 10, 20),
+                (Outgoing, 0, 0, 0),
+                (observer, 0, 0, 0),
+                (Answer, 0, result, 0),
+                (InboundLimits, 0, 1, 0),
+                (Request, 0, 20, 1),
+                (Outgoing, 0, 0, 0),
+                (Advance, 0, 0, 1),
+                (Answer, 1, result, 0),
+                (Wait, 1, 0, 0),
+            ]);
+        }
+    }
+}

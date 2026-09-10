@@ -21,7 +21,7 @@ pub struct Action {
     pub slot: u8,
     /// Payload tag, error code or malformed envelope shape.
     pub value: u8,
-    /// Pipeline size, deadline adjustment or duplicate-request phase.
+    /// Pipeline size, deadline adjustment or ordering of a failure scenario.
     pub budget: u8,
 }
 
@@ -46,6 +46,8 @@ pub enum Kind {
     ReplyRefusal,
     QueuedTimeout,
     ResponseBeforeFailure,
+    /// Inbound limit or deferred decode failure, optionally with blocked output.
+    InboundFailure,
 }
 
 /// Maximum actions run from one input, each driving several live exchanges.
@@ -60,7 +62,8 @@ fn ends_client(action: &Action) -> bool {
         | Kind::Exhaust
         | Kind::Close
         | Kind::Fault
-        | Kind::ResponseBeforeFailure => true,
+        | Kind::ResponseBeforeFailure
+        | Kind::InboundFailure => true,
         Kind::ReuseDuringFlush => action.budget & 1 == 1,
         Kind::Replace | Kind::Disconnect | Kind::HandshakeFailure => true,
         _ => false,
@@ -377,18 +380,119 @@ pub fn run(actions: &[Action]) {
                 ended = true;
             }
             Kind::Malformed => {
-                let (id, body) = match value % 5 {
-                    0 => (peer, EnvelopeShape::Error(u64::from(value))),
-                    1 => (peer, EnvelopeShape::Both),
-                    2 => (next, EnvelopeShape::Neither),
-                    3 => (next, EnvelopeShape::Both),
-                    _ => (peer, EnvelopeShape::Invalid),
+                match value % 8 {
+                    5 => steps.extend([
+                        Step::Send(peer, EnvelopeShape::MalformedBody),
+                        Step::ReceiveError(local, Failure::Malformed),
+                    ]),
+                    6 | 7 => steps.extend([
+                        Step::Request(local, 0, value, 3000),
+                        Step::Read(next, content.clone()),
+                        Step::Send(
+                            next,
+                            if value % 8 == 6 {
+                                EnvelopeShape::MalformedBody
+                            } else {
+                                EnvelopeShape::MalformedError
+                            },
+                        ),
+                        Step::ResponseReceived(local, next),
+                        Step::StartReceive(local),
+                        Step::Answer(0, Err(Failure::Malformed)),
+                        Step::ReceiveFailed(local, Failure::Malformed),
+                    ]),
+                    shape => {
+                        let (id, body) = match shape {
+                            0 => (peer, EnvelopeShape::Error(u64::from(value))),
+                            1 => (peer, EnvelopeShape::Both),
+                            2 => (next, EnvelopeShape::Neither),
+                            3 => (next, EnvelopeShape::Both),
+                            _ => (peer, EnvelopeShape::Invalid),
+                        };
+                        steps.extend([
+                            Step::StartReceive(local),
+                            Step::Reject(id, body),
+                            Step::ReceiveFailed(local, Failure::Malformed),
+                        ]);
+                    }
+                }
+                ended = true;
+            }
+            Kind::InboundFailure if budget & 128 != 0 => {
+                let reason = match value % 3 {
+                    0 => Failure::Requests,
+                    1 => Failure::Bytes,
+                    _ => Failure::Malformed,
                 };
-                steps.extend([
-                    Step::StartReceive(local),
-                    Step::Reject(id, body),
-                    Step::ReceiveFailed(local, Failure::Malformed),
-                ]);
+                let phase = if slot & 2 == 0 {
+                    Operation::Write
+                } else {
+                    Operation::Flush
+                };
+                steps.extend(super::blocked_inbound_steps(
+                    local, next, peer, outgoing, phase, reason,
+                ));
+                ended = true;
+            }
+            Kind::InboundFailure => {
+                use crate::protocol::envelope::Side;
+                use crate::protocol::{DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS};
+                match value % 3 {
+                    0 => {
+                        let count = budget % 4;
+                        steps.push(Step::InboundLimits(
+                            local,
+                            usize::from(count),
+                            DEFAULT_MAX_INBOUND_BYTES,
+                        ));
+                        for id in 0..count {
+                            steps.extend([
+                                Step::Send(peer.wrapping_add(u64::from(id) * 2), content.clone()),
+                                Step::Receive(local, value, id),
+                            ]);
+                        }
+                        steps.extend([
+                            Step::StartReceive(local),
+                            Step::Reject(peer.wrapping_add(u64::from(count) * 2), content.clone()),
+                            Step::ReceiveFailed(local, Failure::Requests),
+                        ]);
+                        for id in 0..count {
+                            steps.push(Step::Abandon(id));
+                        }
+                    }
+                    1 => steps.extend([
+                        Step::InboundLimits(local, DEFAULT_MAX_INBOUND_REQUESTS, 0),
+                        Step::Request(local, 0, value, 3000),
+                        Step::Read(next, content.clone()),
+                        Step::StartReceive(local),
+                        Step::Reject(peer, content.clone()),
+                        Step::ReceiveFailed(local, Failure::Bytes),
+                        Step::Answer(0, Err(Failure::Bytes)),
+                    ]),
+                    _ => {
+                        let peer_side = if server { Side::Client } else { Side::Server };
+                        let bytes = peer_side
+                            .encode(next, Ok(vec![value].into()))
+                            .unwrap()
+                            .len();
+                        steps.extend([
+                            Step::InboundLimits(local, 0, bytes),
+                            Step::Request(local, 0, value, 3000),
+                            Step::Read(next, content.clone()),
+                            Step::Send(next, content.clone()),
+                            Step::ResponseReceived(local, next),
+                            Step::Usage(local, 0, bytes),
+                            Step::Request(local, 1, value, 3000),
+                            Step::Read(next + 2, content.clone()),
+                            Step::StartReceive(local),
+                            Step::Reject(next + 2, content.clone()),
+                            Step::ReceiveFailed(local, Failure::Bytes),
+                            Step::Answer(1, Err(Failure::Bytes)),
+                            Step::Answer(0, Ok(value)),
+                            Step::Usage(local, 0, 0),
+                        ]);
+                    }
+                }
                 ended = true;
             }
             Kind::Exhaust => {

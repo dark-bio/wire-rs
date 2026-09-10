@@ -222,3 +222,20 @@ fn test_encoded_size_boundaries() {
         }
     }
 }
+
+/// Opaque parsing accepts bounded nested bytes that native decoding rejects.
+#[test]
+fn test_opaque_header_defers_nested_validation() {
+    for client in [false, true] {
+        let side = if client { Side::Client } else { Side::Server };
+        for error in [false, true] {
+            let bytes = malformed_body(client, u64::MAX, error);
+            let header = side.decode_header(bytes.clone().into()).unwrap();
+            assert_eq!(header.id, u64::MAX);
+            assert_eq!(header.is_error, error);
+            let mut input = vec![u8::from(client)];
+            input.extend(bytes);
+            assert!(!run(&input));
+        }
+    }
+}
