@@ -24,6 +24,7 @@ use crate::transport::{Closer, Error, MAX_FRAME_SIZE, Read, Write};
 use darkbio_cobs as cobs;
 use std::ops::Range;
 use std::time::Instant;
+use tracing::debug;
 
 /// Reads and decodes frames using its own input buffers. The writing half can
 /// run on another thread without sharing these buffers.
@@ -139,9 +140,18 @@ impl<R: Read> FrameReader<R> {
             }
             // Read more data to try and find the next frame marker
             match self.reader.read(&mut self.buffer[self.filled..], deadline) {
-                Err(err) => return Err(Error::RecvFailed(err)), // Adapter or deadline setter failure
-                Ok(0) => return Err(Error::Terminated),         // EOF or permanent closure
-                Ok(n) => self.filled += n,                      // Keep the newly read bytes
+                // Adapter or deadline setter failure
+                Err(err) => {
+                    debug!("wire read failed: {}", err);
+                    return Err(Error::RecvFailed(err));
+                }
+                // EOF or permanent closure
+                Ok(0) => {
+                    debug!("wire stream ended");
+                    return Err(Error::Terminated);
+                }
+                // Keep the newly read bytes
+                Ok(n) => self.filled += n,
             }
         }
     }

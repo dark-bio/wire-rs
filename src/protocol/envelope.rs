@@ -114,12 +114,21 @@ impl Side {
                 MessageKind::Response => "response",
             };
             tracing::warn!(
-                "malformed protocol {stage} (id: {}, kind: {kind}, payload: {}, length: {length}): {reason}",
+                "malformed protocol {} (id: {}, kind: {}, payload: {}, length: {}): {}",
+                stage,
                 header.id,
+                kind,
                 header.payload.unwrap_or("none"),
+                length,
+                reason,
             );
         } else {
-            tracing::warn!("malformed protocol {stage} (length: {length}): {reason}");
+            tracing::warn!(
+                "malformed protocol {} (length: {}): {}",
+                stage,
+                length,
+                reason
+            );
         }
         Error::Malformed
     }
@@ -132,8 +141,8 @@ pub(super) struct Header {
     pub(super) id: u64,
     /// Whether the envelope carries an error instead of content.
     pub(super) failed: bool,
-    /// Payload field name for warnings. Absent if the envelope has no body.
-    payload: Option<&'static str>,
+    /// Payload field name for log lines. Absent if the envelope has no body.
+    pub(super) payload: Option<&'static str>,
 }
 
 /// One encoded envelope held by the request queue or a completed response promise.
@@ -216,7 +225,10 @@ impl ByteCharge {
         })
         .map_err(|used| {
             tracing::warn!(
-                "inbound byte limit exceeded (used: {used}, incoming: {bytes}, limit: {limit})"
+                "inbound byte limit exceeded (used: {}, incoming: {}, limit: {})",
+                used,
+                bytes,
+                limit
             );
             Error::InboundByteLimitExceeded(limit)
         })?;

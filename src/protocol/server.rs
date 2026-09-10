@@ -185,9 +185,12 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
             }
             // A failed handshake leaves the reader available for the next reset.
             Err(transport::Error::RecvFailed(error))
-                if error.kind() == std::io::ErrorKind::TimedOut => {}
+                if error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                tracing::debug!("wire handshake timed out");
+            }
             Err(transport::Error::SendFailed(error)) => {
-                tracing::debug!("server handshake output failed: {error}");
+                tracing::debug!("wire handshake output failed: {}", error);
             }
             Err(error) => {
                 server.close(error.into());
@@ -302,6 +305,13 @@ impl ServerInner {
                         reason: error.clone(),
                         session: session.clone(),
                     };
+                    match &error {
+                        Error::Closed => tracing::info!("wire server closed locally"),
+                        _ if error.orderly() => {
+                            tracing::info!("wire server closed: {}", error.reason());
+                        }
+                        _ => tracing::warn!("wire server failed: {}", error.reason()),
+                    }
                     (session.upgrade(), error, ready)
                 }
             }
@@ -331,6 +341,11 @@ impl ServerInner {
             }
         };
         if let Some(previous) = previous {
+            tracing::info!(
+                "replacing wire session {} with session {}",
+                previous.log_id,
+                session.inner.log_id
+            );
             previous.close(transport::Error::SessionReset.into());
         }
         // Another thread may have closed the server while we closed the old

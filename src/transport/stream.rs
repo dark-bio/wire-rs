@@ -8,6 +8,7 @@ use super::{DEFAULT_WRITE_TIMEOUT, Read, Write};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 /// A duplex byte stream with a shutdown operation for both directions.
 ///
@@ -158,6 +159,7 @@ impl Closer {
 
                     // Stream open, mark it closing and begin teardown
                     Phase::Open => {
+                        debug!("closing wire stream");
                         state.phase = Phase::Closing;
                         break state.action.take().expect("shutdown called once");
                     }

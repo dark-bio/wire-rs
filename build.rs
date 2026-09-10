@@ -23,8 +23,9 @@ fn main() {
         .load_fds(&["proto/wire.proto"], &["proto/"])
         .expect("failed to load wire.proto");
 
-    // Collect the union of both envelopes' bodies for the public message enum.
-    // A body appears once even if it travels both ways (such as develop bytes).
+    // Collect the union of both envelopes' bodies, with their schema field names,
+    // for the public message enum. A body appears once even if it travels both
+    // ways (such as develop bytes).
     let mut messages = BTreeSet::new();
     let mut conversions = String::new();
     let mut envelope_names = String::new();
@@ -66,7 +67,7 @@ fn main() {
                     ("Develop", "Vec<u8>")
                 }
             };
-            messages.insert((variant, payload));
+            messages.insert((variant, payload, field.name()));
             let field_variant: String = field
                 .name()
                 .split('_')
@@ -92,11 +93,23 @@ fn main() {
         writeln!(envelope_names, "        }}\n    }}\n}}").unwrap();
     }
     let mut content = String::from("messages! {\n");
-    for (variant, payload) in messages {
+    for (variant, payload, _) in &messages {
         writeln!(content, "    {variant}({payload}),").unwrap();
     }
     writeln!(content, "}}").unwrap();
     content.push_str(&conversions);
+
+    // Name bodies by their schema field in log lines, matching the names the
+    // envelope reader logs for received messages.
+    writeln!(
+        content,
+        "impl Message {{\n    /// Returns the payload's protobuf field name for log lines.\n    pub(super) fn field_name(&self) -> &'static str {{\n        match self {{"
+    )
+    .unwrap();
+    for (variant, _, name) in &messages {
+        writeln!(content, "            Self::{variant}(..) => {name:?},").unwrap();
+    }
+    writeln!(content, "        }}\n    }}\n}}").unwrap();
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
     fs::write(out_dir.join("message.rs"), content).expect("write message enum and conversions");
     fs::write(out_dir.join("darkbio.wire.names.rs"), envelope_names)

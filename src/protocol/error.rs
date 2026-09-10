@@ -87,6 +87,30 @@ impl From<Infallible> for Error {
     }
 }
 
+impl Error {
+    /// Whether a session or server ending with this error did so in an orderly
+    /// way, through a local close, a peer reset or the stream ending.
+    pub(super) fn orderly(&self) -> bool {
+        match self {
+            Self::Closed => true,
+            Self::Transport(error) => matches!(
+                **error,
+                transport::Error::SessionReset | transport::Error::Terminated
+            ),
+            _ => false,
+        }
+    }
+
+    /// The error as a log reason, a transport failure named by the transport's
+    /// own error rather than by the wrapping one.
+    pub(super) fn reason(&self) -> &dyn std::fmt::Display {
+        match self {
+            Self::Transport(error) => error.as_ref(),
+            other => other,
+        }
+    }
+}
+
 impl RemoteError {
     /// Builds an error with a numeric code and a human-readable message.
     /// Codes from 0x100 are request-specific. Use [`Self::reserved`] for named

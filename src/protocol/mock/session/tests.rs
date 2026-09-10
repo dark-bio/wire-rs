@@ -1495,6 +1495,7 @@ fn test_observer_drop_during_response_completion() {
             let pending = PendingOperation {
                 deadline: now + Duration::from_secs(60),
                 sender,
+                log_id: None,
             };
             let (entered, reserved) = mpsc::channel();
             let (release, released) = mpsc::channel();

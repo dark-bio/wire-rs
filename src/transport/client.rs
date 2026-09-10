@@ -1,6 +1,7 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
 
+use crate::LogId;
 use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
@@ -17,7 +18,7 @@ use darkbio_crypto::{cbor, cose, xdsa, xhpke};
 use darkbio_trust as trust;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Trust policy for the device attestation presented during a handshake.
 /// The caller decides which roots to trust and whether to allow self-signed
@@ -87,6 +88,7 @@ pub struct Client<R: Read, W: Write> {
     receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this client
     sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
     outbound: Arc<Outbound<W>>, // Outgoing transport, shared with the senders
+    log_id: LogId,          // Label of the current session in log lines, unset before the first
 }
 
 impl<R: Read, W: Write> Client<R, W> {
@@ -105,6 +107,7 @@ impl<R: Read, W: Write> Client<R, W> {
             receiver: None,
             sealer: None,
             outbound,
+            log_id: LogId::default(),
         }
     }
 
@@ -175,6 +178,7 @@ impl<R: Read, W: Write> Client<R, W> {
     ) -> Result<(Sender<W>, V::Info), Error> {
         let host_xdsa_pk = host_xdsa_sk.public_key();
         let host_xhpke_pk = host_xhpke_sk.public_key();
+        debug!("starting wire handshake");
 
         // Message 1: Send HostHello (plain CBOR, COBS-framed)
         let hello = cbor::encode(&handshake::HostHello {
@@ -206,7 +210,7 @@ impl<R: Read, W: Write> Client<R, W> {
             if cose::recipient(packet).is_ok_and(|fp| fp == recipient) {
                 break packet;
             }
-            warn!("skipping stale frame during handshake");
+            debug!("skipping stale frame during handshake");
         };
         let auth = handshake::ArkHelloAuth {
             host_signer: host_xdsa_pk.clone(),
@@ -289,6 +293,11 @@ impl<R: Read, W: Write> Client<R, W> {
 
         // Session established, the ack ahead of anything sealed into it
         let sender = self.new_session(sender, receiver);
+        info!(
+            "wire session {} established with ark {}",
+            self.log_id,
+            hex(&auth.ark_signer.fingerprint())
+        );
         Ok((sender, info))
     }
 
@@ -316,10 +325,14 @@ impl<R: Read, W: Write> Client<R, W> {
         // An empty frame is the server telling us it has no session with us.
         let packet = match self.reader.next_packet(None) {
             Err(err) => {
+                if matches!(err, Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) {
+                    warn!("ending session {}: {}", self.log_id, err);
+                }
                 self.end_session();
                 return Err(err);
             }
             Ok(None) => {
+                info!("wire session {} reset by ark", self.log_id);
                 self.end_session();
                 return Err(Error::SessionReset);
             }
@@ -330,17 +343,23 @@ impl<R: Read, W: Write> Client<R, W> {
             .as_ref()
             .expect("receiver has a sending context");
         let opened = sealing::open(receiver, packet);
+        let undecryptable = opened.is_err();
         let message = match self.outbound.finish_receive(sealer, opened) {
             Err(err) => {
+                if undecryptable {
+                    warn!("ending session {}: {}", self.log_id, err);
+                } else {
+                    debug!(
+                        "discarding message read after session {} ended",
+                        self.log_id
+                    );
+                }
                 self.end_session();
                 return Err(err);
             }
             Ok(message) => message,
         };
-        trace!(
-            "read ark-to-host message ({} bytes encrypted)",
-            packet.len()
-        );
+        trace!("received ark-to-host message ({} bytes)", packet.len());
         Ok(message)
     }
 
@@ -356,6 +375,7 @@ impl<R: Read, W: Write> Client<R, W> {
     fn new_session(&mut self, sender: xhpke::Sender, receiver: xhpke::Receiver) -> Sender<W> {
         let sealer = Arc::new(Mutex::new(sender));
         let sender = self.outbound.bind(&sealer);
+        self.log_id = sender.log_id();
 
         self.receiver = Some(receiver);
         self.sealer = Some(sealer);
@@ -447,6 +467,15 @@ impl<R: Read, W: Write> Drop for Client<R, W> {
         self.outbound.close();
         self.end_session();
     }
+}
+
+/// Hex encodes a fingerprint for the session log line.
+fn hex(fingerprint: &xdsa::Fingerprint) -> String {
+    fingerprint
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]

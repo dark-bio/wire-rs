@@ -7,13 +7,13 @@
 This repository implements the wire protocol between an [Ark](https://dark.bio) enclave and the host machine it is plugged into. The wire wraps an arbitrary byte stream into an encrypted, request oriented transport:
 
 - **Framing**: [Consistent Overhead Byte Stuffing (COBS)](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing) encoded frames delimited by zero bytes.
-- **Sessions**: The wire assumes its stream carries no connection lifecycle as USB bulk transfers deliver none. Empty frames are used to mark session resets.
-- **Handshake**: Three message exchange of ephemeral signing and encryption keys, authenticated by the device attestation. It establishes independent encrypted contexts per direction.
-- **Timeouts**: Handshakes and individual writes have a configurable (by default 5 second) timeout, reads block until the underlying stream is torn down.
-- **Messages**: Protobuf encoded requests and responses, individually sealed by the session encryption contexts. A `develop` envelope carries unreleased messages opaquely; only development firmware serves it, production Arks refuse it.
-- **Ordering**: Messages sent through a session are guaranteed to be received in the same order. Concurrent threads also have their own messages arrive in order.
+- **Sessions**: Empty frames are used to mark session resets as USB bulk endpoints carry no lifecycle events.
+- **Handshake**: Exchange of ephemeral signing and encryption keys, authenticated by the device attestation.
+- **Timeouts**: Handshakes and writes configurable (by default 5s), reads block until the transport is torn down.
+- **Messages**: Protobuf encoded requests and responses with direction and id parity differentiating the two.
+- **Ordering**: Send and receive order guaranteed. Concurrent threads also guarantee local message ordering.
 
-The wire keeps trust policy at its edges. The server takes an `Attester` producing the attestation to present to the client; the client takes a `Verifier` checking the attestation it received. A `Roots` verifier built on [darkbio-trust](https://github.com/dark-bio/trust-rs) accepts the Arks attested under a given set of hardware and emulator roots; which roots to trust, self-signing rules and recovery overrides stay with the consumer.
+Authentication is left up to the caller. The server can produce signed attestations for connecting clients to verify; clients can require a server's identity to be signed by approved root keys. The [darkbio-trust](https://github.com/dark-bio/trust-rs) crate contains the root pubkeys for all genuine Arks and emulators.
 
 This package does not concern itself with the underlying transport. Genuine Ark devices use USB bulk endpoints, emulators use websockets and tests use memory sockets. Creating the underlying data-stream is the caller's task.
 

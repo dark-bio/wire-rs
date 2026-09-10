@@ -7,8 +7,10 @@
 use super::Write;
 use super::outbound::Outbound;
 use super::{Error, sealing};
+use crate::LogId;
 use darkbio_crypto::xhpke;
 use std::sync::{Mutex, Weak};
+use tracing::{debug, warn};
 
 /// Cloneable handle for sending messages into a session from any thread.
 /// Returned by [`Client::connect`](super::Client::connect) or delivered in a
@@ -28,13 +30,27 @@ use std::sync::{Mutex, Weak};
 pub struct Sender<W: Write> {
     outbound: Weak<Outbound<W>>, // Writer retained by the client/server and active sends
     sealer: Weak<Mutex<xhpke::Sender>>, // Encryption context whose allocation identifies the session
+    log_id: LogId,                      // Label of the session in log lines
 }
 
 impl<W: Write> Sender<W> {
     /// Stores weak references to the writer and encryption allocation. Each
     /// active send temporarily retains both. An idle handle owns neither.
-    pub(super) fn new(outbound: Weak<Outbound<W>>, sealer: Weak<Mutex<xhpke::Sender>>) -> Self {
-        Self { outbound, sealer }
+    pub(super) fn new(
+        outbound: Weak<Outbound<W>>,
+        sealer: Weak<Mutex<xhpke::Sender>>,
+        log_id: LogId,
+    ) -> Self {
+        Self {
+            outbound,
+            sealer,
+            log_id,
+        }
+    }
+
+    /// Label of the session this sender belongs to, for log lines.
+    pub(crate) fn log_id(&self) -> LogId {
+        self.log_id
     }
 
     /// Encrypts a message, writes its complete frame and flushes the output.
@@ -62,23 +78,32 @@ impl<W: Write> Sender<W> {
     /// overlapping send may succeed. Unexpected encryption failures and poisoned
     /// locks panic. Transport reuse after a panic is unsupported.
     pub fn send(&self, message: &[u8]) -> Result<(), Error> {
-        let outbound = self.outbound.upgrade().ok_or(Error::Terminated)?;
-        let context = self
-            .sealer
-            .upgrade()
-            .ok_or_else(|| Error::EncryptionFailed("session ended".into()))?;
-
+        let Some(outbound) = self.outbound.upgrade() else {
+            debug!("wire send refused, transport released");
+            return Err(Error::Terminated);
+        };
+        let Some(context) = self.sealer.upgrade() else {
+            debug!("wire send refused, session {} ended", self.log_id);
+            return Err(Error::EncryptionFailed("session ended".into()));
+        };
         let mut sealer = context.lock().expect("encryption lock not poisoned");
         let packet = match sealing::seal(&mut sealer, message) {
             Ok(packet) => packet,
-            Err(Error::PacketTooLarge(size)) => return outbound.refuse_oversized(&context, size),
+            Err(Error::PacketTooLarge(size)) => {
+                warn!("wire message of {} bytes exceeds the sending limit", size);
+                return outbound.refuse_oversized(&context, size);
+            }
             Err(err) => panic!("message encryption failed: {err}"),
         };
         // Acquire the writer before releasing encryption, keeping wire order
         // equal to sealing order while the next message seals during this I/O.
         let mut writer = outbound.lock();
         drop(sealer);
-        writer.send(&context, &packet)
+        let result = writer.send(&context, &packet, self.log_id);
+        if let Err(Error::EncryptionFailed(_)) = &result {
+            debug!("wire send refused, session {} ended", self.log_id);
+        }
+        result
     }
 
     /// Ends this sender's session. On the server, also sends Dropped under the
@@ -95,7 +120,7 @@ impl<W: Write> Sender<W> {
 
 impl<W: Write> Clone for Sender<W> {
     fn clone(&self) -> Self {
-        Self::new(self.outbound.clone(), self.sealer.clone())
+        Self::new(self.outbound.clone(), self.sealer.clone(), self.log_id)
     }
 }
 
