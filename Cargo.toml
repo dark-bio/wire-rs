@@ -1,14 +1,15 @@
 [package]
 name = "darkbio-wire"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Encrypted protocol between Ark and host"
 repository = "https://github.com/dark-bio/wire-rs"
 documentation = "https://docs.rs/darkbio-wire"
 categories = ["network-programming", "encoding"]
-keywords = ["ark", "wire", "transport", "protobuf"]
+keywords = ["ark", "dark-bio", "transport", "protobuf"]
 license = "BSD-3-Clause"
 edition = "2024"
+rust-version = "1.95"
 autobenches = false
 
 [package.metadata.docs.rs]
@@ -20,16 +21,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", 'cfg(g
 
 [features]
 default = []
-bench = ["criterion", "sysinfo"]
-fuzz = ["arbitrary", "base64", "getrandom", "rand_chacha", "serde_json", "sha2", "strum"]
+bench = ["dep:criterion", "dep:sysinfo"]
+fuzz = ["dep:arbitrary", "dep:base64", "dep:getrandom", "dep:rand_chacha", "dep:serde_json", "dep:sha2", "dep:strum"]
 
 [dependencies]
 arbitrary = { version = "1", features = ["derive"], optional = true }
 base64 = { version = "0.23", optional = true }
 criterion = { version = "0.8", optional = true }
-darkbio-cobs = "0.2.0"
-darkbio-crypto = { version = "0.18.0", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
-darkbio-trust = "0.3.0"
+darkbio-cobs = "1"
+darkbio-crypto = { version = "0.18.2", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
+darkbio-trust = "0.5"
 getrandom = { version = "0.4", optional = true }
 memchr = "2"
 prost = "0.14"

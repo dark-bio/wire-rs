@@ -70,7 +70,7 @@ impl Verifier for Roots<'_> {
             Some(now),
         )
         .map_err(|err| err.to_string())?;
-        Ok((device.signer.clone(), device))
+        Ok((device.identity.clone(), device))
     }
 }
 /// Client side of the wire, exchanging encrypted messages over a byte stream.
