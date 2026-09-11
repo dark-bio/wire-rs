@@ -66,6 +66,18 @@ jobs:
         with:
           feature-group: all-features
 
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          make generate
+          if [ -n "$(git status --porcelain src/protocol/generated)" ]; then
+            git status --short src/protocol/generated
+            echo "generated sources are stale, run make generate and commit"
+            exit 1
+          fi
+
   vectors:
     runs-on: ubuntu-latest
     steps:

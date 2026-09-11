@@ -7,7 +7,7 @@ use super::Error;
 use super::schema::*;
 
 /// Defines the shared body enum and conversions from the schema-derived payload list.
-/// The build script invokes this once with the union of both envelope directions.
+/// The generator invokes this once with the union of both envelope directions.
 macro_rules! messages {
     ($($variant:ident($payload:ty),)*) => {
         /// A request or successful response body from either direction. Variants
@@ -94,7 +94,7 @@ macro_rules! contents {
     };
 }
 
-include!(concat!(env!("OUT_DIR"), "/message.rs"));
+include!("generated/message.rs");
 
 /// Checks variant-safe conversion between message bodies and concrete payloads.
 #[cfg(test)]

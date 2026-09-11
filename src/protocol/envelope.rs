@@ -483,8 +483,8 @@ mod tests {
 #[allow(clippy::all)]
 #[allow(rustdoc::broken_intra_doc_links)]
 pub(super) mod opaque {
-    include!(concat!(env!("OUT_DIR"), "/darkbio.wire.opaque.rs"));
+    include!("generated/darkbio.wire.opaque.rs");
 }
 
 // Payload names follow the schema alongside the generated envelope views.
-include!(concat!(env!("OUT_DIR"), "/darkbio.wire.names.rs"));
+include!("generated/darkbio.wire.names.rs");
