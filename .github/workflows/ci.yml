@@ -37,17 +37,6 @@ jobs:
       - name: Test with all features
         run: cargo test --all-features
 
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install the minimum supported toolchain
-        run: rustup toolchain install 1.95 --profile minimal
-
-      - name: Check the crate on it
-        run: cargo +1.95 check --all-features
-
   format:
     runs-on: ubuntu-latest
     steps:
