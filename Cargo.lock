@@ -385,9 +385,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-cobs"
-version = "0.2.1"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1e3fe69fc8d60dd544eebc236f76795d42dfab73c53ced2decd01a8ef2e0cd"
+checksum = "fb1c8fd159d655841568f7990c30cfc97de19283b263555ff601429ad744a0df"
 dependencies = [
  "memchr",
  "thiserror",
@@ -395,9 +395,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto"
-version = "0.18.0"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a75c1e707f065a5d9955e0a4a5e4701ed20aa04f58e2ede4d55e9593fab96ac"
+checksum = "dbbc26cef72218bb30779a4269d2f5be84bf20575848a63a6044a786b9e332a1"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -421,9 +421,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto-cbor-derive"
-version = "0.18.0"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cc8e60c71b10c3ec23711f874999dad8b0a1464fbeb40a4983ad4fe07aac171"
+checksum = "0e0905e0df57aae0ba154f635c11a8e6ea39f79aba99edfdf2c8114fc31ad250"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -432,9 +432,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-trust"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25f74cc71bb685cc5cb438e2ee13415bb5bdb2af537a195c20202dc80af4d65"
+checksum = "6156e469d7f053c00530a14f51c377dd23c501112fd8a57d004e3ddb17778cb9"
 dependencies = [
  "darkbio-crypto",
  "hex",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "darkbio-wire"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arbitrary",
  "base64",

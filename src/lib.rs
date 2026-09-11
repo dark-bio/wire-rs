@@ -10,6 +10,13 @@ pub mod memory;
 pub mod protocol;
 pub mod transport;
 
+// The crates whose types appear in this crate's API, re-exported so consumers
+// can name them at the exact versions this crate was compiled against
+pub use darkbio_cobs as cobs;
+pub use darkbio_crypto as crypto;
+pub use darkbio_trust as trust;
+pub use prost;
+
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 

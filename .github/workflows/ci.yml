@@ -37,6 +37,17 @@ jobs:
       - name: Test with all features
         run: cargo test --all-features
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the minimum supported toolchain
+        run: rustup toolchain install 1.95 --profile minimal
+
+      - name: Check the crate on it
+        run: cargo +1.95 check --all-features
+
   format:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +65,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo doc --all-features --no-deps
+
+  semver:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the public API against the published release
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features
 
   vectors:
     runs-on: ubuntu-latest
