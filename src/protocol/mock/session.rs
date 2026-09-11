@@ -158,10 +158,10 @@ enum Step {
     InboundLimits(u8, usize, usize),
     /// Changes both server limits for the current and future sessions.
     ServerInboundLimits(usize, usize),
-    /// Sets the automatic reply budget for subsequent responder drops.
-    AbandonmentTimeout(u8, Duration),
+    /// Sets the timeout for subsequent automatic replies.
+    AutoreplyTimeout(u8, Duration),
     /// Sets the automatic reply timeout for the current and future server sessions.
-    ServerAbandonmentTimeout(Duration),
+    ServerAutoreplyTimeout(Duration),
     /// Checks accepted requests and retained bytes from the original envelopes.
     Usage(u8, usize, usize),
 
@@ -476,13 +476,13 @@ impl Driver {
                         .set_inbound_limits(requests, bytes),
                 );
             }
-            Step::AbandonmentTimeout(id, timeout) => {
+            Step::AutoreplyTimeout(id, timeout) => {
                 let session = self.sessions.remove(&id).unwrap();
                 self.sessions
-                    .insert(id, session.set_abandonment_timeout(timeout));
+                    .insert(id, session.set_autoreply_timeout(timeout));
             }
-            Step::ServerAbandonmentTimeout(timeout) => {
-                self.server = Some(self.server.take().unwrap().set_abandonment_timeout(timeout));
+            Step::ServerAutoreplyTimeout(timeout) => {
+                self.server = Some(self.server.take().unwrap().set_autoreply_timeout(timeout));
             }
             Step::Usage(id, requests, bytes) => {
                 assert_eq!(
@@ -660,6 +660,8 @@ impl Driver {
                                     error.msg,
                                     if code == schema::ReservedErrors::Unanswered as u64 {
                                         "request left unanswered"
+                                    } else if code == schema::ReservedErrors::Unknown as u64 {
+                                        "request not known"
                                     } else {
                                         "refused"
                                     }

@@ -10,7 +10,7 @@ use super::operation::{
 use super::promise::PromiseResult;
 use super::worker;
 use super::{
-    Closer, DEFAULT_ABANDONMENT_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
+    Closer, DEFAULT_AUTOREPLY_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
     Error, Message, Promise, Requester, Responder, schema,
 };
 use crate::LogId;
@@ -99,25 +99,27 @@ pub struct Session {
 }
 
 impl Session {
-    /// Sets the lifetime of automatic `UNANSWERED` replies when responders are
-    /// subsequently dropped. Defaults to [`DEFAULT_ABANDONMENT_TIMEOUT`]. Replies
-    /// already queued keep their deadlines.
+    /// Sets the timeout for automatic `UNANSWERED` and `UNKNOWN` replies.
+    /// Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`]. Replies already queued keep
+    /// their deadlines.
     ///
-    /// The budget starts when the responder is dropped and includes queueing.
+    /// The budget starts when a responder is dropped or an unknown request is
+    /// received, and includes queueing.
     /// Expiry discards a queued reply; a write already started still runs under the
     /// transport's independent timeout. Explicit request/reply deadlines are
     /// unaffected. Zero or an unrepresentable deadline expires immediately.
-    /// Use [`super::Server::set_abandonment_timeout`] to also set the timeout for
+    /// Use [`super::Server::set_autoreply_timeout`] to also set the timeout for
     /// future server sessions.
-    pub fn set_abandonment_timeout(self, timeout: Duration) -> Self {
-        self.inner.set_abandonment_timeout(timeout);
+    pub fn set_autoreply_timeout(self, timeout: Duration) -> Self {
+        self.inner.set_autoreply_timeout(timeout);
         self
     }
 
     /// Sets the maximum accepted peer requests and buffered incoming bytes together.
     /// Defaults to [`DEFAULT_MAX_INBOUND_REQUESTS`] and [`DEFAULT_MAX_INBOUND_BYTES`].
     ///
-    /// `requests` counts queued requests, held responders and queued replies.
+    /// `requests` counts queued requests, held responders and queued replies,
+    /// including automatic replies to requests with unknown content.
     /// A slot is freed when the writer takes the reply or the reply is discarded.
     /// Zero refuses all peer requests but still allows responses to our requests.
     ///
@@ -236,8 +238,8 @@ enum State {
         max_inbound_requests: usize,
         /// Ceiling for encoded requests and unread response promises.
         max_inbound_bytes: usize,
-        /// Automatic reply lifetime selected when a responder is dropped.
-        abandonment: Duration,
+        /// Timeout selected when an automatic reply is queued.
+        autoreply_timeout: Duration,
 
         /// Peer requests awaiting application receipt, paired with their request IDs.
         incoming: VecDeque<(u64, IncomingEnvelope)>,
@@ -279,7 +281,7 @@ impl SessionInner {
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
-                abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
+                autoreply_timeout: DEFAULT_AUTOREPLY_TIMEOUT,
 
                 incoming: VecDeque::new(),
                 reserved_ids: HashSet::new(),
@@ -308,12 +310,15 @@ impl SessionInner {
         }
     }
 
-    /// Changes the timeout used when responders are dropped. Queued replies keep
-    /// their original deadlines.
-    pub(super) fn set_abandonment_timeout(&self, timeout: Duration) {
+    /// Changes the timeout for subsequent automatic replies. Queued replies
+    /// keep their original deadlines.
+    pub(super) fn set_autoreply_timeout(&self, timeout: Duration) {
         let mut state = self.state.lock().expect("session state not poisoned");
-        if let State::Open { abandonment, .. } = &mut *state {
-            *abandonment = timeout;
+        if let State::Open {
+            autoreply_timeout, ..
+        } = &mut *state
+        {
+            *autoreply_timeout = timeout;
         }
     }
 
@@ -458,35 +463,50 @@ impl SessionInner {
         }
     }
 
-    /// Queues an `UNANSWERED` reply when a responder is dropped. The
+    /// Queues an `UNANSWERED` reply when a responder is dropped. The writer
+    /// sends the reply later.
+    pub(super) fn reply_unanswered(self: &Arc<Self>, id: u64) {
+        self.autoreply(
+            id,
+            "unanswered",
+            schema::Error::reserved(
+                schema::ReservedErrors::Unanswered,
+                "request left unanswered",
+            ),
+        );
+    }
+
+    /// Queues an `UNKNOWN` reply to a request whose content this build does not
+    /// know, the application never seeing it. The writer sends the reply later.
+    fn reply_unknown(self: &Arc<Self>, id: u64) {
+        self.autoreply(
+            id,
+            "unknown",
+            schema::Error::reserved(schema::ReservedErrors::Unknown, "request not known"),
+        );
+    }
+
+    /// Queues an automatic reply under the configured autoreply timeout. The
     /// budget starts on entry, before acquiring the session lock, and includes
     /// queueing. An unrepresentable deadline expires immediately instead of
-    /// panicking from `Drop`. The writer sends the reply later.
-    pub(super) fn reply_unanswered(self: &Arc<Self>, id: u64) {
+    /// panicking from `Drop`.
+    fn autoreply(self: &Arc<Self>, id: u64, reason: &str, error: schema::Error) {
         let now = self.now();
         let timeout = {
             let state = self.state.lock().expect("session state not poisoned");
             match &*state {
                 State::Open {
-                    abandonment: abandonment_timeout,
-                    ..
-                } => *abandonment_timeout,
+                    autoreply_timeout, ..
+                } => *autoreply_timeout,
                 State::Closed(_) => return,
             }
         };
-        tracing::debug!("answering request {} as unanswered", id);
+        tracing::debug!("answering request {} as {}", id, reason);
 
-        // Fix this reply's deadline at drop. Later changes to the session's
+        // Fix this reply's deadline on entry. Later changes to the session's
         // configuration do not retime already submitted work.
         let deadline = now.checked_add(timeout).unwrap_or(now);
-        let _ = self.reply(
-            id,
-            Err(schema::Error::reserved(
-                schema::ReservedErrors::Unanswered,
-                "request left unanswered",
-            )),
-            deadline,
-        );
+        let _ = self.reply(id, Err(error), deadline);
     }
 
     /// Creates a promise and queues a request through `enqueue()`. If the deadline
@@ -698,6 +718,7 @@ impl SessionInner {
     pub(super) fn handle_message(self: &Arc<Self>, bytes: Vec<u8>) -> Result<(), Error> {
         let bytes = Bytes::from(bytes.into_boxed_slice());
         let header = self.side.decode_header(bytes.clone())?;
+        let mut unknown = None;
         {
             let mut state = self.state.lock().expect("session state not poisoned");
             match MessageKind::from_id(header.id, self.side.into()) {
@@ -710,7 +731,12 @@ impl SessionInner {
                             "request contains an error",
                         ));
                     }
-                    self.queue_request(&mut state, header, bytes)?;
+                    // Unknown content reserves a slot for its automatic reply,
+                    // which is queued once this lock is released.
+                    self.admit_request(&mut state, header, bytes)?;
+                    if header.unknown {
+                        unknown = Some(header.id);
+                    }
                 }
                 MessageKind::Response => {
                     let State::Open {
@@ -746,13 +772,17 @@ impl SessionInner {
                 }
             }
         }
+        if let Some(id) = unknown {
+            self.reply_unknown(id);
+        }
         self.changed.notify_all();
         Ok(())
     }
 
-    /// Reserves a request slot and bytes under the session lock. If either limit
-    /// is exceeded, the queue stays untouched. Never waits for the application.
-    fn queue_request(
+    /// Reserves a request slot and buffers known content under the session lock.
+    /// Unknown content keeps only its ID for the automatic reply. If a limit is
+    /// exceeded, admission leaves the queues untouched. Never waits for the application.
+    fn admit_request(
         self: &Arc<Self>,
         state: &mut State,
         header: Header,
@@ -771,8 +801,7 @@ impl SessionInner {
             };
             return Err(error.clone());
         };
-        let id = header.id;
-        if reserved_ids.contains(&id) {
+        if reserved_ids.contains(&header.id) {
             return Err(self.side.malformed(
                 Some(header),
                 bytes.len(),
@@ -780,6 +809,7 @@ impl SessionInner {
                 "duplicate request ID",
             ));
         }
+        let id = header.id;
         if reserved_ids.len() >= *max_inbound_requests {
             tracing::warn!(
                 "inbound request limit exceeded (id: {}, used: {}, limit: {})",
@@ -790,9 +820,15 @@ impl SessionInner {
             return Err(Error::InboundRequestLimitExceeded(*max_inbound_requests));
         }
         let payload = header.payload.unwrap_or("none");
-        let message = self.retain_incoming(bytes, header, *max_inbound_bytes)?;
+        let message = if header.unknown {
+            None
+        } else {
+            Some(self.retain_incoming(bytes, header, *max_inbound_bytes)?)
+        };
         reserved_ids.insert(id);
-        incoming.push_back((id, message));
+        if let Some(message) = message {
+            incoming.push_back((id, message));
+        }
         tracing::trace!("received request {} ({})", id, payload);
         Ok(())
     }
@@ -1141,7 +1177,7 @@ impl SessionInner {
         let header = self.side.decode_header(bytes.clone())?;
         let result = {
             let mut state = self.state.lock().expect("session state not poisoned");
-            self.queue_request(&mut state, header, bytes)
+            self.admit_request(&mut state, header, bytes)
         };
         self.changed.notify_all();
         if let Err(error) = &result {

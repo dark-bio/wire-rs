@@ -13,9 +13,9 @@ use std::time::Instant;
 /// This handle cannot keep its session open or address a replacement session.
 ///
 /// Dropping an unanswered responder queues an `UNANSWERED` error without blocking
-/// on I/O, using the session's current abandonment timeout.
-/// Configure it with [`super::Session::set_abandonment_timeout`] or
-/// [`super::Server::set_abandonment_timeout`]. If the session has closed, no reply
+/// on I/O, using the session's current autoreply timeout.
+/// Configure it with [`super::Session::set_autoreply_timeout`] or
+/// [`super::Server::set_autoreply_timeout`]. If the session has closed, no reply
 /// is queued.
 ///
 /// A held responder counts toward the session's inbound request limit. Queuing a
@@ -70,10 +70,15 @@ impl Responder {
 
     /// Queues an error response and consumes the responder. The deadline and write
     /// promise work as in [`Self::reply`]. The error itself does not close the session.
-    /// Use [`schema::Error::reserved`] for a named protocol error or
-    /// [`schema::Error::new`] for a numeric error code.
-    pub fn fail(self, error: schema::Error, deadline: Instant) -> Result<Promise<()>, Error> {
-        self.enqueue(Err(error), deadline)
+    /// Accepts an application error implementing [`super::CodedError`] directly. Use
+    /// [`schema::Error::reserved`] for a named protocol error or
+    /// [`schema::Error::new`] for a bare numeric code.
+    pub fn fail(
+        self,
+        error: impl Into<schema::Error>,
+        deadline: Instant,
+    ) -> Result<Promise<()>, Error> {
+        self.enqueue(Err(error.into()), deadline)
     }
 
     /// Queues either kind of response and marks this responder as answered.

@@ -32,11 +32,14 @@ fn check(client: bool, bytes: &[u8]) -> bool {
         true => (Side::Client, Side::Server),
         false => (Side::Server, Side::Client),
     };
-    let header = side.decode_header(Bytes::copy_from_slice(bytes));
+    // Match the reader's admission gate: unknown content beside an error is
+    // rejected here even though schema-only decoding ignores the unknown field.
+    let Ok(header) = side.decode_header(Bytes::copy_from_slice(bytes)) else {
+        return false;
+    };
     let Ok((id, body)) = side.decode(bytes) else {
         return false;
     };
-    let header = header.expect("every fully valid envelope has valid routing metadata");
     assert_eq!(header.id, id);
     assert_eq!(header.failed, body.is_err());
     // Measure the received schema directly, independently of the Message-to-wire

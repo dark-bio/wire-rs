@@ -12,6 +12,7 @@
 use crate::protocol::schema::{self, ArkToHost, HostToArk, ark_to_host, host_to_ark};
 use prost::Message as ProtobufMessage;
 use prost::bytes::Bytes;
+use prost::encoding::{DecodeContext, decode_key, skip_field};
 
 use super::session::SessionInner;
 use super::{Error, Message};
@@ -36,7 +37,7 @@ impl Side {
         let invalid = |error| self.malformed(None, length, "envelope", error);
         let (id, failed, payload) = match self {
             Self::Client => {
-                let envelope = opaque::ArkToHost::decode(bytes).map_err(invalid)?;
+                let envelope = opaque::ArkToHost::decode(bytes.clone()).map_err(invalid)?;
                 (
                     envelope.id,
                     envelope.err.is_some(),
@@ -44,7 +45,7 @@ impl Side {
                 )
             }
             Self::Server => {
-                let envelope = opaque::HostToArk::decode(bytes).map_err(invalid)?;
+                let envelope = opaque::HostToArk::decode(bytes.clone()).map_err(invalid)?;
                 (
                     envelope.id,
                     envelope.err.is_some(),
@@ -52,13 +53,37 @@ impl Side {
                 )
             }
         };
+        // Content the schema does not have is content still, just unknown. With
+        // no known content decoded, any top level tag left in the content range
+        // is probably a future message not yet known by this build.
+        let unknown = payload.is_none() && {
+            let mut rest = &bytes[..];
+            loop {
+                if rest.is_empty() {
+                    break false;
+                }
+                let Ok((tag, wire_type)) = decode_key(&mut rest) else {
+                    break false;
+                };
+                if tag >= 0x100 {
+                    // first field tag of the content oneofs
+                    break true;
+                }
+                if skip_field(wire_type, tag, &mut rest, DecodeContext::default()).is_err() {
+                    break false;
+                }
+            }
+        };
         let header = Header {
             id,
             failed,
-            payload: payload.or(failed.then_some("err")),
+            payload: payload
+                .or(unknown.then_some("unknown"))
+                .or(failed.then_some("err")),
+            unknown,
         };
         // Require exactly one body; presence is preserved even for empty bytes.
-        if payload.is_some() == failed {
+        if (payload.is_some() || unknown) == failed {
             return Err(self.malformed(
                 Some(header),
                 length,
@@ -143,6 +168,8 @@ pub(super) struct Header {
     pub(super) failed: bool,
     /// Payload field name for log lines. Absent if the envelope has no body.
     pub(super) payload: Option<&'static str>,
+    /// Whether the content is a field this build does not know.
+    pub(super) unknown: bool,
 }
 
 /// One encoded envelope held by the request queue or a completed response promise.

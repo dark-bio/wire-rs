@@ -27,7 +27,7 @@ pub struct Action {
     pub slot: u8,
     /// Body tag, result selector, request limit or choice of concurrent execution.
     pub value: u8,
-    /// Relative deadline, clock advance or abandonment timeout in milliseconds,
+    /// Relative deadline, clock advance or autoreply timeout in milliseconds,
     /// or the retained-byte limit.
     pub budget: u8,
 }
@@ -40,7 +40,7 @@ pub enum Kind {
     Open,
     /// Changes both inbound limits, including below live usage.
     InboundLimits,
-    AbandonmentTimeout,
+    AutoreplyTimeout,
 
     // Requests and replies.
     Request,
@@ -69,13 +69,13 @@ pub enum Kind {
     Notify,
 }
 
-/// Default abandonment budget of a fresh session, in script milliseconds.
-const ABANDONMENT: u64 = 5000;
+/// Default autoreply timeout of a fresh session, in script milliseconds.
+const DEFAULT_AUTOREPLY_TIMEOUT: u64 = 5000;
 
 struct Session {
     reason: Option<Failure>,
     owner: bool,
-    abandonment: u64,
+    autoreply_timeout: u64,
     /// Current limit on accepted peer requests.
     max_requests: usize,
     /// Current limit on buffered incoming bytes.
@@ -355,7 +355,7 @@ impl Model {
                     self.sessions.push(Session {
                         reason: None,
                         owner: true,
-                        abandonment: ABANDONMENT,
+                        autoreply_timeout: DEFAULT_AUTOREPLY_TIMEOUT,
                         max_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                         max_bytes: DEFAULT_MAX_INBOUND_BYTES,
                     });
@@ -374,14 +374,12 @@ impl Model {
                     self.close(session, Failure::Bytes);
                 }
             }
-            Kind::AbandonmentTimeout
-                if !self.sessions.is_empty() && self.sessions[session].owner =>
-            {
-                self.steps.push(Step::AbandonmentTimeout(
+            Kind::AutoreplyTimeout if !self.sessions.is_empty() && self.sessions[session].owner => {
+                self.steps.push(Step::AutoreplyTimeout(
                     session as u8,
                     Duration::from_millis(u64::from(budget)),
                 ));
-                self.sessions[session].abandonment = u64::from(budget);
+                self.sessions[session].autoreply_timeout = u64::from(budget);
             }
             Kind::Request if !self.sessions.is_empty() => {
                 if let Some(reason) = self.sessions[session].reason {
@@ -426,7 +424,7 @@ impl Model {
                                     responder as u64,
                                     Err(schema::ReservedErrors::Unanswered as u64),
                                 ),
-                                self.time + self.sessions[session].abandonment,
+                                self.time + self.sessions[session].autoreply_timeout,
                                 false,
                             );
                         }
