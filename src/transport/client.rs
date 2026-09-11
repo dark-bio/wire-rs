@@ -50,8 +50,10 @@ impl Verifier for xdsa::PublicKey {
 /// attestations from devices that have not been onboarded are rejected.
 #[derive(Debug)]
 pub struct Roots<'a> {
-    pub hardware: &'a [xdsa::PublicKey], // Roots attesting hardware Arks
-    pub emulator: &'a [xdsa::PublicKey], // Roots attesting emulated Arks
+    /// Roots attesting hardware Arks.
+    pub hardware: &'a [xdsa::PublicKey],
+    /// Roots attesting emulated Arks.
+    pub emulator: &'a [xdsa::PublicKey],
 }
 
 impl Verifier for Roots<'_> {
