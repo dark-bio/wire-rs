@@ -556,6 +556,10 @@ fn test_full_prefix_failure_surfaces_on_flush() {
 #[test]
 fn test_vectors_replay() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/client");
+    if !dir.try_exists().expect("check vectors directory") {
+        // Published crates omit replay fixtures.
+        return;
+    }
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("no vectors directory")
         .map(|entry| entry.unwrap().path())

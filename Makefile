@@ -1,4 +1,4 @@
-.PHONY: check coverage fuzz fuzz-loop fuzz-minimize fuzz-seeds vectors
+.PHONY: check coverage fuzz fuzz-loop fuzz-minimize fuzz-seeds generate vectors
 .DEFAULT_GOAL := check
 
 # The fuzz budget per target in seconds, the jobs to run it on and the
@@ -74,3 +74,11 @@ vectors:
 	rm -rf vectors/client
 	$(FUZZ_ENV) CARGO_TARGET_DIR=target/vectors \
 		WIRE_VECTORS=$(CURDIR)/vectors cargo test --quiet --features fuzz mock::server
+
+# generate writes the protobuf bindings and the message conversions derived
+# from the schema into src/protocol/generated, formatted like handwritten code.
+# The generator vendors its own protoc, so consumers of the crate need neither
+# protoc nor prost-build.
+generate:
+	cargo run --quiet --manifest-path generator/Cargo.toml
+	rustfmt --edition 2024 src/protocol/generated/*.rs

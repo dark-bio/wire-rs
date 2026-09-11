@@ -10,6 +10,7 @@ keywords = ["ark", "dark-bio", "transport", "protobuf"]
 license = "BSD-3-Clause"
 edition = "2024"
 rust-version = "1.95"
+exclude = ["vectors/"] # Replay transcripts feed only the tests, no reason to ship them
 autobenches = false
 
 [package.metadata.docs.rs]
@@ -48,11 +49,6 @@ rand = "0.10.2" # Keep >= 0.10.1, fixes rng logger unsoundness (RUSTSEC-2026-009
 serde_json = "1"
 strum = { version = "0.28", features = ["derive"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] } # Keep >= 0.3.20, fixes ANSI escape injection (RUSTSEC-2025-0055)
-
-[build-dependencies]
-prost-build = "0.14.1"
-prost-types = "0.14"
-protoc-bin-vendored = "3.2.0"
 
 [lib]
 bench = false

@@ -102,5 +102,5 @@ pub const DEFAULT_MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 #[allow(clippy::all)]
 #[allow(rustdoc::broken_intra_doc_links)]
 pub mod schema {
-    include!(concat!(env!("OUT_DIR"), "/darkbio.wire.rs"));
+    include!("generated/darkbio.wire.rs");
 }
