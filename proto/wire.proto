@@ -17,54 +17,64 @@ message HostToArk {
   uint64 id = 1;           // Request identifier, the host's own or responded to
   optional Error err = 2;  // Error encountered while serving the Ark's request (if any)
 
+  // Body of the message, a request of the host or its response to a request of
+  // the Ark. The tags are grouped by area, each area with its own range.
   oneof content {
+
     // Special factory message
-    OnboardingRequest onboard = 0x100;
+
+    OnboardingRequest onboard = 0x100; // Installs the signed device attestation at manufacturing
 
     // System messages, reserved range 0x101-0x200
-    DeviceInfoRequest      device_info = 0x101;
-    CloudSyncStartRequest  cloud_sync_start = 0x102;
-    CloudSyncFinishRequest cloud_sync_finish = 0x103;
-    GenuinityProofRequest  genuinity_proof = 0x104;
+
+    DeviceInfoRequest      device_info = 0x101;       // Fetches the hardware and firmware versions
+    CloudSyncStartRequest  cloud_sync_start = 0x102;  // Starts a cloud sync with the attested cloud keys
+    CloudSyncFinishRequest cloud_sync_finish = 0x103; // Finishes a cloud sync with the signed server time
+    GenuinityProofRequest  genuinity_proof = 0x104;   // Requests a proof of the device's genuinity
 
     // Firmware update messages, reserved range 0x201-0x300
-    FirmwareUpdatePrepRequest    firmware_update_prep = 0x201;
-    FirmwareUpdateInitRequest    firmware_update_init = 0x202;
-    FirmwareUpdateUploadRequest  firmware_update_upload = 0x203;
-    FirmwareUpdateVerifyRequest  firmware_update_verify = 0x204;
-    FirmwareUpdateInstallRequest firmware_update_install = 0x205;
+
+    FirmwareUpdatePrepRequest    firmware_update_prep = 0x201;    // Prepares an update, aborting any in progress
+    FirmwareUpdateInitRequest    firmware_update_init = 0x202;    // Initiates a prepared update with the sealed firmware key
+    FirmwareUpdateUploadRequest  firmware_update_upload = 0x203;  // Appends a chunk of the firmware archive
+    FirmwareUpdateVerifyRequest  firmware_update_verify = 0x204;  // Decrypts and verifies the uploaded firmware
+    FirmwareUpdateInstallRequest firmware_update_install = 0x205; // Installs the verified firmware and reboots
 
     // Pairing messages, reserved range 0x301-0x400
-    PairingStatusRequest         pairing_status = 0x301;
-    PairingAuthRequest           pairing_auth = 0x302;
-    PairingSetAppIdentityRequest pairing_set_app_id = 0x303;
-    PairingSetAppStorageRequest  pairing_set_app_storage = 0x304;
-    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x305;
-    PairingAcceptanceRequest     pairing_accept = 0x306;
-    PairingCompletionRequest     pairing_complete = 0x307;
+
+    PairingStatusRequest         pairing_status = 0x301;          // Queries whether the Ark is paired and opened
+    PairingAuthRequest           pairing_auth = 0x302;            // Asks the Ark to authorize a pairing rendezvous
+    PairingSetAppIdentityRequest pairing_set_app_id = 0x303;      // Injects the companion app's identity, relayed by the cloud
+    PairingSetAppStorageRequest  pairing_set_app_storage = 0x304; // Injects the companion app's storage key material
+    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x305; // Confirms the app received the Ark's key material
+    PairingAcceptanceRequest     pairing_accept = 0x306;          // Waits for the user to accept the pairing
+    PairingCompletionRequest     pairing_complete = 0x307;        // Waits for the Ark to finish pairing maintenance
 
     // Relay messages, reserved range 0x401-0x500
-    RelayJoinRequest      relay_join = 0x401;
-    RelayAppToArkRequest  relay_req = 0x402;
-    RelayAppToArkResponse relay_res = 0x403;
+
+    RelayJoinRequest      relay_join = 0x401; // Asks the Ark to authorize joining the app relay
+    RelayAppToArkRequest  relay_req = 0x402;  // Opaque request from the companion app to the Ark
+    RelayAppToArkResponse relay_res = 0x403;  // Opaque response from the companion app to an Ark request
 
     // Operational messages, reserved range 0x501-0x600
-    UnlockRequest                unlock = 0x501;
-    ExecutionUploadStartRequest  exec_upload_start = 0x502;
-    ExecutionUploadChunkRequest  exec_upload_chunk = 0x503;
-    ExecutionScheduleRequest     exec_sched = 0x504;
-    ExecutionStatusRequest       exec_status = 0x505;
-    ExecutionCancelRequest       exec_cancel = 0x506;
+
+    UnlockRequest                unlock = 0x501;            // Starts the unlock, confirmed through the app
+    ExecutionUploadStartRequest  exec_upload_start = 0x502; // Begins a chunked upload of an app to execute
+    ExecutionUploadChunkRequest  exec_upload_chunk = 0x503; // Appends a chunk to a pending app upload
+    ExecutionScheduleRequest     exec_sched = 0x504;        // Runs an uploaded app, confirmed through the app
+    ExecutionStatusRequest       exec_status = 0x505;       // Checks on a running app
+    ExecutionCancelRequest       exec_cancel = 0x506;       // Cancels an app run or a pending upload
 
     // Slot messages, reserved range 0x601-0x700
-    SlotListRequest          slot_list = 0x601;
-    SlotRepairRequest        slot_repair = 0x602;
-    SlotDeleteRequest        slot_delete = 0x603;
-    SlotUploadPeekRequest    slot_upload_peek = 0x604;
-    SlotUploadStartRequest   slot_upload_start = 0x605;
-    SlotUploadChunkRequest   slot_upload_chunk = 0x606;
-    SlotUploadCancelRequest  slot_upload_cancel = 0x607;
-    SlotUploadProcessRequest slot_upload_process = 0x608;
+
+    SlotListRequest          slot_list = 0x601;           // Lists the state of every data slot
+    SlotRepairRequest        slot_repair = 0x602;         // Resets a slot to empty whatever its state
+    SlotDeleteRequest        slot_delete = 0x603;         // Removes the contents of a filled slot
+    SlotUploadPeekRequest    slot_upload_peek = 0x604;    // Asks the Ark to identify a file from its first chunk
+    SlotUploadStartRequest   slot_upload_start = 0x605;   // Starts uploading a file into a slot
+    SlotUploadChunkRequest   slot_upload_chunk = 0x606;   // Appends a chunk to a pending slot upload
+    SlotUploadCancelRequest  slot_upload_cancel = 0x607;  // Aborts a pending slot upload
+    SlotUploadProcessRequest slot_upload_process = 0x608; // Marks an upload complete and polls its processing
 
     // Unreleased messages served by development firmware only, carried opaquely
     // so the public protocol is untouched while they are still under development.
@@ -85,55 +95,65 @@ message ArkToHost {
   uint64 id = 1;           // Request identifier, responded to or the Ark's own
   optional Error err = 2;  // Error encountered while serving the host's request (if any)
 
+  // Body of the message, a response of the Ark to a request of the host or a
+  // request of its own. The tags are grouped by area, each area with its own range.
   oneof content {
+
     // Special factory message
-    OnboardingResponse onboard = 0x100;
+
+    OnboardingResponse onboard = 0x100; // Acknowledges the onboarding
 
     // System messages, reserved range 0x101-0x200
-    DeviceInfoResponse      device_info = 0x101;
-    CloudSyncStartResponse  cloud_sync_start = 0x102;
-    CloudSyncFinishResponse cloud_sync_finish = 0x103;
-    GenuinityProofResponse  genuinity_proof = 0x104;
+
+    DeviceInfoResponse      device_info = 0x101;       // Hardware and firmware versions of the Ark
+    CloudSyncStartResponse  cloud_sync_start = 0x102;  // Challenge for the cloud to sign along its time
+    CloudSyncFinishResponse cloud_sync_finish = 0x103; // Timestamp the Ark accepted from the cloud
+    GenuinityProofResponse  genuinity_proof = 0x104;   // Encrypted proof of the Ark's genuinity for the cloud
 
     // Firmware update messages, reserved range 0x201-0x300
-    FirmwareUpdatePrepResponse    firmware_update_prep = 0x201;
-    FirmwareUpdateInitResponse    firmware_update_init = 0x202;
-    FirmwareUpdateUploadResponse  firmware_update_upload = 0x203;
-    FirmwareUpdateVerifyResponse  firmware_update_verify = 0x204;
-    FirmwareUpdateInstallResponse firmware_update_install = 0x205;
+
+    FirmwareUpdatePrepResponse    firmware_update_prep = 0x201;    // Ephemeral key to receive the firmware key with, sealed for the cloud
+    FirmwareUpdateInitResponse    firmware_update_init = 0x202;    // Acknowledges the initiated update
+    FirmwareUpdateUploadResponse  firmware_update_upload = 0x203;  // Acknowledges the appended firmware chunk
+    FirmwareUpdateVerifyResponse  firmware_update_verify = 0x204;  // Acknowledges the verified firmware
+    FirmwareUpdateInstallResponse firmware_update_install = 0x205; // Acknowledges the installed firmware
 
     // Pairing messages, reserved range 0x301-0x400
-    PairingStatusResponse           pairing_status = 0x301;
-    PairingAuthResponse             pairing_auth = 0x302;
-    PairingSetAppIdentityResponse   pairing_set_app_id = 0x303;
-    PairingSetAppStorageResponse    pairing_set_app_storage = 0x304;
-    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x305;
-    PairingAcceptanceResponse       pairing_accept = 0x306;
-    PairingCompletionResponse       pairing_complete = 0x307;
+
+    PairingStatusResponse           pairing_status = 0x301;          // Whether the Ark is paired and opened
+    PairingAuthResponse             pairing_auth = 0x302;            // Signed authorization for the cloud to open a rendezvous
+    PairingSetAppIdentityResponse   pairing_set_app_id = 0x303;      // Acknowledges the accepted app identity
+    PairingSetAppStorageResponse    pairing_set_app_storage = 0x304; // Ark device infos and key material, sealed for the app
+    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x305; // Acknowledges the app's receipt of the Ark's keys
+    PairingAcceptanceResponse       pairing_accept = 0x306;          // Signed confirmation that the user accepted the pairing
+    PairingCompletionResponse       pairing_complete = 0x307;        // Signed confirmation that the Ark finished pairing
 
     // Relay messages, reserved range 0x401-0x500
-    RelayJoinResponse     relay_join = 0x401;
-    RelayArkToAppRequest  relay_req = 0x402;
-    RelayArkToAppResponse relay_res = 0x403;
-    RelayAppToArkFailure  relay_fail = 0x404;
+
+    RelayJoinResponse     relay_join = 0x401; // Signed authorization for the cloud to join the relay
+    RelayArkToAppRequest  relay_req = 0x402;  // Opaque request from the Ark to the companion app
+    RelayArkToAppResponse relay_res = 0x403;  // Opaque response from the Ark to an app request
+    RelayAppToArkFailure  relay_fail = 0x404; // Protocol violation found in an app response, for debugging
 
     // Operational messages, reserved range 0x501-0x600
-    UnlockResponse                unlock = 0x501;
-    ExecutionUploadStartResponse  exec_upload_start = 0x502;
-    ExecutionUploadChunkResponse  exec_upload_chunk = 0x503;
-    ExecutionScheduleResponse     exec_sched = 0x504;
-    ExecutionStatusResponse       exec_status = 0x505;
-    ExecutionCancelResponse       exec_cancel = 0x506;
+
+    UnlockResponse                unlock = 0x501;            // Acknowledges the completed unlock
+    ExecutionUploadStartResponse  exec_upload_start = 0x502; // Task id for the chunk, schedule and cancel messages
+    ExecutionUploadChunkResponse  exec_upload_chunk = 0x503; // Acknowledges the appended app chunk
+    ExecutionScheduleResponse     exec_sched = 0x504;        // Acknowledges the authorized and started execution
+    ExecutionStatusResponse       exec_status = 0x505;       // Whether the app still runs, with its result once done
+    ExecutionCancelResponse       exec_cancel = 0x506;       // Acknowledges the cancelled run or upload
 
     // Slot messages, reserved range 0x601-0x700
-    SlotListResponse          slot_list = 0x601;
-    SlotRepairResponse        slot_repair = 0x602;
-    SlotDeleteResponse        slot_delete = 0x603;
-    SlotUploadPeekResponse    slot_upload_peek = 0x604;
-    SlotUploadStartResponse   slot_upload_start = 0x605;
-    SlotUploadChunkResponse   slot_upload_chunk = 0x606;
-    SlotUploadCancelResponse  slot_upload_cancel = 0x607;
-    SlotUploadProcessResponse slot_upload_process = 0x608;
+
+    SlotListResponse          slot_list = 0x601;           // Current state of every data slot
+    SlotRepairResponse        slot_repair = 0x602;         // Acknowledges the reset slot
+    SlotDeleteResponse        slot_delete = 0x603;         // Acknowledges the deleted slot
+    SlotUploadPeekResponse    slot_upload_peek = 0x604;    // Identification of the peeked file
+    SlotUploadStartResponse   slot_upload_start = 0x605;   // Session id of the approved upload
+    SlotUploadChunkResponse   slot_upload_chunk = 0x606;   // Acknowledges the appended slot chunk
+    SlotUploadCancelResponse  slot_upload_cancel = 0x607;  // Acknowledges the aborted upload
+    SlotUploadProcessResponse slot_upload_process = 0x608; // Processing progress of the completed upload
 
     // Unreleased messages emitted by development firmware only, in response to
     // a develop request, carried opaquely so the public protocol is untouched
@@ -182,9 +202,9 @@ enum ReservedErrors {
 // the signed device genuinity attestation (certificate).
 //
 // Note, as this method is only used during initial device setup, there is no API
-// compatibility guarantee, it will evolve with the
+// compatibility guarantee, it will evolve with the factory tooling.
 message OnboardingRequest {
-  bytes device_attestation = 1;
+  bytes device_attestation = 1; // Signed device genuinity attestation (CWT) to install
 }
 // OnboardingResponse is the acknowledgement of the onboarding.
 message OnboardingResponse {
@@ -622,10 +642,10 @@ message SlotStatus {
   // Slot-type-specific metadata, set when the device has information about
   // this slot (either filled or dependencies provide enough context).
   oneof meta {
-    SlotMetaReferenceGenome reference_genome = 100;
-    SlotMetaGeneAnnotations gene_annotations = 101;
-    SlotMetaSnpIndelCalls   snp_indel_calls = 102;
-    SlotMetaVariantCatalog  variant_catalog = 103;
+    SlotMetaReferenceGenome reference_genome = 100; // Metadata of the reference genome slot
+    SlotMetaGeneAnnotations gene_annotations = 101; // Metadata of the gene annotations slot
+    SlotMetaSnpIndelCalls   snp_indel_calls = 102;  // Metadata of the user's variant calls slot
+    SlotMetaVariantCatalog  variant_catalog = 103;  // Metadata of the variant catalog slot
   }
 }
 
@@ -634,7 +654,7 @@ message SlotListRequest {
 }
 // SlotListResponse contains the current state of every slot slot.
 message SlotListResponse {
-  repeated SlotStatus slots = 1;
+  repeated SlotStatus slots = 1; // State of every slot, one entry per slot kind
 }
 
 // SlotRepairRequest resets a slot to empty regardless of its current state.
@@ -644,6 +664,7 @@ message SlotListResponse {
 message SlotRepairRequest{
   SlotKind slot = 1; // Slot to repair (reset to empty)
 }
+// SlotRepairResponse is an empty ack of the repair request.
 message SlotRepairResponse{
 }
 
@@ -653,6 +674,7 @@ message SlotRepairResponse{
 message SlotDeleteRequest{
   SlotKind slot = 1; // Slot to delete
 }
+// SlotDeleteResponse is an empty ack of the delete request.
 message SlotDeleteResponse{
 }
 

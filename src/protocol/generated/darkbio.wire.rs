@@ -16,6 +16,8 @@ pub struct HostToArk {
     /// Error encountered while serving the Ark's request (if any)
     #[prost(message, optional, tag = "2")]
     pub err: ::core::option::Option<Error>,
+    /// Body of the message, a request of the host or its response to a request of
+    /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
         tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
@@ -24,81 +26,110 @@ pub struct HostToArk {
 }
 /// Nested message and enum types in `HostToArk`.
 pub mod host_to_ark {
+    /// Body of the message, a request of the host or its response to a request of
+    /// the Ark. The tags are grouped by area, each area with its own range.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Content {
-        /// Special factory message
+        /// Installs the signed device attestation at manufacturing
         #[prost(message, tag = "256")]
         Onboard(super::OnboardingRequest),
-        /// System messages, reserved range 0x101-0x200
+        /// Fetches the hardware and firmware versions
         #[prost(message, tag = "257")]
         DeviceInfo(super::DeviceInfoRequest),
+        /// Starts a cloud sync with the attested cloud keys
         #[prost(message, tag = "258")]
         CloudSyncStart(super::CloudSyncStartRequest),
+        /// Finishes a cloud sync with the signed server time
         #[prost(message, tag = "259")]
         CloudSyncFinish(super::CloudSyncFinishRequest),
+        /// Requests a proof of the device's genuinity
         #[prost(message, tag = "260")]
         GenuinityProof(super::GenuinityProofRequest),
-        /// Firmware update messages, reserved range 0x201-0x300
+        /// Prepares an update, aborting any in progress
         #[prost(message, tag = "513")]
         FirmwareUpdatePrep(super::FirmwareUpdatePrepRequest),
+        /// Initiates a prepared update with the sealed firmware key
         #[prost(message, tag = "514")]
         FirmwareUpdateInit(super::FirmwareUpdateInitRequest),
+        /// Appends a chunk of the firmware archive
         #[prost(message, tag = "515")]
         FirmwareUpdateUpload(super::FirmwareUpdateUploadRequest),
+        /// Decrypts and verifies the uploaded firmware
         #[prost(message, tag = "516")]
         FirmwareUpdateVerify(super::FirmwareUpdateVerifyRequest),
+        /// Installs the verified firmware and reboots
         #[prost(message, tag = "517")]
         FirmwareUpdateInstall(super::FirmwareUpdateInstallRequest),
-        /// Pairing messages, reserved range 0x301-0x400
+        /// Queries whether the Ark is paired and opened
         #[prost(message, tag = "769")]
         PairingStatus(super::PairingStatusRequest),
+        /// Asks the Ark to authorize a pairing rendezvous
         #[prost(message, tag = "770")]
         PairingAuth(super::PairingAuthRequest),
+        /// Injects the companion app's identity, relayed by the cloud
         #[prost(message, tag = "771")]
         PairingSetAppId(super::PairingSetAppIdentityRequest),
+        /// Injects the companion app's storage key material
         #[prost(message, tag = "772")]
         PairingSetAppStorage(super::PairingSetAppStorageRequest),
+        /// Confirms the app received the Ark's key material
         #[prost(message, tag = "773")]
         PairingAckArkStorage(super::PairingAckArkStorageRequest),
+        /// Waits for the user to accept the pairing
         #[prost(message, tag = "774")]
         PairingAccept(super::PairingAcceptanceRequest),
+        /// Waits for the Ark to finish pairing maintenance
         #[prost(message, tag = "775")]
         PairingComplete(super::PairingCompletionRequest),
-        /// Relay messages, reserved range 0x401-0x500
+        /// Asks the Ark to authorize joining the app relay
         #[prost(message, tag = "1025")]
         RelayJoin(super::RelayJoinRequest),
+        /// Opaque request from the companion app to the Ark
         #[prost(message, tag = "1026")]
         RelayReq(super::RelayAppToArkRequest),
+        /// Opaque response from the companion app to an Ark request
         #[prost(message, tag = "1027")]
         RelayRes(super::RelayAppToArkResponse),
-        /// Operational messages, reserved range 0x501-0x600
+        /// Starts the unlock, confirmed through the app
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockRequest),
+        /// Begins a chunked upload of an app to execute
         #[prost(message, tag = "1282")]
         ExecUploadStart(super::ExecutionUploadStartRequest),
+        /// Appends a chunk to a pending app upload
         #[prost(message, tag = "1283")]
         ExecUploadChunk(super::ExecutionUploadChunkRequest),
+        /// Runs an uploaded app, confirmed through the app
         #[prost(message, tag = "1284")]
         ExecSched(super::ExecutionScheduleRequest),
+        /// Checks on a running app
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusRequest),
+        /// Cancels an app run or a pending upload
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelRequest),
-        /// Slot messages, reserved range 0x601-0x700
+        /// Lists the state of every data slot
         #[prost(message, tag = "1537")]
         SlotList(super::SlotListRequest),
+        /// Resets a slot to empty whatever its state
         #[prost(message, tag = "1538")]
         SlotRepair(super::SlotRepairRequest),
+        /// Removes the contents of a filled slot
         #[prost(message, tag = "1539")]
         SlotDelete(super::SlotDeleteRequest),
+        /// Asks the Ark to identify a file from its first chunk
         #[prost(message, tag = "1540")]
         SlotUploadPeek(super::SlotUploadPeekRequest),
+        /// Starts uploading a file into a slot
         #[prost(message, tag = "1541")]
         SlotUploadStart(super::SlotUploadStartRequest),
+        /// Appends a chunk to a pending slot upload
         #[prost(message, tag = "1542")]
         SlotUploadChunk(super::SlotUploadChunkRequest),
+        /// Aborts a pending slot upload
         #[prost(message, tag = "1543")]
         SlotUploadCancel(super::SlotUploadCancelRequest),
+        /// Marks an upload complete and polls its processing
         #[prost(message, tag = "1544")]
         SlotUploadProcess(super::SlotUploadProcessRequest),
         /// Unreleased messages served by development firmware only, carried opaquely
@@ -125,6 +156,8 @@ pub struct ArkToHost {
     /// Error encountered while serving the host's request (if any)
     #[prost(message, optional, tag = "2")]
     pub err: ::core::option::Option<Error>,
+    /// Body of the message, a response of the Ark to a request of the host or a
+    /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
         tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
@@ -133,83 +166,113 @@ pub struct ArkToHost {
 }
 /// Nested message and enum types in `ArkToHost`.
 pub mod ark_to_host {
+    /// Body of the message, a response of the Ark to a request of the host or a
+    /// request of its own. The tags are grouped by area, each area with its own range.
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Content {
-        /// Special factory message
+        /// Acknowledges the onboarding
         #[prost(message, tag = "256")]
         Onboard(super::OnboardingResponse),
-        /// System messages, reserved range 0x101-0x200
+        /// Hardware and firmware versions of the Ark
         #[prost(message, tag = "257")]
         DeviceInfo(super::DeviceInfoResponse),
+        /// Challenge for the cloud to sign along its time
         #[prost(message, tag = "258")]
         CloudSyncStart(super::CloudSyncStartResponse),
+        /// Timestamp the Ark accepted from the cloud
         #[prost(message, tag = "259")]
         CloudSyncFinish(super::CloudSyncFinishResponse),
+        /// Encrypted proof of the Ark's genuinity for the cloud
         #[prost(message, tag = "260")]
         GenuinityProof(super::GenuinityProofResponse),
-        /// Firmware update messages, reserved range 0x201-0x300
+        /// Ephemeral key to receive the firmware key with, sealed for the cloud
         #[prost(message, tag = "513")]
         FirmwareUpdatePrep(super::FirmwareUpdatePrepResponse),
+        /// Acknowledges the initiated update
         #[prost(message, tag = "514")]
         FirmwareUpdateInit(super::FirmwareUpdateInitResponse),
+        /// Acknowledges the appended firmware chunk
         #[prost(message, tag = "515")]
         FirmwareUpdateUpload(super::FirmwareUpdateUploadResponse),
+        /// Acknowledges the verified firmware
         #[prost(message, tag = "516")]
         FirmwareUpdateVerify(super::FirmwareUpdateVerifyResponse),
+        /// Acknowledges the installed firmware
         #[prost(message, tag = "517")]
         FirmwareUpdateInstall(super::FirmwareUpdateInstallResponse),
-        /// Pairing messages, reserved range 0x301-0x400
+        /// Whether the Ark is paired and opened
         #[prost(message, tag = "769")]
         PairingStatus(super::PairingStatusResponse),
+        /// Signed authorization for the cloud to open a rendezvous
         #[prost(message, tag = "770")]
         PairingAuth(super::PairingAuthResponse),
+        /// Acknowledges the accepted app identity
         #[prost(message, tag = "771")]
         PairingSetAppId(super::PairingSetAppIdentityResponse),
+        /// Ark device infos and key material, sealed for the app
         #[prost(message, tag = "772")]
         PairingSetAppStorage(super::PairingSetAppStorageResponse),
+        /// Acknowledges the app's receipt of the Ark's keys
         #[prost(message, tag = "773")]
         PairingAckArkStorage(super::PairingAckArkStorageResponse),
+        /// Signed confirmation that the user accepted the pairing
         #[prost(message, tag = "774")]
         PairingAccept(super::PairingAcceptanceResponse),
+        /// Signed confirmation that the Ark finished pairing
         #[prost(message, tag = "775")]
         PairingComplete(super::PairingCompletionResponse),
-        /// Relay messages, reserved range 0x401-0x500
+        /// Signed authorization for the cloud to join the relay
         #[prost(message, tag = "1025")]
         RelayJoin(super::RelayJoinResponse),
+        /// Opaque request from the Ark to the companion app
         #[prost(message, tag = "1026")]
         RelayReq(super::RelayArkToAppRequest),
+        /// Opaque response from the Ark to an app request
         #[prost(message, tag = "1027")]
         RelayRes(super::RelayArkToAppResponse),
+        /// Protocol violation found in an app response, for debugging
         #[prost(message, tag = "1028")]
         RelayFail(super::RelayAppToArkFailure),
-        /// Operational messages, reserved range 0x501-0x600
+        /// Acknowledges the completed unlock
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockResponse),
+        /// Task id for the chunk, schedule and cancel messages
         #[prost(message, tag = "1282")]
         ExecUploadStart(super::ExecutionUploadStartResponse),
+        /// Acknowledges the appended app chunk
         #[prost(message, tag = "1283")]
         ExecUploadChunk(super::ExecutionUploadChunkResponse),
+        /// Acknowledges the authorized and started execution
         #[prost(message, tag = "1284")]
         ExecSched(super::ExecutionScheduleResponse),
+        /// Whether the app still runs, with its result once done
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusResponse),
+        /// Acknowledges the cancelled run or upload
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelResponse),
-        /// Slot messages, reserved range 0x601-0x700
+        /// Current state of every data slot
         #[prost(message, tag = "1537")]
         SlotList(super::SlotListResponse),
+        /// Acknowledges the reset slot
         #[prost(message, tag = "1538")]
         SlotRepair(super::SlotRepairResponse),
+        /// Acknowledges the deleted slot
         #[prost(message, tag = "1539")]
         SlotDelete(super::SlotDeleteResponse),
+        /// Identification of the peeked file
         #[prost(message, tag = "1540")]
         SlotUploadPeek(super::SlotUploadPeekResponse),
+        /// Session id of the approved upload
         #[prost(message, tag = "1541")]
         SlotUploadStart(super::SlotUploadStartResponse),
+        /// Acknowledges the appended slot chunk
         #[prost(message, tag = "1542")]
         SlotUploadChunk(super::SlotUploadChunkResponse),
+        /// Acknowledges the aborted upload
         #[prost(message, tag = "1543")]
         SlotUploadCancel(super::SlotUploadCancelResponse),
+        /// Processing progress of the completed upload
         #[prost(message, tag = "1544")]
         SlotUploadProcess(super::SlotUploadProcessResponse),
         /// Unreleased messages emitted by development firmware only, in response to
@@ -238,9 +301,10 @@ pub struct Error {
 /// the signed device genuinity attestation (certificate).
 ///
 /// Note, as this method is only used during initial device setup, there is no API
-/// compatibility guarantee, it will evolve with the
+/// compatibility guarantee, it will evolve with the factory tooling.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OnboardingRequest {
+    /// Signed device genuinity attestation (CWT) to install
     #[prost(bytes = "vec", tag = "1")]
     pub device_attestation: ::prost::alloc::vec::Vec<u8>,
 }
@@ -806,12 +870,16 @@ pub mod slot_status {
     /// this slot (either filled or dependencies provide enough context).
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Meta {
+        /// Metadata of the reference genome slot
         #[prost(message, tag = "100")]
         ReferenceGenome(super::SlotMetaReferenceGenome),
+        /// Metadata of the gene annotations slot
         #[prost(message, tag = "101")]
         GeneAnnotations(super::SlotMetaGeneAnnotations),
+        /// Metadata of the user's variant calls slot
         #[prost(message, tag = "102")]
         SnpIndelCalls(super::SlotMetaSnpIndelCalls),
+        /// Metadata of the variant catalog slot
         #[prost(message, tag = "103")]
         VariantCatalog(super::SlotMetaVariantCatalog),
     }
@@ -822,6 +890,7 @@ pub struct SlotListRequest {}
 /// SlotListResponse contains the current state of every slot slot.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SlotListResponse {
+    /// State of every slot, one entry per slot kind
     #[prost(message, repeated, tag = "1")]
     pub slots: ::prost::alloc::vec::Vec<SlotStatus>,
 }
@@ -835,6 +904,7 @@ pub struct SlotRepairRequest {
     #[prost(enumeration = "SlotKind", tag = "1")]
     pub slot: i32,
 }
+/// SlotRepairResponse is an empty ack of the repair request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotRepairResponse {}
 /// SlotDeleteRequest removes the contents of a filled slot. The slot must be
@@ -846,6 +916,7 @@ pub struct SlotDeleteRequest {
     #[prost(enumeration = "SlotKind", tag = "1")]
     pub slot: i32,
 }
+/// SlotDeleteResponse is an empty ack of the delete request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotDeleteResponse {}
 /// SlotUploadPeekRequest can be used to send an ephemeral file chunk to the

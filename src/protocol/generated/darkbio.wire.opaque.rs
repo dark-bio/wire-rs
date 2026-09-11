@@ -16,6 +16,8 @@ pub struct HostToArk {
     /// Error encountered while serving the Ark's request (if any)
     #[prost(bytes = "bytes", optional, tag = "2")]
     pub err: ::core::option::Option<::prost::bytes::Bytes>,
+    /// Body of the message, a request of the host or its response to a request of
+    /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
         tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
@@ -24,81 +26,110 @@ pub struct HostToArk {
 }
 /// Nested message and enum types in `HostToArk`.
 pub mod host_to_ark {
+    /// Body of the message, a request of the host or its response to a request of
+    /// the Ark. The tags are grouped by area, each area with its own range.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Content {
-        /// Special factory message
+        /// Installs the signed device attestation at manufacturing
         #[prost(bytes, tag = "256")]
         Onboard(::prost::bytes::Bytes),
-        /// System messages, reserved range 0x101-0x200
+        /// Fetches the hardware and firmware versions
         #[prost(bytes, tag = "257")]
         DeviceInfo(::prost::bytes::Bytes),
+        /// Starts a cloud sync with the attested cloud keys
         #[prost(bytes, tag = "258")]
         CloudSyncStart(::prost::bytes::Bytes),
+        /// Finishes a cloud sync with the signed server time
         #[prost(bytes, tag = "259")]
         CloudSyncFinish(::prost::bytes::Bytes),
+        /// Requests a proof of the device's genuinity
         #[prost(bytes, tag = "260")]
         GenuinityProof(::prost::bytes::Bytes),
-        /// Firmware update messages, reserved range 0x201-0x300
+        /// Prepares an update, aborting any in progress
         #[prost(bytes, tag = "513")]
         FirmwareUpdatePrep(::prost::bytes::Bytes),
+        /// Initiates a prepared update with the sealed firmware key
         #[prost(bytes, tag = "514")]
         FirmwareUpdateInit(::prost::bytes::Bytes),
+        /// Appends a chunk of the firmware archive
         #[prost(bytes, tag = "515")]
         FirmwareUpdateUpload(::prost::bytes::Bytes),
+        /// Decrypts and verifies the uploaded firmware
         #[prost(bytes, tag = "516")]
         FirmwareUpdateVerify(::prost::bytes::Bytes),
+        /// Installs the verified firmware and reboots
         #[prost(bytes, tag = "517")]
         FirmwareUpdateInstall(::prost::bytes::Bytes),
-        /// Pairing messages, reserved range 0x301-0x400
+        /// Queries whether the Ark is paired and opened
         #[prost(bytes, tag = "769")]
         PairingStatus(::prost::bytes::Bytes),
+        /// Asks the Ark to authorize a pairing rendezvous
         #[prost(bytes, tag = "770")]
         PairingAuth(::prost::bytes::Bytes),
+        /// Injects the companion app's identity, relayed by the cloud
         #[prost(bytes, tag = "771")]
         PairingSetAppId(::prost::bytes::Bytes),
+        /// Injects the companion app's storage key material
         #[prost(bytes, tag = "772")]
         PairingSetAppStorage(::prost::bytes::Bytes),
+        /// Confirms the app received the Ark's key material
         #[prost(bytes, tag = "773")]
         PairingAckArkStorage(::prost::bytes::Bytes),
+        /// Waits for the user to accept the pairing
         #[prost(bytes, tag = "774")]
         PairingAccept(::prost::bytes::Bytes),
+        /// Waits for the Ark to finish pairing maintenance
         #[prost(bytes, tag = "775")]
         PairingComplete(::prost::bytes::Bytes),
-        /// Relay messages, reserved range 0x401-0x500
+        /// Asks the Ark to authorize joining the app relay
         #[prost(bytes, tag = "1025")]
         RelayJoin(::prost::bytes::Bytes),
+        /// Opaque request from the companion app to the Ark
         #[prost(bytes, tag = "1026")]
         RelayReq(::prost::bytes::Bytes),
+        /// Opaque response from the companion app to an Ark request
         #[prost(bytes, tag = "1027")]
         RelayRes(::prost::bytes::Bytes),
-        /// Operational messages, reserved range 0x501-0x600
+        /// Starts the unlock, confirmed through the app
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
+        /// Begins a chunked upload of an app to execute
         #[prost(bytes, tag = "1282")]
         ExecUploadStart(::prost::bytes::Bytes),
+        /// Appends a chunk to a pending app upload
         #[prost(bytes, tag = "1283")]
         ExecUploadChunk(::prost::bytes::Bytes),
+        /// Runs an uploaded app, confirmed through the app
         #[prost(bytes, tag = "1284")]
         ExecSched(::prost::bytes::Bytes),
+        /// Checks on a running app
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
+        /// Cancels an app run or a pending upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
-        /// Slot messages, reserved range 0x601-0x700
+        /// Lists the state of every data slot
         #[prost(bytes, tag = "1537")]
         SlotList(::prost::bytes::Bytes),
+        /// Resets a slot to empty whatever its state
         #[prost(bytes, tag = "1538")]
         SlotRepair(::prost::bytes::Bytes),
+        /// Removes the contents of a filled slot
         #[prost(bytes, tag = "1539")]
         SlotDelete(::prost::bytes::Bytes),
+        /// Asks the Ark to identify a file from its first chunk
         #[prost(bytes, tag = "1540")]
         SlotUploadPeek(::prost::bytes::Bytes),
+        /// Starts uploading a file into a slot
         #[prost(bytes, tag = "1541")]
         SlotUploadStart(::prost::bytes::Bytes),
+        /// Appends a chunk to a pending slot upload
         #[prost(bytes, tag = "1542")]
         SlotUploadChunk(::prost::bytes::Bytes),
+        /// Aborts a pending slot upload
         #[prost(bytes, tag = "1543")]
         SlotUploadCancel(::prost::bytes::Bytes),
+        /// Marks an upload complete and polls its processing
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
         /// Unreleased messages served by development firmware only, carried opaquely
@@ -125,6 +156,8 @@ pub struct ArkToHost {
     /// Error encountered while serving the host's request (if any)
     #[prost(bytes = "bytes", optional, tag = "2")]
     pub err: ::core::option::Option<::prost::bytes::Bytes>,
+    /// Body of the message, a response of the Ark to a request of the host or a
+    /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
         tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
@@ -133,83 +166,113 @@ pub struct ArkToHost {
 }
 /// Nested message and enum types in `ArkToHost`.
 pub mod ark_to_host {
+    /// Body of the message, a response of the Ark to a request of the host or a
+    /// request of its own. The tags are grouped by area, each area with its own range.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Content {
-        /// Special factory message
+        /// Acknowledges the onboarding
         #[prost(bytes, tag = "256")]
         Onboard(::prost::bytes::Bytes),
-        /// System messages, reserved range 0x101-0x200
+        /// Hardware and firmware versions of the Ark
         #[prost(bytes, tag = "257")]
         DeviceInfo(::prost::bytes::Bytes),
+        /// Challenge for the cloud to sign along its time
         #[prost(bytes, tag = "258")]
         CloudSyncStart(::prost::bytes::Bytes),
+        /// Timestamp the Ark accepted from the cloud
         #[prost(bytes, tag = "259")]
         CloudSyncFinish(::prost::bytes::Bytes),
+        /// Encrypted proof of the Ark's genuinity for the cloud
         #[prost(bytes, tag = "260")]
         GenuinityProof(::prost::bytes::Bytes),
-        /// Firmware update messages, reserved range 0x201-0x300
+        /// Ephemeral key to receive the firmware key with, sealed for the cloud
         #[prost(bytes, tag = "513")]
         FirmwareUpdatePrep(::prost::bytes::Bytes),
+        /// Acknowledges the initiated update
         #[prost(bytes, tag = "514")]
         FirmwareUpdateInit(::prost::bytes::Bytes),
+        /// Acknowledges the appended firmware chunk
         #[prost(bytes, tag = "515")]
         FirmwareUpdateUpload(::prost::bytes::Bytes),
+        /// Acknowledges the verified firmware
         #[prost(bytes, tag = "516")]
         FirmwareUpdateVerify(::prost::bytes::Bytes),
+        /// Acknowledges the installed firmware
         #[prost(bytes, tag = "517")]
         FirmwareUpdateInstall(::prost::bytes::Bytes),
-        /// Pairing messages, reserved range 0x301-0x400
+        /// Whether the Ark is paired and opened
         #[prost(bytes, tag = "769")]
         PairingStatus(::prost::bytes::Bytes),
+        /// Signed authorization for the cloud to open a rendezvous
         #[prost(bytes, tag = "770")]
         PairingAuth(::prost::bytes::Bytes),
+        /// Acknowledges the accepted app identity
         #[prost(bytes, tag = "771")]
         PairingSetAppId(::prost::bytes::Bytes),
+        /// Ark device infos and key material, sealed for the app
         #[prost(bytes, tag = "772")]
         PairingSetAppStorage(::prost::bytes::Bytes),
+        /// Acknowledges the app's receipt of the Ark's keys
         #[prost(bytes, tag = "773")]
         PairingAckArkStorage(::prost::bytes::Bytes),
+        /// Signed confirmation that the user accepted the pairing
         #[prost(bytes, tag = "774")]
         PairingAccept(::prost::bytes::Bytes),
+        /// Signed confirmation that the Ark finished pairing
         #[prost(bytes, tag = "775")]
         PairingComplete(::prost::bytes::Bytes),
-        /// Relay messages, reserved range 0x401-0x500
+        /// Signed authorization for the cloud to join the relay
         #[prost(bytes, tag = "1025")]
         RelayJoin(::prost::bytes::Bytes),
+        /// Opaque request from the Ark to the companion app
         #[prost(bytes, tag = "1026")]
         RelayReq(::prost::bytes::Bytes),
+        /// Opaque response from the Ark to an app request
         #[prost(bytes, tag = "1027")]
         RelayRes(::prost::bytes::Bytes),
+        /// Protocol violation found in an app response, for debugging
         #[prost(bytes, tag = "1028")]
         RelayFail(::prost::bytes::Bytes),
-        /// Operational messages, reserved range 0x501-0x600
+        /// Acknowledges the completed unlock
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
+        /// Task id for the chunk, schedule and cancel messages
         #[prost(bytes, tag = "1282")]
         ExecUploadStart(::prost::bytes::Bytes),
+        /// Acknowledges the appended app chunk
         #[prost(bytes, tag = "1283")]
         ExecUploadChunk(::prost::bytes::Bytes),
+        /// Acknowledges the authorized and started execution
         #[prost(bytes, tag = "1284")]
         ExecSched(::prost::bytes::Bytes),
+        /// Whether the app still runs, with its result once done
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
+        /// Acknowledges the cancelled run or upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
-        /// Slot messages, reserved range 0x601-0x700
+        /// Current state of every data slot
         #[prost(bytes, tag = "1537")]
         SlotList(::prost::bytes::Bytes),
+        /// Acknowledges the reset slot
         #[prost(bytes, tag = "1538")]
         SlotRepair(::prost::bytes::Bytes),
+        /// Acknowledges the deleted slot
         #[prost(bytes, tag = "1539")]
         SlotDelete(::prost::bytes::Bytes),
+        /// Identification of the peeked file
         #[prost(bytes, tag = "1540")]
         SlotUploadPeek(::prost::bytes::Bytes),
+        /// Session id of the approved upload
         #[prost(bytes, tag = "1541")]
         SlotUploadStart(::prost::bytes::Bytes),
+        /// Acknowledges the appended slot chunk
         #[prost(bytes, tag = "1542")]
         SlotUploadChunk(::prost::bytes::Bytes),
+        /// Acknowledges the aborted upload
         #[prost(bytes, tag = "1543")]
         SlotUploadCancel(::prost::bytes::Bytes),
+        /// Processing progress of the completed upload
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
         /// Unreleased messages emitted by development firmware only, in response to
