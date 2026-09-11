@@ -143,7 +143,7 @@ fn test_model_scripts() {
     }
     run_actions(&[
         (Receive, 0, 10, 0),
-        (AbandonmentTimeout, 0, 0, 10),
+        (AutoreplyTimeout, 0, 0, 10),
         (Abandon, 0, 0, 0),
         (Outgoing, 0, 0, 0),
         (Written, 0, 0, 0),
@@ -291,7 +291,7 @@ fn test_batched_abandonment() {
             (Receive, 0, 30, 0),
         ];
         if let Some(timeout) = timeout {
-            actions.push((AbandonmentTimeout, 0, 0, timeout));
+            actions.push((AutoreplyTimeout, 0, 0, timeout));
         }
         actions.extend([
             (Abandon, 2, 0, 0),

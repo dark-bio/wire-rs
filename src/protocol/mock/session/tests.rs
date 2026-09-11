@@ -595,7 +595,7 @@ fn test_observer_drop_keeps_operations() {
 /// Abandonment uses its own configured budget starting at drop, including
 /// queueing. Failed or expired automatic replies do not retry with a fresh budget.
 #[test]
-fn test_abandonment_timeout() {
+fn test_autoreply_timeout() {
     use super::ExpectedMessage;
     use Failure::*;
     use Step::*;
@@ -603,7 +603,7 @@ fn test_abandonment_timeout() {
     run(vec![
         Open(1),
         Accept(1),
-        AbandonmentTimeout(1, Duration::from_millis(30)),
+        AutoreplyTimeout(1, Duration::from_millis(30)),
         Request(1, 0, 10, 200),
         Outgoing(1, 0, ExpectedMessage::Request(10), 200), // Hold unrelated output throughout.
         Deliver(1, 7, 30),
@@ -640,7 +640,7 @@ fn test_abandonment_timeout() {
         run(vec![
             Open(1),
             Accept(1),
-            AbandonmentTimeout(1, budget),
+            AutoreplyTimeout(1, budget),
             Deliver(1, 7, 30),
             Receive(1, 30, 0),
             DropReply(0),
@@ -653,7 +653,7 @@ fn test_abandonment_timeout() {
 /// Drops use current configuration, queued replies keep their deadlines, and
 /// replacement sessions start with the server's default.
 #[test]
-fn test_abandonment_timeout_updates() {
+fn test_autoreply_timeout_updates() {
     use super::ExpectedMessage;
     use Step::*;
     use std::time::Duration;
@@ -668,11 +668,11 @@ fn test_abandonment_timeout_updates() {
         Receive(1, 32, 2),
         Time(20),
         DropReply(0), // Uses the five-second default.
-        AbandonmentTimeout(1, Duration::from_millis(30)),
+        AutoreplyTimeout(1, Duration::from_millis(30)),
         Outgoing(1, 0, ExpectedMessage::Reply(7, Err(1)), 5020),
         Written(0, Ok(())),
         DropReply(1), // Held since before reconfiguration, now uses 30ms.
-        AbandonmentTimeout(1, Duration::from_millis(90)),
+        AutoreplyTimeout(1, Duration::from_millis(90)),
         Outgoing(1, 1, ExpectedMessage::Reply(8, Err(1)), 50),
         Written(1, Ok(())),
         DropReply(2),
@@ -691,19 +691,19 @@ fn test_abandonment_timeout_updates() {
 /// Server timeouts reach pending, accepted and future sessions. Queued replies
 /// keep their deadlines, and a session override does not change the server default.
 #[test]
-fn test_server_abandonment_timeout() {
+fn test_server_autoreply_timeout() {
     use super::ExpectedMessage;
     use Step::*;
     run(vec![
         ServerInboundLimits(2, 100),
-        ServerAbandonmentTimeout(Duration::from_millis(30)),
+        ServerAutoreplyTimeout(Duration::from_millis(30)),
         Open(1),
         Accept(1),
         Deliver(1, 7, 11),
         Receive(1, 11, 0),
         Time(20),
         DropReply(0),
-        ServerAbandonmentTimeout(Duration::from_millis(40)),
+        ServerAutoreplyTimeout(Duration::from_millis(40)),
         Deliver(1, 8, 12),
         Receive(1, 12, 1),
         DropReply(1),
@@ -713,7 +713,7 @@ fn test_server_abandonment_timeout() {
         Outgoing(1, 1, ExpectedMessage::Reply(8, Err(1)), 60),
         Written(1, Ok(())),
         Usage(1, 0, 0),
-        AbandonmentTimeout(1, Duration::from_millis(90)),
+        AutoreplyTimeout(1, Duration::from_millis(90)),
         Deliver(1, 9, 13),
         Receive(1, 13, 2),
         DropReply(2),
@@ -728,28 +728,28 @@ fn test_server_abandonment_timeout() {
         Written(3, Ok(())),
         Deliver(2, 8, 15),
         Receive(2, 15, 4),
-        AbandonmentTimeout(2, Duration::from_millis(90)),
-        ServerAbandonmentTimeout(Duration::from_millis(50)),
+        AutoreplyTimeout(2, Duration::from_millis(90)),
+        ServerAutoreplyTimeout(Duration::from_millis(50)),
         DropReply(4),
         Outgoing(2, 4, ExpectedMessage::Reply(8, Err(1)), 70),
         Written(4, Ok(())),
         Open(3),
         Deliver(3, 7, 16),
-        ServerAbandonmentTimeout(Duration::from_millis(60)),
+        ServerAutoreplyTimeout(Duration::from_millis(60)),
         Accept(3),
         Receive(3, 16, 5),
         DropReply(5),
         Outgoing(3, 5, ExpectedMessage::Reply(7, Err(1)), 80),
         Written(5, Ok(())),
         CloseServer,
-        ServerAbandonmentTimeout(Duration::from_millis(70)),
+        ServerAutoreplyTimeout(Duration::from_millis(70)),
         RefuseOpen(Failure::Closed),
         ReceiveError(3, Failure::Closed),
     ]);
     for timeout in [Duration::ZERO, Duration::MAX] {
         run(vec![
             ServerInboundLimits(1, 100),
-            ServerAbandonmentTimeout(timeout),
+            ServerAutoreplyTimeout(timeout),
             Open(1),
             Accept(1),
             Deliver(1, 7, 11),
@@ -773,14 +773,14 @@ fn test_server_abandonment_timeout() {
 /// Attachment cannot miss a timeout update. A concurrent responder drop uses
 /// either the old or new timeout, and its queued reply is never retimed.
 #[test]
-fn test_server_abandonment_races() {
+fn test_server_autoreply_timeout_races() {
     use crate::protocol::Server;
     let timeout = Duration::from_millis(30);
     for order in orders() {
         let (server, mut source) = Server::fixture();
         let (mut server, (_source, state)) = schedule(
             order,
-            move || server.set_abandonment_timeout(timeout),
+            move || server.set_autoreply_timeout(timeout),
             move || {
                 let state = source.open().unwrap().upgrade().unwrap();
                 (source, state)
@@ -809,7 +809,7 @@ fn test_server_abandonment_races() {
         .finish();
         let (_server, ()) = schedule(
             order,
-            move || server.set_abandonment_timeout(2 * timeout),
+            move || server.set_autoreply_timeout(2 * timeout),
             move || drop(responder),
         );
         let outgoing = state.take_outgoing().unwrap();
@@ -979,6 +979,131 @@ fn incoming(id: u64, tag: u8) -> Vec<u8> {
     Side::Client.encode(id, Ok(vec![tag].into())).unwrap()
 }
 
+/// Builds a request carrying one byte under the unknown content tag 0x7ff.
+fn unknown(id: u64) -> Vec<u8> {
+    let mut bytes = HostToArk {
+        id,
+        err: None,
+        content: None,
+    }
+    .encode_to_vec();
+    bytes.extend_from_slice(&[0xfa, 0x7f, 0x01, 0x2a]);
+    bytes
+}
+
+/// Unknown requests retain a slot until the writer takes their automatic reply,
+/// without buffering the body or delivering it to the application. Finishing
+/// that write must not release a later request reusing the same ID.
+#[test]
+fn test_unknown_request_content() {
+    use super::ExpectedMessage;
+    use Step::*;
+
+    run(vec![
+        Open(0),
+        Accept(0),
+        AutoreplyTimeout(0, Duration::from_millis(30)),
+        Raw(0, unknown(1), Ok(())),
+        Usage(0, 1, 0),
+        Outgoing(
+            0,
+            0,
+            ExpectedMessage::Reply(1, Err(schema::ReservedErrors::Unknown as u64)),
+            30,
+        ),
+        Usage(0, 0, 0),
+        Raw(0, incoming(1, 11), Ok(())),
+        Receive(0, 11, 0),
+        Written(0, Ok(())),
+        Usage(0, 1, 0),
+        Raw(0, unknown(1), Err(Failure::Malformed)),
+    ]);
+}
+
+/// A queued UNKNOWN reply reserves its ID against known and unknown requests.
+#[test]
+fn test_unknown_request_duplicate_ids() {
+    use Step::*;
+
+    for duplicate in [unknown(1), incoming(1, 11)] {
+        run(vec![
+            Open(0),
+            Accept(0),
+            Raw(0, unknown(1), Ok(())),
+            Raw(0, duplicate, Err(Failure::Malformed)),
+        ]);
+    }
+}
+
+/// Automatic replies share the request limit with application requests,
+/// including when the limit is zero or lowered while a reply is queued.
+#[test]
+fn test_unknown_request_limits() {
+    use Step::*;
+
+    for (first, next) in [
+        (unknown(1), unknown(3)),
+        (unknown(1), incoming(3, 11)),
+        (incoming(1, 11), unknown(3)),
+    ] {
+        run(vec![
+            Open(0),
+            Accept(0),
+            InboundLimits(0, 1, DEFAULT_MAX_INBOUND_BYTES),
+            Raw(0, first, Ok(())),
+            Raw(0, next, Err(Failure::Requests)),
+            Usage(0, 0, 0),
+            NoOutgoing(0),
+        ]);
+    }
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 0, DEFAULT_MAX_INBOUND_BYTES),
+        Raw(0, unknown(1), Err(Failure::Requests)),
+        Open(1),
+        Accept(1),
+        Raw(1, unknown(1), Ok(())),
+        InboundLimits(1, 0, DEFAULT_MAX_INBOUND_BYTES),
+        ReceiveError(1, Failure::Requests),
+        NoOutgoing(1),
+    ]);
+}
+
+/// Expiring an automatic reply releases its slot and ID, including immediate
+/// expiry. Unknown bodies consume no retained bytes even with a zero byte limit.
+#[test]
+fn test_unknown_request_expiry() {
+    use Step::*;
+
+    run(vec![
+        Open(0),
+        Accept(0),
+        InboundLimits(0, 1, 0),
+        AutoreplyTimeout(0, Duration::from_millis(30)),
+        Raw(0, unknown(1), Ok(())),
+        Usage(0, 1, 0),
+        Deadline(0, Some(30)),
+        Time(30),
+        Expire(0),
+        Usage(0, 0, 0),
+        NoOutgoing(0),
+        Deadline(0, None),
+        AutoreplyTimeout(0, Duration::ZERO),
+        Raw(0, unknown(1), Ok(())),
+        Usage(0, 0, 0),
+        NoOutgoing(0),
+        AutoreplyTimeout(0, Duration::from_millis(30)),
+        Raw(0, unknown(1), Ok(())),
+        Usage(0, 1, 0),
+        SendNext(0, 0, 1),
+        Usage(0, 0, 0),
+        Raw(0, unknown(1), Ok(())),
+        Written(0, Ok(())),
+        Usage(0, 1, 0),
+    ]);
+}
+
 /// A request slot follows the responder and queued reply, not just the inbox.
 #[test]
 fn test_inbound_request_accounting() {
@@ -1009,7 +1134,7 @@ fn test_inbound_request_accounting() {
         Usage(0, 0, 0),
         Raw(0, incoming(1, 15), Ok(())),
         Receive(0, 15, 2),
-        AbandonmentTimeout(0, std::time::Duration::ZERO),
+        AutoreplyTimeout(0, std::time::Duration::ZERO),
         DropReply(2),
         Usage(0, 0, 0),
     ]);

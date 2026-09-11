@@ -51,7 +51,16 @@ fn main() {
         )
         .unwrap();
         for field in &message.field {
-            if field.oneof_index != Some(oneof as i32) {
+            // The reader tells unknown content from the envelope's own fields by
+            // their tag range, so the layout is enforced here
+            let content = field.oneof_index == Some(oneof as i32);
+            assert_eq!(
+                field.number() >= 0x100,
+                content,
+                "field {} breaks the envelope tag layout",
+                field.name()
+            );
+            if !content {
                 continue;
             }
             // Full body names distinguish requests and responses even when their

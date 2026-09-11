@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-wire"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Encrypted protocol between Ark and host"
 repository = "https://github.com/dark-bio/wire-rs"

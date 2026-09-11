@@ -24,7 +24,12 @@
 //! of every body in the [`schema`]. The [`schema::host_to_ark::Content`] and
 //! [`schema::ark_to_host::Content`] oneofs hold what each side may send. Convert
 //! a received [`Message`] into the peer's oneof to dispatch on it exhaustively.
-//! Callers select response types when waiting on [`Promise<Message>`].
+//! Callers select response types when waiting on [`Promise<Message>`]. A request
+//! is refused with a [`schema::Error`], an application's own error type converting
+//! into one through [`CodedError`]. A request whose content this build does not
+//! know is refused as `UNKNOWN` by the session itself, so a newer peer learns what
+//! an older one serves. A response of unknown content is malformed, no request
+//! having asked for it.
 //!
 //! Requests and replies return promises without waiting for I/O. Their deadlines
 //! include time in the outgoing queue; `wait()` does not restart the timeout.
@@ -56,7 +61,7 @@ mod worker;
 pub mod mock;
 
 pub use closer::Closer;
-pub use error::Error;
+pub use error::{CodedError, Error};
 pub use message::Message;
 pub use promise::Promise;
 pub use requester::Requester;
@@ -66,11 +71,12 @@ pub use session::{Session, connect};
 
 use std::time::Duration;
 
-/// Default timeout for sending an automatic `UNANSWERED` reply. Starts when the
-/// responder is dropped and includes time in the outgoing queue. Configure it
-/// with [`Session::set_abandonment_timeout`] or [`Server::set_abandonment_timeout`].
-/// Transport write timeouts are independent.
-pub const DEFAULT_ABANDONMENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default timeout for sending an automatic reply, `UNANSWERED` when a responder
+/// is dropped or `UNKNOWN` to a request this build does not know. Starts when
+/// the responder is dropped or the request arrives and includes time in the
+/// outgoing queue. Configure it with [`Session::set_autoreply_timeout`] or
+/// [`Server::set_autoreply_timeout`]. Transport write timeouts are independent.
+pub const DEFAULT_AUTOREPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default limit of 1,024 accepted peer requests per session. A request counts
 /// while queued, held by a responder, or waiting to send its reply. The slot is

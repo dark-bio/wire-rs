@@ -127,3 +127,26 @@ impl schema::Error {
         Self::new(code as u64, msg)
     }
 }
+
+/// An application failure a request is answered with. The peer dispatches on
+/// the code and may show the message. Codes below 0x100 are the protocol's
+/// [`schema::ReservedErrors`], an application assigns its own from 0x100 up.
+///
+/// Implementing it converts the error into [`schema::Error`], so a handler can
+/// fail a request with `?` and [`super::Responder::fail`] takes it directly.
+pub trait CodedError: std::error::Error {
+    /// Code identifying the failure to the peer.
+    fn code(&self) -> u64;
+}
+
+impl<E: CodedError> From<E> for schema::Error {
+    /// Converts an application error into its wire form, the code as assigned
+    /// and the message as displayed.
+    fn from(error: E) -> Self {
+        debug_assert!(
+            error.code() >= 0x100,
+            "application error code in the reserved range"
+        );
+        Self::new(error.code(), error.to_string())
+    }
+}

@@ -7,7 +7,7 @@ use super::envelope::Side;
 use super::session::SessionInner;
 use super::worker;
 use super::{
-    Closer, DEFAULT_ABANDONMENT_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
+    Closer, DEFAULT_AUTOREPLY_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
     Error, Session,
 };
 use crate::transport::{self, Attester, Read, Stream, Write};
@@ -42,7 +42,7 @@ impl Server {
                 state: Mutex::new(State::Open {
                     max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                     max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
-                    abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
+                    autoreply_timeout: DEFAULT_AUTOREPLY_TIMEOUT,
                     session: Weak::new(),
                     ready: None,
                     #[cfg(any(test, feature = "fuzz"))]
@@ -67,15 +67,15 @@ impl Server {
         server
     }
 
-    /// Sets the lifetime of automatic `UNANSWERED` replies for the current and
-    /// future sessions. Defaults to [`DEFAULT_ABANDONMENT_TIMEOUT`]. Applies even
-    /// before `accept()`. Replies already queued keep their deadlines.
+    /// Sets the timeout for automatic `UNANSWERED` and `UNKNOWN` replies in the
+    /// current and future sessions. Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`].
+    /// Applies even before `accept()`. Replies already queued keep their deadlines.
     ///
-    /// See [`Session::set_abandonment_timeout`] for when the timeout starts and
+    /// See [`Session::set_autoreply_timeout`] for when the timeout starts and
     /// expires. Changing a session's timeout leaves the server's default unchanged.
     /// This method also replaces a timeout set directly on the current session.
-    pub fn set_abandonment_timeout(self, timeout: Duration) -> Self {
-        self.inner.set_abandonment_timeout(timeout);
+    pub fn set_autoreply_timeout(self, timeout: Duration) -> Self {
+        self.inner.set_autoreply_timeout(timeout);
         self
     }
 
@@ -244,7 +244,7 @@ enum State {
         /// Encoded-byte ceiling applied independently to each session.
         max_inbound_bytes: usize,
         /// Automatic reply timeout applied to the current and future sessions.
-        abandonment: Duration,
+        autoreply_timeout: Duration,
         /// Lets server closure close the session after `accept()` returns it.
         session: Weak<SessionInner>,
         /// Session waiting for `accept()`. A new handshake replaces it.
@@ -266,17 +266,17 @@ enum State {
 impl ServerInner {
     /// Updates the current session and default under the attachment lock.
     /// Lock order is server then session, as with inbound limit updates.
-    fn set_abandonment_timeout(&self, timeout: Duration) {
+    fn set_autoreply_timeout(&self, timeout: Duration) {
         let mut state = self.state.lock().expect("server state not poisoned");
         if let State::Open {
-            abandonment,
+            autoreply_timeout,
             session,
             ..
         } = &mut *state
         {
-            *abandonment = timeout;
+            *autoreply_timeout = timeout;
             if let Some(session) = session.upgrade() {
-                session.set_abandonment_timeout(timeout);
+                session.set_autoreply_timeout(timeout);
             }
         }
     }
@@ -371,7 +371,7 @@ impl ServerInner {
                     session: attached,
                     max_inbound_requests,
                     max_inbound_bytes,
-                    abandonment,
+                    autoreply_timeout,
                     ready,
                     ..
                 } => {
@@ -380,7 +380,7 @@ impl ServerInner {
                     session
                         .inner
                         .set_inbound_limits(*max_inbound_requests, *max_inbound_bytes);
-                    session.inner.set_abandonment_timeout(*abandonment);
+                    session.inner.set_autoreply_timeout(*autoreply_timeout);
                     *attached = Arc::downgrade(&session.inner);
                     ready.replace(session)
                 }
@@ -408,7 +408,7 @@ impl Server {
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
-                abandonment: DEFAULT_ABANDONMENT_TIMEOUT,
+                autoreply_timeout: DEFAULT_AUTOREPLY_TIMEOUT,
                 session: Weak::new(),
                 ready: None,
                 wait_hook: None,

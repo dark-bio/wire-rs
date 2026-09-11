@@ -163,6 +163,18 @@ enum ReservedErrors {
 
   // The request's responder was released without providing an application reply.
   RESERVED_ERRORS_UNANSWERED = 1;
+
+  // The peer does not know this request. Emitted by the protocol layer itself
+  // when a request's content is not in its schema.
+  RESERVED_ERRORS_UNKNOWN = 2;
+
+  // The peer knows this request but never serves it in this build or role,
+  // firmware updates on an emulator or develop envelopes on production.
+  RESERVED_ERRORS_UNSUPPORTED = 3;
+
+  // The peer serves this request but not in its current state, before cloud
+  // sync or pairing. It may once the state changes.
+  RESERVED_ERRORS_UNAVAILABLE = 4;
 }
 
 

@@ -131,6 +131,51 @@ fn test_envelope_shapes() {
     }
 }
 
+/// Content of a tag the schema does not have is unknown content to the header
+/// decoder and refused by the full one. A future envelope field below the
+/// content tags is not content, and unknown content next to an error is both.
+#[test]
+fn test_unknown_content() {
+    use prost::encoding::{WireType, encode_key};
+
+    /// Encodes an envelope with the given error and a bytes field of the tag.
+    fn envelope(id: u64, err: Option<schema::Error>, tag: u32) -> Vec<u8> {
+        let mut bytes = HostToArk {
+            id,
+            err,
+            content: None,
+        }
+        .encode_to_vec();
+        encode_key(tag, WireType::LengthDelimited, &mut bytes);
+        bytes.extend_from_slice(&[1, 0x2a]);
+        bytes
+    }
+    // These fields have identical encodings in both envelope directions.
+    for (direction, side) in [(0, Side::Server), (1, Side::Client)] {
+        let unknown = envelope(5, None, 0x7ff);
+        let header = side.decode_header(Bytes::from(unknown.clone())).unwrap();
+        assert_eq!(header.id, 5);
+        assert!(!header.failed);
+        assert!(header.unknown);
+        assert_eq!(header.payload, Some("unknown"));
+        assert!(side.decode(&unknown).is_err());
+
+        let future = envelope(5, None, 0x7f);
+        assert!(side.decode_header(Bytes::from(future.clone())).is_err());
+
+        let both = envelope(5, Some(schema::Error::new(7, "refused")), 0x7ff);
+        assert!(side.decode_header(Bytes::from(both.clone())).is_err());
+        // Full protobuf decoding ignores the unknown content beside the error.
+        assert!(side.decode(&both).is_ok());
+
+        for bytes in [unknown, future, both] {
+            let mut input = vec![direction];
+            input.extend_from_slice(&bytes);
+            assert!(!run(&input));
+        }
+    }
+}
+
 /// Unknown fields and noncanonical ID encodings preserve the decoded message.
 /// Re-encoding normalizes them, so its size need not match the received bytes.
 #[test]
