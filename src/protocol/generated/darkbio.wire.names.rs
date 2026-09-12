@@ -31,11 +31,12 @@ impl opaque::host_to_ark::Content {
             Self::SlotList(..) => "slot_list",
             Self::SlotRepair(..) => "slot_repair",
             Self::SlotDelete(..) => "slot_delete",
-            Self::SlotUploadPeek(..) => "slot_upload_peek",
+            Self::SlotIdentify(..) => "slot_identify",
             Self::SlotUploadStart(..) => "slot_upload_start",
             Self::SlotUploadChunk(..) => "slot_upload_chunk",
             Self::SlotUploadCancel(..) => "slot_upload_cancel",
             Self::SlotUploadProcess(..) => "slot_upload_process",
+            Self::DatasetPaths(..) => "dataset_paths",
             Self::Develop(..) => "develop",
         }
     }
@@ -73,11 +74,12 @@ impl opaque::ark_to_host::Content {
             Self::SlotList(..) => "slot_list",
             Self::SlotRepair(..) => "slot_repair",
             Self::SlotDelete(..) => "slot_delete",
-            Self::SlotUploadPeek(..) => "slot_upload_peek",
+            Self::SlotIdentify(..) => "slot_identify",
             Self::SlotUploadStart(..) => "slot_upload_start",
             Self::SlotUploadChunk(..) => "slot_upload_chunk",
             Self::SlotUploadCancel(..) => "slot_upload_cancel",
             Self::SlotUploadProcess(..) => "slot_upload_process",
+            Self::DatasetPaths(..) => "dataset_paths",
             Self::Develop(..) => "develop",
         }
     }

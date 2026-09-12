@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Encrypted sessions over a duplex byte stream. COBS framing separates packets,
 //! the handshake establishes encryption contexts, and sealing protects messages.

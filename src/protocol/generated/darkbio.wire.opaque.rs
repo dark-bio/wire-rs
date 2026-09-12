@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -119,7 +119,7 @@ pub mod host_to_ark {
         SlotDelete(::prost::bytes::Bytes),
         /// Asks the Ark to identify a file from its first chunk
         #[prost(bytes, tag = "1540")]
-        SlotUploadPeek(::prost::bytes::Bytes),
+        SlotIdentify(::prost::bytes::Bytes),
         /// Starts uploading a file into a slot
         #[prost(bytes, tag = "1541")]
         SlotUploadStart(::prost::bytes::Bytes),
@@ -132,6 +132,9 @@ pub mod host_to_ark {
         /// Marks an upload complete and polls its processing
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
+        /// Maps every path an app can read, from the dataset view
+        #[prost(bytes, tag = "1793")]
+        DatasetPaths(::prost::bytes::Bytes),
         /// Unreleased messages served by development firmware only, carried opaquely
         /// so the public protocol is untouched while they are still under development.
         /// Their schema is private and production Arks refuse the envelope.
@@ -160,7 +163,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -260,9 +263,9 @@ pub mod ark_to_host {
         /// Acknowledges the deleted slot
         #[prost(bytes, tag = "1539")]
         SlotDelete(::prost::bytes::Bytes),
-        /// Identification of the peeked file
+        /// Identification of the file's first chunk
         #[prost(bytes, tag = "1540")]
-        SlotUploadPeek(::prost::bytes::Bytes),
+        SlotIdentify(::prost::bytes::Bytes),
         /// Session id of the approved upload
         #[prost(bytes, tag = "1541")]
         SlotUploadStart(::prost::bytes::Bytes),
@@ -275,6 +278,9 @@ pub mod ark_to_host {
         /// Processing progress of the completed upload
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
+        /// Generated README.md of the dataset view
+        #[prost(bytes, tag = "1793")]
+        DatasetPaths(::prost::bytes::Bytes),
         /// Unreleased messages emitted by development firmware only, in response to
         /// a develop request, carried opaquely so the public protocol is untouched
         /// while they are still under development. Their schema is private.

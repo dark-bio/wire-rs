@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Standard byte I/O with separate read and write deadlines. Transport chooses
 //! an absolute deadline. The adapter limits how long its I/O can block and keeps

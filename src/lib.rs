@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 // Allow excluding test code from coverage measurements on nightly
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
