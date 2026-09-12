@@ -20,6 +20,11 @@ pub use darkbio_crypto as crypto;
 pub use darkbio_trust as trust;
 pub use prost;
 
+/// Version of the wire crate compiled into this process. It's mostly a debug
+/// utility to help detect protocol version mismatches without having to guess
+/// who compiled what into where.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 

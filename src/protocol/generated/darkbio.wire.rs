@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -60,26 +60,23 @@ pub mod host_to_ark {
         /// Installs the verified firmware and reboots
         #[prost(message, tag = "517")]
         FirmwareUpdateInstall(super::FirmwareUpdateInstallRequest),
-        /// Queries whether the Ark is paired and opened
-        #[prost(message, tag = "769")]
-        PairingStatus(super::PairingStatusRequest),
         /// Asks the Ark to authorize a pairing rendezvous
-        #[prost(message, tag = "770")]
+        #[prost(message, tag = "769")]
         PairingAuth(super::PairingAuthRequest),
         /// Injects the companion app's identity, relayed by the cloud
-        #[prost(message, tag = "771")]
+        #[prost(message, tag = "770")]
         PairingSetAppId(super::PairingSetAppIdentityRequest),
         /// Injects the companion app's storage key material
-        #[prost(message, tag = "772")]
+        #[prost(message, tag = "771")]
         PairingSetAppStorage(super::PairingSetAppStorageRequest),
         /// Confirms the app received the Ark's key material
-        #[prost(message, tag = "773")]
+        #[prost(message, tag = "772")]
         PairingAckArkStorage(super::PairingAckArkStorageRequest),
         /// Waits for the user to accept the pairing
-        #[prost(message, tag = "774")]
+        #[prost(message, tag = "773")]
         PairingAccept(super::PairingAcceptanceRequest),
         /// Waits for the Ark to finish pairing maintenance
-        #[prost(message, tag = "775")]
+        #[prost(message, tag = "774")]
         PairingComplete(super::PairingCompletionRequest),
         /// Asks the Ark to authorize joining the app relay
         #[prost(message, tag = "1025")]
@@ -163,7 +160,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -203,26 +200,23 @@ pub mod ark_to_host {
         /// Acknowledges the installed firmware
         #[prost(message, tag = "517")]
         FirmwareUpdateInstall(super::FirmwareUpdateInstallResponse),
-        /// Whether the Ark is paired and opened
-        #[prost(message, tag = "769")]
-        PairingStatus(super::PairingStatusResponse),
         /// Signed authorization for the cloud to open a rendezvous
-        #[prost(message, tag = "770")]
+        #[prost(message, tag = "769")]
         PairingAuth(super::PairingAuthResponse),
         /// Acknowledges the accepted app identity
-        #[prost(message, tag = "771")]
+        #[prost(message, tag = "770")]
         PairingSetAppId(super::PairingSetAppIdentityResponse),
         /// Ark device infos and key material, sealed for the app
-        #[prost(message, tag = "772")]
+        #[prost(message, tag = "771")]
         PairingSetAppStorage(super::PairingSetAppStorageResponse),
         /// Acknowledges the app's receipt of the Ark's keys
-        #[prost(message, tag = "773")]
+        #[prost(message, tag = "772")]
         PairingAckArkStorage(super::PairingAckArkStorageResponse),
         /// Signed confirmation that the user accepted the pairing
-        #[prost(message, tag = "774")]
+        #[prost(message, tag = "773")]
         PairingAccept(super::PairingAcceptanceResponse),
         /// Signed confirmation that the Ark finished pairing
-        #[prost(message, tag = "775")]
+        #[prost(message, tag = "774")]
         PairingComplete(super::PairingCompletionResponse),
         /// Signed authorization for the cloud to join the relay
         #[prost(message, tag = "1025")]
@@ -341,12 +335,18 @@ pub struct DeviceInfoResponse {
     /// Current firmware publish unix timestamp
     #[prost(uint64, tag = "8")]
     pub firmware_publish: u64,
-    /// Accepted cloud identity expiry unix timestamp (0 if not synced)
-    #[prost(uint64, tag = "9")]
-    pub cloud_expiry: u64,
-    /// Current device clock unix timestamp
+    /// Whether a cloud identity was accepted since boot
+    #[prost(bool, tag = "9")]
+    pub cloud_synced: bool,
+    /// Current device clock unix timestamp, set by the cloud sync
     #[prost(uint64, tag = "10")]
-    pub clock: u64,
+    pub cloud_clock: u64,
+    /// Whether the Ark is paired with a companion app (user data initialized)
+    #[prost(bool, tag = "11")]
+    pub paired: bool,
+    /// Whether the user data storage is open (false if unpaired)
+    #[prost(bool, tag = "12")]
+    pub unlocked: bool,
 }
 /// CloudSyncStartRequest requests the device to start a synchronization procedure
 /// against the cloud servers to establish the current time as well as the currently
@@ -475,19 +475,6 @@ pub struct FirmwareUpdateInstallRequest {}
 /// successfully or not.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FirmwareUpdateInstallResponse {}
-/// PairingStatusRequest requests the initialization status from the device.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PairingStatusRequest {}
-/// PairingStatusResponse is the initialization status response of the device.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PairingStatusResponse {
-    /// Whether the device has user data initialized
-    #[prost(bool, tag = "1")]
-    pub paired: bool,
-    /// Whether the device is currently opened (false if not paired)
-    #[prost(bool, tag = "2")]
-    pub opened: bool,
-}
 /// PairingAuthRequest requests the initiation of a pairing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PairingAuthRequest {}

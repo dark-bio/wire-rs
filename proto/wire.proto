@@ -45,13 +45,12 @@ message HostToArk {
 
     // Pairing messages, reserved range 0x301-0x400
 
-    PairingStatusRequest         pairing_status = 0x301;          // Queries whether the Ark is paired and opened
-    PairingAuthRequest           pairing_auth = 0x302;            // Asks the Ark to authorize a pairing rendezvous
-    PairingSetAppIdentityRequest pairing_set_app_id = 0x303;      // Injects the companion app's identity, relayed by the cloud
-    PairingSetAppStorageRequest  pairing_set_app_storage = 0x304; // Injects the companion app's storage key material
-    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x305; // Confirms the app received the Ark's key material
-    PairingAcceptanceRequest     pairing_accept = 0x306;          // Waits for the user to accept the pairing
-    PairingCompletionRequest     pairing_complete = 0x307;        // Waits for the Ark to finish pairing maintenance
+    PairingAuthRequest           pairing_auth = 0x301;            // Asks the Ark to authorize a pairing rendezvous
+    PairingSetAppIdentityRequest pairing_set_app_id = 0x302;      // Injects the companion app's identity, relayed by the cloud
+    PairingSetAppStorageRequest  pairing_set_app_storage = 0x303; // Injects the companion app's storage key material
+    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x304; // Confirms the app received the Ark's key material
+    PairingAcceptanceRequest     pairing_accept = 0x305;          // Waits for the user to accept the pairing
+    PairingCompletionRequest     pairing_complete = 0x306;        // Waits for the Ark to finish pairing maintenance
 
     // Relay messages, reserved range 0x401-0x500
 
@@ -127,13 +126,12 @@ message ArkToHost {
 
     // Pairing messages, reserved range 0x301-0x400
 
-    PairingStatusResponse           pairing_status = 0x301;          // Whether the Ark is paired and opened
-    PairingAuthResponse             pairing_auth = 0x302;            // Signed authorization for the cloud to open a rendezvous
-    PairingSetAppIdentityResponse   pairing_set_app_id = 0x303;      // Acknowledges the accepted app identity
-    PairingSetAppStorageResponse    pairing_set_app_storage = 0x304; // Ark device infos and key material, sealed for the app
-    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x305; // Acknowledges the app's receipt of the Ark's keys
-    PairingAcceptanceResponse       pairing_accept = 0x306;          // Signed confirmation that the user accepted the pairing
-    PairingCompletionResponse       pairing_complete = 0x307;        // Signed confirmation that the Ark finished pairing
+    PairingAuthResponse             pairing_auth = 0x301;            // Signed authorization for the cloud to open a rendezvous
+    PairingSetAppIdentityResponse   pairing_set_app_id = 0x302;      // Acknowledges the accepted app identity
+    PairingSetAppStorageResponse    pairing_set_app_storage = 0x303; // Ark device infos and key material, sealed for the app
+    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x304; // Acknowledges the app's receipt of the Ark's keys
+    PairingAcceptanceResponse       pairing_accept = 0x305;          // Signed confirmation that the user accepted the pairing
+    PairingCompletionResponse       pairing_complete = 0x306;        // Signed confirmation that the Ark finished pairing
 
     // Relay messages, reserved range 0x401-0x500
 
@@ -246,8 +244,11 @@ message DeviceInfoResponse {
   string firmware_version = 7; // Current firmware version (X.Y.Z-commit)
   uint64 firmware_publish = 8; // Current firmware publish unix timestamp
 
-  uint64 cloud_expiry = 9; // Accepted cloud identity expiry unix timestamp (0 if not synced)
-  uint64 clock = 10;       // Current device clock unix timestamp
+  bool   cloud_synced = 9;  // Whether a cloud identity was accepted since boot
+  uint64 cloud_clock = 10;  // Current device clock unix timestamp, set by the cloud sync
+
+  bool paired   = 11; // Whether the Ark is paired with a companion app (user data initialized)
+  bool unlocked = 12; // Whether the user data storage is open (false if unpaired)
 }
 
 
@@ -353,15 +354,6 @@ message FirmwareUpdateInstallRequest {
 message FirmwareUpdateInstallResponse {
 }
 
-
-// PairingStatusRequest requests the initialization status from the device.
-message PairingStatusRequest{
-}
-// PairingStatusResponse is the initialization status response of the device.
-message PairingStatusResponse{
-  bool paired = 1; // Whether the device has user data initialized
-  bool opened = 2; // Whether the device is currently opened (false if not paired)
-}
 
 // PairingAuthRequest requests the initiation of a pairing.
 message PairingAuthRequest {
