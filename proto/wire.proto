@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 syntax = "proto3";
 
@@ -42,13 +45,12 @@ message HostToArk {
 
     // Pairing messages, reserved range 0x301-0x400
 
-    PairingStatusRequest         pairing_status = 0x301;          // Queries whether the Ark is paired and opened
-    PairingAuthRequest           pairing_auth = 0x302;            // Asks the Ark to authorize a pairing rendezvous
-    PairingSetAppIdentityRequest pairing_set_app_id = 0x303;      // Injects the companion app's identity, relayed by the cloud
-    PairingSetAppStorageRequest  pairing_set_app_storage = 0x304; // Injects the companion app's storage key material
-    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x305; // Confirms the app received the Ark's key material
-    PairingAcceptanceRequest     pairing_accept = 0x306;          // Waits for the user to accept the pairing
-    PairingCompletionRequest     pairing_complete = 0x307;        // Waits for the Ark to finish pairing maintenance
+    PairingAuthRequest           pairing_auth = 0x301;            // Asks the Ark to authorize a pairing rendezvous
+    PairingSetAppIdentityRequest pairing_set_app_id = 0x302;      // Injects the companion app's identity, relayed by the cloud
+    PairingSetAppStorageRequest  pairing_set_app_storage = 0x303; // Injects the companion app's storage key material
+    PairingAckArkStorageRequest  pairing_ack_ark_storage = 0x304; // Confirms the app received the Ark's key material
+    PairingAcceptanceRequest     pairing_accept = 0x305;          // Waits for the user to accept the pairing
+    PairingCompletionRequest     pairing_complete = 0x306;        // Waits for the Ark to finish pairing maintenance
 
     // Relay messages, reserved range 0x401-0x500
 
@@ -70,11 +72,15 @@ message HostToArk {
     SlotListRequest          slot_list = 0x601;           // Lists the state of every data slot
     SlotRepairRequest        slot_repair = 0x602;         // Resets a slot to empty whatever its state
     SlotDeleteRequest        slot_delete = 0x603;         // Removes the contents of a filled slot
-    SlotUploadPeekRequest    slot_upload_peek = 0x604;    // Asks the Ark to identify a file from its first chunk
+    SlotIdentifyRequest      slot_identify = 0x604;       // Asks the Ark to identify a file from its first chunk
     SlotUploadStartRequest   slot_upload_start = 0x605;   // Starts uploading a file into a slot
     SlotUploadChunkRequest   slot_upload_chunk = 0x606;   // Appends a chunk to a pending slot upload
     SlotUploadCancelRequest  slot_upload_cancel = 0x607;  // Aborts a pending slot upload
     SlotUploadProcessRequest slot_upload_process = 0x608; // Marks an upload complete and polls its processing
+
+    // Dataset messages, reserved range 0x701-0x800
+
+    DatasetPathsRequest dataset_paths = 0x701; // Maps every path an app can read, from the dataset view
 
     // Unreleased messages served by development firmware only, carried opaquely
     // so the public protocol is untouched while they are still under development.
@@ -120,13 +126,12 @@ message ArkToHost {
 
     // Pairing messages, reserved range 0x301-0x400
 
-    PairingStatusResponse           pairing_status = 0x301;          // Whether the Ark is paired and opened
-    PairingAuthResponse             pairing_auth = 0x302;            // Signed authorization for the cloud to open a rendezvous
-    PairingSetAppIdentityResponse   pairing_set_app_id = 0x303;      // Acknowledges the accepted app identity
-    PairingSetAppStorageResponse    pairing_set_app_storage = 0x304; // Ark device infos and key material, sealed for the app
-    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x305; // Acknowledges the app's receipt of the Ark's keys
-    PairingAcceptanceResponse       pairing_accept = 0x306;          // Signed confirmation that the user accepted the pairing
-    PairingCompletionResponse       pairing_complete = 0x307;        // Signed confirmation that the Ark finished pairing
+    PairingAuthResponse             pairing_auth = 0x301;            // Signed authorization for the cloud to open a rendezvous
+    PairingSetAppIdentityResponse   pairing_set_app_id = 0x302;      // Acknowledges the accepted app identity
+    PairingSetAppStorageResponse    pairing_set_app_storage = 0x303; // Ark device infos and key material, sealed for the app
+    PairingAckArkStorageResponse    pairing_ack_ark_storage = 0x304; // Acknowledges the app's receipt of the Ark's keys
+    PairingAcceptanceResponse       pairing_accept = 0x305;          // Signed confirmation that the user accepted the pairing
+    PairingCompletionResponse       pairing_complete = 0x306;        // Signed confirmation that the Ark finished pairing
 
     // Relay messages, reserved range 0x401-0x500
 
@@ -149,11 +154,15 @@ message ArkToHost {
     SlotListResponse          slot_list = 0x601;           // Current state of every data slot
     SlotRepairResponse        slot_repair = 0x602;         // Acknowledges the reset slot
     SlotDeleteResponse        slot_delete = 0x603;         // Acknowledges the deleted slot
-    SlotUploadPeekResponse    slot_upload_peek = 0x604;    // Identification of the peeked file
+    SlotIdentifyResponse      slot_identify = 0x604;       // Identification of the file's first chunk
     SlotUploadStartResponse   slot_upload_start = 0x605;   // Session id of the approved upload
     SlotUploadChunkResponse   slot_upload_chunk = 0x606;   // Acknowledges the appended slot chunk
     SlotUploadCancelResponse  slot_upload_cancel = 0x607;  // Acknowledges the aborted upload
     SlotUploadProcessResponse slot_upload_process = 0x608; // Processing progress of the completed upload
+
+    // Dataset messages, reserved range 0x701-0x800
+
+    DatasetPathsResponse dataset_paths = 0x701; // Generated README.md of the dataset view
 
     // Unreleased messages emitted by development firmware only, in response to
     // a develop request, carried opaquely so the public protocol is untouched
@@ -195,6 +204,14 @@ enum ReservedErrors {
   // The peer serves this request but not in its current state, before cloud
   // sync or pairing. It may once the state changes.
   RESERVED_ERRORS_UNAVAILABLE = 4;
+
+  // The peer serves this request but the owner refused the approval it asked
+  // for on the phone. The owner's choice, not a failure.
+  RESERVED_ERRORS_UNAUTHORIZED = 5;
+
+  // The peer serves this request but the approval it asked for did not arrive
+  // before its window ran out, on the phone or at the button.
+  RESERVED_ERRORS_UNCONFIRMED = 6;
 }
 
 
@@ -226,6 +243,12 @@ message DeviceInfoResponse {
 
   string firmware_version = 7; // Current firmware version (X.Y.Z-commit)
   uint64 firmware_publish = 8; // Current firmware publish unix timestamp
+
+  bool   cloud_synced = 9;  // Whether a cloud identity was accepted since boot
+  uint64 cloud_clock = 10;  // Current device clock unix timestamp, set by the cloud sync
+
+  bool paired   = 11; // Whether the Ark is paired with a companion app (user data initialized)
+  bool unlocked = 12; // Whether the user data storage is open (false if unpaired)
 }
 
 
@@ -331,15 +354,6 @@ message FirmwareUpdateInstallRequest {
 message FirmwareUpdateInstallResponse {
 }
 
-
-// PairingStatusRequest requests the initialization status from the device.
-message PairingStatusRequest{
-}
-// PairingStatusResponse is the initialization status response of the device.
-message PairingStatusResponse{
-  bool paired = 1; // Whether the device has user data initialized
-  bool opened = 2; // Whether the device is currently opened (false if not paired)
-}
 
 // PairingAuthRequest requests the initiation of a pairing.
 message PairingAuthRequest {
@@ -572,87 +586,70 @@ message ExecutionStatusResponse{
   optional ExecutionResultResponse result = 2; // The result of the execution
 }
 
-// SlotKind identifies a slot slot on the device. Each value corresponds to
-// a unique data type that the device can store and manage.
+// SlotKind identifies a slot on the device. Each value corresponds to a unique
+// data type that the device can store and manage.
 enum SlotKind {
-  SLOT_REFERENCE_GENOME = 0; // Human reference genome assembly
-  SLOT_GENE_ANNOTATIONS = 1; // Gene-to-coordinate mapping database
-  SLOT_SNP_INDEL_CALLS = 2;  // User's SNP/indel variant calls
-  SLOT_VARIANT_CATALOG = 3;  // Variant catalog (rsID-to-position), from dbSNP
+  SLOT_UNSPECIFIED      = 0; // Never sent, an unset kind
+  SLOT_REFERENCE_GENOME = 1; // Human reference genome assembly
+  SLOT_GENE_ANNOTATIONS = 2; // Gene-to-coordinate mapping database
+  SLOT_SNP_INDEL_CALLS  = 3; // User's SNP/indel variant calls
+  SLOT_VARIANT_CATALOG  = 4; // Variant catalog (rsID-to-position), from dbSNP
 }
 
 // SlotOrigin describes the nature of the data in a slot, determining what
 // actions are available to the user for filling it.
 enum SlotOrigin {
-  ORIGIN_PERSONAL = 0;  // Unique to the user, uploaded by them
-  ORIGIN_REFERENCE = 1; // Standard reference data, downloaded from public sources
+  ORIGIN_UNSPECIFIED = 0; // Never sent, an unset origin
+  ORIGIN_PERSONAL    = 1; // Unique to the user, uploaded by them
+  ORIGIN_REFERENCE   = 2; // Standard reference data, downloaded from public sources
 }
 
-// SlotConfidence indicates how confident the device is in its classification
-// of a peeked slot, based on content, filename, and size.
+// SlotState describes whether a slot holds data and whether that data is sound.
+enum SlotState {
+  STATE_UNSPECIFIED = 0; // Never sent, an unset state
+  STATE_EMPTY       = 1; // Nothing stored
+  STATE_FILLED      = 2; // Data present and healthy
+  STATE_DAMAGED     = 3; // Files exist but the metadata is missing, corrupt or outdated
+}
+
+// SlotConfidence indicates how confident the device is in its identification
+// of a file, based on content, filename and size.
 enum SlotConfidence {
-  CONFIDENCE_LOW  = 0; // Filename/extension only, no content confirmation
-  CONFIDENCE_MID  = 1; // Format detected but slot type inferred from size/filename
-  CONFIDENCE_HIGH = 2; // Magic bytes match and format-specific content confirmed
+  CONFIDENCE_UNSPECIFIED = 0; // Never sent, an unset confidence
+  CONFIDENCE_LOW         = 1; // Filename/extension only, no content confirmation
+  CONFIDENCE_MID         = 2; // Format detected but slot type inferred from size/filename
+  CONFIDENCE_HIGH        = 3; // Magic bytes match and format-specific content confirmed
 }
 
-// SlotMetaReferenceGenome contains metadata for the reference genome slot.
-// Includes download information so the dashboard can fetch it from public sources.
-message SlotMetaReferenceGenome {
-  string build = 1;           // Reference genome build (e.g. "GRCh38.p13")
-  string download_url = 2;    // Public download URL for the reference genome
-  uint64 download_bytes = 3;  // Download file size in bytes
-  string download_sha256 = 4; // Download file SHA256 checksum
+// SlotDownload describes the public download the device advertises for a
+// reference slot, so a host can fetch it and stream it back in.
+message SlotDownload {
+  string url    = 1; // Public download URL
+  uint64 bytes  = 2; // Download size in bytes
+  string sha256 = 3; // Download SHA256 checksum
 }
 
-// SlotMetaGeneAnnotations contains metadata for the gene annotations slot.
-// Includes download information so the dashboard can fetch it from public sources.
-message SlotMetaGeneAnnotations {
-  string build = 1;           // Reference genome build these annotations apply to
-  string download_url = 2;    // Public download URL for the annotation file
-  uint64 download_bytes = 3;  // Download file size in bytes
-  string download_sha256 = 4; // Download file SHA256 checksum
-}
-
-// SlotMetaSnpIndelCalls contains metadata for the user's variant calls slot.
-message SlotMetaSnpIndelCalls {
-  string build = 1; // Reference genome build the variants were called against
-}
-
-// SlotMetaVariantCatalog contains metadata for the variant-catalog slot. Includes
-// download information so the dashboard can fetch it from public sources.
-message SlotMetaVariantCatalog {
-  string build = 1;            // Reference genome build the dbSNP release is keyed to
-  uint32 dbsnp_build = 2;      // dbSNP build number (e.g. 157)
-  string download_url = 3;     // Public download URL for the dbSNP VCF
-  uint64 download_bytes = 4;   // Download file size in bytes
-  string download_sha256 = 5;  // Download file SHA256 checksum
-}
-
-// SlotStatus describes the current state of a single slot slot on the device.
+// SlotStatus describes the current state of a single slot on the device. The
+// data fields are generic so a host renders a kind it has never seen.
 message SlotStatus {
-  SlotKind   kind    = 1; // Slot type
-  string     name    = 2; // Human-readable slot name
-  string     desc    = 3; // Detailed description of this slot
-  SlotOrigin origin  = 4; // Nature of the data (personal, reference, generated)
-  bool       filled  = 5; // Whether data is present on the device
-  string     damaged = 6; // Non-empty if data files exist but metadata is missing/corrupt
+  SlotKind   kind   = 1; // Slot type
+  string     name   = 2; // Human-readable slot name
+  string     desc   = 3; // Detailed description of this slot
+  SlotOrigin origin = 4; // Nature of the data (personal, reference)
+  SlotState  state  = 5; // Whether the slot is empty, filled or damaged
+  string     damage = 6; // Why the slot is damaged, empty otherwise
   repeated SlotKind deps = 7; // Slots that must be filled before this one is actionable
+  uint64     bytes  = 8; // Bytes on disk for this slot (0 if empty)
 
-  // Slot-type-specific metadata, set when the device has information about
-  // this slot (either filled or dependencies provide enough context).
-  oneof meta {
-    SlotMetaReferenceGenome reference_genome = 100; // Metadata of the reference genome slot
-    SlotMetaGeneAnnotations gene_annotations = 101; // Metadata of the gene annotations slot
-    SlotMetaSnpIndelCalls   snp_indel_calls = 102;  // Metadata of the user's variant calls slot
-    SlotMetaVariantCatalog  variant_catalog = 103;  // Metadata of the variant catalog slot
-  }
+  string       build    = 9;  // Reference assembly the data is keyed to (e.g. "GRCh38.p14")
+  string       version  = 10; // The dataset's own release, if it has one (e.g. dbSNP "157")
+  SlotDownload download = 11; // Advertised public download, absent if none
 }
 
-// SlotListRequest requests the state of all slot slots on the device.
+// SlotListRequest requests the state of all slots on the device.
 message SlotListRequest {
 }
-// SlotListResponse contains the current state of every slot slot.
+// SlotListResponse contains the current state of every slot.
 message SlotListResponse {
   repeated SlotStatus slots = 1; // State of every slot, one entry per slot kind
 }
@@ -661,91 +658,109 @@ message SlotListResponse {
 // Unlike SlotDelete (which requires the slot to be filled), repair is a stateless
 // force cleanup that removes any leftover metadata and/or files on disk. It is
 // intended for recovering from corruption or half-written state after crashes.
-message SlotRepairRequest{
+message SlotRepairRequest {
   SlotKind slot = 1; // Slot to repair (reset to empty)
 }
 // SlotRepairResponse is an empty ack of the repair request.
-message SlotRepairResponse{
+message SlotRepairResponse {
 }
 
 // SlotDeleteRequest removes the contents of a filled slot. The slot must be
 // in a healthy, filled state; corrupted or half-written slots must be cleaned
 // up via SlotRepair instead.
-message SlotDeleteRequest{
+message SlotDeleteRequest {
   SlotKind slot = 1; // Slot to delete
 }
 // SlotDeleteResponse is an empty ack of the delete request.
-message SlotDeleteResponse{
+message SlotDeleteResponse {
 }
 
-// SlotUploadPeekRequest can be used to send an ephemeral file chunk to the
-// Ark and ask it to attempt to identify it for the caller. Its purpose is to
-// allow quickly filtering out potentially huge slots without uploading them
-// first (e.g. q 30GB compressed whole genome sequencing).
-message SlotUploadPeekRequest{
-  string name = 1; // Slot file name to guess the contents of
-  uint64 size = 2; // Slot file size to guess the contents of
-  bytes chunk = 3; // Slot first chunk to guess the contents of
+// SlotIdentifyRequest sends an ephemeral file chunk to the Ark and asks it to
+// identify the file. Its purpose is to filter potentially huge files (e.g. a
+// 30GB compressed whole genome sequencing) before uploading them, and to
+// answer what a file is without uploading it at all.
+message SlotIdentifyRequest {
+  string name = 1; // File name to guess the contents of
+  uint64 size = 2; // File size to guess the contents of
+  bytes chunk = 3; // First chunk of the file to guess the contents of
 
-  repeated SlotKind kinds = 4; // Possible slot items to interpret as (empty == any)
+  repeated SlotKind kinds = 4; // Possible slots to interpret as (empty == any)
 }
-// SlotUploadPeekResponse contains the data identification based on the small
-// chunk shared in the request.
-message SlotUploadPeekResponse{
-  SlotKind kind = 1; // Identified slot type to use during upload
-  SlotConfidence conf = 2;    // Identification confidence level
+// SlotIdentifyResponse contains the identification based on the chunk shared
+// in the request.
+message SlotIdentifyResponse {
+  SlotKind kind = 1;       // Identified slot type to use during upload
+  SlotConfidence conf = 2; // Identification confidence level
 
-  string summary = 3; // Short summary of the identified slot type
-  string details = 4; // Detailed description of the identified slot type
-  string reject = 5;  // Reason why the slot is rejected
+  string summary = 3;   // Short summary of the identified data
+  string details = 4;   // Detailed description of the identified data
+  string rejection = 5; // Reason why the file is rejected, empty otherwise
 }
 
-// SlotUploadStartRequest requests uploading a specific type of slot (e.g
-// a whole genome variant call file, a bloodwork report).
-message SlotUploadStartRequest{
+// SlotUploadStartRequest requests uploading a file into a slot of the given
+// kind (e.g. a whole genome variant call file).
+message SlotUploadStartRequest {
   SlotKind kind = 1; // Slot type requesting to upload
 
-  string name = 2; // Slot file name to guess the contents of
-  uint64 size = 3; // Slot file size to guess the contents of
-  bytes chunk = 4; // Slot first chunk to guess the contents of
+  string name = 2; // File name to guess the contents of
+  uint64 size = 3; // File size to guess the contents of
+  bytes chunk = 4; // First chunk of the file to guess the contents of
 }
-// SlotUploadStartResponse contains a unique session id for an approved upload
-// and a maximum file limit after which the upload will be killed.
-message SlotUploadStartResponse{
+// SlotUploadStartResponse contains a unique session id for an approved upload.
+message SlotUploadStartResponse {
   uint64 session = 1; // Session id for concurrent uploads (not recommended)
 }
 // SlotUploadChunkRequest contains a new chunk of data to append to a pending
 // upload session.
-message SlotUploadChunkRequest{
+message SlotUploadChunkRequest {
   uint64 session = 1; // Session id into which to append a new chunk
   bytes chunk = 2;    // Data chunk to append (reasonably capped)
 }
 // SlotUploadChunkResponse is an empty ack of the chunk upload request.
-message SlotUploadChunkResponse{
+message SlotUploadChunkResponse {
 }
 // SlotUploadCancelRequest contains an upload session id to abort.
-message SlotUploadCancelRequest{
+message SlotUploadCancelRequest {
   uint64 session = 1; // Session id to cancel
 }
 // SlotUploadCancelResponse is an empty ack of the cancellation request.
-message SlotUploadCancelResponse{
+message SlotUploadCancelResponse {
 }
+
+// SlotPhase names one step of a slot's processing pipeline.
+message SlotPhase {
+  string name = 1; // Short label for the phase
+  string desc = 2; // Description of what the phase does
+}
+
 // SlotUploadProcessRequest marks an upload session ready for processing and
 // requests a progress report to be sent back. May be called multiple times.
-message SlotUploadProcessRequest{
+message SlotUploadProcessRequest {
   uint64 session = 1; // Session id to mark as completed
 }
 // SlotUploadProcessResponse acks the completion of a slot upload and also
 // contains the current processing progress.
-message SlotUploadProcessResponse{
-  uint64 proc_start = 1; // Timestamp when data processing started
+message SlotUploadProcessResponse {
+  uint64 proc_start = 1; // Unix timestamp when data processing started
 
-  repeated string phase_names = 2; // Short labels for each phase
-  repeated string phase_descs = 3; // Descriptions for each phase
+  repeated SlotPhase phases = 2; // Every phase of the pipeline, in order
 
-  uint64 phase_in = 4;       // Current phase (1-indexed)
-  uint64 phase_start = 5;    // Timestamp when the current phase started
-  uint64 phase_progress = 6; // Approximate progress for this phase [0-10000]
+  uint64 phase_in = 3;       // Current phase (1-indexed)
+  uint64 phase_start = 4;    // Unix timestamp when the current phase started
+  uint64 phase_progress = 5; // Approximate progress for this phase [0-10000]
 
-  string failure = 7; // Failure reason if processing failed, empty otherwise
+  string failure = 6; // Failure reason if processing failed, empty otherwise
+}
+
+
+// DatasetPathsRequest requests the map of every path an app can read, the
+// dataset view the device derives from its slots, lenses included.
+message DatasetPathsRequest {
+}
+// DatasetPathsResponse contains the generated README.md of the dataset view,
+// the same file the Ark serves to apps at /v1/README.md: every path always,
+// absent ones marked with the slot that would make them appear. It describes
+// the tree only and never carries a value from the owner's data.
+message DatasetPathsResponse {
+  string readme = 1; // Generated README.md of the dataset view
 }

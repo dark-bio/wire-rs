@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Records client scenarios as test vectors for other client implementations.
 //! Each transcript contains keys for both peers, client calls and their results,

@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -60,26 +60,23 @@ pub mod host_to_ark {
         /// Installs the verified firmware and reboots
         #[prost(message, tag = "517")]
         FirmwareUpdateInstall(super::FirmwareUpdateInstallRequest),
-        /// Queries whether the Ark is paired and opened
-        #[prost(message, tag = "769")]
-        PairingStatus(super::PairingStatusRequest),
         /// Asks the Ark to authorize a pairing rendezvous
-        #[prost(message, tag = "770")]
+        #[prost(message, tag = "769")]
         PairingAuth(super::PairingAuthRequest),
         /// Injects the companion app's identity, relayed by the cloud
-        #[prost(message, tag = "771")]
+        #[prost(message, tag = "770")]
         PairingSetAppId(super::PairingSetAppIdentityRequest),
         /// Injects the companion app's storage key material
-        #[prost(message, tag = "772")]
+        #[prost(message, tag = "771")]
         PairingSetAppStorage(super::PairingSetAppStorageRequest),
         /// Confirms the app received the Ark's key material
-        #[prost(message, tag = "773")]
+        #[prost(message, tag = "772")]
         PairingAckArkStorage(super::PairingAckArkStorageRequest),
         /// Waits for the user to accept the pairing
-        #[prost(message, tag = "774")]
+        #[prost(message, tag = "773")]
         PairingAccept(super::PairingAcceptanceRequest),
         /// Waits for the Ark to finish pairing maintenance
-        #[prost(message, tag = "775")]
+        #[prost(message, tag = "774")]
         PairingComplete(super::PairingCompletionRequest),
         /// Asks the Ark to authorize joining the app relay
         #[prost(message, tag = "1025")]
@@ -119,7 +116,7 @@ pub mod host_to_ark {
         SlotDelete(super::SlotDeleteRequest),
         /// Asks the Ark to identify a file from its first chunk
         #[prost(message, tag = "1540")]
-        SlotUploadPeek(super::SlotUploadPeekRequest),
+        SlotIdentify(super::SlotIdentifyRequest),
         /// Starts uploading a file into a slot
         #[prost(message, tag = "1541")]
         SlotUploadStart(super::SlotUploadStartRequest),
@@ -132,6 +129,9 @@ pub mod host_to_ark {
         /// Marks an upload complete and polls its processing
         #[prost(message, tag = "1544")]
         SlotUploadProcess(super::SlotUploadProcessRequest),
+        /// Maps every path an app can read, from the dataset view
+        #[prost(message, tag = "1793")]
+        DatasetPaths(super::DatasetPathsRequest),
         /// Unreleased messages served by development firmware only, carried opaquely
         /// so the public protocol is untouched while they are still under development.
         /// Their schema is private and production Arks refuse the envelope.
@@ -160,7 +160,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -200,26 +200,23 @@ pub mod ark_to_host {
         /// Acknowledges the installed firmware
         #[prost(message, tag = "517")]
         FirmwareUpdateInstall(super::FirmwareUpdateInstallResponse),
-        /// Whether the Ark is paired and opened
-        #[prost(message, tag = "769")]
-        PairingStatus(super::PairingStatusResponse),
         /// Signed authorization for the cloud to open a rendezvous
-        #[prost(message, tag = "770")]
+        #[prost(message, tag = "769")]
         PairingAuth(super::PairingAuthResponse),
         /// Acknowledges the accepted app identity
-        #[prost(message, tag = "771")]
+        #[prost(message, tag = "770")]
         PairingSetAppId(super::PairingSetAppIdentityResponse),
         /// Ark device infos and key material, sealed for the app
-        #[prost(message, tag = "772")]
+        #[prost(message, tag = "771")]
         PairingSetAppStorage(super::PairingSetAppStorageResponse),
         /// Acknowledges the app's receipt of the Ark's keys
-        #[prost(message, tag = "773")]
+        #[prost(message, tag = "772")]
         PairingAckArkStorage(super::PairingAckArkStorageResponse),
         /// Signed confirmation that the user accepted the pairing
-        #[prost(message, tag = "774")]
+        #[prost(message, tag = "773")]
         PairingAccept(super::PairingAcceptanceResponse),
         /// Signed confirmation that the Ark finished pairing
-        #[prost(message, tag = "775")]
+        #[prost(message, tag = "774")]
         PairingComplete(super::PairingCompletionResponse),
         /// Signed authorization for the cloud to join the relay
         #[prost(message, tag = "1025")]
@@ -260,9 +257,9 @@ pub mod ark_to_host {
         /// Acknowledges the deleted slot
         #[prost(message, tag = "1539")]
         SlotDelete(super::SlotDeleteResponse),
-        /// Identification of the peeked file
+        /// Identification of the file's first chunk
         #[prost(message, tag = "1540")]
-        SlotUploadPeek(super::SlotUploadPeekResponse),
+        SlotIdentify(super::SlotIdentifyResponse),
         /// Session id of the approved upload
         #[prost(message, tag = "1541")]
         SlotUploadStart(super::SlotUploadStartResponse),
@@ -275,6 +272,9 @@ pub mod ark_to_host {
         /// Processing progress of the completed upload
         #[prost(message, tag = "1544")]
         SlotUploadProcess(super::SlotUploadProcessResponse),
+        /// Generated README.md of the dataset view
+        #[prost(message, tag = "1793")]
+        DatasetPaths(super::DatasetPathsResponse),
         /// Unreleased messages emitted by development firmware only, in response to
         /// a develop request, carried opaquely so the public protocol is untouched
         /// while they are still under development. Their schema is private.
@@ -335,6 +335,18 @@ pub struct DeviceInfoResponse {
     /// Current firmware publish unix timestamp
     #[prost(uint64, tag = "8")]
     pub firmware_publish: u64,
+    /// Whether a cloud identity was accepted since boot
+    #[prost(bool, tag = "9")]
+    pub cloud_synced: bool,
+    /// Current device clock unix timestamp, set by the cloud sync
+    #[prost(uint64, tag = "10")]
+    pub cloud_clock: u64,
+    /// Whether the Ark is paired with a companion app (user data initialized)
+    #[prost(bool, tag = "11")]
+    pub paired: bool,
+    /// Whether the user data storage is open (false if unpaired)
+    #[prost(bool, tag = "12")]
+    pub unlocked: bool,
 }
 /// CloudSyncStartRequest requests the device to start a synchronization procedure
 /// against the cloud servers to establish the current time as well as the currently
@@ -463,19 +475,6 @@ pub struct FirmwareUpdateInstallRequest {}
 /// successfully or not.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FirmwareUpdateInstallResponse {}
-/// PairingStatusRequest requests the initialization status from the device.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PairingStatusRequest {}
-/// PairingStatusResponse is the initialization status response of the device.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PairingStatusResponse {
-    /// Whether the device has user data initialized
-    #[prost(bool, tag = "1")]
-    pub paired: bool,
-    /// Whether the device is currently opened (false if not paired)
-    #[prost(bool, tag = "2")]
-    pub opened: bool,
-}
 /// PairingAuthRequest requests the initiation of a pairing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PairingAuthRequest {}
@@ -774,68 +773,22 @@ pub struct ExecutionStatusResponse {
     #[prost(message, optional, tag = "2")]
     pub result: ::core::option::Option<ExecutionResultResponse>,
 }
-/// SlotMetaReferenceGenome contains metadata for the reference genome slot.
-/// Includes download information so the dashboard can fetch it from public sources.
+/// SlotDownload describes the public download the device advertises for a
+/// reference slot, so a host can fetch it and stream it back in.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SlotMetaReferenceGenome {
-    /// Reference genome build (e.g. "GRCh38.p13")
+pub struct SlotDownload {
+    /// Public download URL
     #[prost(string, tag = "1")]
-    pub build: ::prost::alloc::string::String,
-    /// Public download URL for the reference genome
-    #[prost(string, tag = "2")]
-    pub download_url: ::prost::alloc::string::String,
-    /// Download file size in bytes
-    #[prost(uint64, tag = "3")]
-    pub download_bytes: u64,
-    /// Download file SHA256 checksum
-    #[prost(string, tag = "4")]
-    pub download_sha256: ::prost::alloc::string::String,
-}
-/// SlotMetaGeneAnnotations contains metadata for the gene annotations slot.
-/// Includes download information so the dashboard can fetch it from public sources.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SlotMetaGeneAnnotations {
-    /// Reference genome build these annotations apply to
-    #[prost(string, tag = "1")]
-    pub build: ::prost::alloc::string::String,
-    /// Public download URL for the annotation file
-    #[prost(string, tag = "2")]
-    pub download_url: ::prost::alloc::string::String,
-    /// Download file size in bytes
-    #[prost(uint64, tag = "3")]
-    pub download_bytes: u64,
-    /// Download file SHA256 checksum
-    #[prost(string, tag = "4")]
-    pub download_sha256: ::prost::alloc::string::String,
-}
-/// SlotMetaSnpIndelCalls contains metadata for the user's variant calls slot.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SlotMetaSnpIndelCalls {
-    /// Reference genome build the variants were called against
-    #[prost(string, tag = "1")]
-    pub build: ::prost::alloc::string::String,
-}
-/// SlotMetaVariantCatalog contains metadata for the variant-catalog slot. Includes
-/// download information so the dashboard can fetch it from public sources.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SlotMetaVariantCatalog {
-    /// Reference genome build the dbSNP release is keyed to
-    #[prost(string, tag = "1")]
-    pub build: ::prost::alloc::string::String,
-    /// dbSNP build number (e.g. 157)
-    #[prost(uint32, tag = "2")]
-    pub dbsnp_build: u32,
-    /// Public download URL for the dbSNP VCF
+    pub url: ::prost::alloc::string::String,
+    /// Download size in bytes
+    #[prost(uint64, tag = "2")]
+    pub bytes: u64,
+    /// Download SHA256 checksum
     #[prost(string, tag = "3")]
-    pub download_url: ::prost::alloc::string::String,
-    /// Download file size in bytes
-    #[prost(uint64, tag = "4")]
-    pub download_bytes: u64,
-    /// Download file SHA256 checksum
-    #[prost(string, tag = "5")]
-    pub download_sha256: ::prost::alloc::string::String,
+    pub sha256: ::prost::alloc::string::String,
 }
-/// SlotStatus describes the current state of a single slot slot on the device.
+/// SlotStatus describes the current state of a single slot on the device. The
+/// data fields are generic so a host renders a kind it has never seen.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotStatus {
     /// Slot type
@@ -847,47 +800,35 @@ pub struct SlotStatus {
     /// Detailed description of this slot
     #[prost(string, tag = "3")]
     pub desc: ::prost::alloc::string::String,
-    /// Nature of the data (personal, reference, generated)
+    /// Nature of the data (personal, reference)
     #[prost(enumeration = "SlotOrigin", tag = "4")]
     pub origin: i32,
-    /// Whether data is present on the device
-    #[prost(bool, tag = "5")]
-    pub filled: bool,
-    /// Non-empty if data files exist but metadata is missing/corrupt
+    /// Whether the slot is empty, filled or damaged
+    #[prost(enumeration = "SlotState", tag = "5")]
+    pub state: i32,
+    /// Why the slot is damaged, empty otherwise
     #[prost(string, tag = "6")]
-    pub damaged: ::prost::alloc::string::String,
+    pub damage: ::prost::alloc::string::String,
     /// Slots that must be filled before this one is actionable
     #[prost(enumeration = "SlotKind", repeated, tag = "7")]
     pub deps: ::prost::alloc::vec::Vec<i32>,
-    /// Slot-type-specific metadata, set when the device has information about
-    /// this slot (either filled or dependencies provide enough context).
-    #[prost(oneof = "slot_status::Meta", tags = "100, 101, 102, 103")]
-    pub meta: ::core::option::Option<slot_status::Meta>,
+    /// Bytes on disk for this slot (0 if empty)
+    #[prost(uint64, tag = "8")]
+    pub bytes: u64,
+    /// Reference assembly the data is keyed to (e.g. "GRCh38.p14")
+    #[prost(string, tag = "9")]
+    pub build: ::prost::alloc::string::String,
+    /// The dataset's own release, if it has one (e.g. dbSNP "157")
+    #[prost(string, tag = "10")]
+    pub version: ::prost::alloc::string::String,
+    /// Advertised public download, absent if none
+    #[prost(message, optional, tag = "11")]
+    pub download: ::core::option::Option<SlotDownload>,
 }
-/// Nested message and enum types in `SlotStatus`.
-pub mod slot_status {
-    /// Slot-type-specific metadata, set when the device has information about
-    /// this slot (either filled or dependencies provide enough context).
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Meta {
-        /// Metadata of the reference genome slot
-        #[prost(message, tag = "100")]
-        ReferenceGenome(super::SlotMetaReferenceGenome),
-        /// Metadata of the gene annotations slot
-        #[prost(message, tag = "101")]
-        GeneAnnotations(super::SlotMetaGeneAnnotations),
-        /// Metadata of the user's variant calls slot
-        #[prost(message, tag = "102")]
-        SnpIndelCalls(super::SlotMetaSnpIndelCalls),
-        /// Metadata of the variant catalog slot
-        #[prost(message, tag = "103")]
-        VariantCatalog(super::SlotMetaVariantCatalog),
-    }
-}
-/// SlotListRequest requests the state of all slot slots on the device.
+/// SlotListRequest requests the state of all slots on the device.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotListRequest {}
-/// SlotListResponse contains the current state of every slot slot.
+/// SlotListResponse contains the current state of every slot.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SlotListResponse {
     /// State of every slot, one entry per slot kind
@@ -919,64 +860,63 @@ pub struct SlotDeleteRequest {
 /// SlotDeleteResponse is an empty ack of the delete request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotDeleteResponse {}
-/// SlotUploadPeekRequest can be used to send an ephemeral file chunk to the
-/// Ark and ask it to attempt to identify it for the caller. Its purpose is to
-/// allow quickly filtering out potentially huge slots without uploading them
-/// first (e.g. q 30GB compressed whole genome sequencing).
+/// SlotIdentifyRequest sends an ephemeral file chunk to the Ark and asks it to
+/// identify the file. Its purpose is to filter potentially huge files (e.g. a
+/// 30GB compressed whole genome sequencing) before uploading them, and to
+/// answer what a file is without uploading it at all.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SlotUploadPeekRequest {
-    /// Slot file name to guess the contents of
+pub struct SlotIdentifyRequest {
+    /// File name to guess the contents of
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    /// Slot file size to guess the contents of
+    /// File size to guess the contents of
     #[prost(uint64, tag = "2")]
     pub size: u64,
-    /// Slot first chunk to guess the contents of
+    /// First chunk of the file to guess the contents of
     #[prost(bytes = "vec", tag = "3")]
     pub chunk: ::prost::alloc::vec::Vec<u8>,
-    /// Possible slot items to interpret as (empty == any)
+    /// Possible slots to interpret as (empty == any)
     #[prost(enumeration = "SlotKind", repeated, tag = "4")]
     pub kinds: ::prost::alloc::vec::Vec<i32>,
 }
-/// SlotUploadPeekResponse contains the data identification based on the small
-/// chunk shared in the request.
+/// SlotIdentifyResponse contains the identification based on the chunk shared
+/// in the request.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SlotUploadPeekResponse {
+pub struct SlotIdentifyResponse {
     /// Identified slot type to use during upload
     #[prost(enumeration = "SlotKind", tag = "1")]
     pub kind: i32,
     /// Identification confidence level
     #[prost(enumeration = "SlotConfidence", tag = "2")]
     pub conf: i32,
-    /// Short summary of the identified slot type
+    /// Short summary of the identified data
     #[prost(string, tag = "3")]
     pub summary: ::prost::alloc::string::String,
-    /// Detailed description of the identified slot type
+    /// Detailed description of the identified data
     #[prost(string, tag = "4")]
     pub details: ::prost::alloc::string::String,
-    /// Reason why the slot is rejected
+    /// Reason why the file is rejected, empty otherwise
     #[prost(string, tag = "5")]
-    pub reject: ::prost::alloc::string::String,
+    pub rejection: ::prost::alloc::string::String,
 }
-/// SlotUploadStartRequest requests uploading a specific type of slot (e.g
-/// a whole genome variant call file, a bloodwork report).
+/// SlotUploadStartRequest requests uploading a file into a slot of the given
+/// kind (e.g. a whole genome variant call file).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotUploadStartRequest {
     /// Slot type requesting to upload
     #[prost(enumeration = "SlotKind", tag = "1")]
     pub kind: i32,
-    /// Slot file name to guess the contents of
+    /// File name to guess the contents of
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
-    /// Slot file size to guess the contents of
+    /// File size to guess the contents of
     #[prost(uint64, tag = "3")]
     pub size: u64,
-    /// Slot first chunk to guess the contents of
+    /// First chunk of the file to guess the contents of
     #[prost(bytes = "vec", tag = "4")]
     pub chunk: ::prost::alloc::vec::Vec<u8>,
 }
-/// SlotUploadStartResponse contains a unique session id for an approved upload
-/// and a maximum file limit after which the upload will be killed.
+/// SlotUploadStartResponse contains a unique session id for an approved upload.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotUploadStartResponse {
     /// Session id for concurrent uploads (not recommended)
@@ -1007,6 +947,16 @@ pub struct SlotUploadCancelRequest {
 /// SlotUploadCancelResponse is an empty ack of the cancellation request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SlotUploadCancelResponse {}
+/// SlotPhase names one step of a slot's processing pipeline.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SlotPhase {
+    /// Short label for the phase
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Description of what the phase does
+    #[prost(string, tag = "2")]
+    pub desc: ::prost::alloc::string::String,
+}
 /// SlotUploadProcessRequest marks an upload session ready for processing and
 /// requests a progress report to be sent back. May be called multiple times.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1017,29 +967,40 @@ pub struct SlotUploadProcessRequest {
 }
 /// SlotUploadProcessResponse acks the completion of a slot upload and also
 /// contains the current processing progress.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SlotUploadProcessResponse {
-    /// Timestamp when data processing started
+    /// Unix timestamp when data processing started
     #[prost(uint64, tag = "1")]
     pub proc_start: u64,
-    /// Short labels for each phase
-    #[prost(string, repeated, tag = "2")]
-    pub phase_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Descriptions for each phase
-    #[prost(string, repeated, tag = "3")]
-    pub phase_descs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Every phase of the pipeline, in order
+    #[prost(message, repeated, tag = "2")]
+    pub phases: ::prost::alloc::vec::Vec<SlotPhase>,
     /// Current phase (1-indexed)
-    #[prost(uint64, tag = "4")]
+    #[prost(uint64, tag = "3")]
     pub phase_in: u64,
-    /// Timestamp when the current phase started
-    #[prost(uint64, tag = "5")]
+    /// Unix timestamp when the current phase started
+    #[prost(uint64, tag = "4")]
     pub phase_start: u64,
     /// Approximate progress for this phase \[0-10000\]
-    #[prost(uint64, tag = "6")]
+    #[prost(uint64, tag = "5")]
     pub phase_progress: u64,
     /// Failure reason if processing failed, empty otherwise
-    #[prost(string, tag = "7")]
+    #[prost(string, tag = "6")]
     pub failure: ::prost::alloc::string::String,
+}
+/// DatasetPathsRequest requests the map of every path an app can read, the
+/// dataset view the device derives from its slots, lenses included.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatasetPathsRequest {}
+/// DatasetPathsResponse contains the generated README.md of the dataset view,
+/// the same file the Ark serves to apps at /v1/README.md: every path always,
+/// absent ones marked with the slot that would make them appear. It describes
+/// the tree only and never carries a value from the owner's data.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatasetPathsResponse {
+    /// Generated README.md of the dataset view
+    #[prost(string, tag = "1")]
+    pub readme: ::prost::alloc::string::String,
 }
 /// ReservedErrors names the assigned protocol-wide errors in the reserved range
 /// 0x00 to 0xff (inclusive). No code in this range may be assigned a request
@@ -1061,6 +1022,12 @@ pub enum ReservedErrors {
     /// The peer serves this request but not in its current state, before cloud
     /// sync or pairing. It may once the state changes.
     Unavailable = 4,
+    /// The peer serves this request but the owner refused the approval it asked
+    /// for on the phone. The owner's choice, not a failure.
+    Unauthorized = 5,
+    /// The peer serves this request but the approval it asked for did not arrive
+    /// before its window ran out, on the phone or at the button.
+    Unconfirmed = 6,
 }
 impl ReservedErrors {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1074,6 +1041,8 @@ impl ReservedErrors {
             Self::Unknown => "RESERVED_ERRORS_UNKNOWN",
             Self::Unsupported => "RESERVED_ERRORS_UNSUPPORTED",
             Self::Unavailable => "RESERVED_ERRORS_UNAVAILABLE",
+            Self::Unauthorized => "RESERVED_ERRORS_UNAUTHORIZED",
+            Self::Unconfirmed => "RESERVED_ERRORS_UNCONFIRMED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1084,23 +1053,27 @@ impl ReservedErrors {
             "RESERVED_ERRORS_UNKNOWN" => Some(Self::Unknown),
             "RESERVED_ERRORS_UNSUPPORTED" => Some(Self::Unsupported),
             "RESERVED_ERRORS_UNAVAILABLE" => Some(Self::Unavailable),
+            "RESERVED_ERRORS_UNAUTHORIZED" => Some(Self::Unauthorized),
+            "RESERVED_ERRORS_UNCONFIRMED" => Some(Self::Unconfirmed),
             _ => None,
         }
     }
 }
-/// SlotKind identifies a slot slot on the device. Each value corresponds to
-/// a unique data type that the device can store and manage.
+/// SlotKind identifies a slot on the device. Each value corresponds to a unique
+/// data type that the device can store and manage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SlotKind {
+    /// Never sent, an unset kind
+    SlotUnspecified = 0,
     /// Human reference genome assembly
-    SlotReferenceGenome = 0,
+    SlotReferenceGenome = 1,
     /// Gene-to-coordinate mapping database
-    SlotGeneAnnotations = 1,
+    SlotGeneAnnotations = 2,
     /// User's SNP/indel variant calls
-    SlotSnpIndelCalls = 2,
+    SlotSnpIndelCalls = 3,
     /// Variant catalog (rsID-to-position), from dbSNP
-    SlotVariantCatalog = 3,
+    SlotVariantCatalog = 4,
 }
 impl SlotKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1109,6 +1082,7 @@ impl SlotKind {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
+            Self::SlotUnspecified => "SLOT_UNSPECIFIED",
             Self::SlotReferenceGenome => "SLOT_REFERENCE_GENOME",
             Self::SlotGeneAnnotations => "SLOT_GENE_ANNOTATIONS",
             Self::SlotSnpIndelCalls => "SLOT_SNP_INDEL_CALLS",
@@ -1118,6 +1092,7 @@ impl SlotKind {
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
+            "SLOT_UNSPECIFIED" => Some(Self::SlotUnspecified),
             "SLOT_REFERENCE_GENOME" => Some(Self::SlotReferenceGenome),
             "SLOT_GENE_ANNOTATIONS" => Some(Self::SlotGeneAnnotations),
             "SLOT_SNP_INDEL_CALLS" => Some(Self::SlotSnpIndelCalls),
@@ -1131,10 +1106,12 @@ impl SlotKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SlotOrigin {
+    /// Never sent, an unset origin
+    OriginUnspecified = 0,
     /// Unique to the user, uploaded by them
-    OriginPersonal = 0,
+    OriginPersonal = 1,
     /// Standard reference data, downloaded from public sources
-    OriginReference = 1,
+    OriginReference = 2,
 }
 impl SlotOrigin {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1143,6 +1120,7 @@ impl SlotOrigin {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
+            Self::OriginUnspecified => "ORIGIN_UNSPECIFIED",
             Self::OriginPersonal => "ORIGIN_PERSONAL",
             Self::OriginReference => "ORIGIN_REFERENCE",
         }
@@ -1150,23 +1128,63 @@ impl SlotOrigin {
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
+            "ORIGIN_UNSPECIFIED" => Some(Self::OriginUnspecified),
             "ORIGIN_PERSONAL" => Some(Self::OriginPersonal),
             "ORIGIN_REFERENCE" => Some(Self::OriginReference),
             _ => None,
         }
     }
 }
-/// SlotConfidence indicates how confident the device is in its classification
-/// of a peeked slot, based on content, filename, and size.
+/// SlotState describes whether a slot holds data and whether that data is sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SlotState {
+    /// Never sent, an unset state
+    StateUnspecified = 0,
+    /// Nothing stored
+    StateEmpty = 1,
+    /// Data present and healthy
+    StateFilled = 2,
+    /// Files exist but the metadata is missing, corrupt or outdated
+    StateDamaged = 3,
+}
+impl SlotState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::StateUnspecified => "STATE_UNSPECIFIED",
+            Self::StateEmpty => "STATE_EMPTY",
+            Self::StateFilled => "STATE_FILLED",
+            Self::StateDamaged => "STATE_DAMAGED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STATE_UNSPECIFIED" => Some(Self::StateUnspecified),
+            "STATE_EMPTY" => Some(Self::StateEmpty),
+            "STATE_FILLED" => Some(Self::StateFilled),
+            "STATE_DAMAGED" => Some(Self::StateDamaged),
+            _ => None,
+        }
+    }
+}
+/// SlotConfidence indicates how confident the device is in its identification
+/// of a file, based on content, filename and size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SlotConfidence {
+    /// Never sent, an unset confidence
+    ConfidenceUnspecified = 0,
     /// Filename/extension only, no content confirmation
-    ConfidenceLow = 0,
+    ConfidenceLow = 1,
     /// Format detected but slot type inferred from size/filename
-    ConfidenceMid = 1,
+    ConfidenceMid = 2,
     /// Magic bytes match and format-specific content confirmed
-    ConfidenceHigh = 2,
+    ConfidenceHigh = 3,
 }
 impl SlotConfidence {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1175,6 +1193,7 @@ impl SlotConfidence {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
+            Self::ConfidenceUnspecified => "CONFIDENCE_UNSPECIFIED",
             Self::ConfidenceLow => "CONFIDENCE_LOW",
             Self::ConfidenceMid => "CONFIDENCE_MID",
             Self::ConfidenceHigh => "CONFIDENCE_HIGH",
@@ -1183,6 +1202,7 @@ impl SlotConfidence {
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
+            "CONFIDENCE_UNSPECIFIED" => Some(Self::ConfidenceUnspecified),
             "CONFIDENCE_LOW" => Some(Self::ConfidenceLow),
             "CONFIDENCE_MID" => Some(Self::ConfidenceMid),
             "CONFIDENCE_HIGH" => Some(Self::ConfidenceHigh),

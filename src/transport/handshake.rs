@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Messages of the session handshake. Each struct encodes as a CBOR array.
 //! Field order is part of the protocol; changing it requires a wire version bump.

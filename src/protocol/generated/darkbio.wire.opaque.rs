@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -60,26 +60,23 @@ pub mod host_to_ark {
         /// Installs the verified firmware and reboots
         #[prost(bytes, tag = "517")]
         FirmwareUpdateInstall(::prost::bytes::Bytes),
-        /// Queries whether the Ark is paired and opened
-        #[prost(bytes, tag = "769")]
-        PairingStatus(::prost::bytes::Bytes),
         /// Asks the Ark to authorize a pairing rendezvous
-        #[prost(bytes, tag = "770")]
+        #[prost(bytes, tag = "769")]
         PairingAuth(::prost::bytes::Bytes),
         /// Injects the companion app's identity, relayed by the cloud
-        #[prost(bytes, tag = "771")]
+        #[prost(bytes, tag = "770")]
         PairingSetAppId(::prost::bytes::Bytes),
         /// Injects the companion app's storage key material
-        #[prost(bytes, tag = "772")]
+        #[prost(bytes, tag = "771")]
         PairingSetAppStorage(::prost::bytes::Bytes),
         /// Confirms the app received the Ark's key material
-        #[prost(bytes, tag = "773")]
+        #[prost(bytes, tag = "772")]
         PairingAckArkStorage(::prost::bytes::Bytes),
         /// Waits for the user to accept the pairing
-        #[prost(bytes, tag = "774")]
+        #[prost(bytes, tag = "773")]
         PairingAccept(::prost::bytes::Bytes),
         /// Waits for the Ark to finish pairing maintenance
-        #[prost(bytes, tag = "775")]
+        #[prost(bytes, tag = "774")]
         PairingComplete(::prost::bytes::Bytes),
         /// Asks the Ark to authorize joining the app relay
         #[prost(bytes, tag = "1025")]
@@ -119,7 +116,7 @@ pub mod host_to_ark {
         SlotDelete(::prost::bytes::Bytes),
         /// Asks the Ark to identify a file from its first chunk
         #[prost(bytes, tag = "1540")]
-        SlotUploadPeek(::prost::bytes::Bytes),
+        SlotIdentify(::prost::bytes::Bytes),
         /// Starts uploading a file into a slot
         #[prost(bytes, tag = "1541")]
         SlotUploadStart(::prost::bytes::Bytes),
@@ -132,6 +129,9 @@ pub mod host_to_ark {
         /// Marks an upload complete and polls its processing
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
+        /// Maps every path an app can read, from the dataset view
+        #[prost(bytes, tag = "1793")]
+        DatasetPaths(::prost::bytes::Bytes),
         /// Unreleased messages served by development firmware only, carried opaquely
         /// so the public protocol is untouched while they are still under development.
         /// Their schema is private and production Arks refuse the envelope.
@@ -160,7 +160,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 775, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -200,26 +200,23 @@ pub mod ark_to_host {
         /// Acknowledges the installed firmware
         #[prost(bytes, tag = "517")]
         FirmwareUpdateInstall(::prost::bytes::Bytes),
-        /// Whether the Ark is paired and opened
-        #[prost(bytes, tag = "769")]
-        PairingStatus(::prost::bytes::Bytes),
         /// Signed authorization for the cloud to open a rendezvous
-        #[prost(bytes, tag = "770")]
+        #[prost(bytes, tag = "769")]
         PairingAuth(::prost::bytes::Bytes),
         /// Acknowledges the accepted app identity
-        #[prost(bytes, tag = "771")]
+        #[prost(bytes, tag = "770")]
         PairingSetAppId(::prost::bytes::Bytes),
         /// Ark device infos and key material, sealed for the app
-        #[prost(bytes, tag = "772")]
+        #[prost(bytes, tag = "771")]
         PairingSetAppStorage(::prost::bytes::Bytes),
         /// Acknowledges the app's receipt of the Ark's keys
-        #[prost(bytes, tag = "773")]
+        #[prost(bytes, tag = "772")]
         PairingAckArkStorage(::prost::bytes::Bytes),
         /// Signed confirmation that the user accepted the pairing
-        #[prost(bytes, tag = "774")]
+        #[prost(bytes, tag = "773")]
         PairingAccept(::prost::bytes::Bytes),
         /// Signed confirmation that the Ark finished pairing
-        #[prost(bytes, tag = "775")]
+        #[prost(bytes, tag = "774")]
         PairingComplete(::prost::bytes::Bytes),
         /// Signed authorization for the cloud to join the relay
         #[prost(bytes, tag = "1025")]
@@ -260,9 +257,9 @@ pub mod ark_to_host {
         /// Acknowledges the deleted slot
         #[prost(bytes, tag = "1539")]
         SlotDelete(::prost::bytes::Bytes),
-        /// Identification of the peeked file
+        /// Identification of the file's first chunk
         #[prost(bytes, tag = "1540")]
-        SlotUploadPeek(::prost::bytes::Bytes),
+        SlotIdentify(::prost::bytes::Bytes),
         /// Session id of the approved upload
         #[prost(bytes, tag = "1541")]
         SlotUploadStart(::prost::bytes::Bytes),
@@ -275,6 +272,9 @@ pub mod ark_to_host {
         /// Processing progress of the completed upload
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
+        /// Generated README.md of the dataset view
+        #[prost(bytes, tag = "1793")]
+        DatasetPaths(::prost::bytes::Bytes),
         /// Unreleased messages emitted by development firmware only, in response to
         /// a develop request, carried opaquely so the public protocol is untouched
         /// while they are still under development. Their schema is private.

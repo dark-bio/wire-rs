@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2025 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 // Allow excluding test code from coverage measurements on nightly
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
@@ -16,6 +19,11 @@ pub use darkbio_cobs as cobs;
 pub use darkbio_crypto as crypto;
 pub use darkbio_trust as trust;
 pub use prost;
+
+/// Version of the wire crate compiled into this process. It's mostly a debug
+/// utility to help detect protocol version mismatches without having to guess
+/// who compiled what into where.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};

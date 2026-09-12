@@ -1,5 +1,8 @@
 // wire-rs: encrypted protocol between Ark and host
 // Copyright 2026 Dark Bio AG. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 //! Output and session boundaries of one byte stream. The writer lock orders
 //! frames, handshakes and session ending. A separate binding lock orders receive
