@@ -162,7 +162,7 @@ message ArkToHost {
 
     // Dataset messages, reserved range 0x701-0x800
 
-    DatasetPathsResponse dataset_paths = 0x701; // Generated README.md of the dataset view
+    DatasetPathsResponse dataset_paths = 0x701; // Every path an app can read, with its description, format and examples
 
     // Unreleased messages emitted by development firmware only, in response to
     // a develop request, carried opaquely so the public protocol is untouched
@@ -634,16 +634,17 @@ message SlotDownload {
 message SlotStatus {
   SlotKind   kind   = 1; // Slot type
   string     name   = 2; // Human-readable slot name
-  string     desc   = 3; // Detailed description of this slot
-  SlotOrigin origin = 4; // Nature of the data (personal, reference)
-  SlotState  state  = 5; // Whether the slot is empty, filled or damaged
-  string     damage = 6; // Why the slot is damaged, empty otherwise
-  repeated SlotKind deps = 7; // Slots that must be filled before this one is actionable
-  uint64     bytes  = 8; // Bytes on disk for this slot (0 if empty)
+  string     desc   = 3; // Owner-facing description of the data this slot holds
+  string     format = 4; // The file that fills this slot, its required shape and what is refused
+  SlotOrigin origin = 5; // Nature of the data (personal, reference)
+  SlotState  state  = 6; // Whether the slot is empty, filled or damaged
+  string     damage = 7; // Why the slot is damaged, empty otherwise
+  repeated SlotKind deps = 8; // Slots that must be filled before this one is actionable
+  uint64     bytes  = 9; // Bytes on disk for this slot (0 if empty)
 
-  string       build    = 9;  // Reference assembly the data is keyed to (e.g. "GRCh38.p14")
-  string       version  = 10; // The dataset's own release, if it has one (e.g. dbSNP "157")
-  SlotDownload download = 11; // Advertised public download, absent if none
+  string       build    = 10; // Reference assembly the data is keyed to (e.g. "GRCh38.p14")
+  string       version  = 11; // The dataset's own release, if it has one (e.g. dbSNP "157")
+  SlotDownload download = 12; // Advertised public download, absent if none
 }
 
 // SlotListRequest requests the state of all slots on the device.
@@ -757,10 +758,22 @@ message SlotUploadProcessResponse {
 // dataset view the device derives from its slots, lenses included.
 message DatasetPathsRequest {
 }
-// DatasetPathsResponse contains the generated README.md of the dataset view,
-// the same file the Ark serves to apps at /v1/README.md: every path always,
-// absent ones marked with the slot that would make them appear. It describes
-// the tree only and never carries a value from the owner's data.
+// DatasetPathsResponse maps every path an app can read, available or not, in
+// tree order. It describes the tree only and never carries a value from the
+// owner's data.
 message DatasetPathsResponse {
-  string readme = 1; // Generated README.md of the dataset view
+  repeated DatasetPath paths = 1; // Every path pattern, in tree order
+}
+
+// DatasetPath describes one path pattern under the data root. A segment in angle
+// brackets is a placeholder, described by the directory entry it names. The path
+// is the entry's stable key.
+message DatasetPath {
+  string          path      = 1; // Path as a manifest names it
+  bool            directory = 2; // Directory or file
+  bool            grantable = 3; // Whether a manifest may name it
+  bool            available = 4; // Whether the data this path needs is on the Ark now
+  string          desc      = 5; // What it holds, when it is absent and when it fails
+  string          format    = 6; // Exact file content, or what a directory lists
+  repeated string examples  = 7; // Complete example values, most typical first
 }

@@ -272,7 +272,7 @@ pub mod ark_to_host {
         /// Processing progress of the completed upload
         #[prost(message, tag = "1544")]
         SlotUploadProcess(super::SlotUploadProcessResponse),
-        /// Generated README.md of the dataset view
+        /// Every path an app can read, with its description, format and examples
         #[prost(message, tag = "1793")]
         DatasetPaths(super::DatasetPathsResponse),
         /// Unreleased messages emitted by development firmware only, in response to
@@ -797,32 +797,35 @@ pub struct SlotStatus {
     /// Human-readable slot name
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
-    /// Detailed description of this slot
+    /// Owner-facing description of the data this slot holds
     #[prost(string, tag = "3")]
     pub desc: ::prost::alloc::string::String,
+    /// The file that fills this slot, its required shape and what is refused
+    #[prost(string, tag = "4")]
+    pub format: ::prost::alloc::string::String,
     /// Nature of the data (personal, reference)
-    #[prost(enumeration = "SlotOrigin", tag = "4")]
+    #[prost(enumeration = "SlotOrigin", tag = "5")]
     pub origin: i32,
     /// Whether the slot is empty, filled or damaged
-    #[prost(enumeration = "SlotState", tag = "5")]
+    #[prost(enumeration = "SlotState", tag = "6")]
     pub state: i32,
     /// Why the slot is damaged, empty otherwise
-    #[prost(string, tag = "6")]
+    #[prost(string, tag = "7")]
     pub damage: ::prost::alloc::string::String,
     /// Slots that must be filled before this one is actionable
-    #[prost(enumeration = "SlotKind", repeated, tag = "7")]
+    #[prost(enumeration = "SlotKind", repeated, tag = "8")]
     pub deps: ::prost::alloc::vec::Vec<i32>,
     /// Bytes on disk for this slot (0 if empty)
-    #[prost(uint64, tag = "8")]
+    #[prost(uint64, tag = "9")]
     pub bytes: u64,
     /// Reference assembly the data is keyed to (e.g. "GRCh38.p14")
-    #[prost(string, tag = "9")]
+    #[prost(string, tag = "10")]
     pub build: ::prost::alloc::string::String,
     /// The dataset's own release, if it has one (e.g. dbSNP "157")
-    #[prost(string, tag = "10")]
+    #[prost(string, tag = "11")]
     pub version: ::prost::alloc::string::String,
     /// Advertised public download, absent if none
-    #[prost(message, optional, tag = "11")]
+    #[prost(message, optional, tag = "12")]
     pub download: ::core::option::Option<SlotDownload>,
 }
 /// SlotListRequest requests the state of all slots on the device.
@@ -992,15 +995,41 @@ pub struct SlotUploadProcessResponse {
 /// dataset view the device derives from its slots, lenses included.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DatasetPathsRequest {}
-/// DatasetPathsResponse contains the generated README.md of the dataset view,
-/// the same file the Ark serves to apps at /v1/README.md: every path always,
-/// absent ones marked with the slot that would make them appear. It describes
-/// the tree only and never carries a value from the owner's data.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// DatasetPathsResponse maps every path an app can read, available or not, in
+/// tree order. It describes the tree only and never carries a value from the
+/// owner's data.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DatasetPathsResponse {
-    /// Generated README.md of the dataset view
+    /// Every path pattern, in tree order
+    #[prost(message, repeated, tag = "1")]
+    pub paths: ::prost::alloc::vec::Vec<DatasetPath>,
+}
+/// DatasetPath describes one path pattern under the data root. A segment in angle
+/// brackets is a placeholder, described by the directory entry it names. The path
+/// is the entry's stable key.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatasetPath {
+    /// Path as a manifest names it
     #[prost(string, tag = "1")]
-    pub readme: ::prost::alloc::string::String,
+    pub path: ::prost::alloc::string::String,
+    /// Directory or file
+    #[prost(bool, tag = "2")]
+    pub directory: bool,
+    /// Whether a manifest may name it
+    #[prost(bool, tag = "3")]
+    pub grantable: bool,
+    /// Whether the data this path needs is on the Ark now
+    #[prost(bool, tag = "4")]
+    pub available: bool,
+    /// What it holds, when it is absent and when it fails
+    #[prost(string, tag = "5")]
+    pub desc: ::prost::alloc::string::String,
+    /// Exact file content, or what a directory lists
+    #[prost(string, tag = "6")]
+    pub format: ::prost::alloc::string::String,
+    /// Complete example values, most typical first
+    #[prost(string, repeated, tag = "7")]
+    pub examples: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// ReservedErrors names the assigned protocol-wide errors in the reserved range
 /// 0x00 to 0xff (inclusive). No code in this range may be assigned a request

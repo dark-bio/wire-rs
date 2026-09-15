@@ -272,7 +272,7 @@ pub mod ark_to_host {
         /// Processing progress of the completed upload
         #[prost(bytes, tag = "1544")]
         SlotUploadProcess(::prost::bytes::Bytes),
-        /// Generated README.md of the dataset view
+        /// Every path an app can read, with its description, format and examples
         #[prost(bytes, tag = "1793")]
         DatasetPaths(::prost::bytes::Bytes),
         /// Unreleased messages emitted by development firmware only, in response to
