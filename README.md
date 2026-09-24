@@ -3,6 +3,7 @@
 [![](https://img.shields.io/crates/v/darkbio-wire.svg)](https://crates.io/crates/darkbio-wire)
 [![](https://docs.rs/darkbio-wire/badge.svg)](https://docs.rs/darkbio-wire)
 [![](https://github.com/dark-bio/wire-rs/workflows/tests/badge.svg)](https://github.com/dark-bio/wire-rs/actions/workflows/ci.yml)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](https://github.com/dark-bio/wire-rs/blob/main/LICENSE)
 
 This repository implements the wire protocol between an [Ark](https://dark.bio) enclave and the host machine it is plugged into. The wire wraps an arbitrary byte stream into an encrypted, request oriented transport:
 

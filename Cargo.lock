@@ -395,9 +395,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto"
-version = "0.18.2"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbbc26cef72218bb30779a4269d2f5be84bf20575848a63a6044a786b9e332a1"
+checksum = "030dcbb25b2b423e3ffddbf27b834815353a86aad76e828d852be3581a8e0b15"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -421,20 +421,20 @@ dependencies = [
 
 [[package]]
 name = "darkbio-crypto-cbor-derive"
-version = "0.18.2"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0905e0df57aae0ba154f635c11a8e6ea39f79aba99edfdf2c8114fc31ad250"
+checksum = "a4a03fa7df24e0afd285b98163b0b24ecde7ce87f2672e55bf70b12a7afec3c0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
 name = "darkbio-trust"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f071d9b0c29b337c5342872ecf0b149f3b2b2ea9447c21cde1dffe53f810e2f1"
+checksum = "68d3d06e8971c65286e956a3b8eadcde851e7f60ec4a854d04ce84b9db14725e"
 dependencies = [
  "darkbio-crypto",
  "hex",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "darkbio-wire"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arbitrary",
  "base64",
@@ -1347,7 +1347,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1539,9 +1539,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.5"
+version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1565,22 +1565,22 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1756,7 +1756,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
  "wasm-bindgen-shared",
 ]
 
