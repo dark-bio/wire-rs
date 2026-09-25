@@ -100,7 +100,9 @@ pub enum Step {
     /// Nothing if none was produced yet.
     Truncated(u8),
     /// A valid ArkHello without its delimiter. A following zero completes the
-    /// hello; any other frame merges into its bytes and makes it invalid.
+    /// hello. So does a frame encoding the empty packet when the hello's encoding
+    /// ends in a full run, as COBS implies no zero after one. Any other frame
+    /// merges into its bytes and makes it invalid.
     Partial,
     /// A frame past the size limit, delimiter included. Receiving it ends a
     /// session; a handshake drains it and continues waiting for its ArkHello.
@@ -255,7 +257,8 @@ enum Partial {
     /// The stream is at a frame boundary.
     None,
     /// An ArkHello for this generation, completed successfully only if the next
-    /// byte is a delimiter.
+    /// byte is a delimiter, or if its encoding ends in a full run and the next
+    /// frame encodes the empty packet.
     Hello(u64, Vec<u8>),
     /// Bytes no delimiter can complete into anything valid.
     Junk(Vec<u8>),
@@ -479,7 +482,8 @@ impl Server {
             }
         };
         // Combine this frame with any earlier partial input. A lone delimiter
-        // completes a pending hello. Other combinations become invalid or too large.
+        // completes a pending hello, as does the empty packet after a full run.
+        // Other combinations become invalid or too large.
         let (bytes, frame) = produced;
         let frame = match std::mem::replace(&mut self.partial, Partial::None) {
             Partial::None => Some(if bytes.len() - 1 > MAX_FRAME_SIZE {
@@ -491,6 +495,17 @@ impl Server {
                 generation,
                 flaw: Flaw::None,
             }),
+            // COBS implies no zero after a full run, so the empty packet's 0x01
+            // can end a hello without changing what it decodes to
+            Partial::Hello(generation, prior)
+                if bytes == [0x01, 0x00]
+                    && unframe(&[prior.as_slice(), &[0x01]].concat()) == unframe(&prior) =>
+            {
+                Some(Frame::ArkHello {
+                    generation,
+                    flaw: Flaw::None,
+                })
+            }
             Partial::Hello(_, prior) | Partial::Junk(prior) => {
                 let mut merged = prior;
                 merged.extend_from_slice(&bytes[..bytes.len() - 1]);

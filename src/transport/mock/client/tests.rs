@@ -505,6 +505,29 @@ fn test_scripted_partial_frames() {
     assert_eq!(summary.dropped, 1);
 }
 
+// Tests a partial hello followed by a frame encoding the empty packet. If the
+// hello's encoding ends in a full run, that lone 0x01 decodes to nothing and
+// completes the hello. Otherwise the merge is junk. Keys are random, so the
+// script repeats until one run draws a hello of the first kind.
+#[test]
+fn test_scripted_partial_hello_empty_packet() {
+    // Pair a reset, a partial hello and an empty packet as often as a script allows
+    let rounds = MAX_STEPS / 3;
+    let steps: Vec<Step> = (0..rounds)
+        .flat_map(|_| [Step::Reset, Step::Partial, Step::Junk(vec![])])
+        .collect();
+
+    // Rerun with fresh keys until one hello ends in a full run and completes
+    for run in 0..1000 {
+        let summary = run_logged(&steps);
+        assert_eq!(summary.handshakes + summary.dropped, rounds, "run {run}");
+        if summary.handshakes > 0 {
+            return;
+        }
+    }
+    panic!("no partial hello ended in a full run");
+}
+
 // Tests that a WouldBlock read aborts an unfinished handshake without a wire
 // signal, while an established session remains usable.
 #[test]

@@ -89,7 +89,9 @@ pub enum Step {
     /// if no valid frame was sent yet.
     Truncated(u8),
     /// A valid HostHello without its delimiter. A following zero completes the
-    /// hello; any other frame merges into its bytes and makes it invalid.
+    /// hello. So does a frame encoding the empty packet when the hello's encoding
+    /// ends in a full run, as COBS implies no zero after one. Any other frame
+    /// merges into its bytes and makes it invalid.
     Partial,
     /// A frame past the size limit, delimiter included. The server rejects it
     /// as soon as the limit is exceeded, ending any session or handshake. Its
@@ -207,6 +209,8 @@ enum Frame {
     Request(u64),
     /// Sealed bytes outside the tagged request format, still valid transport data.
     Garbage,
+    /// A frame encoding the empty packet, refused like junk on its own.
+    EmptyPacket,
     /// Anything else, refused in every state.
     Junk,
 }
@@ -216,7 +220,9 @@ enum Partial {
     /// The stream is at a frame boundary.
     None,
     /// A hello completed successfully only if the next byte is a delimiter.
-    Hello(Box<Keys>),
+    /// With the flag, its encoding ends in a full run, after which a frame
+    /// encoding the empty packet decodes to nothing and completes it too.
+    Hello(Box<Keys>, bool),
     /// Bytes no delimiter can complete into anything valid.
     Junk,
 }
@@ -586,9 +592,7 @@ impl Client {
                 if junk.is_empty() {
                     junk.push(1);
                 }
-                self.deliver(Frame::Junk);
-                self.bytes.extend(junk);
-                self.bytes.push(0x00);
+                self.raw(&junk);
             }
             Step::Truncated(n) => {
                 if let Some(valid) = self.last_valid.clone() {
@@ -596,18 +600,21 @@ impl Client {
                         0..=1 => 1,
                         len => 1 + n as usize % (len - 1),
                     };
-                    self.deliver(Frame::Junk);
-                    self.bytes.extend(&valid[..keep]);
-                    self.bytes.push(0x00);
+                    self.raw(&valid[..keep]);
                 }
             }
             Step::Partial => {
                 let keys = Keys::generate();
-                let mut framed = frame(&keys.hello());
+                let hello = keys.hello();
+                let mut framed = frame(&hello);
                 framed.pop();
+
+                // An encoding ending in a full run has no implied zero to
+                // restore, so the empty packet's 0x01 leaves the hello intact
+                let full_run = unframe(&[framed.as_slice(), &[0x01]].concat()) == hello;
                 self.bytes.extend(framed);
                 self.partial = match self.partial {
-                    Partial::None => Partial::Hello(Box::new(keys)),
+                    Partial::None => Partial::Hello(Box::new(keys), full_run),
                     _ => Partial::Junk,
                 };
             }
@@ -668,6 +675,17 @@ impl Client {
         self.bytes.extend(frame(text));
     }
 
+    /// Queues raw frame bytes and their delimiter, refused by the server on their
+    /// own. A lone 0x01 encodes the empty packet, which can complete a partial hello.
+    fn raw(&mut self, body: &[u8]) {
+        self.deliver(match body {
+            [0x01] => Frame::EmptyPacket,
+            _ => Frame::Junk,
+        });
+        self.bytes.extend(body);
+        self.bytes.push(0x00);
+    }
+
     /// Remembers the frame as the last valid one, for truncating later.
     fn record(&mut self, framed: &[u8]) {
         self.last_valid = Some(framed[..framed.len() - 1].to_vec());
@@ -680,13 +698,15 @@ impl Client {
     }
 
     /// Predicts the server's response to an incoming frame. A preceding partial
-    /// hello is valid only if this frame supplies its missing delimiter. Other
-    /// combinations of partial input and new bytes become junk.
+    /// hello is valid only if this frame supplies its missing delimiter, or if it
+    /// encodes the empty packet right after a full run. Other combinations of
+    /// partial input and new bytes become junk.
     fn deliver(&mut self, frame: Frame) {
         let frame = match std::mem::replace(&mut self.partial, Partial::None) {
             Partial::None => frame,
-            Partial::Hello(keys) => match frame {
+            Partial::Hello(keys, full_run) => match frame {
                 Frame::Empty => Frame::Hello(keys),
+                Frame::EmptyPacket if full_run => Frame::Hello(keys),
                 _ => Frame::Junk,
             },
             Partial::Junk => Frame::Junk,
