@@ -391,9 +391,9 @@ checksum = "85c141bbdcd8501a06371992d3ea79a7a3297e37f989991b50f9d77c5f27e412"
 
 [[package]]
 name = "darkbio-cobs"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb1c8fd159d655841568f7990c30cfc97de19283b263555ff601429ad744a0df"
+checksum = "c539cbd4d351f77eafbf76ea2b385a268dd5c5986d34c93c958f75861dcbc4e4"
 dependencies = [
  "memchr",
  "thiserror",
