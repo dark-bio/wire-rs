@@ -415,7 +415,7 @@ mod tests {
                     deadline: None,
                 },
                 Side::Server,
-                Closer::new(|| {}),
+                Closer::new(&Clock::real(), || {}),
                 DEFAULT_WRITE_TIMEOUT,
             ));
             let sealer = Arc::new(Mutex::new(contexts().0));
@@ -469,7 +469,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             Refused(settings.clone()),
             Side::Server,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
@@ -500,7 +500,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             Memory::new(io::Cursor::new([0u8; 0])),
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
@@ -533,7 +533,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             Memory::new(Vec::new()),
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
@@ -568,7 +568,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             Memory::new(Vec::new()),
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
@@ -615,7 +615,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             collector.clone(),
             Side::Server,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let old = Arc::new(Mutex::new(contexts().0));
@@ -647,7 +647,8 @@ mod tests {
         sender.send(&payload(1)).unwrap();
 
         let bytes = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(Memory::new(&bytes[..]), Closer::new(|| {}));
+        let mut reader =
+            FrameReader::new(Memory::new(&bytes[..]), Closer::new(&Clock::real(), || {}));
         assert!(reader.next_packet(None).unwrap().is_none());
         assert_eq!(reader.next_packet(None).unwrap(), Some(&b"hello"[..]));
         let packet = reader.next_packet(None).unwrap().unwrap();

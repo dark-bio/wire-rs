@@ -134,7 +134,9 @@ fn test_notification_races() {
         let (promise, ()) = schedule(
             order,
             move || {
-                promise.notify(events, 1);
+                promise.notify(move || {
+                    let _ = events.send(1);
+                });
                 promise
             },
             move || deliver(&state, incoming(id, 11)).unwrap(),
@@ -147,7 +149,9 @@ fn test_notification_races() {
         let (session, deadline) = fixture(0, 1024);
         let (id, mut promise) = request(&session, deadline);
         let (events, receiver) = mpsc::channel();
-        promise.notify(events, 1);
+        promise.notify(move || {
+            let _ = events.send(1);
+        });
         let state = session.inner.clone();
         schedule(
             order,
@@ -894,12 +898,13 @@ fn test_operation_close_races() {
     }
 }
 
-/// `Promise::wait()` enforces its deadline even without a deadline worker.
-/// The watchdog fails the test if the call remains blocked.
+/// The deadline worker settles real-time requests and replies while their promises wait.
 #[test]
 fn test_real_wait_deadlines() {
     use Failure::*;
     use Step::*;
+
+    // Keep the real-time scenario's deadlines serviced while both promises wait
     run(vec![
         Open(1),
         Accept(1),
@@ -1618,12 +1623,8 @@ fn test_observer_drop_during_response_completion() {
             let used = Arc::new(AtomicUsize::new(0));
             let counter = used.clone();
             let now = Instant::now();
-            let (sender, promise) = Promise::<Message>::pair(
-                Weak::new(),
-                &crate::clock::Clock::real(),
-                now + Duration::from_secs(60),
-                true,
-            );
+            let (sender, promise) =
+                Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60), true);
             let pending = PendingOperation {
                 deadline: now + Duration::from_secs(60),
                 sender,
@@ -1632,7 +1633,8 @@ fn test_observer_drop_during_response_completion() {
             let (entered, reserved) = mpsc::channel();
             let (release, released) = mpsc::channel();
             let completed = Job::start(move || {
-                pending.complete_response(now, || {
+                let mut notifications = crate::protocol::promise::Notifications::default();
+                pending.complete_response(now, &mut notifications, || {
                     let result = IncomingEnvelope::new(
                         bytes.into(),
                         header,

@@ -9,7 +9,6 @@
 use super::envelope::IncomingEnvelope;
 use super::session::SessionInner;
 use super::{Error, Message};
-use darkbio_clock::Clock;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, Weak, mpsc};
@@ -43,8 +42,6 @@ use std::time::Instant;
 /// }
 /// ```
 pub struct Promise<T> {
-    /// Session clock used to compute the remaining receive budget.
-    clock: Clock,
     /// Receives one result from the corresponding `PendingOperation`. A buffered
     /// result remains available even after the session is dropped.
     result: mpsc::Receiver<Result<PromiseResult, Error>>,
@@ -54,7 +51,7 @@ pub struct Promise<T> {
     registered: bool,
     /// Public result type; responses stay encoded until `wait()`.
     value: PhantomData<fn() -> T>,
-    /// Lets the waiter call `SessionInner::expire()` when its deadline is reached.
+    /// Lets the waiter service expired operations before receiving its result.
     session: Weak<SessionInner>,
     /// Deadline supplied with the request or reply. `wait()` does not restart it.
     deadline: Instant,
@@ -110,7 +107,6 @@ impl<T> Promise<T> {
     /// The channel holds one result without waiting for the caller to receive it.
     pub(super) fn pair(
         session: Weak<SessionInner>,
-        clock: &Clock,
         deadline: Instant,
         response: bool,
     ) -> (ResultSender, Self) {
@@ -118,7 +114,7 @@ impl<T> Promise<T> {
         let (sender, result) = mpsc::sync_channel(1);
         let notification = Arc::new(Mutex::new(NotificationState::default()));
 
-        // Retain the clock independently of the session's lifetime
+        // Keep publication and observation independent of the session's lifetime
         (
             ResultSender {
                 response,
@@ -126,7 +122,6 @@ impl<T> Promise<T> {
                 notification: notification.clone(),
             },
             Self {
-                clock: clock.clone(),
                 result,
                 notification,
                 registered: false,
@@ -139,51 +134,46 @@ impl<T> Promise<T> {
         )
     }
 
-    /// Sends `event` through the unbounded channel once a terminal result is ready.
-    /// Requests notify on a response or error; replies notify on local write/flush
-    /// completion or error. Notification does not imply success or peer receipt.
-    /// The result is published before the event, so `wait()` can then extract it
-    /// without waiting for completion. Response decoding still happens in `wait()`.
+    /// Runs `callback` once the result is ready. Requests notify on a response or
+    /// an error, replies on local write and flush completion or an error, so a
+    /// notification implies neither success nor peer receipt. The result is
+    /// published first, so `wait()` then takes it without waiting for
+    /// publication, though it still decodes a response.
     ///
     /// Registering or receiving a notification neither decodes the response nor
     /// releases its retained bytes. They remain charged until `wait()` or drop.
     /// Deadlines are unchanged, and registration does not service expiry.
     ///
-    /// An already-completed promise sends immediately on the registering thread,
+    /// On a settled promise, the callback runs at once on the registering thread,
     /// even after its session is gone. Otherwise the thread settling the operation
-    /// sends the event. A disconnected notification receiver discards the event
-    /// without affecting the result. Copy tokens cannot run application destructors
-    /// on a protocol worker; keep any associated payload on the consumer's side.
+    /// runs it, which can be a protocol worker. Either way it runs, and its captures
+    /// drop, outside every wire lock, so it may call back into the session. It must
+    /// return promptly and must not panic.
     ///
-    /// Dropping the promise clears an unsent notification without cancelling the
-    /// operation. An event already sent can outlive its promise.
+    /// Dropping the promise drops a callback still waiting for settlement, without
+    /// cancelling the operation. A callback already taken by settlement still runs.
     ///
     /// # Panics
     /// Panics if notification was already registered on this promise.
-    pub fn notify<E: Copy + Send + 'static>(&mut self, sender: mpsc::Sender<E>, event: E) {
+    pub fn notify(&mut self, callback: impl FnOnce() + Send + 'static) {
         // Check before locking so caller misuse cannot poison shared state and
         // cause another panic when the promise is dropped during unwinding.
         assert!(!self.registered, "promise notification already registered");
 
+        // Serialize registration with publication and promise drop
         self.registered = true;
         let mut notification = self.notification.lock().expect("notification not poisoned");
         if notification.done {
-            let _ = sender.send(event);
+            drop(notification);
+            callback();
         } else {
-            notification.hook = Some(Box::new(move || {
-                let _ = sender.send(event);
-            }));
+            notification.hook = Some(Box::new(callback));
         }
     }
 
-    /// Waits for the result channel. On timeout, asks the session to expire pending
-    /// operations, then reads the result it sent. The session decides whether an
-    /// answer or timeout came first; results already in the channel are kept.
+    /// Expires pending operations, then waits for the session to publish its result.
+    /// The session decides whether an answer or timeout came first.
     #[allow(unused_mut)] // The test-only wait hook must be taken now that we implement Drop.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the promise receive becomes untimed in W2"
-    )]
     fn wait_result(mut self) -> Result<PromiseResult, Error> {
         // Settle any operations already expired before waiting
         if let Some(session) = self.session.upgrade() {
@@ -196,21 +186,11 @@ impl<T> Promise<T> {
             let _ = wait_hook.send(());
         }
 
-        // Keep the original deadline while waiting for the session's result
-        loop {
-            match self
-                .result
-                .recv_timeout(self.deadline.saturating_duration_since(self.clock.now()))
-            {
-                Ok(result) => return result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(session) = self.session.upgrade() {
-                        session.expire();
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    unreachable!("registered operation settles before its sender is released");
-                }
+        // Let the deadline worker settle timeouts while this receive stays untimed
+        match self.result.recv() {
+            Ok(result) => result,
+            Err(mpsc::RecvError) => {
+                unreachable!("registered operation settles before its sender is released");
             }
         }
     }
@@ -222,6 +202,13 @@ impl<T> Promise<T> {
         let (sender, receiver) = mpsc::channel();
         self.wait_hook = Some(sender);
         receiver
+    }
+
+    /// Lets callback tests check the notification lock without retaining the promise.
+    #[cfg(test)]
+    pub(super) fn notification_unlocked(&self) -> impl Fn() -> bool + Send + 'static {
+        let notification = self.notification.clone();
+        move || notification.try_lock().is_ok()
     }
 
     /// Waits for a worker result without calling `SessionInner::expire()`, so tests
@@ -240,15 +227,18 @@ impl<T> Promise<T> {
 }
 
 impl<T> Drop for Promise<T> {
-    /// Clears an unsent event. The protocol never drops a handed-out promise
-    /// under its session lock; this path only takes the notification lock.
+    /// Takes an unrun callback under the notification lock, then drops it outside.
+    /// The protocol never drops a handed-out promise under its session lock.
     fn drop(&mut self) {
+        // Clear registration before releasing the lock
         let hook = self
             .notification
             .lock()
             .expect("notification not poisoned")
             .hook
             .take();
+
+        // Release application captures without the notification lock
         drop(hook);
     }
 }
@@ -274,7 +264,7 @@ impl<T> fmt::Debug for Promise<T> {
 struct NotificationState {
     /// The result has been published, including when no hook was registered yet.
     done: bool,
-    /// Internally constructed channel send; never an application callback.
+    /// Application callback taken by settlement or promise drop.
     hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -290,20 +280,72 @@ pub(super) struct ResultSender {
 }
 
 impl ResultSender {
-    /// Publishes before notifying, preserving disconnection for byte admission.
-    pub(super) fn send(
-        self,
-        result: Result<PromiseResult, Error>,
-    ) -> Result<(), mpsc::SendError<Result<PromiseResult, Error>>> {
+    /// Publishes the result and hands back its callback, to run once the caller
+    /// holds no wire lock. The delivery flag tells byte admission whether the
+    /// promise still exists.
+    pub(super) fn send(self, result: Result<PromiseResult, Error>) -> Notification {
         // Lock before publishing: a concurrent waiter must not drop the promise
         // and clear its hook between receiving the result and our notification.
         let mut notification = self.notification.lock().expect("notification not poisoned");
-        self.result.send(result)?;
-        notification.done = true;
-        if let Some(hook) = notification.hook.take() {
-            hook();
+        let delivered = self.result.send(result).is_ok();
+        if delivered {
+            notification.done = true;
         }
-        Ok(())
+
+        // Hand ownership to the caller before releasing the publication lock
+        Notification {
+            delivered,
+            callback: notification.hook.take(),
+        }
+    }
+}
+
+/// Publication status and the callback to run once every wire lock is released.
+#[must_use = "collect the notification and run it outside all wire locks"]
+pub(super) struct Notification {
+    /// Whether the promise still existed when its result was published.
+    pub(super) delivered: bool,
+    /// Callback removed atomically with result publication.
+    callback: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Notification {
+    /// Runs the callback and drops its captures on the settling thread.
+    pub(super) fn run(self) {
+        if let Some(callback) = self.callback {
+            callback();
+        }
+    }
+}
+
+/// Runs collected callbacks on scope exit, including early returns.
+/// Declare this before acquiring any wire locks so their guards drop first.
+#[derive(Default)]
+pub(super) struct Notifications {
+    /// Callbacks taken from promises settled in this scope.
+    pending: Vec<Notification>,
+}
+
+impl Notifications {
+    /// Retains callbacks until the caller has released its locks.
+    pub(super) fn push(&mut self, notification: Notification) {
+        if notification.callback.is_some() {
+            self.pending.push(notification);
+        }
+    }
+
+    /// Reports whether no callback is waiting to run.
+    pub(super) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+impl Drop for Notifications {
+    /// Runs callbacks after guards declared later in the scope have released locks.
+    fn drop(&mut self) {
+        for notification in self.pending.drain(..) {
+            notification.run();
+        }
     }
 }
 
@@ -338,34 +380,46 @@ impl PromiseResult {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
     clippy::disallowed_methods,
-    reason = "promise tests move to TestClock in W3"
+    reason = "the promise test watchdog is removed in W3"
 )]
 mod tests {
-    use super::{Error, Message, Promise, PromiseResult};
-    use darkbio_clock::Clock;
+    use super::{Error, Message, NotificationState, Promise, PromiseResult};
+    use darkbio_clock::TestClock;
     use std::fmt::Debug;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Weak, mpsc};
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex, Weak, mpsc};
+    use std::time::Duration;
 
-    /// Misuse panics before poisoning the lock, keeping the original registration
-    /// and result usable whether the promise was pending or already completed.
+    /// Duplicate registration leaves the original callback and result usable.
     #[test]
     fn test_duplicate_notification() {
         for completed in [false, true] {
+            // Register a callback on a pending promise
+            let tester = TestClock::new();
             let (sender, mut promise) =
-                Promise::<()>::pair(Weak::new(), &Clock::real(), Instant::now(), false);
+                Promise::<()>::pair(Weak::new(), tester.clock().now(), false);
             let (events, receiver) = mpsc::channel();
-            promise.notify(events.clone(), 1);
+            promise.notify(move || {
+                let _ = events.send(1);
+            });
+
+            // Reject another registration before or after settlement
             let sender = if completed {
-                assert!(sender.send(Ok(PromiseResult::Written)).is_ok());
+                sender.send(Ok(PromiseResult::Written)).run();
                 None
             } else {
                 Some(sender)
             };
-            assert!(catch_unwind(AssertUnwindSafe(|| promise.notify(events, 2))).is_err());
+            assert!(
+                catch_unwind(AssertUnwindSafe(
+                    || promise.notify(|| panic!("duplicate callback ran"))
+                ))
+                .is_err()
+            );
+
+            // Keep the first callback and result intact without poisoning the lock
             if let Some(sender) = sender {
-                assert!(sender.send(Ok(PromiseResult::Written)).is_ok());
+                sender.send(Ok(PromiseResult::Written)).run();
             }
             assert_eq!(receiver.try_recv(), Ok(1));
             assert!(receiver.try_recv().is_err());
@@ -373,28 +427,37 @@ mod tests {
         }
     }
 
-    /// Losing the event consumer does not change success or failure, including
-    /// when registration happens after publication and sender destruction.
+    /// A disconnected callback consumer leaves success and failure unchanged.
     #[test]
     fn test_disconnected_notification() {
         for completed in [false, true] {
             for success in [false, true] {
+                // Disconnect the callback's consumer before registering it
+                let tester = TestClock::new();
                 let (sender, mut promise) =
-                    Promise::<()>::pair(Weak::new(), &Clock::real(), Instant::now(), false);
+                    Promise::<()>::pair(Weak::new(), tester.clock().now(), false);
                 let (events, receiver) = mpsc::channel();
                 drop(receiver);
+
+                // Register on either side of publishing success or failure
                 let result = if success {
                     Ok(PromiseResult::Written)
                 } else {
                     Err(Error::Timeout)
                 };
                 if completed {
-                    assert!(sender.send(result).is_ok());
-                    promise.notify(events, 1);
+                    sender.send(result).run();
+                    promise.notify(move || {
+                        let _ = events.send(1);
+                    });
                 } else {
-                    promise.notify(events, 1);
-                    assert!(sender.send(result).is_ok());
+                    promise.notify(move || {
+                        let _ = events.send(1);
+                    });
+                    sender.send(result).run();
                 }
+
+                // Observe the original result despite the lost notification consumer
                 match promise.wait() {
                     Ok(()) => assert!(success),
                     Err(Error::Timeout) => assert!(!success),
@@ -404,27 +467,79 @@ mod tests {
         }
     }
 
-    /// A waiter can receive immediately after publication, but its Drop must not
-    /// clear the hook before the sender has emitted the completion event.
+    /// A returning waiter cannot clear a callback already taken by publication.
     #[test]
     fn test_notification_with_waiter() {
         for _ in 0..32 {
+            // Register a callback and start a waiter before publishing
+            let tester = TestClock::new();
             let (sender, mut promise) = Promise::<()>::pair(
                 Weak::new(),
-                &Clock::real(),
-                Instant::now() + Duration::from_secs(5),
+                tester.clock().now() + Duration::from_secs(5),
                 false,
             );
             let (events, receiver) = mpsc::channel();
-            promise.notify(events, 1);
+            promise.notify(move || {
+                let _ = events.send(1);
+            });
             let waiting = promise.watch_wait();
             let waiter = std::thread::spawn(move || promise.wait());
             waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(sender.send(Ok(PromiseResult::Written)).is_ok());
+
+            // Let the waiter drop its promise before running the taken callback
+            let notification = sender.send(Ok(PromiseResult::Written));
             waiter.join().unwrap().unwrap();
+            notification.run();
+
+            // Require exactly one notification after the promise is gone
             assert_eq!(receiver.try_recv(), Ok(1));
             assert!(receiver.try_recv().is_err());
         }
+    }
+
+    /// Dropping a pending promise releases its callback captures outside the notification lock.
+    #[test]
+    fn test_dropped_promise_releases_callback_without_lock() {
+        /// Reports whether capture destruction can acquire the notification lock.
+        struct Capture {
+            /// Shared registration state surviving the dropped promise.
+            notification: Arc<Mutex<NotificationState>>,
+            /// Reports destruction to the test without blocking.
+            dropped: mpsc::Sender<bool>,
+        }
+
+        impl Drop for Capture {
+            /// Checks the lock from application destruction code.
+            fn drop(&mut self) {
+                let _ = self.dropped.send(self.notification.try_lock().is_ok());
+            }
+        }
+
+        // Register a callback whose capture checks its destruction context
+        let tester = TestClock::new();
+        let (sender, mut promise) = Promise::<()>::pair(Weak::new(), tester.clock().now(), false);
+        let (dropped, observed) = mpsc::channel();
+        let capture = Capture {
+            notification: promise.notification.clone(),
+            dropped,
+        };
+        let (ran, running) = mpsc::channel();
+        promise.notify(move || {
+            let _ = ran.send(());
+            drop(capture);
+        });
+
+        // Drop before settlement and require unlocked capture destruction
+        drop(promise);
+        assert_eq!(observed.try_recv(), Ok(true));
+        assert!(running.try_recv().is_err());
+
+        // Settle the abandoned operation without running its cleared callback
+        let notification = sender.send(Ok(PromiseResult::Written));
+        assert!(!notification.delivered);
+        notification.run();
+        assert!(running.try_recv().is_err());
+        assert!(observed.try_recv().is_err());
     }
 
     /// Checks the bounds required to move a promise to an application thread

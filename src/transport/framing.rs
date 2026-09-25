@@ -280,6 +280,7 @@ mod tests {
     use crate::testing;
     use crate::transport::DEFAULT_WRITE_TIMEOUT;
     use crate::transport::testing::Memory;
+    use darkbio_clock::Clock;
     use std::collections::VecDeque;
     use std::io::{self, Cursor};
     use std::panic::{self, AssertUnwindSafe};
@@ -289,7 +290,10 @@ mod tests {
     // read. A new attempt must still find that exact frame.
     #[test]
     fn test_deadline_preserves_buffered_frames() {
-        let mut reader = FrameReader::new(Memory::new(&[2, 1, 0, 2, 2, 0][..]), Closer::new(|| {}));
+        let mut reader = FrameReader::new(
+            Memory::new(&[2, 1, 0, 2, 2, 0][..]),
+            Closer::new(&Clock::real(), || {}),
+        );
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[1][..]));
         assert!(matches!(
             reader.next_packet(Some(Instant::now())),
@@ -335,7 +339,7 @@ mod tests {
                     first: Some(first),
                     deadline: None,
                 },
-                Closer::new(|| {}),
+                Closer::new(&Clock::real(), || {}),
             );
             assert!(matches!(
                 reader.next_packet(Some(Instant::now() + Duration::from_millis(20))),
@@ -351,7 +355,10 @@ mod tests {
     fn test_deadline_preserves_oversized_discard() {
         let mut input = vec![1; MAX_FRAME_SIZE + 1];
         input.extend_from_slice(&[1, 0, 2, 42, 0]);
-        let mut reader = FrameReader::new(Memory::new(Cursor::new(input)), Closer::new(|| {}));
+        let mut reader = FrameReader::new(
+            Memory::new(Cursor::new(input)),
+            Closer::new(&Clock::real(), || {}),
+        );
         assert!(matches!(
             reader.next_packet(None),
             Err(Error::FrameTooLarge(_))
@@ -366,7 +373,7 @@ mod tests {
     // Closing leaves complete buffered frames readable, then reports EOF.
     #[test]
     fn test_close_drains_buffered_frames() {
-        let closer = Closer::new(|| {});
+        let closer = Closer::new(&Clock::real(), || {});
         let mut reader =
             FrameReader::new(Memory::new(&[0x02, 1, 0, 0x02, 2, 0][..]), closer.clone());
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[1][..]));
@@ -427,7 +434,10 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
-            let mut framing = FrameReader::new(Memory::new(&mut host_to_wire), Closer::new(|| {}));
+            let mut framing = FrameReader::new(
+                Memory::new(&mut host_to_wire),
+                Closer::new(&Clock::real(), || {}),
+            );
             match tt.expected {
                 Some(expected) => {
                     let packet = framing
@@ -504,7 +514,10 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut wire_to_host = Cursor::new(Vec::<u8>::new());
 
-            let mut framing = FrameWriter::new(Memory::new(&mut wire_to_host), Closer::new(|| {}));
+            let mut framing = FrameWriter::new(
+                Memory::new(&mut wire_to_host),
+                Closer::new(&Clock::real(), || {}),
+            );
             match tt.expected {
                 Some(expected) => {
                     framing
@@ -560,7 +573,10 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             let mut host_to_wire = Cursor::new(tt.input);
 
-            let mut framing = FrameReader::new(Memory::new(&mut host_to_wire), Closer::new(|| {}));
+            let mut framing = FrameReader::new(
+                Memory::new(&mut host_to_wire),
+                Closer::new(&Clock::real(), || {}),
+            );
             let frame = framing.next_frame_blob().unwrap();
             assert_eq!(frame, tt.expected, "test {i}");
         }
@@ -576,7 +592,10 @@ mod tests {
             input.extend(std::iter::repeat_n(b'a', size));
             input.extend_from_slice(b"\0after\0\0");
         }
-        let mut framing = FrameReader::new(Memory::new(Cursor::new(input)), Closer::new(|| {}));
+        let mut framing = FrameReader::new(
+            Memory::new(Cursor::new(input)),
+            Closer::new(&Clock::real(), || {}),
+        );
         assert_eq!(framing.next_frame_blob().unwrap(), b"before");
         for _ in 0..2 {
             assert!(matches!(
@@ -643,8 +662,10 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
-            let mut framing =
-                FrameReader::new(Memory::new(Mock(tt.reads.into())), Closer::new(|| {}));
+            let mut framing = FrameReader::new(
+                Memory::new(Mock(tt.reads.into())),
+                Closer::new(&Clock::real(), || {}),
+            );
             assert!(matches!(
                 framing.next_frame_blob(),
                 Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
@@ -667,7 +688,10 @@ mod tests {
             Ok(Vec::new()),
             Ok(b"tail\0foo\0".to_vec()),
         ];
-        let mut framing = FrameReader::new(Memory::new(Mock(reads.into())), Closer::new(|| {}));
+        let mut framing = FrameReader::new(
+            Memory::new(Mock(reads.into())),
+            Closer::new(&Clock::real(), || {}),
+        );
         assert!(matches!(
             framing.next_frame_blob(),
             Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
@@ -710,8 +734,10 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             for resync in [false, true] {
                 let mut wire_to_host = Vec::new();
-                let mut framing =
-                    FrameWriter::new(Memory::new(&mut wire_to_host), Closer::new(|| {}));
+                let mut framing = FrameWriter::new(
+                    Memory::new(&mut wire_to_host),
+                    Closer::new(&Clock::real(), || {}),
+                );
                 framing.resync = resync;
                 framing
                     .send_frame_blob(tt.input, Instant::now() + DEFAULT_WRITE_TIMEOUT)
@@ -766,7 +792,7 @@ mod tests {
                 deadline: None,
                 delay: true,
             },
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
         );
         let result = framing.send_frame_blob(b"old", Instant::now() + Duration::from_millis(100));
         assert!(
@@ -811,7 +837,7 @@ mod tests {
                 armed: true,
                 written: Vec::new(),
             }),
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
         );
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             framing.send_packet(&[1, 2, 3], Instant::now() + DEFAULT_WRITE_TIMEOUT)

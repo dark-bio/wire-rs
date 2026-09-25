@@ -7,6 +7,7 @@
 //! Persistent server ownership and ordered attachment of successive sessions.
 
 use super::envelope::Side;
+use super::promise::Notifications;
 use super::session::SessionInner;
 use super::worker;
 use super::{
@@ -15,9 +16,10 @@ use super::{
 };
 use crate::transport::{self, Attester, Read, Stream, Write};
 use darkbio_clock::Clock;
+use darkbio_clock::sync::{Condvar, Mutex};
 use darkbio_crypto::xdsa;
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 /// Owner of a persistent server stream, accepting successive sessions.
@@ -54,7 +56,7 @@ impl Server {
                     #[cfg(any(test, feature = "fuzz"))]
                     wait_hook: None,
                 }),
-                changed: Condvar::new(),
+                changed: Condvar::new(&stream.clock()),
                 stream_closer: Some(stream_closer),
                 #[cfg(any(test, feature = "fuzz"))]
                 workers: Arc::new(worker::Tracker::default()),
@@ -296,6 +298,8 @@ impl ServerInner {
     /// session; session methods never acquire the server lock. Server sessions
     /// have no stream closer, so applying their limits cannot wait for stream I/O.
     fn set_inbound_limits(&self, requests: usize, bytes: usize) {
+        // Defer session callbacks until the server's policy lock is released too
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("server state not poisoned");
         if let State::Open {
             max_inbound_requests,
@@ -307,7 +311,7 @@ impl ServerInner {
             *max_inbound_requests = requests;
             *max_inbound_bytes = bytes;
             if let Some(session) = session.upgrade() {
-                session.set_inbound_limits(requests, bytes);
+                session.set_inbound_limits(requests, bytes, &mut notifications);
             }
         }
     }
@@ -374,6 +378,7 @@ impl ServerInner {
         }
         // Another thread may have closed the server while we closed the old
         // session. Check again under the lock before installing the new one.
+        let mut notifications = Notifications::default();
         let previous = {
             let mut state = self.state.lock().expect("server state not poisoned");
             match &mut *state {
@@ -388,9 +393,11 @@ impl ServerInner {
                 } => {
                     // Apply the current policy before exposing this session or
                     // letting the reader deliver its first message.
-                    session
-                        .inner
-                        .set_inbound_limits(*max_inbound_requests, *max_inbound_bytes);
+                    session.inner.set_inbound_limits(
+                        *max_inbound_requests,
+                        *max_inbound_bytes,
+                        &mut notifications,
+                    );
                     session.inner.set_autoreply_timeout(*autoreply_timeout);
                     *attached = Arc::downgrade(&session.inner);
                     ready.replace(session)
@@ -425,7 +432,7 @@ impl Server {
                 ready: None,
                 wait_hook: None,
             }),
-            changed: Condvar::new(),
+            changed: Condvar::new(&Clock::real()),
             stream_closer: None,
             workers: Arc::new(worker::Tracker::default()),
         });
@@ -487,10 +494,50 @@ impl ServerInner {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::Side;
     use crate::protocol::{Error, Server, Session};
     use crate::transport::{Attester, Read, Stream, Write};
     use darkbio_crypto::xdsa;
     use std::fmt::Debug;
+
+    /// A server policy closure runs promise callbacks after releasing the server lock.
+    #[test]
+    fn test_limit_callback_releases_server_lock() {
+        use darkbio_clock::TestClock;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Attach a clock-controlled session and retain a peer request against its limit
+        let tester = TestClock::new();
+        let (server, _source) = Server::fixture();
+        let session = Session::fixture_with_clock(Side::Server, tester.clock());
+        let inner = session.inner.clone();
+        server.inner.attach(session).unwrap();
+        inner.inject_request(1, vec![1].into()).unwrap();
+
+        // Register a callback on another pending operation in that session
+        let mut promise = inner
+            .request(
+                vec![2].into(),
+                tester.clock().now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let state = server.inner.clone();
+        let notification = promise.notification_unlocked();
+        let (observed, receiver) = mpsc::channel();
+        promise.notify(move || {
+            let _ = observed.send((state.state.try_lock().is_ok(), notification()));
+        });
+
+        // Lower the server policy and require notification outside both owning locks
+        let server = server.set_inbound_limits(0, 1024);
+        assert_eq!(receiver.try_recv(), Ok((true, true)));
+        assert!(matches!(
+            promise.wait::<Vec<u8>>(),
+            Err(Error::InboundRequestLimitExceeded(0))
+        ));
+        drop(server);
+    }
 
     /// Compiles server construction from a caller-owned stream, signer and attester.
     #[allow(dead_code)]

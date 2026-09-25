@@ -712,16 +712,18 @@ impl Driver {
                     crate::protocol::schema::DeviceInfoRequest::default().into(),
                 ));
             }
-            Step::Notify(slot, token) => self
-                .promises
-                .get_mut(&slot)
-                .unwrap()
-                .notify(self.notifications.0.clone(), token),
-            Step::NotifyWrite(slot, token) => self
-                .writes
-                .get_mut(&slot)
-                .unwrap()
-                .notify(self.notifications.0.clone(), token),
+            Step::Notify(slot, token) => {
+                let events = self.notifications.0.clone();
+                self.promises.get_mut(&slot).unwrap().notify(move || {
+                    let _ = events.send(token);
+                });
+            }
+            Step::NotifyWrite(slot, token) => {
+                let events = self.notifications.0.clone();
+                self.writes.get_mut(&slot).unwrap().notify(move || {
+                    let _ = events.send(token);
+                });
+            }
             Step::Notifications(mut expected) => {
                 let mut received: Vec<_> = self.notifications.1.try_iter().collect();
                 received.sort_unstable();

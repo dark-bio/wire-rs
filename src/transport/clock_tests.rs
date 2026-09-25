@@ -352,7 +352,9 @@ fn test_protocol_handles_keep_the_stream_clock() {
     for requester in [&requester, &session.requester()] {
         let mut expired = requester.request(vec![0], clock.now()).unwrap();
         let (notified, notification) = mpsc::channel();
-        expired.notify(notified, ());
+        expired.notify(move || {
+            let _ = notified.send(());
+        });
         assert_eq!(notification.try_recv(), Ok(()));
         assert!(matches!(
             expired.wait::<Vec<u8>>(),
@@ -377,4 +379,92 @@ fn test_protocol_handles_keep_the_stream_clock() {
     drop(server);
     assert_eq!(requester.clock(), clock);
     assert_eq!(responder.clock(), clock);
+}
+
+// Server acceptance parks on the stream clock until a client establishes a session.
+#[test]
+fn test_server_accept_waits_on_stream_clock() {
+    // Start acceptance before the client has sent a handshake
+    let tester = TestClock::new();
+    let clock = tester.clock();
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let mut server = protocol::Server::new(ark, signer, attest);
+    let accepting = thread::spawn(move || {
+        let session = server.accept().unwrap();
+        (server, session)
+    });
+
+    // Observe both the server reader and acceptance parked on this clock
+    tester.wait_blocked(2);
+    let (client, _) = protocol::connect(host, &identity).unwrap();
+    let (server, session) = accepting.join().unwrap();
+
+    // Close both owners after acceptance has returned
+    drop(client);
+    drop(session);
+    drop(server);
+}
+
+// The deadline worker settles a request on clock advance while nobody waits on its promise.
+#[test]
+fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
+    // Establish both protocol peers a day ahead of real time
+    let mut tester = TestClock::new();
+    tester.advance(Duration::from_secs(86400));
+    let clock = tester.clock();
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let mut server = protocol::Server::new(ark, signer, attest);
+    let (client, _) = protocol::connect(host, &identity).unwrap();
+    let mut session = server.accept().unwrap();
+
+    // Leave one request pending, with all six protocol threads parked: a reader, a
+    // writer and a deadline worker per side
+    let later = clock.now() + Duration::from_secs(30);
+    let first = client.requester().request(vec![1], later).unwrap();
+    let (_, first_responder) = session.recv().unwrap();
+    tester.wait_blocked(6);
+
+    // Submit an earlier deadline, which the parked worker must recompute its wait for
+    let deadline = clock.now() + Duration::from_secs(5);
+    let mut promise = client.requester().request(vec![2], deadline).unwrap();
+    let (events, observed) = mpsc::channel();
+    promise.notify(move || {
+        let _ = events.send(());
+    });
+    let (_, responder) = session.recv().unwrap();
+    tester.wait_blocked(6);
+    assert!(observed.try_recv().is_err());
+
+    // Observe worker notification before any call that could synchronously expire work
+    tester.advance_to(deadline);
+    observed.recv().unwrap();
+    assert!(matches!(
+        promise.wait::<Vec<u8>>(),
+        Err(protocol::Error::Timeout)
+    ));
+
+    // Keep the later request alive until its own deadline and observe worker settlement
+    let mut first = first;
+    let (events, observed) = mpsc::channel();
+    first.notify(move || {
+        let _ = events.send(());
+    });
+    assert!(observed.try_recv().is_err());
+    tester.advance_to(later);
+    observed.recv().unwrap();
+    assert!(matches!(
+        first.wait::<Vec<u8>>(),
+        Err(protocol::Error::Timeout)
+    ));
+
+    // Close the peers before abandoning unanswered responders
+    client.close();
+    server.close();
+    drop((first_responder, responder));
 }

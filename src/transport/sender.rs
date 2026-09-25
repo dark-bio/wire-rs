@@ -152,6 +152,7 @@ mod tests {
     use crate::transport::mock::payload;
     use crate::transport::outbound::Side;
     use crate::transport::testing::Memory;
+    use darkbio_clock::Clock;
     use std::io;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, TryLockError, mpsc};
@@ -293,7 +294,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             collector.clone(),
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let (_sealer, sender) = connect(&outbound, sender);
@@ -314,7 +315,10 @@ mod tests {
 
         // Every frame must open in the order written, or the sequence is off
         let written = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(Memory::new(&written[..]), Closer::new(|| {}));
+        let mut reader = FrameReader::new(
+            Memory::new(&written[..]),
+            Closer::new(&Clock::real(), || {}),
+        );
         let mut messages = Vec::new();
         loop {
             let packet = match reader.next_packet(None) {
@@ -342,7 +346,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             collector.clone(),
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let (crypto, _) = contexts();
@@ -364,7 +368,8 @@ mod tests {
         ));
 
         let bytes = collector.0.lock().unwrap().clone();
-        let mut reader = FrameReader::new(Memory::new(&bytes[..]), Closer::new(|| {}));
+        let mut reader =
+            FrameReader::new(Memory::new(&bytes[..]), Closer::new(&Clock::real(), || {}));
         let packet = reader.next_packet(None).unwrap().unwrap();
         assert_eq!(sealing::open(&mut peer, packet).unwrap(), payload(2));
         assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
@@ -382,7 +387,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             gate,
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let (sealer, sender) = connect(&outbound, sender);
@@ -429,7 +434,7 @@ mod tests {
         let outbound = Arc::new(Outbound::new(
             Memory::new(Vec::new()),
             Side::Client,
-            Closer::new(|| {}),
+            Closer::new(&Clock::real(), || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let (crypto, _) = contexts();
@@ -484,7 +489,7 @@ mod tests {
 
         let (gate, entered, release, dropped) = Gate::new();
         let (sender, _) = contexts();
-        let closer = Closer::new(move || {
+        let closer = Closer::new(&Clock::real(), move || {
             let _ = release.send(());
         });
         let outbound = Arc::new(Outbound::new(
@@ -552,7 +557,7 @@ mod tests {
         let (mut gate, entered, release, dropped) = Gate::new();
         gate.panics = true;
         let (sender, _) = contexts();
-        let closer = Closer::new(move || {
+        let closer = Closer::new(&Clock::real(), move || {
             let _ = release.send(());
         });
         let outbound = Arc::new(Outbound::new(

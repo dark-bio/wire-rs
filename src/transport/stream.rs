@@ -9,9 +9,10 @@
 use super::io::check_deadline;
 use super::{DEFAULT_WRITE_TIMEOUT, Read, Write};
 use darkbio_clock::Clock;
+use darkbio_clock::sync::{Condvar, Mutex};
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -57,9 +58,9 @@ impl<R: Read, W: Write> Stream<R, W> {
 
         // Retain the shared clock alongside the adapters
         Self {
+            closer: Closer::new(&clock, shutdown),
             clock,
             io: Some((reader, writer)),
-            closer: Closer::new(shutdown),
             timeout: DEFAULT_WRITE_TIMEOUT,
         }
     }
@@ -154,14 +155,14 @@ struct State {
 
 impl Closer {
     /// Creates the shutdown coordinator before either I/O half can be used.
-    pub(super) fn new(shutdown: impl FnOnce() + Send + 'static) -> Self {
+    pub(super) fn new(clock: &Clock, shutdown: impl FnOnce() + Send + 'static) -> Self {
         Self(Arc::new(Shutdown {
             state: Mutex::new(State {
                 phase: Phase::Open,
                 active: 0,
                 action: Some(Box::new(shutdown)),
             }),
-            changed: Condvar::new(),
+            changed: Condvar::new(clock),
         }))
     }
 
@@ -371,11 +372,35 @@ mod tests {
     use crate::transport::Client;
     use crate::transport::testing::Memory;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
     const PATIENCE: Duration = Duration::from_secs(5);
+
+    // Concurrent closers park on the stream clock until admitted I/O is released.
+    #[test]
+    fn test_concurrent_closers_wait_on_stream_clock() {
+        // Keep an admitted operation alive while two threads close the stream
+        let tester = darkbio_clock::TestClock::new();
+        let (stream, _peer) = crate::memory::duplex(1, &tester.clock());
+        let closer = stream.closer();
+        let activity = closer.enter().unwrap();
+        thread::scope(|scope| {
+            let first = scope.spawn(|| closer.close());
+            let second = scope.spawn(|| closer.close());
+
+            // Require both shutdown waits to be registered on this clock
+            tester.wait_blocked(2);
+            assert!(closer.enter().is_none());
+
+            // Complete the admitted operation and let both closers finish
+            drop(activity);
+            first.join().unwrap();
+            second.join().unwrap();
+            assert!(closer.enter().is_none());
+        });
+    }
 
     /// Checks that the transport's owners and handles print without printable
     /// adapters, which hosts may box as trait objects.
@@ -491,7 +516,7 @@ mod tests {
     ) {
         let (entered, entries) = mpsc::channel();
         let (release, released) = mpsc::channel();
-        let closer = Closer::new(move || release.send(()).unwrap());
+        let closer = Closer::new(&Clock::real(), move || release.send(()).unwrap());
         let io = thread::spawn({
             let closer = closer.clone();
             move || {
@@ -972,7 +997,7 @@ mod tests {
                     settings: 0,
                     deadline: None,
                 },
-                closer: Closer::new(|| {}),
+                closer: Closer::new(&Clock::real(), || {}),
             };
             let result = writer.write(b"ab", Instant::now() + PATIENCE);
             if stalls {
@@ -1045,7 +1070,7 @@ mod tests {
         }
 
         for kind in [io::ErrorKind::Interrupted, io::ErrorKind::TimedOut] {
-            let closer = Closer::new(|| {});
+            let closer = Closer::new(&Clock::real(), || {});
             let mut reader = ReadHalf {
                 inner: Refused { settings: 0, kind },
                 closer: closer.clone(),
@@ -1111,7 +1136,7 @@ mod tests {
         for bytes in [&b"a"[..], &b"ab"[..]] {
             let mut writer = WriteHalf {
                 inner: LateWriter::default(),
-                closer: Closer::new(|| {}),
+                closer: Closer::new(&Clock::real(), || {}),
             };
             let deadline = Instant::now() + Duration::from_millis(40);
             assert_eq!(

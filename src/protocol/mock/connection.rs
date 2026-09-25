@@ -664,16 +664,18 @@ impl Driver {
             Step::Abandon(slot) => {
                 drop(self.responders.remove(&slot).unwrap());
             }
-            Step::Notify(slot, token) => self
-                .promises
-                .get_mut(&slot)
-                .unwrap()
-                .notify(self.notifications.0.clone(), token),
-            Step::NotifyWrite(slot, token) => self
-                .writes
-                .get_mut(&slot)
-                .unwrap()
-                .notify(self.notifications.0.clone(), token),
+            Step::Notify(slot, token) => {
+                let events = self.notifications.0.clone();
+                self.promises.get_mut(&slot).unwrap().notify(move || {
+                    let _ = events.send(token);
+                });
+            }
+            Step::NotifyWrite(slot, token) => {
+                let events = self.notifications.0.clone();
+                self.writes.get_mut(&slot).unwrap().notify(move || {
+                    let _ = events.send(token);
+                });
+            }
             Step::Notified(token) => {
                 assert_eq!(self.notifications.1.recv_timeout(BUDGET).unwrap(), token)
             }

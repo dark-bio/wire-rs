@@ -524,6 +524,7 @@ mod tests {
     use crate::transport::server::Server;
     use crate::transport::testing::Memory;
     use crate::{memory, testing};
+    use darkbio_clock::Clock;
     use std::io::{self, Read as _};
     use std::sync::mpsc;
     use std::thread;
@@ -636,7 +637,7 @@ mod tests {
         let (mut peer, receiver) = contexts();
         let packet = sealing::seal(&mut peer, &payload(1)).unwrap();
         let mut bytes = Vec::new();
-        FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
+        FrameWriter::new(Memory::new(&mut bytes), Closer::new(&Clock::real(), || {}))
             .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         let (entered_tx, entered) = mpsc::channel();
@@ -678,7 +679,7 @@ mod tests {
         let (mut peer, receiver) = contexts();
         let packet = sealing::seal(&mut peer, &payload(2)).unwrap();
         let mut bytes = Vec::new();
-        FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
+        FrameWriter::new(Memory::new(&mut bytes), Closer::new(&Clock::real(), || {}))
             .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         let mut client = Client::new(Stream::new(

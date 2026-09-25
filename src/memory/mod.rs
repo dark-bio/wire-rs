@@ -6,15 +6,16 @@
 
 //! Portable in-memory streams for local connections, emulators and tests.
 //!
-//! These streams use only standard Rust synchronization, with no sockets or
+//! These streams synchronize through the clock's locks, with no sockets or
 //! worker threads. Split an endpoint with [`Duplex::into_halves`] for plain I/O.
 
 use crate::transport::{Read, Stream, Write};
 use darkbio_clock::Clock;
+use darkbio_clock::sync::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// One endpoint of an in-memory duplex connection, ready for a client or server.
 pub type Duplex = Stream<Reader, Writer>;
@@ -133,9 +134,8 @@ impl io::Read for Reader {
             if !state.writer_open {
                 return Ok(0);
             }
-            state = self
-                .pipe
-                .wait(state, time_left(&self.pipe.clock, self.deadline)?);
+            self.pipe.check_deadline(self.deadline)?;
+            state = self.pipe.wait(state, self.deadline);
         }
     }
 }
@@ -179,7 +179,7 @@ impl io::Write for Writer {
         let mut state = self.pipe.lock();
         loop {
             // Refuse expiry and closure before accepting any bytes
-            let timeout = time_left(&self.pipe.clock, self.deadline)?;
+            self.pipe.check_deadline(self.deadline)?;
             if buf.is_empty() {
                 return Ok(0);
             }
@@ -197,14 +197,14 @@ impl io::Write for Writer {
             }
 
             // Wait for space without extending the deadline
-            state = self.pipe.wait(state, timeout);
+            state = self.pipe.wait(state, self.deadline);
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         // Check the installed deadline while observing a consistent pipe state
         let state = self.pipe.lock();
-        time_left(&self.pipe.clock, self.deadline)?;
+        self.pipe.check_deadline(self.deadline)?;
 
         // Reject local closure or output lost when the peer closed
         if !state.writer_open || state.lost {
@@ -268,7 +268,7 @@ impl Pipe {
                 #[cfg(test)]
                 waits_forbidden: false,
             }),
-            changed: Condvar::new(),
+            changed: Condvar::new(clock),
         }
     }
 
@@ -277,14 +277,11 @@ impl Pipe {
         self.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the condvar moves to darkbio_clock::sync in W2"
-    )]
+    /// Releases the buffer until notified or the installed deadline is reached.
     fn wait<'a>(
         &self,
         state: MutexGuard<'a, State>,
-        timeout: Option<Duration>,
+        deadline: Option<Instant>,
     ) -> MutexGuard<'a, State> {
         // Let tests observe the wait before it releases the mutex, or refuse it
         #[cfg(test)]
@@ -297,10 +294,10 @@ impl Pipe {
         };
 
         // Release the buffer lock until notified or the current budget runs out
-        let state = match timeout {
-            Some(timeout) => {
+        let state = match deadline {
+            Some(deadline) => {
                 self.changed
-                    .wait_timeout(state, timeout)
+                    .wait_deadline(state, deadline)
                     .unwrap_or_else(|err| err.into_inner())
                     .0
             }
@@ -320,6 +317,14 @@ impl Pipe {
         state
     }
 
+    /// Refuses an expired deadline using the pipe's clock on every attempt.
+    fn check_deadline(&self, deadline: Option<Instant>) -> io::Result<()> {
+        if deadline.is_some_and(|deadline| self.clock.now() >= deadline) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
+
     fn close_reader(&self) {
         let mut state = self.lock();
         state.reader_open = false;
@@ -335,18 +340,6 @@ impl Pipe {
     }
 }
 
-/// Computes a fresh wait budget without extending the installed deadline.
-fn time_left(clock: &Clock, deadline: Option<Instant>) -> io::Result<Option<Duration>> {
-    deadline
-        .map(|deadline| {
-            deadline
-                .checked_duration_since(clock.now())
-                .filter(|left| !left.is_zero())
-                .ok_or_else(|| io::ErrorKind::TimedOut.into())
-        })
-        .transpose()
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
@@ -356,9 +349,11 @@ fn time_left(clock: &Clock, deadline: Option<Instant>) -> io::Result<Option<Dura
 mod tests {
     use super::*;
     use crate::transport::Closer;
+    use darkbio_clock::TestClock;
     use std::io::{Read as _, Write as _};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     const PATIENCE: Duration = Duration::from_secs(5);
     const TIMEOUT: Duration = Duration::from_millis(50);
@@ -375,9 +370,83 @@ mod tests {
         let deadline = Instant::now() + PATIENCE;
         let mut state = pipe.lock();
         while state.waiting == 0 {
-            let timeout = deadline.checked_duration_since(Instant::now()).unwrap();
-            state = pipe.changed.wait_timeout(state, timeout).unwrap().0;
+            assert!(pipe.clock.now() < deadline, "memory operation did not wait");
+            state = pipe.changed.wait_deadline(state, deadline).unwrap().0;
         }
+    }
+
+    // A blocked empty read expires when its clock reaches the installed deadline.
+    #[test]
+    fn test_blocked_read_expires_on_clock_deadline() {
+        // Park an empty read with a deadline a day ahead of real time
+        let mut tester = TestClock::new();
+        tester.advance(Duration::from_secs(86400));
+        let clock = tester.clock();
+        let (host, _peer) = duplex(1, &clock);
+        let (mut reader, _writer) = host.into_halves();
+        let deadline = clock.now() + Duration::from_secs(5);
+        reader.set_read_deadline(Some(deadline)).unwrap();
+        let reading = thread::spawn(move || reader.read(&mut [0]));
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(deadline));
+
+        // Advance exactly to expiry and observe the blocked operation returning
+        tester.advance_to(deadline);
+        assert_eq!(
+            reading.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    // A blocked full write expires when its clock reaches the installed deadline.
+    #[test]
+    fn test_blocked_write_expires_on_clock_deadline() {
+        // Fill the pipe and park another write on the same fixed deadline
+        let mut tester = TestClock::new();
+        tester.advance(Duration::from_secs(86400));
+        let clock = tester.clock();
+        let (host, _peer) = duplex(1, &clock);
+        let (_reader, mut writer) = host.into_halves();
+        writer.write_all(b"a").unwrap();
+        let deadline = clock.now() + Duration::from_secs(5);
+        writer.set_write_deadline(deadline).unwrap();
+        let writing = thread::spawn(move || writer.write(b"b"));
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(deadline));
+
+        // Advance exactly to expiry and observe the blocked operation returning
+        tester.advance_to(deadline);
+        assert_eq!(
+            writing.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    // An expired read delivers available input before reporting expiry on the empty pipe.
+    #[test]
+    fn test_read_delivers_buffered_bytes_after_deadline() {
+        // Buffer input before the installed read deadline
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let (host, peer) = duplex(1, &clock);
+        let (mut reader, _writer) = host.into_halves();
+        let (_peer_reader, mut writer) = peer.into_halves();
+        let deadline = clock.now() + Duration::from_secs(5);
+        reader.set_read_deadline(Some(deadline)).unwrap();
+        writer.write_all(b"a").unwrap();
+
+        // Read buffered bytes at expiry without entering a condvar wait
+        tester.advance_to(deadline);
+        reader.forbid_waits();
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(&byte, b"a");
+
+        // Derive expiry from the clock once input is exhausted
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     #[test]
