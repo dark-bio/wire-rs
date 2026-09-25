@@ -21,14 +21,19 @@ FUZZ_BUILD = -O -s $(FUZZ_SANITIZER)
 HOST_MUSL = $(findstring musl,$(shell rustc -vV | sed -n 's/^host: //p'))
 FUZZ_ENV = RUSTFLAGS='--cfg getrandom_backend="custom"$(if $(HOST_MUSL), -C target-feature=-crt-static)'
 
-# check runs the gates CI holds a push to, the formatting, clippy, the docs and
-# the tests of every feature combination.
+# check runs the gates CI holds a push to, the formatting, clippy, the builds,
+# the docs and the tests of every feature combination. It needs cargo-hack and
+# cargo-nextest installed.
 check:
 	cargo fmt --all -- --check
-	cargo clippy --all-features -- -D warnings
-	cargo doc --all-features --no-deps
-	cargo hack test --each-feature
-	cargo test --all-features
+	cargo clippy --all-features --all-targets -- -D warnings
+	cargo build --verbose
+	cargo hack build --each-feature
+	RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
+	cargo hack nextest run --each-feature
+	cargo nextest run --all-features
+	cargo hack test --doc --each-feature
+	cargo test --doc --all-features
 
 # coverage measures the test coverage of the library code and opens the HTML
 # report. It needs nightly to leave the test modules out of the numbers. The
@@ -44,7 +49,7 @@ coverage:
 # without seeds means a name drifted from the binary.
 fuzz-seeds:
 	rm -rf fuzz/seeds
-	WIRE_SEEDS=$(CURDIR)/fuzz/seeds cargo test --features fuzz --quiet
+	WIRE_SEEDS=$(CURDIR)/fuzz/seeds cargo nextest run --features fuzz --status-level fail --final-status-level fail
 	for target in $$(cargo +nightly fuzz list); do \
 		test -d fuzz/seeds/$$target || { echo "no seeds for $$target"; exit 1; }; \
 	done
@@ -78,7 +83,7 @@ fuzz-loop:
 vectors:
 	rm -rf vectors/client
 	$(FUZZ_ENV) CARGO_TARGET_DIR=target/vectors \
-		WIRE_VECTORS=$(CURDIR)/vectors cargo test --quiet --features fuzz mock::server
+		WIRE_VECTORS=$(CURDIR)/vectors cargo nextest run --features fuzz --status-level fail --final-status-level fail mock::server
 
 # generate writes the protobuf bindings and the message conversions derived
 # from the schema into src/protocol/generated, formatted like handwritten code.

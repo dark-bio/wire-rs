@@ -1,0 +1,6 @@
+# Settings for cargo-nextest, which runs the tests in CI and in make check.
+
+[profile.default]
+# The tests run on a paused clock, so a stuck wait hangs instead of timing out.
+# nextest flags a test after 30 s and kills it after four periods, at 120 s.
+slow-timeout = { period = "30s", terminate-after = 4 }

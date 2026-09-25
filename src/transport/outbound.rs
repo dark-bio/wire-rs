@@ -49,6 +49,9 @@ impl Side {
 /// overlap a preceding write, and receiving can progress during blocked output.
 /// Panics and poisoned locks are fatal to this transport. It must not be reused.
 pub(crate) struct Outbound<W: Write> {
+    /// Observes calls waiting to acquire the writer in concurrency tests.
+    #[cfg(any(test, feature = "fuzz"))]
+    writer_waits: (Mutex<usize>, std::sync::Condvar),
     writer: Mutex<FrameWriter<W>>, // Serializes complete writes, flushes and binding changes
     binding: Mutex<Weak<Mutex<xhpke::Sender>>>, // Sole authority for the current session
     timeout: Duration,             // Time budget for each frame, including partial writes and flush
@@ -61,6 +64,8 @@ impl<W: Write> Outbound<W> {
     /// Creates an unbound writer around the byte stream's writing half.
     pub(crate) fn new(writer: W, side: Side, closer: Closer, timeout: Duration) -> Self {
         Self {
+            #[cfg(any(test, feature = "fuzz"))]
+            writer_waits: (Mutex::new(0), std::sync::Condvar::new()),
             clock: writer.clock(),
             writer: Mutex::new(FrameWriter::new(writer, closer.clone())),
             binding: Mutex::new(Weak::new()),
@@ -214,9 +219,31 @@ impl<W: Write> Outbound<W> {
     /// guard until this returns, preserving sealing order through the handoff.
     /// A poisoned writer is an implementation failure and is not recovered.
     pub(super) fn lock(&self) -> Writer<'_, W> {
+        // Let tests fence writer acquisition while another call owns the lock
+        #[cfg(any(test, feature = "fuzz"))]
+        {
+            *self.writer_waits.0.lock().unwrap() += 1;
+            self.writer_waits.1.notify_all();
+        }
+        let framer = self.writer.lock().expect("writer lock not poisoned");
+        #[cfg(any(test, feature = "fuzz"))]
+        {
+            *self.writer_waits.0.lock().unwrap() -= 1;
+        }
+
+        // Keep the frame guard through any binding changes
         Writer {
             outbound: self,
-            framer: self.writer.lock().expect("writer lock not poisoned"),
+            framer,
+        }
+    }
+
+    /// Waits for calls to reach writer acquisition while a test holds that writer.
+    #[cfg(any(test, feature = "fuzz"))]
+    pub(super) fn wait_writers(&self, count: usize) {
+        let mut waiting = self.writer_waits.0.lock().unwrap();
+        while *waiting < count {
+            waiting = self.writer_waits.1.wait(waiting).unwrap();
         }
     }
 }
@@ -320,29 +347,34 @@ impl<W: Write> Writer<'_, W> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "outbound tests move to TestClock in W3"
-)]
 mod tests {
     use super::*;
     use crate::testing;
     use crate::transport::DEFAULT_WRITE_TIMEOUT;
     use crate::transport::framing::FrameReader;
-    use crate::transport::testing::Memory;
+    use crate::transport::testing::{Memory, test_clock};
     use crate::transport::{mock::payload, sealing};
     use std::io;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// Writer exposing its bytes for assertions about frame and notification order.
-    #[derive(Clone, Default)]
-    struct Collector(Arc<Mutex<Vec<u8>>>);
+    #[derive(Clone)]
+    struct Collector(
+        /// Bytes accepted by the adapter.
+        Arc<Mutex<Vec<u8>>>,
+        /// Clock governing output deadlines.
+        Clock,
+    );
 
     impl Write for Collector {
+        fn clock(&self) -> Clock {
+            self.1.clone()
+        }
+
         fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-            testing::remaining(deadline)?;
+            testing::remaining(&self.1, deadline)?;
             Ok(())
         }
     }
@@ -372,11 +404,17 @@ mod tests {
     fn test_failure_notification_keeps_frame_deadline() {
         /// Records adapter deadlines and fails the second partial write once.
         struct Probe {
+            /// Clock used by the outgoing transport under test.
+            clock: Clock,
             calls: Arc<Mutex<Vec<Instant>>>,
             deadline: Option<Instant>,
         }
 
         impl Write for Probe {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
                 self.deadline = Some(deadline);
                 Ok(())
@@ -408,14 +446,18 @@ mod tests {
         }
 
         for handshake in [false, true] {
+            // Fail output on a paused clock and record each adapter deadline
+            let tester = test_clock();
+            let clock = tester.clock();
             let calls = Arc::new(Mutex::new(Vec::new()));
             let outbound = Arc::new(Outbound::new(
                 Probe {
+                    clock: clock.clone(),
                     calls: calls.clone(),
                     deadline: None,
                 },
                 Side::Server,
-                Closer::new(&Clock::real(), || {}),
+                Closer::new(&clock, || {}),
                 DEFAULT_WRITE_TIMEOUT,
             ));
             let sealer = Arc::new(Mutex::new(contexts().0));
@@ -429,6 +471,7 @@ mod tests {
             assert!(
                 matches!(result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::BrokenPipe)
             );
+            // Require failure notification to retain the original deadline
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), 4); // Partial write, failure, resync with signal, flush.
             assert!(calls.iter().all(|deadline| *deadline == calls[0]));
@@ -446,9 +489,18 @@ mod tests {
     #[test]
     fn test_deadline_setter_failure_ends_session() {
         /// Rejects output configuration and records attempts without accepting bytes.
-        struct Refused(Arc<Mutex<usize>>);
+        struct Refused(
+            /// Number of deadline installation attempts.
+            Arc<Mutex<usize>>,
+            /// Clock shared with the outgoing transport.
+            Clock,
+        );
 
         impl Write for Refused {
+            fn clock(&self) -> Clock {
+                self.1.clone()
+            }
+
             fn set_write_deadline(&mut self, _: Instant) -> io::Result<()> {
                 *self.0.lock().unwrap() += 1;
                 Err(io::Error::new(io::ErrorKind::TimedOut, "deadline refused"))
@@ -465,11 +517,14 @@ mod tests {
             }
         }
 
+        // Refuse deadline installation before any byte reaches the adapter
+        let tester = test_clock();
+        let clock = tester.clock();
         let settings = Arc::new(Mutex::new(0));
         let outbound = Arc::new(Outbound::new(
-            Refused(settings.clone()),
+            Refused(settings.clone(), clock.clone()),
             Side::Server,
-            Closer::new(&Clock::real(), || {}),
+            Closer::new(&clock, || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
@@ -495,24 +550,28 @@ mod tests {
     // before the failure but presented for acceptance afterward. It is refused.
     #[test]
     fn test_receive_acceptance_after_send_failure() {
+        // Prepare a send failure on a paused clock
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let outbound = Arc::new(Outbound::new(
-            Memory::new(io::Cursor::new([0u8; 0])),
+            Memory::new(io::Cursor::new([0u8; 0]), &clock),
             Side::Client,
-            Closer::new(&Clock::real(), || {}),
+            Closer::new(&clock, || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
         let sender = outbound.bind(&sealer);
         let (mut peer, mut receiver) = contexts();
 
+        // Accept one receive and retain another before the send fails
         let packet = sealing::seal(&mut peer, &payload(1)).unwrap();
         let accepted = outbound.finish_receive(&sealer, sealing::open(&mut receiver, &packet));
         let packet = sealing::seal(&mut peer, &payload(2)).unwrap();
         let pending = sealing::open(&mut receiver, &packet);
         assert!(pending.is_ok());
 
+        // Keep the accepted result and refuse completion after the failure
         assert!(matches!(
             sender.send(&payload(3)),
             Err(Error::SendFailed(_))
@@ -528,12 +587,14 @@ mod tests {
     // locked until ending completes, after which its sender cannot write.
     #[test]
     fn test_end_while_sealing() {
+        // Retain the encryption lock while session ending runs
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let outbound = Arc::new(Outbound::new(
-            Memory::new(Vec::new()),
+            Memory::new(Vec::new(), &clock),
             Side::Client,
-            Closer::new(&Clock::real(), || {}),
+            Closer::new(&clock, || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
@@ -548,7 +609,9 @@ mod tests {
                 done_tx.send(()).unwrap();
             })
         };
-        let result = done.recv_timeout(Duration::from_secs(5));
+
+        // Require completion before releasing encryption
+        let result = done.recv();
         drop(sealing);
         ending.join().unwrap();
         result.unwrap();
@@ -563,18 +626,32 @@ mod tests {
     // Both callers must remain blocked until the test releases that writer.
     #[test]
     fn test_repeated_end_waits_for_writer() {
+        // End the binding while retaining writer ownership
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let outbound = Arc::new(Outbound::new(
-            Memory::new(Vec::new()),
+            Memory::new(Vec::new(), &clock),
             Side::Client,
-            Closer::new(&Clock::real(), || {}),
+            Closer::new(&clock, || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let sealer = Arc::new(Mutex::new(contexts().0));
         outbound.bind(&sealer);
-        let mut writer = outbound.lock();
-        assert!(writer.end(&sealer));
+        let release = testing::Gate::new(&clock);
+        let (held, holding) = mpsc::channel();
+        let owner = thread::spawn({
+            let outbound = outbound.clone();
+            let sealer = sealer.clone();
+            let release = release.clone();
+            move || {
+                let mut writer = outbound.lock();
+                assert!(writer.end(&sealer));
+                held.send(()).unwrap();
+                release.wait(None).unwrap();
+            }
+        });
+        holding.recv().unwrap();
         let (started_tx, started) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
         let ending: Vec<_> = (0..2)
@@ -591,16 +668,22 @@ mod tests {
             })
             .collect();
         for _ in 0..2 {
-            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            started.recv().unwrap();
         }
-        let early = done.recv_timeout(Duration::from_millis(50));
-        drop(writer);
+
+        // Fence both writer acquisitions before checking that neither returned
+        outbound.wait_writers(2);
+        tester.wait_blocked(1);
+        assert!(done.try_recv().is_err());
+
+        // Release the writer and await both end calls
+        release.open();
+        owner.join().unwrap();
         for ending in ending {
             ending.join().unwrap();
         }
-        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
         for _ in 0..2 {
-            done.recv_timeout(Duration::from_secs(5)).unwrap();
+            done.recv().unwrap();
         }
     }
 
@@ -609,13 +692,15 @@ mod tests {
     // the old context models an operation delayed beyond session replacement.
     #[test]
     fn test_old_notification_cannot_cross_handshake() {
+        // Record output on a paused clock while retaining the old context
         testing::init_tracing();
-
-        let collector = Collector::default();
+        let tester = test_clock();
+        let clock = tester.clock();
+        let collector = Collector(Arc::default(), clock.clone());
         let outbound = Arc::new(Outbound::new(
             collector.clone(),
             Side::Server,
-            Closer::new(&Clock::real(), || {}),
+            Closer::new(&clock, || {}),
             DEFAULT_WRITE_TIMEOUT,
         ));
         let old = Arc::new(Mutex::new(contexts().0));
@@ -626,7 +711,7 @@ mod tests {
             if writer.end(&delayed) {
                 writer.notify_failure(
                     &Error::SendFailed(io::Error::other("injected failure")),
-                    Instant::now() + DEFAULT_WRITE_TIMEOUT,
+                    clock.now() + DEFAULT_WRITE_TIMEOUT,
                 );
             }
         };
@@ -648,7 +733,7 @@ mod tests {
 
         let bytes = collector.0.lock().unwrap().clone();
         let mut reader =
-            FrameReader::new(Memory::new(&bytes[..]), Closer::new(&Clock::real(), || {}));
+            FrameReader::new(Memory::new(&bytes[..], &clock), Closer::new(&clock, || {}));
         assert!(reader.next_packet(None).unwrap().is_none());
         assert_eq!(reader.next_packet(None).unwrap(), Some(&b"hello"[..]));
         let packet = reader.next_packet(None).unwrap().unwrap();

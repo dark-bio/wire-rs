@@ -207,6 +207,8 @@ fn settle(
 
 /// Shared replay state for delivering recorded input and checking client output.
 struct Playback {
+    /// Paused time shared by both replay adapters.
+    clock: darkbio_clock::Clock,
     tape: Mutex<Tape>,
 }
 
@@ -214,6 +216,7 @@ impl Playback {
     /// Shares the ordered tape between the reader and handshake writer.
     fn new(trace: Vec<Event>) -> Self {
         Self {
+            clock: crate::transport::testing::test_clock().clock(),
             tape: Mutex::new(Tape::new(trace)),
         }
     }
@@ -261,6 +264,10 @@ struct Reader {
 }
 
 impl Read for Reader {
+    fn clock(&self) -> darkbio_clock::Clock {
+        self.playback.clock.clone()
+    }
+
     fn set_read_deadline(&mut self, _deadline: Option<Instant>) -> io::Result<()> {
         // Recorded outcomes determine expiry without wall-clock delays.
         Ok(())
@@ -312,6 +319,10 @@ struct Writer {
 }
 
 impl Write for Writer {
+    fn clock(&self) -> darkbio_clock::Clock {
+        self.playback.clock.clone()
+    }
+
     fn set_write_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
         // Recorded outcomes determine expiry without wall-clock delays.
         // Starting new output discards any error left by an abandoned write.
@@ -522,15 +533,12 @@ fn recorded_ack_recipient(frame: &[u8]) -> xhpke::Fingerprint {
 // The standard write reports that whole frame as accepted; flush must surface
 // the deferred error without consuming the following transcript event.
 #[test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "replay adapter tests move to TestClock in W3"
-)]
 fn test_full_prefix_failure_surfaces_on_flush() {
     use std::io::Write as _;
     use std::time::Duration;
 
     for error in [ErrorKind::BrokenPipe, ErrorKind::TimedOut] {
+        // Replay a failure whose accepted prefix covers the entire actual write
         let prefix = vec![1, 2, 3, 4];
         let failure = match error {
             ErrorKind::TimedOut => Event::WriteTimedOut { bytes: prefix },
@@ -551,13 +559,14 @@ fn test_full_prefix_failure_surfaces_on_flush() {
             pending_error: None,
         };
         writer
-            .set_write_deadline(Instant::now() + Duration::from_secs(1))
+            .set_write_deadline(playback.clock.now() + Duration::from_secs(1))
             .unwrap();
         assert_eq!(writer.write(&[1, 2, 0]).unwrap(), 3);
         assert_eq!(writer.flush().unwrap_err().kind(), error);
 
+        // Clear the deferred error when starting new output on the same clock
         writer
-            .set_write_deadline(Instant::now() + Duration::from_secs(1))
+            .set_write_deadline(playback.clock.now() + Duration::from_secs(1))
             .unwrap();
         writer.write_all(&[0]).unwrap();
         writer.flush().unwrap();

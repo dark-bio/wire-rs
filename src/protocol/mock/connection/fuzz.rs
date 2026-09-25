@@ -258,6 +258,7 @@ pub fn run(actions: &[Action]) {
                 ]);
                 if timeout {
                     steps.extend([
+                        Step::Advance(50 + u64::from(budget % 10)),
                         Step::Notified(0),
                         Step::Answer(0, Err(Failure::Timeout)),
                         Step::Pause(outgoing, op, false),
@@ -284,6 +285,7 @@ pub fn run(actions: &[Action]) {
                     Step::Reply(0, 0, Ok(value.wrapping_add(1)), 50 + u64::from(budget % 10)),
                     Step::Blocked(outgoing, Operation::Flush),
                     Step::NotifyWrite(0, 0),
+                    Step::Advance(50 + u64::from(budget % 10)),
                     Step::Notified(0),
                     Step::Written(0, Err(Failure::Timeout)),
                     Step::Read(peer, answer.clone()),
@@ -302,6 +304,7 @@ pub fn run(actions: &[Action]) {
                     Step::Send(peer, content.clone()),
                     Step::Receive(local, value, 0),
                     Step::Reply(0, 0, Ok(value), timeout),
+                    Step::Advance(timeout),
                     Step::Answer(1, Err(Failure::Timeout)),
                     Step::Written(0, Err(Failure::Timeout)),
                     Step::Send(peer, answer.clone()),

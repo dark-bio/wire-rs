@@ -8,6 +8,7 @@
 
 use super::*;
 
+/// Repeated failed handshakes keep each flush gate bound to its own attempt.
 #[test]
 fn test_connection_fuzz_repeated_handshake_timeouts() {
     // CI crash-448f502ce99548911982fe206e1b63f888716b00: a new flush gate must
@@ -37,9 +38,11 @@ fn test_connection_fuzz_repeated_handshake_timeouts() {
     run(&actions);
 }
 
+/// Mixed exchanges and lifecycle changes remain valid in both peer roles.
 #[test]
 fn test_connection_fuzz_sequences() {
     use Kind::*;
+    // Replay each action sequence through both protocol roles
     for slot in 0..2 {
         for kinds in [
             [
@@ -86,9 +89,11 @@ fn test_connection_fuzz_sequences() {
     }
 }
 
+/// Every action preserves its predicted result across selectors and budgets.
 #[test]
 fn test_connection_fuzz_actions() {
     use Kind::*;
+    // Exercise each action before a fresh pipeline exchange
     for slot in 0..6 {
         for kind in [
             Pipeline,

@@ -142,6 +142,28 @@ fn test_memory_and_adapter_wrappers_keep_the_clock() {
     );
 }
 
+// A framed read blocked in its adapter expires through the stream reader's clock check.
+#[test]
+fn test_blocked_framed_read_expires_on_stream_clock() {
+    // Park an empty framed read a day ahead of real time
+    let mut tester = crate::transport::testing::test_clock();
+    let clock = tester.clock();
+    let (host, _peer) = memory::duplex(64, &clock);
+    let (reader, _writer, closer, _) = host.into_parts();
+    let mut reader = FrameReader::new(reader, closer);
+    let deadline = clock.now() + Duration::from_secs(5);
+    let reading = thread::spawn(move || reader.next_packet(Some(deadline)).map(|_| ()));
+    tester.wait_blocked(1);
+    assert_eq!(tester.next_deadline(), Some(deadline));
+
+    // Pass expiry and require the reader to return instead of retrying adapter timeouts
+    tester.advance_to(deadline + Duration::from_nanos(1));
+    assert!(matches!(
+        reading.join().unwrap(),
+        Err(Error::RecvFailed(error)) if error.kind() == io::ErrorKind::TimedOut
+    ));
+}
+
 // Checks that a client verifies the attestation and signs its ack at the wall
 // time of the stream's clock.
 #[test]

@@ -11,6 +11,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use darkbio_cobs as cobs;
+use darkbio_wire::clock::Clock;
 use darkbio_wire::transport::Client;
 use darkbio_wire::transport::testing::Memory;
 use rand::RngExt;
@@ -45,8 +46,8 @@ fn bench_frame_read(c: &mut Criterion) {
 
                 reader.set_position(0);
                 let mut wire = Client::new(darkbio_wire::transport::Stream::new(
-                    Memory::new(&mut reader),
-                    Memory::new(sink()),
+                    Memory::new(&mut reader, &Clock::real()),
+                    Memory::new(sink(), &Clock::real()),
                     || {},
                 ));
 
@@ -81,8 +82,8 @@ fn bench_frame_write(c: &mut Criterion) {
 
                 drain.set_position(0);
                 let mut wire = Client::new(darkbio_wire::transport::Stream::new(
-                    Memory::new(empty()),
-                    Memory::new(&mut drain),
+                    Memory::new(empty(), &Clock::real()),
+                    Memory::new(&mut drain, &Clock::real()),
                     || {},
                 ));
 
@@ -126,8 +127,8 @@ fn bench_packet_read(c: &mut Criterion) {
 
                 reader.set_position(0);
                 let mut wire = Client::new(darkbio_wire::transport::Stream::new(
-                    Memory::new(&mut reader),
-                    Memory::new(sink()),
+                    Memory::new(&mut reader, &Clock::real()),
+                    Memory::new(sink(), &Clock::real()),
                     || {},
                 ));
 
@@ -158,8 +159,8 @@ fn bench_packet_write(c: &mut Criterion) {
 
                 drain.set_position(0);
                 let mut wire = Client::new(darkbio_wire::transport::Stream::new(
-                    Memory::new(empty()),
-                    Memory::new(&mut drain),
+                    Memory::new(empty(), &Clock::real()),
+                    Memory::new(&mut drain, &Clock::real()),
                     || {},
                 ));
 

@@ -363,20 +363,15 @@ impl<W: Write> WriteHalf<W> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "stream tests move to TestClock in W3"
-)]
 mod tests {
     use super::*;
+    use crate::testing;
     use crate::transport::Client;
-    use crate::transport::testing::Memory;
+    use crate::transport::testing::{Memory, test_clock};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Condvar, Mutex, mpsc};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
-
-    const PATIENCE: Duration = Duration::from_secs(5);
 
     // Concurrent closers park on the stream clock until admitted I/O is released.
     #[test]
@@ -424,7 +419,10 @@ mod tests {
     // transport must reject an expired attempt before consuming those bytes.
     #[test]
     fn test_memory_reader_keeps_transport_deadline() {
-        let (host, ark) = crate::memory::duplex(4, &Clock::real());
+        // Queue bytes on a clock a day ahead of real time
+        let tester = test_clock();
+        let clock = tester.clock();
+        let (host, ark) = crate::memory::duplex(4, &clock);
         let (_ark_read, mut ark_write) = ark.into_halves();
         std::io::Write::write_all(&mut ark_write, b"abc").unwrap();
         let (reader, _writer, closer, _) = host.into_parts();
@@ -432,10 +430,11 @@ mod tests {
             inner: reader,
             closer,
         };
+        // Refuse an expired read without consuming the available bytes
         let mut bytes = [0; 3];
         assert_eq!(
             reader
-                .read(&mut bytes, Some(Instant::now()))
+                .read(&mut bytes, Some(clock.now()))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::TimedOut
@@ -448,8 +447,10 @@ mod tests {
     /// Adapter holding an admitted call until shutdown has been requested,
     /// then returning the result selected by the test.
     struct Adapter {
+        /// Clock shared by the adapter and shutdown gate.
+        clock: Clock,
         entered: mpsc::Sender<()>,
-        released: mpsc::Receiver<()>,
+        released: testing::Gate,
         fails: bool,
         deadline: Option<Instant>,
     }
@@ -458,16 +459,7 @@ mod tests {
         /// Waits for the test's release without exceeding this adapter call's deadline.
         fn wait(&self, deadline: Option<Instant>) -> io::Result<()> {
             self.entered.send(()).unwrap();
-            match deadline {
-                Some(deadline) => self
-                    .released
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now())),
-                None => self
-                    .released
-                    .recv()
-                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-            }
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            self.released.wait(deadline)?;
             if self.fails {
                 Err(io::Error::other("adapter failure"))
             } else {
@@ -477,6 +469,10 @@ mod tests {
     }
 
     impl Read for Adapter {
+        fn clock(&self) -> Clock {
+            self.clock.clone()
+        }
+
         fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
             self.deadline = deadline;
             Ok(())
@@ -492,6 +488,10 @@ mod tests {
     }
 
     impl Write for Adapter {
+        fn clock(&self) -> Clock {
+            self.clock.clone()
+        }
+
         fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
             self.deadline = Some(deadline);
             Ok(())
@@ -514,14 +514,19 @@ mod tests {
         fails: bool,
         operation: impl FnOnce(Adapter, Closer) -> io::Result<()> + Send + 'static,
     ) {
+        // Start an admitted adapter call on a paused clock
+        let tester = test_clock();
+        let clock = tester.clock();
         let (entered, entries) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let closer = Closer::new(&Clock::real(), move || release.send(()).unwrap());
+        let released = testing::Gate::new(&clock);
+        let release = released.clone();
+        let closer = Closer::new(&clock, move || release.open());
         let io = thread::spawn({
             let closer = closer.clone();
             move || {
                 operation(
                     Adapter {
+                        clock,
                         entered,
                         released,
                         fails,
@@ -531,7 +536,9 @@ mod tests {
                 )
             }
         });
-        entries.recv_timeout(PATIENCE).unwrap();
+        // Close only after the adapter has parked and preserve its result
+        entries.recv().unwrap();
+        tester.wait_blocked(1);
         closer.close();
         let result = io.join().unwrap();
         if fails {
@@ -549,6 +556,7 @@ mod tests {
     #[test]
     fn test_admitted_io_preserves_results_during_shutdown() {
         for fails in [false, true] {
+            // Preserve the admitted read's result across shutdown
             during_shutdown(fails, |inner, closer| {
                 let mut buf = [0];
                 assert_eq!(ReadHalf { inner, closer }.read(&mut buf, None)?, 1);
@@ -556,8 +564,8 @@ mod tests {
                 Ok(())
             });
             during_shutdown(fails, move |inner, closer| {
-                let result =
-                    WriteHalf { inner, closer }.write(&[1, 2, 3], Instant::now() + PATIENCE);
+                let deadline = inner.clock.now() + Duration::from_secs(5);
+                let result = WriteHalf { inner, closer }.write(&[1, 2, 3], deadline);
                 if fails {
                     result
                 } else {
@@ -566,7 +574,8 @@ mod tests {
                 }
             });
             during_shutdown(fails, |inner, closer| {
-                WriteHalf { inner, closer }.write(&[], Instant::now() + PATIENCE)
+                let deadline = inner.clock.now() + Duration::from_secs(5);
+                WriteHalf { inner, closer }.write(&[], deadline)
             });
         }
     }
@@ -576,13 +585,20 @@ mod tests {
     // and repeated closes do nothing.
     #[test]
     fn test_ownership_and_repeated_close() {
+        // Transfer a paused stream to its client without closing it
+        let tester = test_clock();
+        let clock = tester.clock();
         let calls = Arc::new(AtomicUsize::new(0));
-        let stream = Stream::new(Memory::new(io::empty()), Memory::new(io::sink()), {
-            let calls = calls.clone();
-            move || {
-                calls.fetch_add(1, Ordering::SeqCst);
-            }
-        });
+        let stream = Stream::new(
+            Memory::new(io::empty(), &clock),
+            Memory::new(io::sink(), &clock),
+            {
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
         let closer = stream.closer();
         let client = Client::new(stream);
         assert_eq!(
@@ -590,18 +606,24 @@ mod tests {
             0,
             "handoff must keep the stream open"
         );
+        // Close once when its owner drops and ignore repeated closes
         drop(client);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         closer.close();
         drop(closer.clone());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let stream = Stream::new(Memory::new(io::empty()), Memory::new(io::sink()), {
-            let calls = calls.clone();
-            move || {
-                calls.fetch_add(1, Ordering::SeqCst);
-            }
-        });
+        // Close an unclaimed stream when it drops too
+        let stream = Stream::new(
+            Memory::new(io::empty(), &clock),
+            Memory::new(io::sink(), &clock),
+            {
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
         drop(stream);
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -615,14 +637,18 @@ mod tests {
     // returns before the callback is released.
     #[test]
     fn test_every_closer_waits_for_the_shutdown_callback() {
+        // Park the shutdown callback on the stream's paused clock
+        let tester = test_clock();
+        let clock = tester.clock();
         let (entered, callback) = mpsc::channel();
-        let (release, released) = mpsc::channel();
+        let release = testing::Gate::new(&clock);
+        let released = release.clone();
         let stream = Stream::new(
-            Memory::new(io::empty()),
-            Memory::new(io::sink()),
+            Memory::new(io::empty(), &clock),
+            Memory::new(io::sink(), &clock),
             move || {
                 entered.send(()).unwrap();
-                released.recv_timeout(PATIENCE).unwrap();
+                released.wait(None).unwrap();
             },
         );
         let closer = stream.closer();
@@ -635,8 +661,9 @@ mod tests {
                 finished.send(()).unwrap();
             }
         });
-        callback.recv_timeout(PATIENCE).unwrap();
+        callback.recv().unwrap();
 
+        // Start another close and owner drop while the first callback is parked
         let (started, starts) = mpsc::channel();
         let second = thread::spawn({
             let closer = closer.clone();
@@ -653,13 +680,16 @@ mod tests {
             drop(stream);
             finished.send(()).unwrap();
         });
-        starts.recv_timeout(PATIENCE).unwrap();
-        starts.recv_timeout(PATIENCE).unwrap();
-        assert!(finishes.recv_timeout(Duration::from_millis(50)).is_err());
-        release.send(()).unwrap();
-        finishes.recv_timeout(PATIENCE).unwrap();
-        finishes.recv_timeout(PATIENCE).unwrap();
-        finishes.recv_timeout(PATIENCE).unwrap();
+        starts.recv().unwrap();
+        starts.recv().unwrap();
+        tester.wait_blocked(3);
+        assert!(finishes.try_recv().is_err());
+
+        // Release the callback and await all three closers
+        release.open();
+        finishes.recv().unwrap();
+        finishes.recv().unwrap();
+        finishes.recv().unwrap();
         first.join().unwrap();
         second.join().unwrap();
         owner.join().unwrap();
@@ -679,10 +709,11 @@ mod tests {
     /// Holds one adapter operation until the test releases it. This keeps I/O in
     /// progress long enough to observe shutdown.
     struct Gate {
+        /// Clock shared with both gated adapters.
+        clock: Clock,
         at: BlockAt,
         entered: mpsc::Sender<()>,
-        released: Mutex<bool>,
-        changed: Condvar,
+        released: testing::Gate,
         calls: AtomicUsize,
     }
 
@@ -692,34 +723,14 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if at == self.at {
                 self.entered.send(()).unwrap();
-                let released = self.released.lock().unwrap();
-                let released = match deadline {
-                    Some(deadline) => {
-                        self.changed
-                            .wait_timeout_while(
-                                released,
-                                deadline.saturating_duration_since(Instant::now()),
-                                |released| !*released,
-                            )
-                            .unwrap()
-                            .0
-                    }
-                    None => self
-                        .changed
-                        .wait_while(released, |released| !*released)
-                        .unwrap(),
-                };
-                if !*released {
-                    return Err(io::ErrorKind::TimedOut.into());
-                }
+                self.released.wait(deadline)?;
             }
             Ok(())
         }
 
         /// Allows the admitted operation to finish.
         fn release(&self) {
-            *self.released.lock().unwrap() = true;
-            self.changed.notify_all();
+            self.released.open();
         }
     }
 
@@ -730,6 +741,10 @@ mod tests {
     }
 
     impl Read for GatedAdapter {
+        fn clock(&self) -> Clock {
+            self.gate.clock.clone()
+        }
+
         fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
             self.deadline = deadline;
             Ok(())
@@ -744,6 +759,10 @@ mod tests {
     }
 
     impl Write for GatedAdapter {
+        fn clock(&self) -> Clock {
+            self.gate.clock.clone()
+        }
+
         fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
             self.deadline = Some(deadline);
             Ok(())
@@ -773,12 +792,15 @@ mod tests {
     #[test]
     fn test_every_closer_waits_for_active_io_and_refuses_new_io() {
         for at in [BlockAt::Read, BlockAt::Write, BlockAt::Flush] {
+            // Hold one admitted adapter operation on the stream's clock
+            let tester = test_clock();
+            let clock = tester.clock();
             let (entered, entries) = mpsc::channel();
             let gate = Arc::new(Gate {
+                clock: clock.clone(),
                 at,
                 entered,
-                released: Mutex::new(false),
-                changed: Condvar::new(),
+                released: testing::Gate::new(&clock),
                 calls: AtomicUsize::new(0),
             });
             let (requested, requests) = mpsc::channel();
@@ -797,6 +819,7 @@ mod tests {
             );
             let (reader, writer, closer, _) = stream.into_parts();
             let io_closer = closer.clone();
+            let deadline = clock.now() + Duration::from_secs(5);
             let io = thread::spawn(move || {
                 let mut reader = ReadHalf {
                     inner: reader,
@@ -806,7 +829,6 @@ mod tests {
                     inner: writer,
                     closer: io_closer,
                 };
-                let deadline = Instant::now() + PATIENCE;
                 match at {
                     BlockAt::Read => assert_eq!(reader.read(&mut [0], None).unwrap(), 0),
                     BlockAt::Write => assert_eq!(
@@ -817,7 +839,9 @@ mod tests {
                 }
                 (reader, writer)
             });
-            entries.recv_timeout(PATIENCE).unwrap();
+            entries.recv().unwrap();
+
+            // Require both I/O and shutdown to park before checking completion
             let (finished, finishes) = mpsc::channel();
             let closing = thread::spawn({
                 let closer = closer.clone();
@@ -826,17 +850,19 @@ mod tests {
                     finished.send(()).unwrap();
                 }
             });
-            requests.recv_timeout(PATIENCE).unwrap();
-            assert!(finishes.recv_timeout(Duration::from_millis(20)).is_err());
+            requests.recv().unwrap();
+            tester.wait_blocked(2);
+            assert!(finishes.try_recv().is_err());
 
+            // Release the admitted operation and refuse every new adapter call
             gate.release();
-            finishes.recv_timeout(PATIENCE).unwrap();
+            finishes.recv().unwrap();
             closing.join().unwrap();
             let (mut reader, mut writer) = io.join().unwrap();
             let calls = gate.calls.load(Ordering::SeqCst);
             assert_eq!(reader.read(&mut [0], None).unwrap(), 0);
             assert!(matches!(
-                writer.write(&[1], Instant::now() + PATIENCE),
+                writer.write(&[1], deadline),
                 Err(err) if err.kind() == io::ErrorKind::NotConnected
             ));
             assert_eq!(gate.calls.load(Ordering::SeqCst), calls);
@@ -848,6 +874,8 @@ mod tests {
     /// Accepts one byte per write and can hold flush until its supplied deadline.
     /// Recorded deadlines reveal whether partial progress restarts the budget.
     struct BudgetWriter {
+        /// Clock governing writes and the deliberately stalled flush.
+        clock: Clock,
         bytes: Vec<u8>,
         deadlines: Vec<Instant>,
         stall_flush: bool,
@@ -856,6 +884,10 @@ mod tests {
     }
 
     impl Write for BudgetWriter {
+        fn clock(&self) -> Clock {
+            self.clock.clone()
+        }
+
         fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
             self.deadline = Some(deadline);
             self.settings += 1;
@@ -876,7 +908,7 @@ mod tests {
             let deadline = self.deadline.expect("write deadline installed");
             self.deadlines.push(deadline);
             if self.stall_flush {
-                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                self.clock.sleep_until(deadline);
                 return Err(io::ErrorKind::TimedOut.into());
             }
             check_deadline(&self.clock(), deadline)
@@ -887,10 +919,14 @@ mod tests {
     // a timeout leaves the stream reusable, and a zero budget never calls I/O.
     #[test]
     fn test_output_deadline_and_reuse() {
+        // Start a partial write whose flush parks until its clock deadline
+        let mut tester = test_clock();
+        let clock = tester.clock();
         let timeout = Duration::from_millis(40);
         let stream = Stream::new(
-            Memory::new(io::empty()),
+            Memory::new(io::empty(), &clock),
             BudgetWriter {
+                clock: clock.clone(),
                 bytes: Vec::new(),
                 deadlines: Vec::new(),
                 stall_flush: true,
@@ -903,22 +939,28 @@ mod tests {
         let (_, inner, closer, configured) = stream.into_parts();
         assert_eq!(configured, timeout);
         let mut writer = WriteHalf { inner, closer };
-        let deadline = Instant::now() + configured;
-        assert_eq!(
-            writer.write(b"abc", deadline).unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
+        let deadline = clock.now() + configured;
+        let result = thread::scope(|scope| {
+            let writing = scope.spawn(|| writer.write(b"abc", deadline));
+            tester.wait_blocked(1);
+            assert_eq!(tester.next_deadline(), Some(deadline));
+            tester.advance_to(deadline);
+            writing.join().unwrap()
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(writer.inner.deadlines, vec![deadline; 4]);
         assert_eq!(writer.inner.settings, 1);
 
+        // Resume writes with a new deadline on the same stream
         writer.inner.stall_flush = false;
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = clock.now() + Duration::from_secs(5);
         writer.write(b"d", deadline).unwrap();
         assert_eq!(writer.inner.bytes, b"abcd");
         assert_eq!(writer.inner.settings, 2);
 
+        // Reject an already expired budget before configuring adapter I/O
         let calls = writer.inner.deadlines.len();
-        let deadline = Instant::now();
+        let deadline = clock.now();
         assert!(matches!(
             writer.write(b"e", deadline),
             Err(err) if err.kind() == io::ErrorKind::TimedOut
@@ -935,6 +977,8 @@ mod tests {
     fn test_partial_write_retries_and_failures() {
         /// Scripts adapter results and records offered and accepted byte sequences.
         struct Script {
+            /// Clock governing every scripted partial write.
+            clock: Clock,
             results: std::collections::VecDeque<io::Result<usize>>,
             offered: Vec<Vec<u8>>,
             accepted: Vec<u8>,
@@ -945,6 +989,10 @@ mod tests {
         }
 
         impl Write for Script {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
                 self.settings += 1;
                 self.deadline = Some(deadline);
@@ -982,8 +1030,12 @@ mod tests {
         }
 
         for (stalls, interrupted_flush) in [(false, false), (true, false), (false, true)] {
+            // Run an interrupted write followed by partial progress on a paused clock
+            let tester = test_clock();
+            let clock = tester.clock();
             let mut writer = WriteHalf {
                 inner: Script {
+                    clock: clock.clone(),
                     results: [
                         Err(io::ErrorKind::Interrupted.into()),
                         Ok(1),
@@ -997,9 +1049,9 @@ mod tests {
                     settings: 0,
                     deadline: None,
                 },
-                closer: Closer::new(&Clock::real(), || {}),
+                closer: Closer::new(&clock, || {}),
             };
-            let result = writer.write(b"ab", Instant::now() + PATIENCE);
+            let result = writer.write(b"ab", clock.now() + Duration::from_secs(5));
             if stalls {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
             } else if interrupted_flush {
@@ -1007,6 +1059,7 @@ mod tests {
             } else {
                 result.unwrap();
             }
+            // Retain the unsent suffix across retries and configure the deadline once
             assert_eq!(
                 writer.inner.offered,
                 [b"ab".to_vec(), b"ab".to_vec(), b"b".to_vec()]
@@ -1028,6 +1081,8 @@ mod tests {
     fn test_deadline_setter_failure_prevents_io() {
         /// Rejects deadline installation and panics if byte I/O is attempted.
         struct Refused {
+            /// Clock shared by the test's adapters and closer.
+            clock: Clock,
             settings: usize,
             kind: io::ErrorKind,
         }
@@ -1042,6 +1097,10 @@ mod tests {
         }
 
         impl Read for Refused {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_read_deadline(&mut self, _: Option<Instant>) -> io::Result<()> {
                 self.reject()
             }
@@ -1054,6 +1113,10 @@ mod tests {
         }
 
         impl Write for Refused {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_write_deadline(&mut self, _: Instant) -> io::Result<()> {
                 self.reject()
             }
@@ -1070,27 +1133,39 @@ mod tests {
         }
 
         for kind in [io::ErrorKind::Interrupted, io::ErrorKind::TimedOut] {
-            let closer = Closer::new(&Clock::real(), || {});
+            // Fail each direction's deadline installation before byte I/O
+            let tester = test_clock();
+            let clock = tester.clock();
+            let closer = Closer::new(&clock, || {});
             let mut reader = ReadHalf {
-                inner: Refused { settings: 0, kind },
+                inner: Refused {
+                    clock: clock.clone(),
+                    settings: 0,
+                    kind,
+                },
                 closer: closer.clone(),
             };
             let err = reader.read(&mut [0], None).unwrap_err();
             assert_eq!(err.kind(), kind);
             assert_eq!(err.to_string(), "deadline refused");
             let mut writer = WriteHalf {
-                inner: Refused { settings: 0, kind },
+                inner: Refused {
+                    clock: clock.clone(),
+                    settings: 0,
+                    kind,
+                },
                 closer: closer.clone(),
             };
             assert!(matches!(
-                writer.write(&[1], Instant::now() + PATIENCE),
+                writer.write(&[1], clock.now() + Duration::from_secs(5)),
                 Err(err) if err.kind() == kind && err.to_string() == "deadline refused"
             ));
 
+            // Refuse all new I/O after shutdown without another deadline setter call
             closer.close();
             assert_eq!(reader.read(&mut [0], None).unwrap(), 0);
             assert!(matches!(
-                writer.write(&[1], Instant::now() + PATIENCE),
+                writer.write(&[1], clock.now() + Duration::from_secs(5)),
                 Err(err) if err.kind() == io::ErrorKind::NotConnected
             ));
             assert_eq!(reader.inner.settings, 1);
@@ -1104,13 +1179,18 @@ mod tests {
     #[test]
     fn test_late_write_preserves_progress() {
         /// Accepts one byte but delays returning until its installed deadline.
-        #[derive(Default)]
         struct LateWriter {
+            /// Clock governing the late partial write.
+            clock: Clock,
             deadline: Option<Instant>,
             bytes: Vec<u8>,
         }
 
         impl Write for LateWriter {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
                 self.deadline = Some(deadline);
                 Ok(())
@@ -1120,11 +1200,8 @@ mod tests {
         impl io::Write for LateWriter {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 self.bytes.push(bytes[0]);
-                thread::sleep(
-                    self.deadline
-                        .expect("write deadline installed")
-                        .saturating_duration_since(Instant::now()),
-                );
+                self.clock
+                    .sleep_until(self.deadline.expect("write deadline installed"));
                 Ok(1)
             }
 
@@ -1134,15 +1211,27 @@ mod tests {
         }
 
         for bytes in [&b"a"[..], &b"ab"[..]] {
+            // Park a successful partial write until its deadline
+            let mut tester = test_clock();
+            let clock = tester.clock();
             let mut writer = WriteHalf {
-                inner: LateWriter::default(),
-                closer: Closer::new(&Clock::real(), || {}),
+                inner: LateWriter {
+                    clock: clock.clone(),
+                    deadline: None,
+                    bytes: Vec::new(),
+                },
+                closer: Closer::new(&clock, || {}),
             };
-            let deadline = Instant::now() + Duration::from_millis(40);
-            assert_eq!(
-                writer.write(bytes, deadline).unwrap_err().kind(),
-                io::ErrorKind::TimedOut
-            );
+            let deadline = clock.now() + Duration::from_millis(40);
+            let result = thread::scope(|scope| {
+                let writing = scope.spawn(|| writer.write(bytes, deadline));
+                tester.wait_blocked(1);
+                tester.advance_to(deadline);
+                writing.join().unwrap()
+            });
+
+            // Retain only the accepted byte and reject all subsequent adapter I/O
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
             assert_eq!(writer.inner.bytes, b"a");
             writer.closer.close();
         }

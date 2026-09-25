@@ -23,7 +23,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", 'cfg(g
 [features]
 default = []
 bench = ["dep:criterion", "dep:sysinfo"]
-fuzz = ["dep:arbitrary", "dep:base64", "dep:getrandom", "dep:rand_chacha", "dep:serde_json", "dep:sha2", "dep:strum"]
+fuzz = ["darkbio-clock/test-clock", "dep:arbitrary", "dep:base64", "dep:getrandom", "dep:rand_chacha", "dep:serde_json", "dep:sha2", "dep:strum"]
 
 [dependencies]
 arbitrary = { version = "1", features = ["derive"], optional = true }
@@ -46,7 +46,7 @@ tracing = "0.1.40" # Keep >= 0.1.40, fixes Instrumented use-after-free (RUSTSEC-
 
 [dev-dependencies]
 base64 = "0.23"
-darkbio-clock = { version = "0.2", features = ["test-clock"] }
+darkbio-clock = { version = "0.2", features = ["test-clock", "crossbeam"] }
 rand = "0.10.2" # Keep >= 0.10.1, fixes rng logger unsoundness (RUSTSEC-2026-0097)
 serde_json = "1"
 strum = { version = "0.28", features = ["derive"] }

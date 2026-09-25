@@ -6,7 +6,7 @@
 
 //! Session lifecycle, inbound accounting, and concurrency regressions.
 
-use super::{Failure, Job, PATIENCE, Step, run};
+use super::{Failure, Job, Step, run};
 use crate::protocol::envelope::{IncomingEnvelope, Side, opaque};
 use crate::protocol::operation::PendingOperation;
 use crate::protocol::schema::{self, HostToArk, host_to_ark};
@@ -782,9 +782,12 @@ fn test_server_autoreply_timeout() {
 #[test]
 fn test_server_autoreply_timeout_races() {
     use crate::protocol::Server;
+
+    // Race attachment against the server's timeout update
     let timeout = Duration::from_millis(30);
     for order in orders() {
-        let (server, mut source) = Server::fixture();
+        let tester = crate::transport::testing::test_clock();
+        let (server, mut source) = Server::fixture(tester.clock());
         let (mut server, (_source, state)) = schedule(
             order,
             move || server.set_autoreply_timeout(timeout),
@@ -794,8 +797,9 @@ fn test_server_autoreply_timeout_races() {
             },
         );
         let mut session = server.accept().unwrap();
-        let now = Instant::now() + Duration::from_secs(60);
-        state.set_time(now);
+
+        // Apply the winning timeout to the first abandoned request
+        let now = tester.clock().now();
         state.inject_request(1, vec![11].into()).unwrap();
         let (session, responder) = Job::start(move || {
             let (_, responder) = session.recv().unwrap();
@@ -807,6 +811,7 @@ fn test_server_autoreply_timeout_races() {
         assert_eq!(outgoing.deadline, now + timeout);
         outgoing.operation.record_write(Ok(()));
 
+        // Race a later responder drop against another timeout update
         state.inject_request(3, vec![12].into()).unwrap();
         let mut session = session;
         let (session, responder) = Job::start(move || {
@@ -898,22 +903,24 @@ fn test_operation_close_races() {
     }
 }
 
-/// The deadline worker settles real-time requests and replies while their promises wait.
+/// The deadline worker settles requests and replies while their promises wait.
 #[test]
-fn test_real_wait_deadlines() {
+fn test_clock_settles_waiting_request_and_reply() {
     use Failure::*;
     use Step::*;
 
-    // Keep the real-time scenario's deadlines serviced while both promises wait
+    // Park both promises before advancing the shared deadline worker's clock
     run(vec![
         Open(1),
         Accept(1),
-        RealRequest(1, 0, 20),
+        Request(1, 0, 1, 20),
         Deliver(1, 7, 30),
         Receive(1, 30, 0),
-        RealReply(0, 0, 20),
+        Reply(0, 0, Ok(2), 20),
         StartWait(0),
         StartWaitWrite(0),
+        Deadlines(1),
+        Time(20),
         FinishWait(0, Err(Timeout)),
         FinishWaitWrite(0, Err(Timeout)),
         NoOutgoing(1),
@@ -1473,9 +1480,12 @@ fn test_inbound_shared_byte_budget() {
 fn test_inbound_limits_during_attachment() {
     use crate::protocol::Server;
     use std::sync::{Arc, Barrier};
+
+    // Race session attachment against both kinds of server limit update
     for (requests, bytes, reason) in [(0, 100, Failure::Requests), (1, 0, Failure::Bytes)] {
         for _ in 0..16 {
-            let (server, mut source) = Server::fixture();
+            let tester = crate::transport::testing::test_clock();
+            let (server, mut source) = Server::fixture(tester.clock());
             let barrier = Arc::new(Barrier::new(2));
             let ready = barrier.clone();
             let update = super::Job::start(move || {
@@ -1486,6 +1496,8 @@ fn test_inbound_limits_during_attachment() {
             let state = source.open().unwrap();
             let mut server = update.finish();
             let mut session = server.accept().unwrap();
+
+            // Require the attached session to enforce the new limits
             let result = state.upgrade().unwrap().inject_request(1, vec![11].into());
             assert_eq!(result.map_err(super::failure), Err(reason));
             assert_eq!(super::failure(session.recv().err().unwrap()), reason);
@@ -1541,8 +1553,7 @@ fn orders() -> impl Iterator<Item = Order> {
 /// Creates a session with the given limits and a controlled deadline.
 fn fixture(requests: usize, bytes: usize) -> (Session, Instant) {
     let session = Session::fixture().set_inbound_limits(requests, bytes);
-    let now = Instant::now() + Duration::from_secs(60);
-    session.inner.set_time(now);
+    let now = session.clock().now();
     (session, now + Duration::from_secs(1))
 }
 
@@ -1615,6 +1626,7 @@ fn test_release_races_response_admission() {
 /// limit failure closes the session only if the promise still exists at delivery.
 #[test]
 fn test_observer_drop_during_response_completion() {
+    // Vary admission and observer lifetime independently
     for admit in [false, true] {
         for drop_observer in [false, true] {
             let bytes = incoming(2, 11);
@@ -1622,7 +1634,8 @@ fn test_observer_drop_during_response_completion() {
             let limit = if admit { bytes.len() } else { 0 };
             let used = Arc::new(AtomicUsize::new(0));
             let counter = used.clone();
-            let now = Instant::now();
+            let tester = crate::transport::testing::test_clock();
+            let now = tester.clock().now();
             let (sender, promise) =
                 Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60), true);
             let pending = PendingOperation {
@@ -1630,6 +1643,8 @@ fn test_observer_drop_during_response_completion() {
                 sender,
                 log_id: None,
             };
+
+            // Hold response completion after its byte reservation
             let (entered, reserved) = mpsc::channel();
             let (release, released) = mpsc::channel();
             let completed = Job::start(move || {
@@ -1644,12 +1659,14 @@ fn test_observer_drop_during_response_completion() {
                         Weak::new(),
                     );
                     entered.send(()).unwrap();
-                    released.recv_timeout(PATIENCE).unwrap();
+                    released.recv().unwrap();
                     result
                 })
             });
-            reserved.recv_timeout(PATIENCE).unwrap();
+            reserved.recv().unwrap();
             assert_eq!(used.load(Ordering::Relaxed), limit);
+
+            // Drop or retain the observer before releasing response completion
             let promise = if drop_observer {
                 drop(promise);
                 None
@@ -1798,6 +1815,7 @@ fn malformed(id: u64) -> Vec<Vec<u8>> {
     ]
 }
 
+/// Malformed buffered responses fail decoding while late arrivals settle as timeouts.
 #[test]
 fn test_malformed_response_observation_and_deadlines() {
     use Step::*;
@@ -1942,13 +1960,14 @@ fn test_repeated_payload_fields() {
 /// Only the final ID decides routing, even if an earlier ID has the other parity.
 #[test]
 fn test_repeated_id_changes_routing() {
+    // Exercise request and response routing in each envelope direction
     for (side, peer, peer_id) in [
         (Side::Server, Side::Client, 1),
         (Side::Client, Side::Server, 2),
     ] {
         for is_response in [false, true] {
             let session = Session::fixture_for(side).set_inbound_limits(1, 100);
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = session.clock().now() + Duration::from_secs(60);
             let (own, promise) = request(&session, deadline);
             let (first, last) = if is_response {
                 (peer_id, own)
@@ -1956,6 +1975,7 @@ fn test_repeated_id_changes_routing() {
                 (own, peer_id)
             };
             let mut bytes = peer.encode(first, Ok(vec![11].into())).unwrap();
+
             // An ID-only envelope appends a scalar occurrence without replacing content.
             bytes.extend(match peer {
                 Side::Client => HostToArk {
@@ -2027,6 +2047,7 @@ fn large_envelope(peer: Side, id: u64, error: bool) -> (Vec<u8>, usize) {
 /// Includes large error strings and development payloads.
 #[test]
 fn test_large_inbound_boundaries_and_error_values() {
+    // Exercise exact byte limits for requests, successful responses and errors
     let size = crate::transport::MAX_MESSAGE_SIZE;
     for (side, peer, peer_id) in [
         (Side::Server, Side::Client, 1),
@@ -2041,7 +2062,7 @@ fn test_large_inbound_boundaries_and_error_values() {
                     let mut session = Session::fixture_for(side).set_inbound_limits(1, limit);
                     let (id, promise) = if response {
                         let (id, promise) =
-                            request(&session, Instant::now() + Duration::from_secs(60));
+                            request(&session, session.clock().now() + Duration::from_secs(60));
                         (id, Some(promise))
                     } else {
                         (peer_id, None)

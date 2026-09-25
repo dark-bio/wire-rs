@@ -6,45 +6,97 @@
 
 //! Private fixtures shared by the crate's tests.
 
-#![expect(
-    clippy::disallowed_methods,
-    reason = "test pipes and their watchdogs move to TestClock in W3"
-)]
-
 use crate::transport::{Attester, Error, Event, Read, Sender, Server, Write};
+use darkbio_clock::{Clock, crossbeam_channel as mpsc};
 use std::io;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-use std::sync::{Once, mpsc};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
+/// Installs the test logger once per process.
 static INIT: Once = Once::new();
+
+/// A one-shot gate whose wait is visible to the scenario's paused clock.
+#[derive(Clone)]
+pub struct Gate {
+    /// Shared release state and its clock-aware notification.
+    inner: Arc<(
+        darkbio_clock::sync::Mutex<bool>,
+        darkbio_clock::sync::Condvar,
+    )>,
+}
+
+impl Gate {
+    /// Creates a closed gate on the supplied clock.
+    pub fn new(clock: &Clock) -> Self {
+        Self {
+            inner: Arc::new((
+                darkbio_clock::sync::Mutex::new(false),
+                darkbio_clock::sync::Condvar::new(clock),
+            )),
+        }
+    }
+
+    /// Parks until released or until the supplied clock deadline expires.
+    pub fn wait(&self, deadline: Option<Instant>) -> io::Result<()> {
+        let mut open = self.inner.0.lock().unwrap();
+        while !*open {
+            open = match deadline {
+                Some(deadline) => {
+                    let (open, timeout) = self.inner.1.wait_deadline(open, deadline).unwrap();
+                    if timeout.timed_out() && !*open {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    open
+                }
+                None => self.inner.1.wait(open).unwrap(),
+            };
+        }
+        Ok(())
+    }
+
+    /// Releases the current wait and every later wait.
+    pub fn open(&self) {
+        *self.inner.0.lock().unwrap() = true;
+        self.inner.1.notify_all();
+    }
+}
 
 /// Receiving end of a test pipe, retaining unread bytes across bounded reads.
 pub struct PipeReader {
+    /// Clock governing read deadlines.
+    clock: Clock,
+    /// Chunks queued by the writer.
     incoming: mpsc::Receiver<Vec<u8>>,
+    /// Unconsumed bytes of the current chunk.
     buffered: io::Cursor<Vec<u8>>,
+    /// Latest read deadline.
     deadline: Option<Instant>,
 }
 
 /// Sending end of an unbounded test pipe, closed when its owner is dropped.
 pub struct PipeWriter {
+    /// Clock governing write deadlines.
+    clock: Clock,
+    /// Queue consumed by the reader.
     outgoing: mpsc::Sender<Vec<u8>>,
+    /// Latest write deadline.
     deadline: Option<Instant>,
 }
 
 /// Creates an in-memory pipe whose configured deadlines bound reads and whose
 /// output never waits for the reader. Dropping the writer delivers EOF after
 /// its bytes. Direct standard I/O is unlimited until a deadline is configured.
-pub fn pipe() -> (PipeReader, PipeWriter) {
-    let (outgoing, incoming) = mpsc::channel();
+pub fn pipe(clock: &Clock) -> (PipeReader, PipeWriter) {
+    let (outgoing, incoming) = mpsc::unbounded();
     (
         PipeReader {
+            clock: clock.clone(),
             incoming,
             buffered: io::Cursor::new(Vec::new()),
             deadline: None,
         },
         PipeWriter {
+            clock: clock.clone(),
             outgoing,
             deadline: None,
         },
@@ -54,14 +106,14 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
 impl io::Read for PipeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(deadline) = self.deadline {
-            remaining(deadline)?;
+            remaining(&self.clock, deadline)?;
         }
         if buf.is_empty() {
             return Ok(0);
         }
         if self.buffered.position() == self.buffered.get_ref().len() as u64 {
             let incoming = match self.deadline {
-                Some(deadline) => self.incoming.recv_timeout(remaining(deadline)?),
+                Some(deadline) => self.clock.recv_deadline(&self.incoming, deadline),
                 None => self
                     .incoming
                     .recv()
@@ -80,6 +132,10 @@ impl io::Read for PipeReader {
 }
 
 impl Read for PipeReader {
+    fn clock(&self) -> Clock {
+        self.clock.clone()
+    }
+
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
         Ok(())
@@ -89,7 +145,7 @@ impl Read for PipeReader {
 impl io::Write for PipeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if let Some(deadline) = self.deadline {
-            remaining(deadline)?;
+            remaining(&self.clock, deadline)?;
         }
         if !buf.is_empty() {
             self.outgoing
@@ -101,104 +157,36 @@ impl io::Write for PipeWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         if let Some(deadline) = self.deadline {
-            remaining(deadline)?;
+            remaining(&self.clock, deadline)?;
         }
         Ok(())
     }
 }
 
 impl Write for PipeWriter {
+    fn clock(&self) -> Clock {
+        self.clock.clone()
+    }
+
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
         Ok(())
     }
 }
 
-/// Test socket adapter with independent absolute deadlines. Every standard
-/// I/O call recomputes its relative socket timeout so partial progress never
-/// restarts the budget and an expired deadline leaves the socket reusable.
-#[cfg(unix)]
-#[derive(Debug)]
-pub struct Socket {
-    inner: UnixStream,
-    read_deadline: Option<Instant>,
-    write_deadline: Option<Instant>,
-}
-
-#[cfg(unix)]
-impl Socket {
-    /// Wraps a test socket without configuring either direction's deadline.
-    pub fn new(inner: UnixStream) -> Self {
-        Self {
-            inner,
-            read_deadline: None,
-            write_deadline: None,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl io::Read for Socket {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner
-            .set_read_timeout(self.read_deadline.map(remaining).transpose()?)?;
-        io::Read::read(&mut self.inner, buf).map_err(socket_error)
-    }
-}
-
-#[cfg(unix)]
-impl Read for Socket {
-    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
-        self.read_deadline = deadline;
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-impl io::Write for Socket {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner
-            .set_write_timeout(self.write_deadline.map(remaining).transpose()?)?;
-        io::Write::write(&mut self.inner, buf).map_err(socket_error)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner
-            .set_write_timeout(self.write_deadline.map(remaining).transpose()?)?;
-        io::Write::flush(&mut self.inner).map_err(socket_error)
-    }
-}
-
-#[cfg(unix)]
-impl Write for Socket {
-    fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.write_deadline = Some(deadline);
-        Ok(())
-    }
-}
-
 /// Returns the nonzero part of a deadline still available for an adapter call.
-pub fn remaining(deadline: Instant) -> io::Result<Duration> {
+pub fn remaining(clock: &Clock, deadline: Instant) -> io::Result<Duration> {
     deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(clock.now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| io::ErrorKind::TimedOut.into())
-}
-
-/// Normalizes the platform-specific socket timeout result for transport.
-#[cfg(unix)]
-fn socket_error(error: io::Error) -> io::Error {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        io::ErrorKind::TimedOut.into()
-    } else {
-        error
-    }
 }
 
 // init_tracing sets up a test logger to push log messages to stderr.
 pub fn init_tracing() {
     INIT.call_once(|| {
         tracing_subscriber::fmt()
+            .without_time()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
                     .add_directive(tracing::Level::TRACE.into()),

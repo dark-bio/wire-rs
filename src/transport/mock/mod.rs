@@ -21,6 +21,7 @@ pub mod server;
 pub mod vector;
 
 use crate::transport::{Attestation, Error, MAX_MESSAGE_SIZE, Sender, Write};
+use darkbio_clock::Clock;
 use darkbio_cobs as cobs;
 use darkbio_crypto::cwt::claims::{self, eat};
 use darkbio_crypto::{cwt, xdsa};
@@ -157,8 +158,10 @@ pub enum CutPoint {
 
 /// Captures output for the mock peer to consume.
 /// Scripts can inject partial writes, timeouts and persistent write failures.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Outbox {
+    /// Clock shared with the scripted input adapter.
+    clock: Clock,
     shared: Arc<Mutex<OutputState>>,
     recorder: Recorder, // Transcript the writes are logged into
 }
@@ -175,6 +178,15 @@ struct OutputState {
 }
 
 impl Outbox {
+    /// Creates empty output on the scenario's clock.
+    pub fn new(clock: &Clock) -> Self {
+        Self {
+            clock: clock.clone(),
+            shared: Arc::default(),
+            recorder: Recorder::default(),
+        }
+    }
+
     /// Removes and returns all delimited frames, without their delimiters.
     /// Keeps any unfinished tail until a later write supplies its delimiter.
     pub fn take_frames(&self) -> Vec<Vec<u8>> {
@@ -243,6 +255,10 @@ impl Outbox {
 }
 
 impl Write for Outbox {
+    fn clock(&self) -> Clock {
+        self.clock.clone()
+    }
+
     fn set_write_deadline(&mut self, _deadline: Instant) -> io::Result<()> {
         // Scripted faults determine expiry without wall-clock delays.
         // Starting a new frame discards deferred errors from previous output.
@@ -301,10 +317,6 @@ impl io::Write for Outbox {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "outbox tests move to TestClock in W3"
-)]
 mod tests {
     use super::*;
     use std::io::Write as _;
@@ -315,10 +327,13 @@ mod tests {
     // and a fresh frame can complete the prefix on the same adapter.
     #[test]
     fn test_partial_write_reports_progress_before_failure() {
-        let mut outbox = Outbox::default();
+        // Inject a partial failure on a paused clock
+        let tester = crate::transport::testing::test_clock();
+        let clock = tester.clock();
+        let mut outbox = Outbox::new(&clock);
         outbox.set_cut(CutPoint::Delimiter);
         outbox
-            .set_write_deadline(Instant::now() + Duration::from_secs(1))
+            .set_write_deadline(clock.now() + Duration::from_secs(1))
             .unwrap();
         assert_eq!(outbox.write(&[1, 2, 0]).unwrap(), 2);
         assert_eq!(
@@ -328,8 +343,9 @@ mod tests {
         assert!(outbox.take_frames().is_empty());
         assert!(outbox.has_tail());
 
+        // Complete the partial frame with a fresh output operation
         outbox
-            .set_write_deadline(Instant::now() + Duration::from_secs(1))
+            .set_write_deadline(clock.now() + Duration::from_secs(1))
             .unwrap();
         outbox.write_all(&[0]).unwrap();
         outbox.flush().unwrap();
@@ -342,9 +358,13 @@ mod tests {
     #[test]
     fn test_new_output_discards_abandoned_fault() {
         for cut in [CutPoint::Delimiter, CutPoint::Flush] {
-            let mut outbox = Outbox::default();
-            let deadline = Instant::now() + Duration::from_secs(1);
+            // Accept a prefix and leave its failure unobserved
+            let tester = crate::transport::testing::test_clock();
+            let clock = tester.clock();
+            let mut outbox = Outbox::new(&clock);
+            let deadline = clock.now() + Duration::from_secs(1);
             outbox.set_cut(cut);
+            // Start another output operation with the same deadline
             outbox.set_write_deadline(deadline).unwrap();
             assert!(outbox.write(&[1, 2, 0]).unwrap() > 0);
 

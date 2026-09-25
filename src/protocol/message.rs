@@ -109,9 +109,10 @@ mod tests {
     /// Rejects a different `Message` variant even when its protobuf fields could
     /// be decoded as the requested type.
     #[test]
-    fn response_extraction_checks_the_variant() {
+    fn test_response_extraction_checks_the_variant() {
         use prost::Message as _;
 
+        // Reject a different variant even when its encoded fields would decode
         let other = schema::OnboardingResponse {};
         assert!(DeviceInfoResponse::decode(other.encode_to_vec().as_slice()).is_ok());
         let message: Message = other.into();
@@ -134,6 +135,7 @@ mod tests {
             })
         ));
 
+        // Extract the matching structured response without changing its fields
         let response = DeviceInfoResponse {
             version_id: 7,
             ..Default::default()
@@ -141,6 +143,7 @@ mod tests {
         let message: Message = response.clone().into();
         assert_eq!(DeviceInfoResponse::try_from(message).unwrap(), response);
 
+        // Extract opaque development bytes through the same conversion API
         let message: Message = vec![1, 2, 3].into();
         assert_eq!(Vec::<u8>::try_from(message).unwrap(), vec![1, 2, 3]);
     }

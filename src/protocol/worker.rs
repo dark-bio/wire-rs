@@ -74,25 +74,11 @@ pub(super) struct Tracker {
 
 #[cfg(any(test, feature = "fuzz"))]
 impl Tracker {
-    /// Waits for the count to reach zero, failing the test after five seconds.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the worker watchdog is removed in W3"
-    )]
+    /// Waits for every worker to release its captured state.
     pub(super) fn wait_stopped(&self) {
-        use std::time::{Duration, Instant};
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut active = self.active.lock().unwrap();
         while *active != 0 {
-            let (count, timeout) = self
-                .stopped
-                .wait_timeout(active, deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
-            active = count;
-            if timeout.timed_out() && *active != 0 {
-                drop(active);
-                panic!("protocol workers did not exit");
-            }
+            active = self.stopped.wait(active).unwrap();
         }
     }
 }

@@ -12,8 +12,6 @@ use super::{Error, Message};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, Weak, mpsc};
-#[cfg(any(test, feature = "fuzz"))]
-use std::time::Duration;
 use std::time::Instant;
 
 /// Result of a queued request or reply.
@@ -213,15 +211,10 @@ impl<T> Promise<T> {
 
     /// Waits for a worker result without calling `SessionInner::expire()`, so tests
     /// can prove workers process deadlines without help from `Promise::wait()`.
-    /// Fails the test if the result does not arrive within five seconds.
     #[cfg(any(test, feature = "fuzz"))]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the promise watchdog is removed in W3"
-    )]
     fn worker_result(self) -> Result<PromiseResult, Error> {
         self.result
-            .recv_timeout(Duration::from_secs(5))
+            .recv()
             .expect("protocol worker must settle the promise")
     }
 }
@@ -378,10 +371,6 @@ impl PromiseResult {
 /// Checks that both promise owners can be transferred to application threads.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the promise test watchdog is removed in W3"
-)]
 mod tests {
     use super::{Error, Message, NotificationState, Promise, PromiseResult};
     use darkbio_clock::TestClock;
@@ -484,7 +473,7 @@ mod tests {
             });
             let waiting = promise.watch_wait();
             let waiter = std::thread::spawn(move || promise.wait());
-            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            waiting.recv().unwrap();
 
             // Let the waiter drop its promise before running the taken callback
             let notification = sender.send(Ok(PromiseResult::Written));

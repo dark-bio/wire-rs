@@ -86,9 +86,11 @@ fn test_notification_lifetimes() {
     ]);
 }
 
+/// Writes and replies preserve completion ordering before, at and after expiry.
 #[test]
 fn test_completion_orderings() {
     use Kind::*;
+    // Vary completion results around the original deadline
     for time in [9, 10, 11] {
         for result in 0..3 {
             let steps = [
@@ -118,9 +120,11 @@ fn test_completion_orderings() {
     }
 }
 
+/// Model scripts settle pending work across expiry and every owner transition.
 #[test]
 fn test_model_scripts() {
     use Kind::*;
+    // Exercise each ending with expired and future deadlines
     for ending in [Open, Close, Drop, CloseServer, DropSource] {
         for budget in [0, 1, 10, 255] {
             run_actions(&[

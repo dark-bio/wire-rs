@@ -7,11 +7,6 @@
 //! Real transport scenarios using the transport runner's gated byte pipes.
 //! Scripts can run both protocol peers or inspect one peer through a raw transport.
 
-#![expect(
-    clippy::disallowed_methods,
-    reason = "connection scenarios and watchdogs move to TestClock in W3"
-)]
-
 use super::session::Job;
 use crate::protocol::schema::{self, ArkToHost, HostToArk, ark_to_host, host_to_ark};
 use crate::protocol::session::SessionInner;
@@ -29,11 +24,11 @@ use prost::Message as _;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Weak, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Default protocol timeout for scenarios that do not specify one.
 const BUDGET: Duration = Duration::from_secs(3);
-/// Transport write timeout, shorter than the scenario watchdog.
+/// Transport write timeout, independent of protocol request deadlines.
 const WRITE_BUDGET: Duration = Duration::from_millis(500);
 
 /// Which peers run the protocol API; the other peer, if any, uses raw envelopes.
@@ -110,6 +105,8 @@ enum EnvelopeShape {
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step {
+    /// Advances the scenario clock after its current protocol workers park.
+    Advance(u64),
     // Session setup and limits.
     /// Reconnect the raw client and accept a replacement under this label.
     Reconnect(u8),
@@ -319,8 +316,12 @@ impl RawPeer {
     }
 }
 
-/// Connection fixtures, application handles, and an independent hang watchdog.
+/// Connection fixtures and application handles sharing one scenario clock.
 struct Driver {
+    /// Sole driver of time for the encrypted peers and protocol workers.
+    tester: darkbio_clock::TestClock,
+    /// Number of protocol workers that park before scripted clock advances.
+    parked: usize,
     /// Persistent protocol server, if this scenario exercises one.
     server: Option<Server>,
     /// Optional scripted transport peer.
@@ -355,12 +356,8 @@ struct Driver {
     disconnects: HashMap<u8, (mpsc::Receiver<()>, mpsc::Sender<()>)>,
     /// Trackers used to wait for each connection's workers to finish.
     workers: Vec<Arc<Tracker>>,
-    /// Physical closers used on normal cleanup and watchdog expiry.
+    /// Physical closers used on scenario cleanup.
     shutdown: [transport::Closer; 2],
-    /// Stops the watchdog once all workers and calls have been released.
-    stop: Option<mpsc::Sender<()>>,
-    /// Watchdog outcome; true means the scenario exceeded its time budget.
-    watchdog: Option<Job<bool>>,
 }
 
 /// A receive call returning its non-cloneable owner alongside its result.
@@ -369,7 +366,12 @@ type ReceiveJob = Job<(Session, Result<(Message, Responder), Error>)>;
 impl Driver {
     /// Constructs peers on shared transport gates, with space for a full handshake.
     fn new(mode: Mode) -> Self {
-        let pipes = [Pipe::new(64 * 1024), Pipe::new(64 * 1024)];
+        // Give both gated pipes the scenario's paused clock
+        let tester = crate::transport::testing::test_clock();
+        let pipes = [
+            Pipe::new(64 * 1024, &tester.clock()),
+            Pipe::new(64 * 1024, &tester.clock()),
+        ];
         let stream = |side: usize| {
             Stream::new(
                 Adapter::new(pipes[1 - side].clone()),
@@ -388,23 +390,14 @@ impl Driver {
         let host = stream(0);
         let ark = stream(1);
         let shutdown = [host.closer(), ark.closer()];
-        let (stop, stopped) = mpsc::channel();
-        let closers = shutdown.clone();
-        // Arm the watchdog before handshaking so setup stalls release the same
-        // pipes as stalls during a scripted step.
-        let watchdog = Job::start(move || {
-            if stopped.recv_timeout(Duration::from_secs(8)).is_ok() {
-                return false;
-            }
-            for closer in closers {
-                closer.close();
-            }
-            true
-        });
+
+        // Retain the identity and application handles for later script steps
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
         let mut driver = Self {
+            tester,
+            parked: if matches!(mode, Mode::Both) { 6 } else { 3 },
             server: None,
             raw: None,
             identity: identity.clone(),
@@ -424,9 +417,9 @@ impl Driver {
             disconnects: HashMap::new(),
             workers: Vec::new(),
             shutdown,
-            stop: Some(stop),
-            watchdog: Some(watchdog),
         };
+
+        // Establish the protocol roles selected by the scenario
         match mode {
             Mode::Both | Mode::Server => {
                 let mut server = Server::new(ark, signer, attestation);
@@ -490,6 +483,10 @@ impl Driver {
     /// Runs one scripted action using public calls and controlled adapter events.
     fn step(&mut self, step: Step) {
         match step {
+            Step::Advance(millis) => {
+                self.tester.wait_blocked(self.parked);
+                self.tester.advance(Duration::from_millis(millis));
+            }
             Step::Reconnect(label) => {
                 let Some(RawPeer::Client(client, sender)) = &mut self.raw else {
                     panic!("raw client required")
@@ -502,7 +499,18 @@ impl Driver {
                 let Some(RawPeer::Client(client, _)) = &mut self.raw else {
                     panic!("raw client required")
                 };
-                assert!(client.connect(&self.identity).is_err());
+                // Expire the raw client's read after failed server output leaves it
+                // parked. Time moves only once the server's hello has taken the write
+                // fault. A hello that expires first skips the fault, leaving it to fail
+                // the next handshake, whose client then waits on this stopped clock.
+                let deadline = self.tester.clock().now() + WRITE_BUDGET;
+                std::thread::scope(|scope| {
+                    let connecting = scope.spawn(|| client.connect(&self.identity));
+                    self.pipes[1].wait_blocked(Operation::Read);
+                    self.pipes[1].wait_faults_taken();
+                    self.tester.advance_to(deadline);
+                    assert!(connecting.join().unwrap().is_err());
+                });
             }
             Step::HandshakeReadTimeout => {
                 let incoming = self.pipes[0].clone();
@@ -543,7 +551,10 @@ impl Driver {
             }
             Step::TypedExchange => {
                 let promise = self.requesters[&0]
-                    .request(schema::DeviceInfoRequest {}, Instant::now() + BUDGET)
+                    .request(
+                        schema::DeviceInfoRequest {},
+                        self.tester.clock().now() + BUDGET,
+                    )
                     .unwrap();
                 let (message, responder) = self.sessions.get_mut(&1).unwrap().recv().unwrap();
                 assert!(matches!(message, Message::DeviceInfoRequest(_)));
@@ -553,7 +564,7 @@ impl Driver {
                             version_id: 42,
                             ..Default::default()
                         },
-                        Instant::now() + BUDGET,
+                        self.tester.clock().now() + BUDGET,
                     )
                     .unwrap();
                 let reply: schema::DeviceInfoResponse = promise.wait().unwrap();
@@ -564,7 +575,10 @@ impl Driver {
                 self.promises.insert(
                     slot,
                     self.requesters[&session]
-                        .request(vec![tag], Instant::now() + Duration::from_millis(ms))
+                        .request(
+                            vec![tag],
+                            self.tester.clock().now() + Duration::from_millis(ms),
+                        )
                         .unwrap(),
                 );
             }
@@ -577,7 +591,7 @@ impl Driver {
                 self.promises.insert(
                     slot,
                     self.requesters[&session]
-                        .request(body, Instant::now() + BUDGET)
+                        .request(body, self.tester.clock().now() + BUDGET)
                         .unwrap(),
                 );
             }
@@ -587,7 +601,7 @@ impl Driver {
                     self.requesters[&session]
                         .request(
                             vec![0; transport::MAX_MESSAGE_SIZE + 1],
-                            Instant::now() + BUDGET,
+                            self.tester.clock().now() + BUDGET,
                         )
                         .unwrap(),
                 );
@@ -617,7 +631,7 @@ impl Driver {
                         (session, result)
                     }),
                 );
-                waiting.recv_timeout(BUDGET).unwrap();
+                waiting.recv().unwrap();
             }
             Step::ReceiveFailed(label, expected) => {
                 let (session, result) = self.receiving.remove(&label).unwrap().finish();
@@ -626,7 +640,7 @@ impl Driver {
             }
             Step::Reply(slot, promise, body, ms) => {
                 let responder = self.responders.remove(&slot).unwrap();
-                let deadline = Instant::now() + Duration::from_millis(ms);
+                let deadline = self.tester.clock().now() + Duration::from_millis(ms);
                 let result = match body {
                     Ok(tag) => responder.reply(vec![tag], deadline),
                     Err(code) => responder.fail(schema::Error::new(code, "refused"), deadline),
@@ -644,7 +658,7 @@ impl Driver {
                     self.responders
                         .remove(&slot)
                         .unwrap()
-                        .reply(body, Instant::now() + BUDGET)
+                        .reply(body, self.tester.clock().now() + BUDGET)
                         .unwrap(),
                 );
             }
@@ -656,7 +670,7 @@ impl Driver {
                         .unwrap()
                         .reply(
                             vec![0; transport::MAX_MESSAGE_SIZE + 1],
-                            Instant::now() + BUDGET,
+                            self.tester.clock().now() + BUDGET,
                         )
                         .unwrap(),
                 );
@@ -677,7 +691,7 @@ impl Driver {
                 });
             }
             Step::Notified(token) => {
-                assert_eq!(self.notifications.1.recv_timeout(BUDGET).unwrap(), token)
+                assert_eq!(self.notifications.1.recv().unwrap(), token)
             }
             Step::NoNotifications => assert!(self.notifications.1.try_recv().is_err()),
             Step::ResponseReceived(label, id) => {
@@ -735,9 +749,7 @@ impl Driver {
                     self.states[&label].upgrade().unwrap().pause_disconnect(),
                 );
             }
-            Step::DisconnectPaused(label) => {
-                self.disconnects[&label].0.recv_timeout(BUDGET).unwrap()
-            }
+            Step::DisconnectPaused(label) => self.disconnects[&label].0.recv().unwrap(),
             Step::ResumeDisconnect(label) => {
                 self.disconnects.remove(&label).unwrap().1.send(()).unwrap();
             }
@@ -748,17 +760,16 @@ impl Driver {
             Step::Refused(label) => {
                 assert!(
                     self.requesters[&label]
-                        .request(vec![1], Instant::now() + BUDGET)
+                        .request(vec![1], self.tester.clock().now() + BUDGET)
                         .is_err()
                 );
             }
             Step::Released(label) => {
-                // Workers release their SessionInner references on exit. Wait up to
-                // BUDGET for the last strong reference to disappear.
+                // Wait for workers to release the last strong session reference
                 if let Some(state) = self.states[&label].upgrade() {
                     let released = state.watch_drop();
                     drop(state);
-                    released.recv_timeout(BUDGET).unwrap();
+                    released.recv().unwrap();
                 }
                 assert!(self.states[&label].upgrade().is_none());
             }
@@ -789,11 +800,6 @@ impl Drop for Driver {
         // sessions the application never accepted.
         for workers in &self.workers {
             workers.wait_stopped();
-        }
-        let _ = self.stop.take().unwrap().send(());
-        let expired = self.watchdog.take().unwrap().finish();
-        if !std::thread::panicking() {
-            assert!(!expired, "connection scenario exceeded watchdog");
         }
     }
 }

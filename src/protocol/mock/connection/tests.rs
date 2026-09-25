@@ -8,13 +8,12 @@
 
 use crate::protocol::{DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS};
 
-use super::{BUDGET, Driver, EnvelopeShape, Failure, Job, Mode, Step, run};
+use super::{BUDGET, Driver, EnvelopeShape, Failure, Job, Mode, Step, WRITE_BUDGET, run};
 use crate::protocol::{Error, Message};
 use crate::transport;
 use crate::transport::mock::duplex::Operation;
 use std::io;
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
 
 /// Both peers queue multiple requests before waiting for answers or calling `recv()`.
 #[test]
@@ -50,6 +49,8 @@ fn test_bidirectional_exchange() {
 #[test]
 fn test_error_replies() {
     use crate::protocol::schema;
+
+    // Connect both roles and preserve reserved and custom error values
     let mut driver = Driver::new(Mode::Both);
     for local in [0, 1] {
         for (error, code, text) in [
@@ -69,7 +70,7 @@ fn test_error_replies() {
                 "request refused",
             ),
         ] {
-            let deadline = Instant::now() + BUDGET;
+            let deadline = driver.tester.clock().now() + BUDGET;
             let answer = driver.requesters[&(1 - local)]
                 .request(vec![11], deadline)
                 .unwrap();
@@ -106,6 +107,7 @@ fn test_concurrent_requesters() {
     const PRODUCERS: u8 = 8;
     const REQUESTS: u8 = 8;
 
+    // Start concurrent producers on one paused connection per role
     crate::testing::init_tracing();
     for (mode, local, first) in [(Mode::Client, 0, 1), (Mode::Server, 1, 2)] {
         let mut driver = Driver::new(mode);
@@ -120,7 +122,7 @@ fn test_concurrent_requesters() {
                         .map(|index| {
                             let tag = producer * REQUESTS + index;
                             let promise = requester
-                                .request(vec![tag], Instant::now() + BUDGET)
+                                .request(vec![tag], requester.clock().now() + BUDGET)
                                 .unwrap();
                             (tag, promise)
                         })
@@ -291,6 +293,8 @@ fn test_duplicate_active_request_ids() {
 #[test]
 fn test_deadline_during_write() {
     use Step::*;
+
+    // Expire the parked request before letting its frame reach the peer
     for (mode, local, id, outgoing) in [(Mode::Client, 0, 1, 0), (Mode::Server, 1, 2, 1)] {
         run(
             mode,
@@ -299,6 +303,7 @@ fn test_deadline_during_write() {
                 Request(local, 0, 10, 50),
                 Notify(0, 7),
                 Blocked(outgoing, Operation::Write),
+                Advance(50),
                 Notified(7),
                 Answer(0, Err(Failure::Timeout)),
                 Outstanding(local, vec![id]),
@@ -320,6 +325,8 @@ fn test_deadline_during_write() {
 #[test]
 fn test_reply_deadline_during_flush() {
     use Step::*;
+
+    // Expire the reply promise while its complete frame waits in flush
     for (mode, local, request, outgoing) in [(Mode::Client, 0, 2, 0), (Mode::Server, 1, 1, 1)] {
         run(
             mode,
@@ -330,6 +337,7 @@ fn test_reply_deadline_during_flush() {
                 Reply(0, 0, Ok(20), 50),
                 NotifyWrite(0, 7),
                 Blocked(outgoing, Operation::Flush),
+                Advance(50),
                 Notified(7),
                 Written(0, Err(Failure::Timeout)),
                 Read(request, EnvelopeShape::Content(20)),
@@ -459,6 +467,8 @@ fn test_send_failure_wakes_receivers() {
 #[test]
 fn test_read_failure_wakes_callers() {
     use Step::*;
+
+    // Inject EOF or an adapter failure after both receive paths have parked
     crate::testing::init_tracing();
     for (mode, local, first, peer, incoming) in
         [(Mode::Client, 0, 1, 2, 1), (Mode::Server, 1, 2, 1, 0)]
@@ -483,7 +493,7 @@ fn test_read_failure_wakes_callers() {
                     let error = server.accept().expect_err("accept must fail");
                     (server, error)
                 });
-                waiting.recv_timeout(BUDGET).unwrap();
+                waiting.recv().unwrap();
                 job
             });
             if eof {
@@ -512,7 +522,7 @@ fn test_read_failure_wakes_callers() {
             }
             errors.push(
                 driver.requesters[&local]
-                    .request(vec![12], Instant::now() + BUDGET)
+                    .request(vec![12], driver.tester.clock().now() + BUDGET)
                     .expect_err("request must fail"),
             );
             errors.push(
@@ -520,7 +530,7 @@ fn test_read_failure_wakes_callers() {
                     .responders
                     .remove(&0)
                     .unwrap()
-                    .reply(vec![31], Instant::now() + BUDGET)
+                    .reply(vec![31], driver.tester.clock().now() + BUDGET)
                     .expect_err("reply must fail"),
             );
             for error in errors {
@@ -548,6 +558,8 @@ fn test_read_failure_wakes_callers() {
 #[test]
 fn test_transport_failure_after_protocol_timeout() {
     use Step::*;
+
+    // Advance the protocol deadline before the independent transport deadline
     for (mode, local, outgoing) in [(Mode::Client, 0, 0), (Mode::Server, 1, 1)] {
         run(
             mode,
@@ -556,7 +568,9 @@ fn test_transport_failure_after_protocol_timeout() {
                 Pause(outgoing, Operation::Write, true),
                 Request(local, 0, 10, 50),
                 Blocked(outgoing, Operation::Write),
+                Advance(50),
                 Answer(0, Err(Failure::Timeout)),
+                Advance(450),
                 ReceiveFailed(local, Failure::Transport),
                 Refused(local),
             ],
@@ -843,6 +857,32 @@ fn test_handshake_failure_recovery() {
     );
 }
 
+/// A failed reconnect moves time only after the server's hello takes the write
+/// fault. A hello expiring first would skip the fault and fail the next handshake,
+/// whose client then waits forever on the stopped clock.
+#[test]
+fn test_failed_reconnect_awaits_server_output() {
+    // Arm the server's next hello write to fail
+    let mut driver = Driver::new(Mode::Server);
+    let deadline = driver.tester.clock().now() + WRITE_BUDGET;
+    driver.step(Step::Fault(1, Operation::Write, io::ErrorKind::BrokenPipe));
+
+    // Keep the server from the reset until the step waits for its output, or
+    // until the step expires the client without waiting
+    driver.pipes[0].pause(Operation::Read, true);
+    let pipes = driver.pipes.clone();
+    let release = Job::start(move || {
+        let awaited = pipes[1].wait_fault_waiter(deadline);
+        pipes[0].pause(Operation::Read, false);
+        awaited
+    });
+
+    // Require the step to wait for the fault, leaving the next handshake clean
+    driver.step(Step::FailedReconnect);
+    assert!(release.finish());
+    driver.step(Step::Reconnect(2));
+}
+
 /// An immediately expired reply fails its promise and releases the peer's request ID.
 #[test]
 fn test_expired_reply_releases_incoming_id() {
@@ -870,6 +910,8 @@ fn test_expired_reply_releases_incoming_id() {
 #[test]
 fn test_queued_expiry_releases_ids() {
     use Step::*;
+
+    // Expire queued requests and replies behind one blocked writer
     for (mode, local, first, peer, outgoing) in
         [(Mode::Client, 0, 1, 2, 0), (Mode::Server, 1, 2, 1, 1)]
     {
@@ -883,6 +925,7 @@ fn test_queued_expiry_releases_ids() {
                 Send(peer, EnvelopeShape::Content(20)),
                 Receive(local, 20, 0),
                 Reply(0, 0, Ok(30), 50),
+                Advance(50),
                 Answer(1, Err(Failure::Timeout)),
                 Written(0, Err(Failure::Timeout)),
                 Send(peer, EnvelopeShape::Content(21)),
@@ -908,6 +951,8 @@ fn test_queued_expiry_releases_ids() {
 #[test]
 fn test_new_earlier_deadline() {
     use Step::*;
+
+    // Wake a parked worker with an earlier request and expire only that request
     for (mode, local, first) in [(Mode::Client, 0, 1), (Mode::Server, 1, 2)] {
         run(
             mode,
@@ -916,6 +961,7 @@ fn test_new_earlier_deadline() {
                 Read(first, EnvelopeShape::Content(10)),
                 Request(local, 1, 11, 50),
                 Read(first + 2, EnvelopeShape::Content(11)),
+                Advance(50),
                 Answer(1, Err(Failure::Timeout)),
                 Outstanding(local, vec![first, first + 2]),
                 Send(first + 2, EnvelopeShape::Content(21)),

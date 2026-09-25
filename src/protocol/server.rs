@@ -421,9 +421,9 @@ pub(super) struct SessionSource {
 #[cfg(any(test, feature = "fuzz"))]
 impl Server {
     /// Creates a server and a fixture that attaches sessions without a stream.
-    pub(super) fn fixture() -> (Self, SessionSource) {
+    pub(super) fn fixture(clock: Clock) -> (Self, SessionSource) {
         let inner = Arc::new(ServerInner {
-            clock: Clock::real(),
+            clock: clock.clone(),
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
@@ -432,7 +432,7 @@ impl Server {
                 ready: None,
                 wait_hook: None,
             }),
-            changed: Condvar::new(&Clock::real()),
+            changed: Condvar::new(&clock),
             stream_closer: None,
             workers: Arc::new(worker::Tracker::default()),
         });
@@ -450,7 +450,7 @@ impl SessionSource {
     /// to it even after another session connects.
     pub(super) fn open(&mut self) -> Result<Weak<SessionInner>, Error> {
         let server = self.server_ref.upgrade().ok_or(Error::Closed)?;
-        let session = Session::fixture();
+        let session = Session::fixture_with_clock(Side::Server, server.clock.clone());
         let session_ref = Arc::downgrade(&session.inner);
         server.attach(session)?;
         Ok(session_ref)
@@ -509,7 +509,7 @@ mod tests {
 
         // Attach a clock-controlled session and retain a peer request against its limit
         let tester = TestClock::new();
-        let (server, _source) = Server::fixture();
+        let (server, _source) = Server::fixture(tester.clock());
         let session = Session::fixture_with_clock(Side::Server, tester.clock());
         let inner = session.inner.clone();
         server.inner.attach(session).unwrap();

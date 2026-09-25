@@ -236,9 +236,6 @@ pub(super) struct SessionInner {
     /// Lets tests wait for worker threads to exit.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
-    /// Controlled protocol time for scenarios, overriding the stream clock.
-    #[cfg(any(test, feature = "fuzz"))]
-    time: std::sync::Mutex<Option<Instant>>,
     /// Notifies tests when the last `Arc<SessionInner>` is dropped.
     #[cfg(any(test, feature = "fuzz"))]
     drop_hook: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -325,8 +322,6 @@ impl SessionInner {
             stream_closer,
             #[cfg(any(test, feature = "fuzz"))]
             workers,
-            #[cfg(any(test, feature = "fuzz"))]
-            time: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fuzz"))]
             drop_hook: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fuzz"))]
@@ -765,13 +760,9 @@ impl SessionInner {
         }
     }
 
-    /// Returns the stream clock's time or the scenario override. Deadline checks
-    /// hold `state`; `reply_unanswered()` also calls this before waiting for that lock.
+    /// Returns the stream clock's time. Deadline checks hold `state`, and
+    /// `reply_unanswered()` also calls this before waiting for that lock.
     fn now(&self) -> Instant {
-        #[cfg(any(test, feature = "fuzz"))]
-        if let Some(now) = *self.time.lock().expect("scenario clock not poisoned") {
-            return now;
-        }
         self.clock.now()
     }
 
@@ -1030,7 +1021,7 @@ impl SessionInner {
 
     /// Expires pending operations even when no caller is waiting on a promise.
     /// Waits on `changed` until the next deadline or until new work arrives.
-    fn run_deadlines(&self) {
+    pub(super) fn run_deadlines(&self) {
         // Keep callbacks outside the guard even when the session closes
         let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
@@ -1192,13 +1183,15 @@ impl State {
 #[cfg(any(test, feature = "fuzz"))]
 impl Session {
     /// Creates a session without a stream or workers for lifecycle scenarios.
+    #[cfg(test)]
     pub(super) fn fixture() -> Self {
         Self::fixture_for(Side::Server)
     }
 
     /// Creates either envelope direction without a stream or workers.
+    #[cfg(test)]
     pub(super) fn fixture_for(side: Side) -> Self {
-        Self::fixture_with_clock(side, Clock::real())
+        Self::fixture_with_clock(side, crate::transport::testing::test_clock().clock())
     }
 
     /// Creates a workerless session whose operations use the supplied clock.
@@ -1257,16 +1250,13 @@ impl SessionInner {
     /// Waits for the reader to remove a previously sent request's ID. Tests use
     /// this to leave a completed promise unread before changing limits or sessions.
     pub(super) fn wait_response(&self, id: u64) {
-        // Bound the response fence by three seconds on the session clock
-        let deadline = self.clock.now() + Duration::from_secs(3);
+        // Wait until the reader removes the request or the session closes
         let mut state = self.state.lock().unwrap();
-        while matches!(&*state, State::Open { outstanding, .. } if outstanding.contains_key(&id))
-            && self.clock.now() < deadline
-        {
-            state = self.changed.wait_deadline(state, deadline).unwrap().0;
+        while matches!(&*state, State::Open { outstanding, .. } if outstanding.contains_key(&id)) {
+            state = self.changed.wait(state).unwrap();
         }
 
-        // Require response processing before closure or watchdog expiry
+        // Require response processing before closure
         let State::Open { outstanding, .. } = &*state else {
             panic!("session closed before response fence");
         };
@@ -1320,34 +1310,6 @@ impl SessionInner {
         (requests, self.retained_bytes.load(Ordering::Relaxed))
     }
 
-    /// Advances the test clock without calling `expire()`, so tests can deliver
-    /// results after a deadline but before the timeout has been processed.
-    pub(super) fn set_time(&self, now: Instant) {
-        let _state = self.state.lock().expect("session state not poisoned");
-        let mut time = self.time.lock().expect("scenario clock not poisoned");
-        assert!(
-            time.is_none_or(|previous| now >= previous),
-            "clock cannot go backwards"
-        );
-        *time = Some(now);
-    }
-
-    /// Restores real time and starts deadline processing for a scenario fixture.
-    /// Called once when its script leaves controlled time for timed waits.
-    pub(super) fn use_realtime(self: &Arc<Self>) {
-        // Switch the fixture's time source before the worker can inspect deadlines
-        {
-            let _state = self.state.lock().expect("session state not poisoned");
-            *self.time.lock().expect("scenario clock not poisoned") = None;
-        }
-
-        // Untimed promise receives rely on the same deadline worker as live sessions
-        let inner = self.clone();
-        worker::spawn("wire-fixture-deadlines", &self.workers, move || {
-            inner.run_deadlines()
-        });
-    }
-
     /// Arms a one-shot notification for the next receive waiting on an empty queue.
     /// The notification is sent while holding the lock, immediately before the
     /// condition-variable wait releases it, so a later close cannot run too early.
@@ -1393,13 +1355,12 @@ mod tests {
     /// The deadline worker releases both locks before notifying and parking again.
     #[test]
     fn test_deadline_callback_releases_locks_before_worker_parks() {
-        use darkbio_clock::TestClock;
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
 
         // Register a callback before starting the fixture's only worker
-        let mut tester = TestClock::new();
+        let mut tester = crate::transport::testing::test_clock();
         let session = Session::fixture_with_clock(Side::Client, tester.clock());
         let deadline = tester.clock().now() + Duration::from_secs(5);
         let mut promise = session.requester().request(vec![1], deadline).unwrap();
@@ -1428,7 +1389,6 @@ mod tests {
     #[test]
     fn test_notification_releases_locks_on_every_settlement_path() {
         use crate::protocol::Promise;
-        use darkbio_clock::TestClock;
         use std::sync::{Arc, mpsc};
         use std::thread::{self, ThreadId};
         use std::time::Duration;
@@ -1520,7 +1480,7 @@ mod tests {
         ] {
             for completed in [false, true] {
                 // Create a session whose deadlines follow a paused clock
-                let mut tester = TestClock::new();
+                let mut tester = crate::transport::testing::test_clock();
                 let clock = tester.clock();
                 let deadline = clock.now() + Duration::from_secs(5);
                 let mut session = Session::fixture_with_clock(Side::Client, clock);
