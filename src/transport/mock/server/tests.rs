@@ -748,6 +748,36 @@ fn test_scripted_interrupted_frames() {
     }
 }
 
+// Tests the model's prediction for a pending ArkHello followed by a frame
+// encoding the empty packet. The lone 0x01 completes a hello whose encoding
+// ends in a full run, as COBS implies no zero after one, and merges into any
+// other hello as junk.
+#[test]
+fn test_partial_hello_empty_packet_model() {
+    // Encoding 254 nonzero bytes ends in a full run, encoding 253 does not
+    for (len, completes) in [(254, true), (253, false)] {
+        let mut server = Server::new(&[], Outbox::default(), Recorder::default());
+        let pending = frame(&vec![0x11; len]);
+        server.partial = Partial::Hello(7, pending[..pending.len() - 1].to_vec());
+
+        // Deliver the empty packet and check the predicted frame
+        server.execute(Step::Junk(vec![]));
+        let (bytes, frame) = server.queue.pop_back().unwrap();
+        assert_eq!(bytes, [0x01, 0x00], "len {len}");
+        assert_eq!(
+            matches!(
+                frame,
+                Some(Frame::ArkHello {
+                    generation: 7,
+                    flaw: Flaw::None
+                })
+            ),
+            completes,
+            "len {len}"
+        );
+    }
+}
+
 // Tests that framing retries Interrupted reads during a handshake or session
 // without ending the call or changing its result.
 #[test]
