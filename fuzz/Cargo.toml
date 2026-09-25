@@ -59,3 +59,19 @@ path = "fuzz_targets/protocol_envelope.rs"
 test = false
 doc = false
 bench = false
+
+# The fuzzers exercise the wire, not its dependencies. The Makefile builds with
+# -O, so these profiles decide the checks. The wire and the fuzz targets keep
+# debug assertions and overflow checks. The dependencies build as plain release
+# code, since their checks made the crypto slow every input down about threefold.
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[profile.release.package."*"]
+debug-assertions = false
+overflow-checks = false
+
+[profile.release.package.darkbio-wire]
+debug-assertions = true
+overflow-checks = true

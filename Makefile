@@ -8,6 +8,11 @@ FUZZ_TIME ?= 180
 FUZZ_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 FUZZ_SANITIZER ?= none
 
+# Build options of the fuzz runs. -O drops the debug assertions and overflow
+# checks cargo-fuzz forces on every crate, leaving them to the profiles in
+# fuzz/Cargo.toml, which keep them for the wire alone.
+FUZZ_BUILD = -O -s $(FUZZ_SANITIZER)
+
 # Environment of the fuzz feature builds. Every random draw goes through the
 # seeded backend of the mocks, see src/transport/mock/random.rs, for reproducible
 # vectors and deterministic fuzzing. A musl host also links dynamically, as
@@ -49,14 +54,14 @@ fuzz-seeds:
 fuzz:
 	for target in $$(cargo +nightly fuzz list); do \
 		mkdir -p fuzz/corpus/$$target; \
-		$(FUZZ_ENV) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
+		$(FUZZ_ENV) cargo +nightly fuzz run $(FUZZ_BUILD) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
 # fuzz-minimize uses set cover to retain coverage features with fewer inputs,
 # keeping a corpus grown by fuzz runs small before it is committed.
 fuzz-minimize:
 	for target in $$(cargo +nightly fuzz list); do \
-		$(FUZZ_ENV) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target -- -set_cover_merge=1 || exit 1; \
+		$(FUZZ_ENV) cargo +nightly fuzz cmin $(FUZZ_BUILD) $$target -- -set_cover_merge=1 || exit 1; \
 	done
 
 # fuzz-loop runs the fuzz targets round robin until a finding stops it or the
