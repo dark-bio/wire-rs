@@ -455,9 +455,16 @@ impl Peer {
                     ark_crypto: crypto.public_key(),
                 };
                 let signer = self.signer.as_ref().expect("ack before any handshake");
-                let ack: handshake::HostAck =
-                    cose::open(&packet, &auth, crypto, signer, CRYPTO_DOMAIN_WIRE, None)
-                        .expect("client ack does not open");
+                let ack: handshake::HostAck = cose::open_at(
+                    &packet,
+                    &auth,
+                    crypto,
+                    signer,
+                    CRYPTO_DOMAIN_WIRE,
+                    None,
+                    TIMESTAMP,
+                )
+                .expect("client ack does not open");
                 let encap: [u8; xhpke::ENCAP_KEY_SIZE] = ack
                     .h2a_encap
                     .try_into()
@@ -515,6 +522,10 @@ fn recorded_ack_recipient(frame: &[u8]) -> xhpke::Fingerprint {
 // The standard write reports that whole frame as accepted; flush must surface
 // the deferred error without consuming the following transcript event.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "replay adapter tests move to TestClock in W3"
+)]
 fn test_full_prefix_failure_surfaces_on_flush() {
     use std::io::Write as _;
     use std::time::Duration;

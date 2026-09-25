@@ -8,6 +8,7 @@
 
 use super::io::check_deadline;
 use super::{DEFAULT_WRITE_TIMEOUT, Read, Write};
+use darkbio_clock::Clock;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,6 +34,7 @@ use tracing::debug;
 /// that responsibility to the transport owner. Closer handles do not keep the
 /// reader or writer alive, and dropping a handle does not close the stream.
 pub struct Stream<R: Read, W: Write> {
+    clock: Clock,       // Shared by both adapters and the transport on them
     io: Option<(R, W)>, // Taken when ownership passes to the transport
     closer: Closer,
     timeout: Duration, // One budget for the frame's writes and flush
@@ -40,12 +42,31 @@ pub struct Stream<R: Read, W: Write> {
 
 impl<R: Read, W: Write> Stream<R, W> {
     /// Bundles the two I/O directions with their shutdown operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reader and writer report different clocks.
     pub fn new(reader: R, writer: W, shutdown: impl FnOnce() + Send + 'static) -> Self {
+        // Reject mixed clocks before creating the stream's shutdown state
+        let clock = reader.clock();
+        assert_eq!(
+            clock,
+            writer.clock(),
+            "stream halves must use the same clock"
+        );
+
+        // Retain the shared clock alongside the adapters
         Self {
+            clock,
             io: Some((reader, writer)),
             closer: Closer::new(shutdown),
             timeout: DEFAULT_WRITE_TIMEOUT,
         }
+    }
+
+    /// Returns the clock shared by this stream's adapters.
+    pub fn clock(&self) -> Clock {
+        self.clock.clone()
     }
 
     /// Sets the budget for writing and flushing one complete frame, including
@@ -254,7 +275,7 @@ impl<R: Read> ReadHalf<R> {
         loop {
             // Refuse an operation whose deadline has expired
             if let Some(deadline) = deadline {
-                check_deadline(deadline)?;
+                check_deadline(&self.inner.clock(), deadline)?;
             }
             // Keep the setter and read accounted for until both have returned.
             let result = {
@@ -298,7 +319,7 @@ impl<W: Write> WriteHalf<W> {
     /// this operation returns, so a late flush fails the complete frame.
     pub(super) fn write(&mut self, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
         // Refuse an operation whose deadline has expired
-        check_deadline(deadline)?;
+        check_deadline(&self.inner.clock(), deadline)?;
 
         // Account for the deadline setter so shutdown waits for it too.
         {
@@ -311,7 +332,7 @@ impl<W: Write> WriteHalf<W> {
         // Keep writing while bytes remain; flush only after the complete write
         while !bytes.is_empty() {
             // Recheck the deadline before each partial write.
-            check_deadline(deadline)?;
+            check_deadline(&self.inner.clock(), deadline)?;
 
             // Attempt to write as much data as possible
             let result = {
@@ -329,7 +350,7 @@ impl<W: Write> WriteHalf<W> {
             }
         }
         // Flush is part of the same operation and gets its own admission
-        check_deadline(deadline)?;
+        check_deadline(&self.inner.clock(), deadline)?;
 
         let _active = self
             .closer
@@ -341,6 +362,10 @@ impl<W: Write> WriteHalf<W> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "stream tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use crate::transport::Client;
@@ -374,7 +399,7 @@ mod tests {
     // transport must reject an expired attempt before consuming those bytes.
     #[test]
     fn test_memory_reader_keeps_transport_deadline() {
-        let (host, ark) = crate::memory::duplex(4);
+        let (host, ark) = crate::memory::duplex(4, &Clock::real());
         let (_ark_read, mut ark_write) = ark.into_halves();
         std::io::Write::write_all(&mut ark_write, b"abc").unwrap();
         let (reader, _writer, closer, _) = host.into_parts();
@@ -816,7 +841,7 @@ mod tests {
     impl io::Write for BudgetWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             let deadline = self.deadline.expect("write deadline installed");
-            check_deadline(deadline)?;
+            check_deadline(&self.clock(), deadline)?;
             self.deadlines.push(deadline);
             self.bytes.push(bytes[0]);
             Ok(1)
@@ -829,7 +854,7 @@ mod tests {
                 thread::sleep(deadline.saturating_duration_since(Instant::now()));
                 return Err(io::ErrorKind::TimedOut.into());
             }
-            check_deadline(deadline)
+            check_deadline(&self.clock(), deadline)
         }
     }
 
@@ -904,7 +929,10 @@ mod tests {
 
         impl io::Write for Script {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                check_deadline(self.deadline.expect("write deadline installed"))?;
+                check_deadline(
+                    &self.clock(),
+                    self.deadline.expect("write deadline installed"),
+                )?;
                 self.offered.push(bytes.to_vec());
                 let result = self.results.pop_front().expect("unexpected write");
                 if let Ok(size) = &result {
@@ -914,7 +942,10 @@ mod tests {
             }
 
             fn flush(&mut self) -> io::Result<()> {
-                check_deadline(self.deadline.expect("write deadline installed"))?;
+                check_deadline(
+                    &self.clock(),
+                    self.deadline.expect("write deadline installed"),
+                )?;
                 self.flushes += 1;
                 assert_eq!(self.flushes, 1, "flush retried");
                 if self.interrupted_flush {

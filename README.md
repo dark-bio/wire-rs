@@ -11,6 +11,7 @@ This repository implements the wire protocol between an [Ark](https://dark.bio) 
 - **Sessions**: Empty frames are used to mark session resets as USB bulk endpoints carry no lifecycle events.
 - **Handshake**: Exchange of ephemeral signing and encryption keys, authenticated by the device attestation.
 - **Timeouts**: Handshakes and writes configurable (by default 5s), reads block until the transport is torn down.
+- **Clock**: Deadlines and handshake times follow the stream's clock, which tests can swap for a [virtual one](https://github.com/dark-bio/clock-rs).
 - **Messages**: Protobuf encoded requests and responses with direction and id parity differentiating the two.
 - **Ordering**: Send and receive order guaranteed. Concurrent threads also guarantee local message ordering.
 

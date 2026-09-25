@@ -9,6 +9,7 @@
 use super::envelope::IncomingEnvelope;
 use super::session::SessionInner;
 use super::{Error, Message};
+use darkbio_clock::Clock;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, Weak, mpsc};
@@ -42,6 +43,8 @@ use std::time::Instant;
 /// }
 /// ```
 pub struct Promise<T> {
+    /// Session clock used to compute the remaining receive budget.
+    clock: Clock,
     /// Receives one result from the corresponding `PendingOperation`. A buffered
     /// result remains available even after the session is dropped.
     result: mpsc::Receiver<Result<PromiseResult, Error>>,
@@ -107,11 +110,15 @@ impl<T> Promise<T> {
     /// The channel holds one result without waiting for the caller to receive it.
     pub(super) fn pair(
         session: Weak<SessionInner>,
+        clock: &Clock,
         deadline: Instant,
         response: bool,
     ) -> (ResultSender, Self) {
+        // Give completion one buffered result and a shared notification state
         let (sender, result) = mpsc::sync_channel(1);
         let notification = Arc::new(Mutex::new(NotificationState::default()));
+
+        // Retain the clock independently of the session's lifetime
         (
             ResultSender {
                 response,
@@ -119,6 +126,7 @@ impl<T> Promise<T> {
                 notification: notification.clone(),
             },
             Self {
+                clock: clock.clone(),
                 result,
                 notification,
                 registered: false,
@@ -172,18 +180,27 @@ impl<T> Promise<T> {
     /// operations, then reads the result it sent. The session decides whether an
     /// answer or timeout came first; results already in the channel are kept.
     #[allow(unused_mut)] // The test-only wait hook must be taken now that we implement Drop.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the promise receive becomes untimed in W2"
+    )]
     fn wait_result(mut self) -> Result<PromiseResult, Error> {
+        // Settle any operations already expired before waiting
         if let Some(session) = self.session.upgrade() {
             session.expire();
         }
+
+        // Let scenarios observe entry into the receive
         #[cfg(any(test, feature = "fuzz"))]
         if let Some(wait_hook) = self.wait_hook.take() {
             let _ = wait_hook.send(());
         }
+
+        // Keep the original deadline while waiting for the session's result
         loop {
             match self
                 .result
-                .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+                .recv_timeout(self.deadline.saturating_duration_since(self.clock.now()))
             {
                 Ok(result) => return result,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -211,6 +228,10 @@ impl<T> Promise<T> {
     /// can prove workers process deadlines without help from `Promise::wait()`.
     /// Fails the test if the result does not arrive within five seconds.
     #[cfg(any(test, feature = "fuzz"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the promise watchdog is removed in W3"
+    )]
     fn worker_result(self) -> Result<PromiseResult, Error> {
         self.result
             .recv_timeout(Duration::from_secs(5))
@@ -315,8 +336,13 @@ impl PromiseResult {
 /// Checks that both promise owners can be transferred to application threads.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "promise tests move to TestClock in W3"
+)]
 mod tests {
     use super::{Error, Message, Promise, PromiseResult};
+    use darkbio_clock::Clock;
     use std::fmt::Debug;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Weak, mpsc};
@@ -327,7 +353,8 @@ mod tests {
     #[test]
     fn test_duplicate_notification() {
         for completed in [false, true] {
-            let (sender, mut promise) = Promise::<()>::pair(Weak::new(), Instant::now(), false);
+            let (sender, mut promise) =
+                Promise::<()>::pair(Weak::new(), &Clock::real(), Instant::now(), false);
             let (events, receiver) = mpsc::channel();
             promise.notify(events.clone(), 1);
             let sender = if completed {
@@ -352,7 +379,8 @@ mod tests {
     fn test_disconnected_notification() {
         for completed in [false, true] {
             for success in [false, true] {
-                let (sender, mut promise) = Promise::<()>::pair(Weak::new(), Instant::now(), false);
+                let (sender, mut promise) =
+                    Promise::<()>::pair(Weak::new(), &Clock::real(), Instant::now(), false);
                 let (events, receiver) = mpsc::channel();
                 drop(receiver);
                 let result = if success {
@@ -381,8 +409,12 @@ mod tests {
     #[test]
     fn test_notification_with_waiter() {
         for _ in 0..32 {
-            let (sender, mut promise) =
-                Promise::<()>::pair(Weak::new(), Instant::now() + Duration::from_secs(5), false);
+            let (sender, mut promise) = Promise::<()>::pair(
+                Weak::new(),
+                &Clock::real(),
+                Instant::now() + Duration::from_secs(5),
+                false,
+            );
             let (events, receiver) = mpsc::channel();
             promise.notify(events, 1);
             let waiting = promise.watch_wait();

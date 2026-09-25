@@ -8,6 +8,11 @@
 //! Scripts call the public request, reply, wait and close methods. Test hooks
 //! report when a call starts waiting so later steps can run while it is blocked.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "session scenarios and watchdogs move to TestClock in W3"
+)]
+
 use crate::protocol::operation::{OutgoingBody, OutgoingMessage};
 use crate::protocol::server::{ServerInner, SessionSource};
 use crate::protocol::session::SessionInner;

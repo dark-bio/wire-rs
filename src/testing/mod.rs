@@ -6,6 +6,11 @@
 
 //! Private fixtures shared by the crate's tests.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test pipes and their watchdogs move to TestClock in W3"
+)]
+
 use crate::transport::{Attester, Error, Event, Read, Sender, Server, Write};
 use std::io;
 #[cfg(unix)]

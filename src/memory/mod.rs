@@ -10,6 +10,7 @@
 //! worker threads. Split an endpoint with [`Duplex::into_halves`] for plain I/O.
 
 use crate::transport::{Read, Stream, Write};
+use darkbio_clock::Clock;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -30,10 +31,10 @@ impl Duplex {
     /// on the halves are retained; new halves have no deadline until configured.
     ///
     /// ```
-    /// use darkbio_wire::memory;
+    /// use darkbio_wire::{clock::Clock, memory};
     /// use darkbio_wire::transport::Client;
     ///
-    /// let (host, bus) = memory::duplex(64 * 1024);
+    /// let (host, bus) = memory::duplex(64 * 1024, &Clock::real());
     /// let (reader, writer) = bus.into_halves();
     /// let client = Client::new(host);
     /// // Move `reader` and `writer` to the bus's input and output pumps.
@@ -45,6 +46,7 @@ impl Duplex {
 }
 
 /// Creates two connected streams with `capacity` bytes of buffering per direction.
+/// Both measure their deadlines on `clock`, and so does any transport on them.
 ///
 /// Reads wait for data and writes wait for buffer space, bounded by the deadlines
 /// installed by Wire. Partial progress never refreshes a deadline. A timeout
@@ -68,10 +70,13 @@ impl Duplex {
 /// # Panics
 ///
 /// Panics if `capacity` is zero.
-pub fn duplex(capacity: usize) -> (Duplex, Duplex) {
+pub fn duplex(capacity: usize, clock: &Clock) -> (Duplex, Duplex) {
+    // Validate capacity before allocating either direction
     assert!(capacity > 0, "duplex capacity must be nonzero");
-    let incoming = Arc::new(Pipe::new(capacity));
-    let outgoing = Arc::new(Pipe::new(capacity));
+
+    // Give both endpoints the same clock and independent buffers
+    let incoming = Arc::new(Pipe::new(capacity, clock));
+    let outgoing = Arc::new(Pipe::new(capacity, clock));
     (
         endpoint(incoming.clone(), outgoing.clone()),
         endpoint(outgoing, incoming),
@@ -105,11 +110,15 @@ pub struct Reader {
 
 impl io::Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Recheck the buffer and closure state after every wake
         let mut state = self.pipe.lock();
         loop {
+            // Empty reads and local closure need no buffered input
             if buf.is_empty() || !state.reader_open {
                 return Ok(0);
             }
+
+            // Deliver ready bytes even after the installed read deadline
             if !state.bytes.is_empty() {
                 let count = buf.len().min(state.bytes.len());
                 for (out, byte) in buf.iter_mut().zip(state.bytes.drain(..count)) {
@@ -119,15 +128,23 @@ impl io::Read for Reader {
                 self.pipe.changed.notify_all();
                 return Ok(count);
             }
+
+            // End at peer closure or wait within the remaining clock budget
             if !state.writer_open {
                 return Ok(0);
             }
-            state = self.pipe.wait(state, time_left(self.deadline)?);
+            state = self
+                .pipe
+                .wait(state, time_left(&self.pipe.clock, self.deadline)?);
         }
     }
 }
 
 impl Read for Reader {
+    fn clock(&self) -> Clock {
+        self.pipe.clock.clone()
+    }
+
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
         Ok(())
@@ -140,6 +157,15 @@ impl Drop for Reader {
     }
 }
 
+#[cfg(test)]
+impl Reader {
+    /// Makes any later wait for input panic instead of blocking, so a test
+    /// expecting an immediate return fails rather than hangs.
+    pub(crate) fn forbid_waits(&self) {
+        self.pipe.lock().waits_forbidden = true;
+    }
+}
+
 /// Sending half of a [`Duplex`], sharing one deadline across writes and flushes.
 #[derive(Debug)]
 pub struct Writer {
@@ -149,15 +175,19 @@ pub struct Writer {
 
 impl io::Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Recheck capacity and the same deadline after every wake
         let mut state = self.pipe.lock();
         loop {
-            let timeout = time_left(self.deadline)?;
+            // Refuse expiry and closure before accepting any bytes
+            let timeout = time_left(&self.pipe.clock, self.deadline)?;
             if buf.is_empty() {
                 return Ok(0);
             }
             if !state.reader_open || !state.writer_open {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
+
+            // Fill available space and wake the reader after releasing the lock
             let count = buf.len().min(self.pipe.capacity - state.bytes.len());
             if count > 0 {
                 state.bytes.extend(&buf[..count]);
@@ -165,13 +195,18 @@ impl io::Write for Writer {
                 self.pipe.changed.notify_all();
                 return Ok(count);
             }
+
+            // Wait for space without extending the deadline
             state = self.pipe.wait(state, timeout);
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        // Check the installed deadline while observing a consistent pipe state
         let state = self.pipe.lock();
-        time_left(self.deadline)?;
+        time_left(&self.pipe.clock, self.deadline)?;
+
+        // Reject local closure or output lost when the peer closed
         if !state.writer_open || state.lost {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -180,6 +215,10 @@ impl io::Write for Writer {
 }
 
 impl Write for Writer {
+    fn clock(&self) -> Clock {
+        self.pipe.clock.clone()
+    }
+
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
         Ok(())
@@ -195,6 +234,8 @@ impl Drop for Writer {
 /// Shared bounded buffer for one direction. Waiting always releases the mutex.
 #[derive(Debug)]
 struct Pipe {
+    /// Clock used to check the installed I/O deadlines.
+    clock: Clock,
     capacity: usize,
     state: Mutex<State>,
     changed: Condvar,
@@ -208,11 +249,14 @@ struct State {
     lost: bool, // Accepted output the reader closed without consuming
     #[cfg(test)]
     waiting: usize,
+    #[cfg(test)]
+    waits_forbidden: bool, // Fails a wait instead of blocking, so a test cannot hang
 }
 
 impl Pipe {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, clock: &Clock) -> Self {
         Self {
+            clock: clock.clone(),
             capacity,
             state: Mutex::new(State {
                 bytes: VecDeque::with_capacity(capacity),
@@ -221,6 +265,8 @@ impl Pipe {
                 lost: false,
                 #[cfg(test)]
                 waiting: 0,
+                #[cfg(test)]
+                waits_forbidden: false,
             }),
             changed: Condvar::new(),
         }
@@ -231,18 +277,26 @@ impl Pipe {
         self.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the condvar moves to darkbio_clock::sync in W2"
+    )]
     fn wait<'a>(
         &self,
         state: MutexGuard<'a, State>,
         timeout: Option<Duration>,
     ) -> MutexGuard<'a, State> {
+        // Let tests observe the wait before it releases the mutex, or refuse it
         #[cfg(test)]
         let state = {
             let mut state = state;
+            assert!(!state.waits_forbidden, "memory pipe waited");
             state.waiting += 1;
             self.changed.notify_all();
             state
         };
+
+        // Release the buffer lock until notified or the current budget runs out
         let state = match timeout {
             Some(timeout) => {
                 self.changed
@@ -255,6 +309,8 @@ impl Pipe {
                 .wait(state)
                 .unwrap_or_else(|err| err.into_inner()),
         };
+
+        // Remove the test's waiter count after the buffer lock is retaken
         #[cfg(test)]
         let state = {
             let mut state = state;
@@ -280,11 +336,11 @@ impl Pipe {
 }
 
 /// Computes a fresh wait budget without extending the installed deadline.
-fn time_left(deadline: Option<Instant>) -> io::Result<Option<Duration>> {
+fn time_left(clock: &Clock, deadline: Option<Instant>) -> io::Result<Option<Duration>> {
     deadline
         .map(|deadline| {
             deadline
-                .checked_duration_since(Instant::now())
+                .checked_duration_since(clock.now())
                 .filter(|left| !left.is_zero())
                 .ok_or_else(|| io::ErrorKind::TimedOut.into())
         })
@@ -293,6 +349,10 @@ fn time_left(deadline: Option<Instant>) -> io::Result<Option<Duration>> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "memory tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use crate::transport::Closer;
@@ -323,14 +383,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplex capacity must be nonzero")]
     fn test_zero_capacity() {
-        duplex(0);
+        duplex(0, &Clock::real());
     }
 
     // Partial reads and writes preserve byte order across queue wraparound. Read
     // and write deadlines remain independent, including empty I/O and flush.
     #[test]
     fn test_byte_stream_and_independent_deadlines() {
-        let (host, ark) = duplex(4);
+        let (host, ark) = duplex(4, &Clock::real());
         let (mut host_read, mut host_write, _host_close) = halves(host);
         let (mut ark_read, mut ark_write, _ark_close) = halves(ark);
 
@@ -388,7 +448,7 @@ mod tests {
     // Clearing that deadline restores an indefinite read, woken by fresh output.
     #[test]
     fn test_read_timeout_and_reuse() {
-        let (host, ark) = duplex(1);
+        let (host, ark) = duplex(1, &Clock::real());
         let (mut reader, _host_write, _host_close) = halves(host);
         let (_ark_read, mut writer, _ark_close) = halves(ark);
         let pipe = reader.pipe.clone();
@@ -423,7 +483,7 @@ mod tests {
     // write must follow that prefix, without an abandoned suffix appearing later.
     #[test]
     fn test_write_timeout_and_reuse() {
-        let (host, ark) = duplex(3);
+        let (host, ark) = duplex(3, &Clock::real());
         let (_host_read, mut writer, _host_close) = halves(host);
         let (mut reader, _ark_write, _ark_close) = halves(ark);
         let (done, result) = mpsc::channel();
@@ -455,7 +515,7 @@ mod tests {
     // partial writes, while bounded reads reconstruct the original byte stream.
     #[test]
     fn test_backpressure_wakes_writer() {
-        let (host, ark) = duplex(3);
+        let (host, ark) = duplex(3, &Clock::real());
         let (_host_read, mut writer, _host_close) = halves(host);
         let (mut reader, _ark_write, _ark_close) = halves(ark);
         writer.write_all(b"abc").unwrap();
@@ -483,7 +543,7 @@ mod tests {
     #[test]
     fn test_shutdown_wakes_both_directions() {
         for local in [false, true] {
-            let (host, ark) = duplex(1);
+            let (host, ark) = duplex(1, &Clock::real());
             let (mut reader, mut writer, closer) = halves(host);
             writer.write_all(b"a").unwrap();
             let incoming = reader.pipe.clone();
@@ -521,7 +581,7 @@ mod tests {
     // drain before EOF. Keeping the handles alive must not keep the connection open.
     #[test]
     fn test_shutdown_drains_output_and_discards_input() {
-        let (host, ark) = duplex(3);
+        let (host, ark) = duplex(3, &Clock::real());
         let (mut host_read, mut host_write, closer) = halves(host);
         let (mut ark_read, mut ark_write, _ark_close) = halves(ark);
         host_write.write_all(b"abc").unwrap();
@@ -550,7 +610,7 @@ mod tests {
     // later flush. Only output it closed without reading is reported as lost.
     #[test]
     fn test_flush_after_peer_drained_and_closed() {
-        let (host, ark) = duplex(4);
+        let (host, ark) = duplex(4, &Clock::real());
         let (_host_read, mut host_write) = host.into_halves();
         let (mut ark_read, _ark_write) = ark.into_halves();
         host_write.write_all(b"ab").unwrap();
@@ -568,7 +628,7 @@ mod tests {
     // its halves. Dropping one half still permits I/O in the other direction.
     #[test]
     fn test_into_halves_and_independent_drop() {
-        let (host, ark) = duplex(4);
+        let (host, ark) = duplex(4, &Clock::real());
         let (mut host_read, mut host_write) = host.set_write_timeout(Duration::ZERO).into_halves();
         let (mut ark_read, mut ark_write) = ark.into_halves();
 
@@ -600,7 +660,7 @@ mod tests {
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
-        let (host, ark) = duplex(64 * 1024);
+        let (host, ark) = duplex(64 * 1024, &Clock::real());
         let mut server = protocol::Server::new(ark, signer, attestation);
         let (client, _) = protocol::connect(host, &identity).unwrap();
         let mut session = server.accept().unwrap();

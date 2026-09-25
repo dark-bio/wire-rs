@@ -4,6 +4,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "benchmarks measure real elapsed time"
+)]
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use darkbio_cobs as cobs;
 use darkbio_wire::transport::Client;

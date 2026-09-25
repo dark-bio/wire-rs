@@ -18,6 +18,7 @@ use super::{
 };
 use crate::LogId;
 use crate::transport::{self, Read, Stream, Verifier, Write};
+use darkbio_clock::Clock;
 use prost::bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -36,13 +37,17 @@ where
     W: Write + Send + 'static,
     V: Verifier,
 {
+    // Take the stream's clock before the client consumes the stream
+    let clock = stream.clock();
     let mut client = transport::Client::new(stream);
 
+    // Establish the session before starting its protocol workers
     let (sender, info) = client.connect(verifier)?;
     #[cfg(any(test, feature = "fuzz"))]
     let workers = Arc::new(worker::Tracker::default());
     let session = Session::start(
         Side::Client,
+        clock,
         sender,
         Some(client.closer()),
         #[cfg(any(test, feature = "fuzz"))]
@@ -50,6 +55,7 @@ where
     );
     let inner = session.inner.clone();
 
+    // Let the reader route transport messages into the shared session
     worker::spawn(
         "wire-client-reader",
         #[cfg(any(test, feature = "fuzz"))]
@@ -102,6 +108,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Returns the clock of the stream this session runs on, which request and
+    /// reply deadlines are measured on.
+    pub fn clock(&self) -> Clock {
+        self.inner.clock.clone()
+    }
+
     /// Sets the timeout for automatic `UNANSWERED` and `UNKNOWN` replies.
     /// Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`]. Replies already queued keep
     /// their deadlines.
@@ -143,7 +155,7 @@ impl Session {
 
     /// Returns a clonable requester bound to this session.
     pub fn requester(&self) -> Requester {
-        Requester::new(Arc::downgrade(&self.inner))
+        Requester::new(Arc::downgrade(&self.inner), &self.inner.clock)
     }
 
     /// Blocks for the next peer request and its [`Responder`]. Closing the session
@@ -200,6 +212,8 @@ impl fmt::Debug for Session {
 /// Queues and pending operations for one session. Requesters, responders, and
 /// closers hold weak references to this object, even after a new session connects.
 pub(super) struct SessionInner {
+    /// Clock inherited from the stream that established this session.
+    pub(super) clock: Clock,
     /// Protects the queues, pending operations, and transition to `State::Closed`.
     state: Mutex<State>,
     /// Wakes `recv()`, the writer, and the deadline worker when `state` changes.
@@ -218,7 +232,7 @@ pub(super) struct SessionInner {
     /// Lets tests wait for worker threads to exit.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
-    /// Controlled protocol time for scenarios; production always uses Instant::now.
+    /// Controlled protocol time for scenarios, overriding the stream clock.
     #[cfg(any(test, feature = "fuzz"))]
     time: Mutex<Option<Instant>>,
     /// Notifies tests when the last `Arc<SessionInner>` is dropped.
@@ -276,11 +290,13 @@ impl SessionInner {
     /// Creates empty queues and pending-operation maps before starting workers.
     fn new(
         side: Side,
+        clock: Clock,
         log_id: LogId,
         stream_closer: Option<transport::Closer>,
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
         Self {
+            clock,
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
@@ -396,7 +412,10 @@ impl SessionInner {
                     ..
                 } => {
                     if let Some((id, message)) = incoming.pop_front() {
-                        break (message, Responder::new(Arc::downgrade(self), id));
+                        break (
+                            message,
+                            Responder::new(Arc::downgrade(self), &self.clock, id),
+                        );
                     }
                     #[cfg(any(test, feature = "fuzz"))]
                     if let Some(wait_hook) = wait_hook.take() {
@@ -519,7 +538,7 @@ impl SessionInner {
         request: Message,
         deadline: Instant,
     ) -> Result<Promise<Message>, Error> {
-        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, true);
+        let (sender, promise) = Promise::pair(Arc::downgrade(self), &self.clock, deadline, true);
         self.enqueue(
             OutgoingBody::Request(request),
             PendingOperation {
@@ -539,7 +558,7 @@ impl SessionInner {
         result: Result<Message, schema::Error>,
         deadline: Instant,
     ) -> Result<Promise<()>, Error> {
-        let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, false);
+        let (sender, promise) = Promise::pair(Arc::downgrade(self), &self.clock, deadline, false);
         self.enqueue(
             OutgoingBody::Reply { id, result },
             PendingOperation {
@@ -705,14 +724,14 @@ impl SessionInner {
         }
     }
 
-    /// Returns `Instant::now()` or the test clock. Deadline checks use this while
-    /// holding `state`; `reply_unanswered()` also calls it before waiting for that lock.
+    /// Returns the stream clock's time or the scenario override. Deadline checks
+    /// hold `state`; `reply_unanswered()` also calls this before waiting for that lock.
     fn now(&self) -> Instant {
         #[cfg(any(test, feature = "fuzz"))]
         if let Some(now) = *self.time.lock().expect("scenario clock not poisoned") {
             return now;
         }
-        Instant::now()
+        self.clock.now()
     }
 
     /// Checks the outer envelope and routes its original bytes. `recv()` and
@@ -951,6 +970,10 @@ impl SessionInner {
 
     /// Expires pending operations even when no caller is waiting on a promise.
     /// Waits on `changed` until the next deadline or until new work arrives.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the condvar moves to darkbio_clock::sync in W2"
+    )]
     fn run_deadlines(&self) {
         let mut state = self.state.lock().expect("session state not poisoned");
         loop {
@@ -985,19 +1008,24 @@ impl Session {
     /// client sessions receive a stream closer; `Server` closes server streams.
     pub(super) fn start<W: Write + Send + 'static>(
         side: Side,
+        clock: Clock,
         sender: transport::Sender<W>,
         stream_closer: Option<transport::Closer>,
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
+        // Keep the stream clock with the session's queues and operations
         let session = Self {
             inner: Arc::new(SessionInner::new(
                 side,
+                clock,
                 sender.log_id(),
                 stream_closer,
                 #[cfg(any(test, feature = "fuzz"))]
                 workers.clone(),
             )),
         };
+
+        // Start the writer independently of the thread reading the stream
         let inner = session.inner.clone();
         worker::spawn(
             "wire-writer",
@@ -1005,6 +1033,8 @@ impl Session {
             &workers,
             move || inner.run_writer(sender),
         );
+
+        // Expire operations even when their promises have no waiter
         let inner = session.inner.clone();
         worker::spawn(
             "wire-deadlines",
@@ -1092,6 +1122,7 @@ impl Session {
         Self {
             inner: Arc::new(SessionInner::new(
                 side,
+                Clock::real(),
                 LogId::default(),
                 None,
                 Arc::new(worker::Tracker::default()),
@@ -1141,6 +1172,10 @@ impl SessionInner {
 
     /// Waits for the reader to remove a previously sent request's ID. Tests use
     /// this to leave a completed promise unread before changing limits or sessions.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the response watchdog is removed in W3"
+    )]
     pub(super) fn wait_response(&self, id: u64) {
         let state = self.state.lock().unwrap();
         let (state, _) = self.changed.wait_timeout_while(state, Duration::from_secs(3), |state| {

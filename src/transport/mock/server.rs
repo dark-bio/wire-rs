@@ -714,13 +714,14 @@ impl Server {
                 ark_signer: self.identity.public_key(),
                 ark_crypto: out.crypto.public_key(),
             };
-            let Ok(ack) = cose::open::<handshake::HostAck, _>(
+            let Ok(ack) = cose::open_at::<handshake::HostAck, _>(
                 packet,
                 &auth,
                 &out.crypto,
                 &out.host_signer,
                 CRYPTO_DOMAIN_WIRE,
                 None,
+                TIMESTAMP,
             ) else {
                 continue;
             };

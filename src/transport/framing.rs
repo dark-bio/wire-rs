@@ -93,7 +93,7 @@ impl<R: Read> FrameReader<R> {
     fn next_frame(&mut self, deadline: Option<Instant>) -> Result<Range<usize>, Error> {
         'outer: loop {
             if let Some(deadline) = deadline {
-                check_deadline(deadline).map_err(Error::RecvFailed)?;
+                check_deadline(&self.reader.inner.clock(), deadline).map_err(Error::RecvFailed)?;
             }
             // Search for the frame delimiter, starting from where we left off
             if let Some(found) = memchr::memchr(0, &self.buffer[self.search..self.filled]) {
@@ -250,7 +250,7 @@ impl<W: Write> FrameWriter<W> {
 
         // Fail the frame if output finished late. Individual writes must still
         // report accepted bytes even when they return after the deadline.
-        let result = check_deadline(deadline).and(result);
+        let result = check_deadline(&self.writer.inner.clock(), deadline).and(result);
 
         // The next send needs a recovery delimiter if this one failed.
         self.resync = result.is_err();
@@ -271,6 +271,10 @@ impl<W: Write> FrameWriter<W> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "framing tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use crate::testing;

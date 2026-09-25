@@ -8,6 +8,7 @@
 //! an absolute deadline. The adapter limits how long its I/O can block and keeps
 //! the stream reusable after a timeout.
 
+use darkbio_clock::Clock;
 use std::io;
 use std::time::Instant;
 
@@ -22,6 +23,13 @@ use std::time::Instant;
 /// can block indefinitely is insufficient. With no deadline, reads wait for data
 /// or shutdown. The stream's shutdown operation must release blocked reads.
 pub trait Read: io::Read {
+    /// Returns the clock this adapter measures its deadlines on, the real one by
+    /// default. The transport reads all its time from this clock, so a stream's
+    /// reader and writer must return the same one.
+    fn clock(&self) -> Clock {
+        Clock::real()
+    }
+
     /// Installs the deadline for subsequent reads until replaced; `None` clears
     /// it. Returns promptly, transfers no bytes and leaves the write deadline
     /// unchanged.
@@ -33,12 +41,20 @@ pub trait Read: io::Read {
 }
 
 impl<T: Read + ?Sized> Read for &mut T {
+    fn clock(&self) -> Clock {
+        (**self).clock()
+    }
+
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         (**self).set_read_deadline(deadline)
     }
 }
 
 impl<T: Read + ?Sized> Read for Box<T> {
+    fn clock(&self) -> Clock {
+        (**self).clock()
+    }
+
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         (**self).set_read_deadline(deadline)
     }
@@ -56,6 +72,13 @@ impl<T: Read + ?Sized> Read for Box<T> {
 /// before that output begins. An abandoned operation must never append bytes out
 /// of order after a later call starts writing. The adapter must bound actual I/O.
 pub trait Write: io::Write {
+    /// Returns the clock this adapter measures its deadlines on, the real one by
+    /// default. The transport reads all its time from this clock, so a stream's
+    /// reader and writer must return the same one.
+    fn clock(&self) -> Clock {
+        Clock::real()
+    }
+
     /// Installs the deadline for subsequent writes and flushes until replaced.
     /// Returns promptly, transfers no bytes and leaves the read deadline unchanged.
     /// Operations attempted after expiration return `TimedOut`. If this setter
@@ -64,20 +87,28 @@ pub trait Write: io::Write {
 }
 
 impl<T: Write + ?Sized> Write for &mut T {
+    fn clock(&self) -> Clock {
+        (**self).clock()
+    }
+
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         (**self).set_write_deadline(deadline)
     }
 }
 
 impl<T: Write + ?Sized> Write for Box<T> {
+    fn clock(&self) -> Clock {
+        (**self).clock()
+    }
+
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         (**self).set_write_deadline(deadline)
     }
 }
 
 /// Refuses work whose absolute I/O deadline has already elapsed.
-pub(super) fn check_deadline(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline {
+pub(super) fn check_deadline(clock: &Clock, deadline: Instant) -> io::Result<()> {
+    if clock.now() >= deadline {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "I/O deadline expired",

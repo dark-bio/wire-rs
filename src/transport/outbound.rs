@@ -11,6 +11,7 @@
 use super::framing::FrameWriter;
 use super::{Closer, Error, Sender, Write};
 use crate::LogId;
+use darkbio_clock::Clock;
 use darkbio_crypto::xhpke;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -53,12 +54,14 @@ pub(crate) struct Outbound<W: Write> {
     timeout: Duration,             // Time budget for each frame, including partial writes and flush
     side: Side,                    // Whether a failed send needs an empty frame notification
     closer: Closer,                // Shutdown independent of encryption, writer and binding locks
+    pub(super) clock: Clock,       // Clock of the stream, which the handshakes read too
 }
 
 impl<W: Write> Outbound<W> {
     /// Creates an unbound writer around the byte stream's writing half.
     pub(crate) fn new(writer: W, side: Side, closer: Closer, timeout: Duration) -> Self {
         Self {
+            clock: writer.clock(),
             writer: Mutex::new(FrameWriter::new(writer, closer.clone())),
             binding: Mutex::new(Weak::new()),
             timeout,
@@ -101,7 +104,9 @@ impl<W: Write> Outbound<W> {
     pub(crate) fn disconnect(&self, sealer: &Arc<Mutex<xhpke::Sender>>) -> Result<(), Error> {
         let mut writer = self.lock();
         if writer.end(sealer) && self.side == Side::Server {
-            writer.framer.send_dropped(Instant::now() + self.timeout)?;
+            writer
+                .framer
+                .send_dropped(self.clock.now() + self.timeout)?;
         }
         Ok(())
     }
@@ -169,7 +174,7 @@ impl<W: Write> Outbound<W> {
         writer.unbind();
         writer
             .framer
-            .send_reset(deadline.min(Instant::now() + self.timeout))
+            .send_reset(deadline.min(self.clock.now() + self.timeout))
     }
 
     /// Removes the binding and sends an empty notification. An optional deadline
@@ -177,7 +182,7 @@ impl<W: Write> Outbound<W> {
     pub(crate) fn send_dropped(&self, limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
-        let budget = Instant::now() + self.timeout;
+        let budget = self.clock.now() + self.timeout;
         let deadline = limit.map_or(budget, |limit| limit.min(budget));
         writer.framer.send_dropped(deadline)
     }
@@ -186,7 +191,7 @@ impl<W: Write> Outbound<W> {
     /// optional deadline limits output and any best-effort failure notification.
     pub(super) fn send_packet(&self, packet: &[u8], limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
-        let budget = Instant::now() + self.timeout;
+        let budget = self.clock.now() + self.timeout;
         let deadline = limit.map_or(budget, |limit| limit.min(budget));
         let result = writer.framer.send_packet(packet, deadline);
         if let Err(err @ Error::SendFailed(_)) = &result {
@@ -202,7 +207,7 @@ impl<W: Write> Outbound<W> {
         let mut writer = self.lock();
         writer
             .framer
-            .send_frame_blob(frame, Instant::now() + self.timeout)
+            .send_frame_blob(frame, self.clock.now() + self.timeout)
     }
 
     /// Acquires exclusive output ownership. A sender retains its encryption
@@ -282,7 +287,7 @@ impl<W: Write> Writer<'_, W> {
                 return Err(Error::EncryptionFailed("session ended".into()));
             }
         }
-        let deadline = Instant::now() + self.outbound.timeout;
+        let deadline = self.outbound.clock.now() + self.outbound.timeout;
         if let Err(err) = self.framer.send_packet(packet, deadline) {
             if self.end(sealer) {
                 warn!("ending session {}: {}", log_id, err);
@@ -315,6 +320,10 @@ impl<W: Write> Writer<'_, W> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "outbound tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use crate::testing;

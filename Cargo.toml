@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-wire"
-version = "0.11.0"
+version = "0.12.0"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Encrypted protocol between Ark and host"
 repository = "https://github.com/dark-bio/wire-rs"
@@ -29,6 +29,7 @@ fuzz = ["dep:arbitrary", "dep:base64", "dep:getrandom", "dep:rand_chacha", "dep:
 arbitrary = { version = "1", features = ["derive"], optional = true }
 base64 = { version = "0.23", optional = true }
 criterion = { version = "0.8", optional = true }
+darkbio-clock = "0.2"
 darkbio-cobs = "1"
 darkbio-crypto = { version = "0.19.1", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
 darkbio-trust = "0.6.0"
@@ -45,6 +46,7 @@ tracing = "0.1.40" # Keep >= 0.1.40, fixes Instrumented use-after-free (RUSTSEC-
 
 [dev-dependencies]
 base64 = "0.23"
+darkbio-clock = { version = "0.2", features = ["test-clock"] }
 rand = "0.10.2" # Keep >= 0.10.1, fixes rng logger unsoundness (RUSTSEC-2026-0097)
 serde_json = "1"
 strum = { version = "0.28", features = ["derive"] }

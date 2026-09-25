@@ -897,9 +897,15 @@ impl Client {
         };
         let sign1 = cose::decrypt(&unframe(frame), &auth, &keys.crypto, CRYPTO_DOMAIN_WIRE)
             .expect("server hello failed to decrypt");
-        let hello: handshake::ArkHello =
-            cose::verify(&sign1, &auth, &self.identity, CRYPTO_DOMAIN_WIRE, None)
-                .expect("server hello signature invalid");
+        let hello: handshake::ArkHello = cose::verify_at(
+            &sign1,
+            &auth,
+            &self.identity,
+            CRYPTO_DOMAIN_WIRE,
+            None,
+            TIMESTAMP,
+        )
+        .expect("server hello signature invalid");
         let encap: [u8; xhpke::ENCAP_KEY_SIZE] = hello
             .a2h_encap
             .try_into()

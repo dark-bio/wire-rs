@@ -14,6 +14,7 @@ use super::{
     Error, Session,
 };
 use crate::transport::{self, Attester, Read, Stream, Write};
+use darkbio_clock::Clock;
 use darkbio_crypto::xdsa;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -39,9 +40,11 @@ impl Server {
         W: Write + Send + 'static,
         A: Attester + Send + 'static,
     {
+        // Retain the stream clock and shutdown handle for every accepted session
         let stream_closer = stream.closer();
         let server = Self {
             inner: Arc::new(ServerInner {
+                clock: stream.clock(),
                 state: Mutex::new(State::Open {
                     max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                     max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
@@ -57,6 +60,8 @@ impl Server {
                 workers: Arc::new(worker::Tracker::default()),
             }),
         };
+
+        // Keep accepting transport handshakes until this owner closes
         let server_ref = Arc::downgrade(&server.inner);
         worker::spawn(
             "wire-server-reader",
@@ -163,6 +168,7 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
             Ok(transport::Event::Connected(sender)) => {
                 let session = Session::start(
                     Side::Server,
+                    server.clock.clone(),
                     sender,
                     None,
                     #[cfg(any(test, feature = "fuzz"))]
@@ -227,6 +233,8 @@ impl fmt::Debug for Server {
 /// attaches replacements in transport order. Accepted sessions own themselves;
 /// the server retains only a weak reference for server shutdown.
 pub(super) struct ServerInner {
+    /// Clock inherited by every session accepted on this stream.
+    clock: Clock,
     /// Protects the attached session, pending acceptance, and server closure.
     state: Mutex<State>,
     /// Wakes `accept()` when a session is attached or the server closes.
@@ -408,6 +416,7 @@ impl Server {
     /// Creates a server and a fixture that attaches sessions without a stream.
     pub(super) fn fixture() -> (Self, SessionSource) {
         let inner = Arc::new(ServerInner {
+            clock: Clock::real(),
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,

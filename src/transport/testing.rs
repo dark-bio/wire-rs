@@ -10,6 +10,11 @@
 //! interrupt a blocking call. Use them for memory buffers, not production
 //! sockets, files or device endpoints.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "memory test adapters move to TestClock in W3"
+)]
+
 use super::{Read, Write};
 use std::io;
 use std::time::Instant;

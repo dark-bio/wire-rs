@@ -8,6 +8,7 @@
 
 use super::session::SessionInner;
 use super::{Error, Message, Promise, schema};
+use darkbio_clock::Clock;
 use std::sync::Weak;
 use std::time::Instant;
 
@@ -45,6 +46,8 @@ use std::time::Instant;
 /// ```
 #[derive(Debug)]
 pub struct Responder {
+    /// Clock of the session, kept here so it outlives the session.
+    clock: Clock,
     /// Session that received the request; holding a responder cannot keep it open.
     session: Weak<SessionInner>,
     /// Request ID to answer. Cleared after queueing a reply so `Drop` does nothing.
@@ -52,6 +55,12 @@ pub struct Responder {
 }
 
 impl Responder {
+    /// Returns the clock of this responder's session, which reply deadlines are
+    /// measured on. It stays available after the session is gone.
+    pub fn clock(&self) -> Clock {
+        self.clock.clone()
+    }
+
     /// Queues a successful response and consumes the responder. Returns a promise
     /// for writing and flushing it. A closed session returns an error immediately.
     /// The deadline includes time in the queue and I/O. Waiting on the promise
@@ -100,8 +109,9 @@ impl Responder {
     }
 
     /// Creates a responder for the request taken by `Session::recv()`.
-    pub(super) fn new(session: Weak<SessionInner>, id: u64) -> Self {
+    pub(super) fn new(session: Weak<SessionInner>, clock: &Clock, id: u64) -> Self {
         Self {
+            clock: clock.clone(),
             session,
             id: Some(id),
         }

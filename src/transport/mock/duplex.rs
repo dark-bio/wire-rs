@@ -9,6 +9,11 @@
 //! Deadlines exercise recovery without closing the stream. A watchdog closes
 //! both peers if the scenario hangs.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "duplex scenarios and watchdogs move to TestClock in W3"
+)]
+
 use super::self_attestation;
 use crate::transport::{Client, Closer, Error, Event, Read, Sender, Server, Stream, Write};
 use darkbio_crypto::xdsa;

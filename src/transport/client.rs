@@ -31,11 +31,15 @@ pub trait Verifier {
     /// Session info extracted from an accepted attestation.
     type Info;
 
-    /// Verifies the device attestation, returning the server's identity key along
-    /// with any info extracted from the attestation. Transport checks the
-    /// handshake signature against that key. Rejecting the attestation aborts
-    /// the handshake.
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String>;
+    /// Verifies the device attestation at `now`, the wall time of the stream's
+    /// clock. Returns the server's identity key along with any info extracted
+    /// from the attestation. Transport checks the handshake signature against
+    /// that key. Rejecting the attestation aborts the handshake.
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        now: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Self::Info), String>;
 }
 
 /// Authenticates the handshake against this pinned identity key. The presented
@@ -43,14 +47,19 @@ pub trait Verifier {
 impl Verifier for xdsa::PublicKey {
     type Info = Attestation;
 
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        _: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Self::Info), String> {
         Ok((self.clone(), attestation.clone()))
     }
 }
 
 /// Roots trusted to attest Arks. Hardware and emulator roots are checked
-/// separately, and attestations must be valid at the current time. Self-signed
-/// attestations from devices that have not been onboarded are rejected.
+/// separately, and attestations must be valid at the stream clock's wall
+/// time. Self-signed attestations from devices that have not been onboarded
+/// are rejected.
 #[derive(Debug)]
 pub struct Roots<'a> {
     /// Roots attesting hardware Arks.
@@ -62,12 +71,18 @@ pub struct Roots<'a> {
 impl Verifier for Roots<'_> {
     type Info = trust::device::Device;
 
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
-        let now = SystemTime::now()
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        now: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Self::Info), String> {
+        // Convert the supplied wall time to the trust API's Unix seconds
+        let now = now
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_secs();
 
+        // Verify the attestation and return its identity with the claims
         let device = trust::device::verify(
             attestation.as_bytes(),
             self.hardware,
@@ -163,7 +178,7 @@ impl<R: Read, W: Write> Client<R, W> {
     /// fails, the client has no session and previously issued senders are invalid.
     pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
         // Compute the deadline by which the handshake must finish
-        let deadline = Instant::now() + self.handshake_timeout;
+        let deadline = self.outbound.clock.now() + self.handshake_timeout;
 
         // Generate ephemeral client keys for this session
         let host_xdsa_sk = xdsa::SecretKey::generate();
@@ -239,14 +254,21 @@ impl<R: Read, W: Write> Client<R, W> {
         // identity key and the caller's session info
         let attestation = Attestation::new(unverified.ark_attest)?;
         let (ark_identity, info) = verifier
-            .verify(&attestation)
+            .verify(&attestation, self.outbound.clock.system_time())
             .map_err(Error::HandshakeFailed)?;
 
         // Step 2d: Verify the COSE_Sign1 signature with the discovered identity
-        let ark_hello: handshake::ArkHello =
-            cose::verify(&sign1, &auth, &ark_identity, CRYPTO_DOMAIN_WIRE, None).map_err(
-                |err| Error::HandshakeFailed(format!("server hello signature invalid: {}", err)),
-            )?;
+        let ark_hello: handshake::ArkHello = cose::verify_at(
+            &sign1,
+            &auth,
+            &ark_identity,
+            CRYPTO_DOMAIN_WIRE,
+            None,
+            0, // unused without a drift check, so the clock is not read
+        )
+        .map_err(|err| {
+            Error::HandshakeFailed(format!("server hello signature invalid: {}", err))
+        })?;
 
         // Set up the server->Client receiver context
         let enc_a2h: [u8; xhpke::ENCAP_KEY_SIZE] = ark_hello
@@ -276,27 +298,18 @@ impl<R: Read, W: Write> Client<R, W> {
             ark_signer: ark_identity,
             ark_crypto: ark_xhpke_pk.clone(),
         };
-        let ack = match timestamp {
-            Some(timestamp) => cose::seal_at(
-                &ack,
-                &auth,
-                &host_xdsa_sk,
-                &ark_xhpke_pk,
-                CRYPTO_DOMAIN_WIRE,
-                timestamp,
-            ),
-            None => cose::seal(
-                &ack,
-                &auth,
-                &host_xdsa_sk,
-                &ark_xhpke_pk,
-                CRYPTO_DOMAIN_WIRE,
-            ),
-        }
+        let ack = cose::seal_at(
+            &ack,
+            &auth,
+            &host_xdsa_sk,
+            &ark_xhpke_pk,
+            CRYPTO_DOMAIN_WIRE,
+            timestamp.unwrap_or_else(|| handshake::timestamp(&self.outbound.clock)),
+        )
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
         self.outbound.send_packet(&ack, Some(deadline))?;
-        check_deadline(deadline).map_err(Error::RecvFailed)?;
+        check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
 
         // Session established, the ack ahead of anything sealed into it
         let sender = self.new_session(sender, receiver);
@@ -425,7 +438,7 @@ impl<R: Read, W: Write> Client<R, W> {
             host_xdsa_sk,
             host_xhpke_sk,
             Some(timestamp),
-            Instant::now() + self.handshake_timeout,
+            self.outbound.clock.now() + self.handshake_timeout,
         )
     }
 
@@ -499,6 +512,10 @@ fn hex(fingerprint: &xdsa::Fingerprint) -> String {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "client tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use crate::transport::DEFAULT_WRITE_TIMEOUT;
@@ -701,7 +718,7 @@ mod tests {
         testing::init_tracing();
 
         // Echo every request over a bounded in-memory stream, then hang up
-        let (host, ark_stream) = memory::duplex(64 * 1024);
+        let (host, ark_stream) = memory::duplex(64 * 1024, &crate::clock::Clock::real());
 
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();

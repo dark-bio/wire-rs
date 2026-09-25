@@ -301,6 +301,10 @@ impl io::Write for Outbox {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "outbox tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use std::io::Write as _;

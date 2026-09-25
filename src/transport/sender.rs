@@ -139,6 +139,10 @@ impl<W: Write> fmt::Debug for Sender<W> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sender tests move to TestClock in W3"
+)]
 mod tests {
     use super::*;
     use crate::testing;

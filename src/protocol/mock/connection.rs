@@ -7,6 +7,11 @@
 //! Real transport scenarios using the transport runner's gated byte pipes.
 //! Scripts can run both protocol peers or inspect one peer through a raw transport.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "connection scenarios and watchdogs move to TestClock in W3"
+)]
+
 use super::session::Job;
 use crate::protocol::schema::{self, ArkToHost, HostToArk, ark_to_host, host_to_ark};
 use crate::protocol::session::SessionInner;

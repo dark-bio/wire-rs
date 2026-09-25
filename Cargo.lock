@@ -384,6 +384,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "darkbio-clock"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85c141bbdcd8501a06371992d3ea79a7a3297e37f989991b50f9d77c5f27e412"
+
+[[package]]
 name = "darkbio-cobs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,11 +449,12 @@ dependencies = [
 
 [[package]]
 name = "darkbio-wire"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arbitrary",
  "base64",
  "criterion",
+ "darkbio-clock",
  "darkbio-cobs",
  "darkbio-crypto",
  "darkbio-trust",

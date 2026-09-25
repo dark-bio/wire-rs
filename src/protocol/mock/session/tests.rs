@@ -1618,8 +1618,12 @@ fn test_observer_drop_during_response_completion() {
             let used = Arc::new(AtomicUsize::new(0));
             let counter = used.clone();
             let now = Instant::now();
-            let (sender, promise) =
-                Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60), true);
+            let (sender, promise) = Promise::<Message>::pair(
+                Weak::new(),
+                &crate::clock::Clock::real(),
+                now + Duration::from_secs(60),
+                true,
+            );
             let pending = PendingOperation {
                 deadline: now + Duration::from_secs(60),
                 sender,

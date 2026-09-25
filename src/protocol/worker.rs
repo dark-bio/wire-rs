@@ -75,6 +75,10 @@ pub(super) struct Tracker {
 #[cfg(any(test, feature = "fuzz"))]
 impl Tracker {
     /// Waits for the count to reach zero, failing the test after five seconds.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the worker watchdog is removed in W3"
+    )]
     pub(super) fn wait_stopped(&self) {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(5);
