@@ -7,7 +7,7 @@
 //! Pending operations, queued messages, and reporting their results to promises.
 
 use super::envelope::IncomingEnvelope;
-use super::promise::{PromiseResult, ResultSender};
+use super::promise::{Notification, Notifications, PromiseResult, ResultSender};
 use super::session::SessionInner;
 use super::{Error, Message, schema};
 use crate::LogId;
@@ -64,22 +64,27 @@ impl PendingOperation {
     pub(super) fn complete_response(
         self,
         now: Instant,
+        notifications: &mut Notifications,
         retain: impl FnOnce() -> Result<IncomingEnvelope, Error>,
     ) -> Result<(), Error> {
+        // Publish expiry or the admitted answer while the session orders results
         if now >= self.deadline {
-            self.fail(Error::Timeout, now);
+            notifications.push(self.fail(Error::Timeout, now));
         } else {
             assert!(self.sender.response, "only requests accept peer answers");
             match retain() {
                 Ok(message) => {
                     // If the promise was dropped, the failed send releases the bytes.
-                    let _ = self.sender.send(Ok(PromiseResult::Response(message)));
+                    notifications.push(self.sender.send(Ok(PromiseResult::Response(message))));
                 }
                 Err(error) => {
                     // The send checks whether the promise still exists. If it was
                     // dropped, this response needs no space and must not close
                     // the session, even if other promises fill the byte limit.
-                    if self.sender.send(Err(error.clone())).is_ok() {
+                    let notification = self.sender.send(Err(error.clone()));
+                    let delivered = notification.delivered;
+                    notifications.push(notification);
+                    if delivered {
                         return Err(error);
                     }
                 }
@@ -91,12 +96,15 @@ impl PendingOperation {
     /// Fails either a request or a reply promise, using `Timeout` if its deadline
     /// has passed. If the promise was dropped, the result is discarded. Timeouts
     /// are logged here, whichever path detected them.
-    pub(super) fn fail(self, error: Error, now: Instant) {
+    pub(super) fn fail(self, error: Error, now: Instant) -> Notification {
+        // Give expiry precedence over another failure
         let error = if now >= self.deadline {
             Error::Timeout
         } else {
             error
         };
+
+        // Record timeouts wherever they were detected
         if matches!(error, Error::Timeout) {
             let kind = if self.sender.response {
                 "request"
@@ -108,7 +116,9 @@ impl PendingOperation {
                 None => tracing::debug!("{} timed out before sending", kind),
             }
         }
-        let _ = self.sender.send(Err(error));
+
+        // Publish now and let the caller defer the callback until unlocking
+        self.sender.send(Err(error))
     }
 }
 

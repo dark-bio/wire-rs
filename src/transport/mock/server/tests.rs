@@ -756,7 +756,8 @@ fn test_scripted_interrupted_frames() {
 fn test_partial_hello_empty_packet_model() {
     // Encoding 254 nonzero bytes ends in a full run, encoding 253 does not
     for (len, completes) in [(254, true), (253, false)] {
-        let mut server = Server::new(&[], Outbox::default(), Recorder::default());
+        let clock = crate::transport::testing::test_clock().clock();
+        let mut server = Server::new(&[], Outbox::new(&clock), Recorder::default());
         let pending = frame(&vec![0x11; len]);
         server.partial = Partial::Hello(7, pending[..pending.len() - 1].to_vec());
 

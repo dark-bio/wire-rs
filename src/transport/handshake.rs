@@ -7,8 +7,19 @@
 //! Messages of the session handshake. Each struct encodes as a CBOR array.
 //! Field order is part of the protocol; changing it requires a wire version bump.
 
+use darkbio_clock::Clock;
 use darkbio_crypto::cbor::Cbor;
 use darkbio_crypto::{xdsa, xhpke};
+use std::time::UNIX_EPOCH;
+
+/// Returns the clock's wall time in the Unix seconds used by COSE.
+pub(super) fn timestamp(clock: &Clock) -> i64 {
+    clock
+        .system_time()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before Unix epoch")
+        .as_secs() as i64
+}
 
 /// Session initiation message from the host, containing its ephemeral keys.
 #[derive(Cbor)]

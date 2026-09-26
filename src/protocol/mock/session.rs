@@ -19,9 +19,6 @@ use std::sync::{Arc, Barrier, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Watchdog for scenario jobs and wait hooks, independent of operation deadlines.
-const PATIENCE: Duration = Duration::from_secs(5);
-
 /// Errors that a script can expect from a protocol call or promise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
@@ -119,15 +116,13 @@ impl<T: Send + 'static> Job<T> {
         }
     }
 
-    /// Requires the result before the watchdog expires, then joins the worker.
+    /// Receives the result and joins the worker.
     ///
     /// # Panics
-    /// The operation must complete within `PATIENCE` without panicking.
+    ///
+    /// Panics if the operation panics or ends without sending its result.
     pub(super) fn finish(self) -> T {
-        let result = self
-            .result
-            .recv_timeout(PATIENCE)
-            .expect("scenario operation must finish");
+        let result = self.result.recv().expect("scenario operation must finish");
         self.thread
             .join()
             .expect("scenario operation must not panic");
@@ -251,10 +246,8 @@ enum Step {
     Expire(u8),
     /// Checks the earliest pending deadline, or that no operations remain.
     Deadline(u8, Option<u64>),
-    /// Switches a session to wall-clock time and submits a request with this budget.
-    RealRequest(u8, u8, u64),
-    /// Submits a reply with a wall-clock deadline to a session already using real time.
-    RealReply(u8, u8, u64),
+    /// Starts the deadline worker for a fixture whose timeouts settle asynchronously.
+    Deadlines(u8),
 
     // Closure and release.
     /// Closes the labeled session through its saved `Closer`.
@@ -296,6 +289,10 @@ type AcceptResult = (Server, Result<Session, Error>);
 /// Sessions, saved handles and background calls used by one script. Labels keep
 /// referring to the same session after replacement so steps can exercise old handles.
 struct Driver {
+    /// Sole driver of time for the server and all fixture sessions.
+    tester: darkbio_clock::TestClock,
+    /// Deadline workers joined after their sessions close.
+    workers: Vec<JoinHandle<()>>,
     /// Server owner, temporarily moved out while acceptance runs.
     server: Option<Server>,
     /// Weak reference used to check that dropping the server frees its state.
@@ -342,9 +339,13 @@ struct Driver {
 impl Driver {
     /// Creates a server fixture with no attached sessions or running jobs.
     fn new() -> Self {
-        let (server, source) = Server::fixture();
+        // Give the server and every replacement session one paused clock
+        let tester = crate::transport::testing::test_clock();
+        let (server, source) = Server::fixture(tester.clock());
         let server_ref = Arc::downgrade(&server.inner);
         let closer = server.closer();
+
+        // Begin with no accepted sessions or in-progress application calls
         Self {
             server: Some(server),
             server_ref,
@@ -366,7 +367,9 @@ impl Driver {
             waiting: HashMap::new(),
             writing: HashMap::new(),
 
-            epoch: Instant::now() + Duration::from_secs(3600),
+            epoch: tester.clock().now(),
+            tester,
+            workers: Vec::new(),
             time: 0,
         }
     }
@@ -413,13 +416,12 @@ impl Driver {
         }
     }
 
-    /// Executes one script action, using watchdogs for operations allowed to block.
+    /// Executes one script action, awaiting acknowledgments for blocking operations.
     /// Assertions also reject invalid scripts, such as overwriting an owned slot.
     fn step(&mut self, step: Step) {
         match step {
             Step::Open(id) => {
                 let session = self.source.as_mut().unwrap().open().unwrap();
-                session.upgrade().unwrap().set_time(self.at(self.time));
                 assert!(self.session_refs.insert(id, session).is_none());
             }
             Step::RefuseOpen(expected) => refused(self.source.as_mut().unwrap().open(), expected),
@@ -440,9 +442,7 @@ impl Driver {
                     let result = server.accept();
                     (server, result)
                 }));
-                waiting
-                    .recv_timeout(PATIENCE)
-                    .expect("accept reached its wait");
+                waiting.recv().expect("accept reached its wait");
             }
             Step::FinishAccept(id) => {
                 let accepted = self.accepting.take().unwrap().finish();
@@ -565,9 +565,7 @@ impl Driver {
                     (session, result)
                 });
                 assert!(self.receiving.insert(id, job).is_none());
-                waiting
-                    .recv_timeout(PATIENCE)
-                    .expect("receive reached its wait");
+                waiting.recv().expect("receive reached its wait");
             }
             Step::FinishReceive(id, tag, slot) => {
                 let received = self.receiving.remove(&id).unwrap().finish();
@@ -588,7 +586,7 @@ impl Driver {
             }
             Step::RefuseRequest(id, expected) => {
                 refused(
-                    self.requesters[&id].request(vec![1], Instant::now()),
+                    self.requesters[&id].request(vec![1], self.tester.clock().now()),
                     expected,
                 );
             }
@@ -608,7 +606,7 @@ impl Driver {
                     self.responders
                         .remove(&slot)
                         .unwrap()
-                        .reply(vec![1], Instant::now()),
+                        .reply(vec![1], self.tester.clock().now()),
                     expected,
                 );
             }
@@ -707,16 +705,18 @@ impl Driver {
                     crate::protocol::schema::DeviceInfoRequest::default().into(),
                 ));
             }
-            Step::Notify(slot, token) => self
-                .promises
-                .get_mut(&slot)
-                .unwrap()
-                .notify(self.notifications.0.clone(), token),
-            Step::NotifyWrite(slot, token) => self
-                .writes
-                .get_mut(&slot)
-                .unwrap()
-                .notify(self.notifications.0.clone(), token),
+            Step::Notify(slot, token) => {
+                let events = self.notifications.0.clone();
+                self.promises.get_mut(&slot).unwrap().notify(move || {
+                    let _ = events.send(token);
+                });
+            }
+            Step::NotifyWrite(slot, token) => {
+                let events = self.notifications.0.clone();
+                self.writes.get_mut(&slot).unwrap().notify(move || {
+                    let _ = events.send(token);
+                });
+            }
             Step::Notifications(mut expected) => {
                 let mut received: Vec<_> = self.notifications.1.try_iter().collect();
                 received.sort_unstable();
@@ -744,9 +744,7 @@ impl Driver {
                         .insert(slot, Job::start(move || promise.wait()))
                         .is_none()
                 );
-                waiting
-                    .recv_timeout(PATIENCE)
-                    .expect("request reached its wait");
+                waiting.recv().expect("request reached its wait");
             }
             Step::FinishWait(slot, expected) => {
                 Self::answer_result(self.waiting.remove(&slot).unwrap().finish(), expected)
@@ -764,9 +762,7 @@ impl Driver {
                         .insert(slot, Job::start(move || promise.wait()))
                         .is_none()
                 );
-                waiting
-                    .recv_timeout(PATIENCE)
-                    .expect("reply reached its wait");
+                waiting.recv().expect("reply reached its wait");
             }
             Step::FinishWaitWrite(slot, expected) => {
                 Self::write_result(self.writing.remove(&slot).unwrap().finish(), expected)
@@ -775,28 +771,18 @@ impl Driver {
             Step::Time(time) => {
                 assert!(time >= self.time);
                 self.time = time;
-                for session in self.session_refs.values().filter_map(Weak::upgrade) {
-                    session.set_time(self.at(time));
-                }
+                self.tester.advance_to(self.at(time));
             }
             Step::Expire(id) => self.session_refs[&id].upgrade().unwrap().expire(),
             Step::Deadline(id, expected) => assert_eq!(
                 self.session_refs[&id].upgrade().unwrap().next_deadline(),
                 expected.map(|time| self.at(time))
             ),
-            Step::RealRequest(id, slot, budget) => {
-                self.session_refs[&id].upgrade().unwrap().use_realtime();
-                let promise = self.requesters[&id]
-                    .request(vec![1], Instant::now() + Duration::from_millis(budget))
-                    .unwrap();
-                assert!(self.promises.insert(slot, promise).is_none());
-            }
-            Step::RealReply(responder, slot, budget) => {
-                let responder = self.responders.remove(&responder).unwrap();
-                let promise = responder
-                    .reply(vec![2], Instant::now() + Duration::from_millis(budget))
-                    .unwrap();
-                assert!(self.writes.insert(slot, promise).is_none());
+            Step::Deadlines(id) => {
+                let session = self.session_refs[&id].upgrade().unwrap();
+                self.workers
+                    .push(thread::spawn(move || session.run_deadlines()));
+                self.tester.wait_blocked(1);
             }
             Step::CloseSession(id) => {
                 let closer = self.closers[&id].clone();
@@ -993,9 +979,15 @@ impl Driver {
 impl Drop for Driver {
     /// Closes the server so blocked calls wake up even if an assertion panics.
     fn drop(&mut self) {
+        // Wake every application call and deadline worker before joining
         self.closer.close();
         for closer in self.closers.values() {
             closer.close();
+        }
+
+        // Leave no fixture worker behind after the script finishes
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
         }
     }
 }

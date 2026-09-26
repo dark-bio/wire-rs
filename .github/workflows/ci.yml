@@ -15,6 +15,7 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [ ubuntu-latest, windows-latest, macOS-latest ]
@@ -28,14 +29,24 @@ jobs:
       - name: Install cargo-hack
         run: cargo install cargo-hack
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Build individual features
         run: cargo hack build --each-feature
 
       - name: Test individual features
-        run: cargo hack test --each-feature
+        run: cargo hack nextest run --each-feature
 
       - name: Test with all features
-        run: cargo test --all-features
+        run: cargo nextest run --all-features
+
+      - name: Test documentation
+        run: |
+          cargo hack test --doc --each-feature
+          cargo test --doc --all-features
 
   format:
     runs-on: ubuntu-latest
@@ -47,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
 
   docs:
     runs-on: ubuntu-latest
@@ -84,6 +95,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: |
           make vectors
           if [ -n "$(git status --porcelain vectors)" ]; then
@@ -102,6 +116,11 @@ jobs:
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       - name: Check the seeds match the scenario tests
         run: |

@@ -10,7 +10,7 @@ use super::envelope::{Header, IncomingEnvelope, MessageKind, Parity, Side};
 use super::operation::{
     OperationHandle, OperationKey, OutgoingBody, OutgoingMessage, PendingOperation,
 };
-use super::promise::PromiseResult;
+use super::promise::{Notifications, PromiseResult};
 use super::worker;
 use super::{
     Closer, DEFAULT_AUTOREPLY_TIMEOUT, DEFAULT_MAX_INBOUND_BYTES, DEFAULT_MAX_INBOUND_REQUESTS,
@@ -18,11 +18,13 @@ use super::{
 };
 use crate::LogId;
 use crate::transport::{self, Read, Stream, Verifier, Write};
+use darkbio_clock::Clock;
+use darkbio_clock::sync::{Condvar, Mutex};
 use prost::bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Establishes a client session, verifies the peer and returns the verifier's info.
@@ -36,13 +38,17 @@ where
     W: Write + Send + 'static,
     V: Verifier,
 {
+    // Take the stream's clock before the client consumes the stream
+    let clock = stream.clock();
     let mut client = transport::Client::new(stream);
 
+    // Establish the session before starting its protocol workers
     let (sender, info) = client.connect(verifier)?;
     #[cfg(any(test, feature = "fuzz"))]
     let workers = Arc::new(worker::Tracker::default());
     let session = Session::start(
         Side::Client,
+        clock,
         sender,
         Some(client.closer()),
         #[cfg(any(test, feature = "fuzz"))]
@@ -50,6 +56,7 @@ where
     );
     let inner = session.inner.clone();
 
+    // Let the reader route transport messages into the shared session
     worker::spawn(
         "wire-client-reader",
         #[cfg(any(test, feature = "fuzz"))]
@@ -102,6 +109,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Returns the clock of the stream this session runs on, which request and
+    /// reply deadlines are measured on.
+    pub fn clock(&self) -> Clock {
+        self.inner.clock.clone()
+    }
+
     /// Sets the timeout for automatic `UNANSWERED` and `UNKNOWN` replies.
     /// Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`]. Replies already queued keep
     /// their deadlines.
@@ -137,23 +150,26 @@ impl Session {
     /// the session. Completed promises keep their results and bytes until read or
     /// dropped. Raising limits does not reopen a closed session.
     pub fn set_inbound_limits(self, requests: usize, bytes: usize) -> Self {
-        self.inner.set_inbound_limits(requests, bytes);
+        let mut notifications = Notifications::default();
+        self.inner
+            .set_inbound_limits(requests, bytes, &mut notifications);
         self
     }
 
     /// Returns a clonable requester bound to this session.
     pub fn requester(&self) -> Requester {
-        Requester::new(Arc::downgrade(&self.inner))
+        Requester::new(Arc::downgrade(&self.inner), &self.inner.clock)
     }
 
     /// Blocks for the next peer request and its [`Responder`]. Closing the session
     /// wakes this call with the error that closed it. The caller decides how to
-    /// handle each request; this method does not run application callbacks.
+    /// handle each request.
     ///
     /// Taking a request removes its bytes from the inbound byte count before
     /// decoding it. The request still counts toward the inbound request limit
-    /// while its responder is held.
-    /// Invalid protobuf returns [`Error::Malformed`] and closes this session.
+    /// while its responder is held. Invalid protobuf returns [`Error::Malformed`]
+    /// and closes this session, which runs the notify callbacks of its pending
+    /// promises on the calling thread.
     ///
     /// If another thread closes the session after `recv()` takes a request from
     /// the queue, `recv()` can still return it. Replying after closure returns an error.
@@ -200,6 +216,8 @@ impl fmt::Debug for Session {
 /// Queues and pending operations for one session. Requesters, responders, and
 /// closers hold weak references to this object, even after a new session connects.
 pub(super) struct SessionInner {
+    /// Clock inherited from the stream that established this session.
+    pub(super) clock: Clock,
     /// Protects the queues, pending operations, and transition to `State::Closed`.
     state: Mutex<State>,
     /// Wakes `recv()`, the writer, and the deadline worker when `state` changes.
@@ -218,15 +236,13 @@ pub(super) struct SessionInner {
     /// Lets tests wait for worker threads to exit.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
-    /// Controlled protocol time for scenarios; production always uses Instant::now.
-    #[cfg(any(test, feature = "fuzz"))]
-    time: Mutex<Option<Instant>>,
     /// Notifies tests when the last `Arc<SessionInner>` is dropped.
     #[cfg(any(test, feature = "fuzz"))]
-    drop_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    drop_hook: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// Pauses the writer before `sender.disconnect()` in replacement tests.
     #[cfg(any(test, feature = "fuzz"))]
-    disconnect_hook: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    disconnect_hook:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// An open session's queues, or the error that closed the session.
@@ -276,11 +292,14 @@ impl SessionInner {
     /// Creates empty queues and pending-operation maps before starting workers.
     fn new(
         side: Side,
+        clock: Clock,
         log_id: LogId,
         stream_closer: Option<transport::Closer>,
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
         Self {
+            changed: Condvar::new(&clock),
+            clock,
             state: Mutex::new(State::Open {
                 max_inbound_requests: DEFAULT_MAX_INBOUND_REQUESTS,
                 max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
@@ -297,7 +316,6 @@ impl SessionInner {
                 #[cfg(any(test, feature = "fuzz"))]
                 wait_hook: None,
             }),
-            changed: Condvar::new(),
             retained_bytes: Arc::new(AtomicUsize::new(0)),
             side,
             log_id,
@@ -305,11 +323,9 @@ impl SessionInner {
             #[cfg(any(test, feature = "fuzz"))]
             workers,
             #[cfg(any(test, feature = "fuzz"))]
-            time: Mutex::new(None),
+            drop_hook: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fuzz"))]
-            drop_hook: Mutex::new(None),
-            #[cfg(any(test, feature = "fuzz"))]
-            disconnect_hook: Mutex::new(None),
+            disconnect_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -327,7 +343,13 @@ impl SessionInner {
 
     /// Updates both limits and closes the session if usage is too high. Holds the
     /// same lock used to accept incoming messages.
-    pub(super) fn set_inbound_limits(&self, requests: usize, bytes: usize) {
+    pub(super) fn set_inbound_limits(
+        &self,
+        requests: usize,
+        bytes: usize,
+        notifications: &mut Notifications,
+    ) {
+        // Apply policy under the lock shared with incoming admission
         let removed = {
             let mut state = self.state.lock().expect("session state not poisoned");
             let State::Open {
@@ -350,13 +372,15 @@ impl SessionInner {
             };
             error.and_then(|error| {
                 let (pending, queued) = state.workload();
-                let removed = state.close(error.clone(), self.now());
+                let removed = state.close(error.clone(), self.now(), notifications);
                 if removed.is_some() {
                     self.log_closed(&error, pending, queued);
                 }
                 removed
             })
         };
+
+        // Release queued work and wake waiters after unlocking
         if removed.is_some() {
             self.finish_close(removed);
         }
@@ -396,7 +420,10 @@ impl SessionInner {
                     ..
                 } => {
                     if let Some((id, message)) = incoming.pop_front() {
-                        break (message, Responder::new(Arc::downgrade(self), id));
+                        break (
+                            message,
+                            Responder::new(Arc::downgrade(self), &self.clock, id),
+                        );
                     }
                     #[cfg(any(test, feature = "fuzz"))]
                     if let Some(wait_hook) = wait_hook.take() {
@@ -417,11 +444,19 @@ impl SessionInner {
     /// Expired operations receive `Timeout`; the rest receive the closing error.
     /// Every call wakes `changed` and finishes any required stream shutdown.
     pub(super) fn close(&self, error: Error) {
+        // Publish closing results while preserving callbacks past the lock scope
+        let mut notifications = Notifications::default();
         let (removed, pending, queued) = {
             let mut state = self.state.lock().expect("session state not poisoned");
             let (pending, queued) = state.workload();
-            (state.close(error.clone(), self.now()), pending, queued)
+            (
+                state.close(error.clone(), self.now(), &mut notifications),
+                pending,
+                queued,
+            )
         };
+
+        // Wake waiters and finish shutdown before running the callbacks
         if removed.is_some() {
             self.log_closed(&error, pending, queued);
         }
@@ -559,6 +594,8 @@ impl SessionInner {
         body: OutgoingBody,
         operation: PendingOperation,
     ) -> Result<(), Error> {
+        // Keep callbacks outside the lock even when admission expires immediately
+        let mut notifications = Notifications::default();
         {
             let mut state = self.state.lock().expect("session state not poisoned");
             let (operations, outgoing, reserved_ids) = match &mut *state {
@@ -575,7 +612,7 @@ impl SessionInner {
                 if let OutgoingBody::Reply { id, .. } = body {
                     reserved_ids.remove(&id);
                 }
-                operation.fail(Error::Timeout, now);
+                notifications.push(operation.fail(Error::Timeout, now));
                 return Ok(());
             }
             let key = OperationKey::new();
@@ -590,6 +627,8 @@ impl SessionInner {
             });
             operations.insert(key, operation);
         }
+
+        // Wake the writer and deadline worker after publishing the queued work
         self.changed.notify_all();
         Ok(())
     }
@@ -598,8 +637,10 @@ impl SessionInner {
     /// can call this if the deadline worker has not yet processed its timeout.
     /// Requests already sent remain in `outstanding` until answered or closed.
     pub(super) fn expire(&self) {
+        // Drop the state guard before notifying completed promises
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
-        state.expire(self.now());
+        state.expire(self.now(), &mut notifications);
     }
 
     /// Returns the earliest pending operation deadline for scenario assertions.
@@ -618,8 +659,12 @@ impl SessionInner {
     /// Takes the next unexpired `OutgoingMessage` for tests that drive writing themselves.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn take_outgoing(&self) -> Option<OutgoingMessage> {
+        // Settle expired operations before selecting queued work
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
-        state.expire(self.now());
+        state.expire(self.now(), &mut notifications);
+
+        // Release a reply's reservation when the writer takes it
         match &mut *state {
             State::Open {
                 outgoing,
@@ -639,6 +684,8 @@ impl SessionInner {
     /// Records a write result under the state lock. A successful request write
     /// leaves its operation waiting for an answer; a reply write completes it.
     pub(super) fn record_write(&self, key: &OperationKey, result: Result<(), Error>) {
+        // Find the operation while deferring callbacks past the state guard
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
         let State::Open { operations, .. } = &mut *state else {
             return;
@@ -646,13 +693,15 @@ impl SessionInner {
         let Some(operation) = operations.get(key) else {
             return;
         };
+
+        // Publish failures and reply completion while requests keep awaiting answers
         let now = self.now();
         if now >= operation.deadline || result.is_err() {
             let operation = operations.remove(key).expect("operation held under lock");
-            operation.fail(result.err().unwrap_or(Error::Timeout), now);
+            notifications.push(operation.fail(result.err().unwrap_or(Error::Timeout), now));
         } else if !operation.sender.response {
             let operation = operations.remove(key).expect("operation held under lock");
-            let _ = operation.sender.send(Ok(PromiseResult::Written));
+            notifications.push(operation.sender.send(Ok(PromiseResult::Written)));
         }
     }
 
@@ -664,6 +713,8 @@ impl SessionInner {
         key: &OperationKey,
         result: Result<Message, Error>,
     ) {
+        // Remove the fixture operation and defer its callback past the lock
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
         let State::Open {
             operations,
@@ -680,10 +731,12 @@ impl SessionInner {
             Ok(message) => Ok(message),
             Err(Error::Remote(error)) => Err(error),
             Err(error) => {
-                operation.fail(error, self.now());
+                notifications.push(operation.fail(error, self.now()));
                 return;
             }
         };
+
+        // Encode the fixture response through the same envelope admission as the reader
         let peer = match self.side {
             Side::Client => Side::Server,
             Side::Server => Side::Client,
@@ -696,32 +749,34 @@ impl SessionInner {
             .side
             .decode_header(bytes.clone())
             .expect("fixture response has a valid envelope");
-        let result = operation.complete_response(self.now(), || {
+        let result = operation.complete_response(self.now(), &mut notifications, || {
             self.retain_incoming(bytes, header, *max_inbound_bytes)
         });
+
+        // Close on admission failure after releasing the session lock
         drop(state);
         if let Err(error) = result {
             self.close(error);
         }
     }
 
-    /// Returns `Instant::now()` or the test clock. Deadline checks use this while
-    /// holding `state`; `reply_unanswered()` also calls it before waiting for that lock.
+    /// Returns the stream clock's time. Deadline checks hold `state`, and
+    /// `reply_unanswered()` also calls this before waiting for that lock.
     fn now(&self) -> Instant {
-        #[cfg(any(test, feature = "fuzz"))]
-        if let Some(now) = *self.time.lock().expect("scenario clock not poisoned") {
-            return now;
-        }
-        Instant::now()
+        self.clock.now()
     }
 
     /// Checks the outer envelope and routes its original bytes. `recv()` and
     /// `wait()` decode nested payloads. Unknown and late responses are discarded
     /// without decoding their bodies. The reader closes the session on error.
     pub(super) fn handle_message(self: &Arc<Self>, bytes: Vec<u8>) -> Result<(), Error> {
+        // Decode routing metadata before taking the session lock
         let bytes = Bytes::from(bytes.into_boxed_slice());
         let header = self.side.decode_header(bytes.clone())?;
         let mut unknown = None;
+
+        // Publish accepted responses while retaining callbacks beyond the lock scope
+        let mut notifications = Notifications::default();
         {
             let mut state = self.state.lock().expect("session state not poisoned");
             match MessageKind::from_id(header.id, self.side.into()) {
@@ -763,7 +818,7 @@ impl SessionInner {
                                 header.id,
                                 header.payload.unwrap_or("none")
                             );
-                            operation.complete_response(self.now(), || {
+                            operation.complete_response(self.now(), &mut notifications, || {
                                 self.retain_incoming(bytes, header, *max_inbound_bytes)
                             })?;
                         } else {
@@ -775,6 +830,8 @@ impl SessionInner {
                 }
             }
         }
+
+        // Queue automatic replies and wake workers after releasing the state lock
         if let Some(id) = unknown {
             self.reply_unknown(id);
         }
@@ -841,10 +898,21 @@ impl SessionInner {
     /// key in `outstanding`, so `handle_message()` can match the peer's response
     /// even if it arrives before the write finishes.
     pub(super) fn next_outgoing(&self) -> Option<(u64, OutgoingMessage)> {
+        // Keep callback ownership outside the lock across every queue check
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
         loop {
-            // Remove expired messages before choosing the next one to send.
-            state.expire(self.now());
+            // Run expiry callbacks before selecting work or parking the writer
+            state.expire(self.now(), &mut notifications);
+            if !notifications.is_empty() {
+                drop(state);
+                drop(notifications);
+                notifications = Notifications::default();
+                state = self.state.lock().expect("session state not poisoned");
+                continue;
+            }
+
+            // Assign an ID and reserve the response route before releasing the lock
             let State::Open {
                 outgoing,
                 next_id,
@@ -879,6 +947,8 @@ impl SessionInner {
                 };
                 return Some((id, outgoing));
             }
+
+            // Sleep until work arrives or the session closes
             state = self
                 .changed
                 .wait(state)
@@ -951,13 +1021,24 @@ impl SessionInner {
 
     /// Expires pending operations even when no caller is waiting on a promise.
     /// Waits on `changed` until the next deadline or until new work arrives.
-    fn run_deadlines(&self) {
+    pub(super) fn run_deadlines(&self) {
+        // Keep callbacks outside the guard even when the session closes
+        let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
         loop {
-            state.expire(self.now());
+            // Run settled callbacks before recomputing deadlines or waiting again
+            state.expire(self.now(), &mut notifications);
+            if !notifications.is_empty() {
+                drop(state);
+                drop(notifications);
+                notifications = Notifications::default();
+                state = self.state.lock().expect("session state not poisoned");
+                continue;
+            }
             let State::Open { operations, .. } = &*state else {
                 return;
             };
+
             // Submitting an earlier deadline wakes this wait. Every wakeup
             // recomputes the minimum under the same lock used by submission.
             state = match operations
@@ -967,7 +1048,7 @@ impl SessionInner {
             {
                 Some(deadline) => {
                     self.changed
-                        .wait_timeout(state, deadline.saturating_duration_since(self.now()))
+                        .wait_deadline(state, deadline)
                         .expect("session state not poisoned")
                         .0
                 }
@@ -985,19 +1066,24 @@ impl Session {
     /// client sessions receive a stream closer; `Server` closes server streams.
     pub(super) fn start<W: Write + Send + 'static>(
         side: Side,
+        clock: Clock,
         sender: transport::Sender<W>,
         stream_closer: Option<transport::Closer>,
         #[cfg(any(test, feature = "fuzz"))] workers: Arc<worker::Tracker>,
     ) -> Self {
+        // Keep the stream clock with the session's queues and operations
         let session = Self {
             inner: Arc::new(SessionInner::new(
                 side,
+                clock,
                 sender.log_id(),
                 stream_closer,
                 #[cfg(any(test, feature = "fuzz"))]
                 workers.clone(),
             )),
         };
+
+        // Start the writer independently of the thread reading the stream
         let inner = session.inner.clone();
         worker::spawn(
             "wire-writer",
@@ -1005,6 +1091,8 @@ impl Session {
             &workers,
             move || inner.run_writer(sender),
         );
+
+        // Expire operations even when their promises have no waiter
         let inner = session.inner.clone();
         worker::spawn(
             "wire-deadlines",
@@ -1032,14 +1120,22 @@ impl State {
 
     /// Stops accepting messages and fails pending operations under the session lock.
     /// Returns the old queues to be dropped after releasing the lock.
-    fn close(&mut self, error: Error, now: Instant) -> Option<Self> {
+    fn close(
+        &mut self,
+        error: Error,
+        now: Instant,
+        notifications: &mut Notifications,
+    ) -> Option<Self> {
+        // Preserve the first closing reason
         if let Self::Closed(_) = self {
             return None;
         }
+
+        // Publish failures now and let the caller run callbacks after unlocking
         let mut removed = std::mem::replace(self, Self::Closed(error.clone()));
         if let Self::Open { operations, .. } = &mut removed {
             for (_, operation) in operations.drain() {
-                operation.fail(error.clone(), now);
+                notifications.push(operation.fail(error.clone(), now));
             }
         }
         Some(removed)
@@ -1047,7 +1143,7 @@ impl State {
 
     /// Removes expired entries from `operations`, sends `Timeout` to their
     /// promises, and discards any messages they still have in `outgoing`.
-    fn expire(&mut self, now: Instant) {
+    fn expire(&mut self, now: Instant, notifications: &mut Notifications) {
         if let Self::Open {
             operations,
             outgoing,
@@ -1055,17 +1151,21 @@ impl State {
             ..
         } = self
         {
+            // Remove each expired operation before publishing its terminal result
             let expired: Vec<_> = operations
                 .iter()
                 .filter(|(_, operation)| now >= operation.deadline)
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in expired {
-                operations
-                    .remove(&key)
-                    .expect("expired operation held under lock")
-                    .fail(Error::Timeout, now);
+                notifications.push(
+                    operations
+                        .remove(&key)
+                        .expect("expired operation held under lock")
+                        .fail(Error::Timeout, now),
+                );
             }
+
             // Only messages still in this queue can be discarded. Writes already
             // started keep running with their independent transport timeout.
             outgoing.retain(|outgoing| {
@@ -1083,15 +1183,23 @@ impl State {
 #[cfg(any(test, feature = "fuzz"))]
 impl Session {
     /// Creates a session without a stream or workers for lifecycle scenarios.
+    #[cfg(test)]
     pub(super) fn fixture() -> Self {
         Self::fixture_for(Side::Server)
     }
 
     /// Creates either envelope direction without a stream or workers.
+    #[cfg(test)]
     pub(super) fn fixture_for(side: Side) -> Self {
+        Self::fixture_with_clock(side, crate::transport::testing::test_clock().clock())
+    }
+
+    /// Creates a workerless session whose operations use the supplied clock.
+    pub(super) fn fixture_with_clock(side: Side, clock: Clock) -> Self {
         Self {
             inner: Arc::new(SessionInner::new(
                 side,
+                clock,
                 LogId::default(),
                 None,
                 Arc::new(worker::Tracker::default()),
@@ -1142,10 +1250,13 @@ impl SessionInner {
     /// Waits for the reader to remove a previously sent request's ID. Tests use
     /// this to leave a completed promise unread before changing limits or sessions.
     pub(super) fn wait_response(&self, id: u64) {
-        let state = self.state.lock().unwrap();
-        let (state, _) = self.changed.wait_timeout_while(state, Duration::from_secs(3), |state| {
-            matches!(state, State::Open { outstanding, .. } if outstanding.contains_key(&id))
-        }).unwrap();
+        // Wait until the reader removes the request or the session closes
+        let mut state = self.state.lock().unwrap();
+        while matches!(&*state, State::Open { outstanding, .. } if outstanding.contains_key(&id)) {
+            state = self.changed.wait(state).unwrap();
+        }
+
+        // Require response processing before closure
         let State::Open { outstanding, .. } = &*state else {
             panic!("session closed before response fence");
         };
@@ -1199,24 +1310,6 @@ impl SessionInner {
         (requests, self.retained_bytes.load(Ordering::Relaxed))
     }
 
-    /// Advances the test clock without calling `expire()`, so tests can deliver
-    /// results after a deadline but before the timeout has been processed.
-    pub(super) fn set_time(&self, now: Instant) {
-        let _state = self.state.lock().expect("session state not poisoned");
-        let mut time = self.time.lock().expect("scenario clock not poisoned");
-        assert!(
-            time.is_none_or(|previous| now >= previous),
-            "clock cannot go backwards"
-        );
-        *time = Some(now);
-    }
-
-    /// Restores wall-clock time for scenarios that exercise the waiter's real timer.
-    pub(super) fn use_realtime(&self) {
-        let _state = self.state.lock().expect("session state not poisoned");
-        *self.time.lock().expect("scenario clock not poisoned") = None;
-    }
-
     /// Arms a one-shot notification for the next receive waiting on an empty queue.
     /// The notification is sent while holding the lock, immediately before the
     /// condition-variable wait releases it, so a later close cannot run too early.
@@ -1254,9 +1347,219 @@ impl Drop for SessionInner {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::{Notifications, SessionInner, Side};
     use crate::protocol::{self, Error, Session};
     use crate::transport::{Read, Stream, Verifier, Write};
     use std::fmt::Debug;
+
+    /// The deadline worker releases both locks before notifying and parking again.
+    #[test]
+    fn test_deadline_callback_releases_locks_before_worker_parks() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        // Register a callback before starting the fixture's only worker
+        let mut tester = crate::transport::testing::test_clock();
+        let session = Session::fixture_with_clock(Side::Client, tester.clock());
+        let deadline = tester.clock().now() + Duration::from_secs(5);
+        let mut promise = session.requester().request(vec![1], deadline).unwrap();
+        let notification = promise.notification_unlocked();
+        let state = session.inner.clone();
+        let (observed, receiver) = mpsc::channel();
+        promise.notify(move || {
+            let _ = observed.send((state.state.try_lock().is_ok(), notification()));
+        });
+        let state = session.inner.clone();
+        let worker = thread::spawn(move || state.run_deadlines());
+
+        // Reach the parked deadline without asking the promise to expire itself
+        tester.wait_blocked(1);
+        tester.advance_to(deadline);
+        let unlocked = receiver.recv().unwrap();
+
+        // Stop the worker and require unlocked notification with a timeout result
+        session.close();
+        worker.join().unwrap();
+        assert_eq!(unlocked, (true, true));
+        assert!(matches!(promise.wait::<Vec<u8>>(), Err(Error::Timeout)));
+    }
+
+    /// Callbacks and their captures run with both locks free on the thread responsible for notification.
+    #[test]
+    fn test_notification_releases_locks_on_every_settlement_path() {
+        use crate::protocol::Promise;
+        use std::sync::{Arc, mpsc};
+        use std::thread::{self, ThreadId};
+        use std::time::Duration;
+
+        /// Checks callback execution and capture destruction against both locks.
+        struct Capture {
+            /// Session whose state must be unlocked during notification.
+            session: Arc<SessionInner>,
+            /// Attempts to acquire the promise's notification lock.
+            notification: Box<dyn Fn() -> bool + Send>,
+            /// Reports lock availability and the executing thread.
+            observed: mpsc::Sender<(bool, bool, ThreadId)>,
+        }
+
+        impl Capture {
+            /// Reports lock availability from application code without blocking.
+            fn check(&self) {
+                let _ = self.observed.send((
+                    self.session.state.try_lock().is_ok(),
+                    (self.notification)(),
+                    thread::current().id(),
+                ));
+            }
+        }
+
+        impl Drop for Capture {
+            /// Checks locks again when the callback's captures are destroyed.
+            fn drop(&mut self) {
+                self.check();
+            }
+        }
+
+        /// Registers on either side of settlement and checks both callback contexts.
+        fn check<T>(
+            mut promise: Promise<T>,
+            session: Arc<SessionInner>,
+            completed: bool,
+            path: &str,
+            settle: impl FnOnce() + Send,
+        ) {
+            // Prepare a capture that checks both application execution points
+            let (observed, receiver) = mpsc::channel();
+            let capture = Capture {
+                session,
+                notification: Box::new(promise.notification_unlocked()),
+                observed,
+            };
+
+            // Settle on another thread to distinguish it from registration
+            let expected = thread::scope(|scope| {
+                if completed {
+                    scope.spawn(settle).join().unwrap();
+                    promise.notify(move || capture.check());
+                    thread::current().id()
+                } else {
+                    promise.notify(move || capture.check());
+                    let settling = scope.spawn(move || {
+                        settle();
+                        thread::current().id()
+                    });
+                    settling.join().unwrap()
+                }
+            });
+
+            // Require one unlocked callback and one unlocked capture destructor
+            let observations: Vec<_> = receiver.try_iter().collect();
+            assert_eq!(
+                observations,
+                vec![(true, true, expected); 2],
+                "{path}, completed={completed}"
+            );
+        }
+
+        // Exercise result publication through each session path without workers
+        for path in [
+            "response",
+            "response limit",
+            "late response",
+            "fixture response",
+            "fixture error",
+            "write failure",
+            "late write",
+            "reply",
+            "close",
+            "expire",
+            "take outgoing",
+            "next outgoing",
+            "limits",
+        ] {
+            for completed in [false, true] {
+                // Create a session whose deadlines follow a paused clock
+                let mut tester = crate::transport::testing::test_clock();
+                let clock = tester.clock();
+                let deadline = clock.now() + Duration::from_secs(5);
+                let mut session = Session::fixture_with_clock(Side::Client, clock);
+                let inner = session.inner.clone();
+
+                // Complete a real responder through the writer's success path
+                if path == "reply" {
+                    inner.inject_request(2, vec![1].into()).unwrap();
+                    let (_, responder) = session.recv().unwrap();
+                    let promise = responder.reply(vec![2], deadline).unwrap();
+                    let outgoing = inner.take_outgoing().unwrap();
+                    check(promise, inner, completed, path, move || {
+                        outgoing.operation.record_write(Ok(()))
+                    });
+                    continue;
+                }
+
+                // Prepare requests and any admission limits before notification
+                if path == "response limit" {
+                    session = session.set_inbound_limits(1, 0);
+                }
+                if path == "limits" {
+                    inner.inject_request(2, vec![1].into()).unwrap();
+                }
+                let promise = session.requester().request(vec![1], deadline).unwrap();
+                let (id, outgoing) = inner.next_outgoing().unwrap();
+                let next = if path == "next outgoing" {
+                    Some(
+                        session
+                            .requester()
+                            .request(vec![2], deadline + Duration::from_secs(5))
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+
+                // Publish through the chosen path and verify registration before or after it
+                check(promise, inner.clone(), completed, path, || match path {
+                    "response" | "response limit" | "late response" => {
+                        // Let response completion detect expiry without the deadline worker
+                        if path == "late response" {
+                            tester.advance_to(deadline);
+                        }
+
+                        // Route the response through the reader's publication path
+                        let bytes = Side::Server.encode(id, Ok(vec![2].into())).unwrap();
+                        let result = inner.handle_message(bytes);
+                        assert_eq!(result.is_ok(), path != "response limit");
+                    }
+                    "fixture response" => outgoing.operation.record_response(Ok(vec![2].into())),
+                    "fixture error" => {
+                        inner.record_response(&outgoing.operation.key, Err(Error::Closed))
+                    }
+                    "write failure" => outgoing.operation.record_write(Err(Error::Closed)),
+                    "late write" => {
+                        tester.advance_to(deadline);
+                        outgoing.operation.record_write(Ok(()));
+                    }
+                    "close" => inner.close(Error::Closed),
+                    "limits" => {
+                        let mut notifications = Notifications::default();
+                        inner.set_inbound_limits(0, 1024, &mut notifications);
+                    }
+                    "expire" | "take outgoing" | "next outgoing" => {
+                        tester.advance_to(deadline);
+                        match path {
+                            "expire" => inner.expire(),
+                            "take outgoing" => assert!(inner.take_outgoing().is_none()),
+                            "next outgoing" => assert!(inner.next_outgoing().is_some()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => unreachable!(),
+                });
+                drop(next);
+            }
+        }
+    }
 
     /// Compiles client construction with verifier-specific information in the result.
     #[allow(dead_code)]

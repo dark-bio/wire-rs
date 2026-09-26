@@ -15,6 +15,7 @@ pub mod transport;
 
 // The crates whose types appear in this crate's API, re-exported so consumers
 // can name them at the exact versions this crate was compiled against
+pub use darkbio_clock as clock;
 pub use darkbio_cobs as cobs;
 pub use darkbio_crypto as crypto;
 pub use darkbio_trust as trust;

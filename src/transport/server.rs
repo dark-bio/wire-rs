@@ -262,7 +262,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                         }
                         // Do not swallow an attempt deadline exhausted during
                         // authentication or its failure notification.
-                        check_deadline(deadline).map_err(Error::RecvFailed)?;
+                        check_deadline(&self.outbound.clock, deadline)
+                            .map_err(Error::RecvFailed)?;
                     }
                     // Report the completed handshake before reading messages.
                     // The caller can now send without waiting for a client request.
@@ -299,7 +300,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // A reset ends any active session. Run the handshake on the next
                 // receive call if we return an event, or on the next loop pass.
                 Ok(None) => {
-                    self.handshake_deadline = Some(Instant::now() + self.handshake_timeout);
+                    self.handshake_deadline =
+                        Some(self.outbound.clock.now() + self.handshake_timeout);
                     if self.end_session() {
                         info!("wire session {} reset by host", self.log_id);
                         return Ok(Event::Disconnected);
@@ -449,31 +451,19 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 host_crypto: host_hello.host_crypto.clone(),
             };
             #[cfg(not(any(test, feature = "bench", feature = "fuzz")))]
-            let sealed = cose::seal(
+            let timestamp = handshake::timestamp(&self.outbound.clock);
+            #[cfg(any(test, feature = "bench", feature = "fuzz"))]
+            let timestamp = self
+                .timestamp
+                .unwrap_or_else(|| handshake::timestamp(&self.outbound.clock));
+            let sealed = cose::seal_at(
                 &ark_hello,
                 &auth,
                 &self.signer,
                 &host_hello.host_crypto,
                 CRYPTO_DOMAIN_WIRE,
+                timestamp,
             );
-            #[cfg(any(test, feature = "bench", feature = "fuzz"))]
-            let sealed = match self.timestamp {
-                Some(timestamp) => cose::seal_at(
-                    &ark_hello,
-                    &auth,
-                    &self.signer,
-                    &host_hello.host_crypto,
-                    CRYPTO_DOMAIN_WIRE,
-                    timestamp,
-                ),
-                None => cose::seal(
-                    &ark_hello,
-                    &auth,
-                    &self.signer,
-                    &host_hello.host_crypto,
-                    CRYPTO_DOMAIN_WIRE,
-                ),
-            };
             let ark_hello = sealed.map_err(|err| {
                 Error::HandshakeFailed(format!("failed to seal server hello: {}", err))
             })?;
@@ -486,7 +476,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 debug!("wire reset received during handshake");
                 continue;
             };
-            let host_ack: handshake::HostAck = cose::open(
+            let host_ack: handshake::HostAck = cose::open_at(
                 packet,
                 &handshake::HostAckAuth {
                     ark_signer: self.signer.public_key(),
@@ -496,6 +486,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 &host_hello.host_signer,
                 CRYPTO_DOMAIN_WIRE,
                 None, // clock possibly unset, ephemeral keys guarantee freshness
+                0,    // unused without a drift check, so the clock is not read
             )
             .map_err(|err| Error::HandshakeFailed(format!("invalid client ack: {}", err)))?;
 
@@ -512,7 +503,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 })?;
 
             // Session established
-            check_deadline(deadline).map_err(Error::RecvFailed)?;
+            check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
             return Ok((sender, receiver));
         }
     }
@@ -544,17 +535,12 @@ impl<R: Read, W: Write, A: Attester> fmt::Debug for Server<R, W, A> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::testing::Socket;
     use crate::transport::mock::payload;
-    use crate::transport::testing::Memory;
+    use crate::transport::testing::{Memory, test_clock};
     use crate::transport::{Client, MAX_FRAME_SIZE, Verifier};
     use crate::{memory, testing};
+    use darkbio_clock::Clock;
     use darkbio_cobs as cobs;
-    #[cfg(unix)]
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::net::UnixStream;
 
     /// Self-signed attestation for a device that has not been onboarded.
     fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
@@ -569,10 +555,11 @@ mod tests {
             hwm: eat::HwModel { hw_model: vec![] },
             hwv: eat::HwVersion::new("".into()),
         };
-        let cwt = cwt::issue(
+        let cwt = cwt::issue_at(
             &claims,
             signer,
             darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+            crate::transport::mock::TIMESTAMP,
         )
         .unwrap();
         Attestation::new(cwt).unwrap()
@@ -593,8 +580,10 @@ mod tests {
     // bytes isolate the framing limit: the server forwards them without parsing.
     #[test]
     fn test_oversized_hello_notifies_once() {
+        // Prepare an oversized server hello on a paused clock
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let hello = cbor::encode(&handshake::HostHello {
             host_signer: xdsa::SecretKey::generate().public_key(),
             host_crypto: xhpke::SecretKey::generate().public_key(),
@@ -604,11 +593,16 @@ mod tests {
         input.extend_from_slice(&cobs_frame(&hello));
         let mut output = Vec::new();
         let mut server = Server::new(
-            Stream::new(Memory::new(&input[..]), Memory::new(&mut output), || {}),
+            Stream::new(
+                Memory::new(&input[..], &clock),
+                Memory::new(&mut output, &clock),
+                || {},
+            ),
             xdsa::SecretKey::generate(),
             Attestation(vec![0; MAX_FRAME_SIZE]),
         );
 
+        // Require exactly one failure notification before EOF
         assert!(matches!(server.recv(), Err(Error::Terminated)));
         drop(server);
         assert_eq!(output, [0]);
@@ -619,26 +613,20 @@ mod tests {
     // response. The server's signal for a dropped session then surfaces on the
     // client as a reset, which a fresh handshake recovers from.
     #[test]
-    #[cfg(unix)]
     fn test_message_round_trip() {
+        // Connect both peers on one paused in-memory stream
         testing::init_tracing();
-
+        let tester = test_clock();
         let signer_key = xdsa::SecretKey::generate();
         let signer_pub = signer_key.public_key();
         let attestation = self_attestation(&signer_key);
         let presented = attestation.clone();
 
-        let (host_sock, ark_sock) = UnixStream::pair().unwrap();
-        let ark_reader = Socket::new(ark_sock.try_clone().unwrap());
-        let ark_writer = Socket::new(ark_sock);
+        let (host, ark) = memory::duplex(64 * 1024, &tester.clock());
 
         // Server side: receive two messages (across two sessions), echo each back.
         let ark_thread = std::thread::spawn(move || {
-            let mut server = Server::new(
-                Stream::new(ark_reader, ark_writer, || {}),
-                signer_key,
-                attestation,
-            );
+            let mut server = Server::new(ark, signer_key, attestation);
             let mut sender = None;
             let mut requests = Vec::new();
             for _ in 0..2 {
@@ -649,15 +637,8 @@ mod tests {
             requests
         });
 
-        // Raw handle to inject bytes past the client side.
-        let mut raw_sock = host_sock.try_clone().unwrap();
-
         // Session 1: handshake, checking the attestation, exchange one message.
-        let mut client = Client::new(Stream::new(
-            Socket::new(host_sock.try_clone().unwrap()),
-            Socket::new(host_sock),
-            || {},
-        ));
+        let mut client = Client::new(host);
         let (sender, attest) = client.connect(&signer_pub).unwrap();
         assert_eq!(attest.as_bytes(), presented.as_bytes());
         sender.send(&payload(1)).unwrap();
@@ -666,9 +647,7 @@ mod tests {
         // Inject a frame the server cannot decrypt. It drops the session and
         // signals it. The client's next read reports a reset, and its old sender
         // cannot send again.
-        raw_sock
-            .write_all(&cobs_frame(b"interrupted transfer"))
-            .unwrap();
+        client.send_packet_blob(b"interrupted transfer").unwrap();
         let result = client.recv();
         assert!(matches!(result, Err(Error::SessionReset)), "{result:?}");
         let result = sender.send(&payload(2));
@@ -697,14 +676,19 @@ mod tests {
         impl Verifier for Untrusting {
             type Info = ();
 
-            fn verify(&self, _: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
+            fn verify(
+                &self,
+                _: &Attestation,
+                _: std::time::SystemTime,
+            ) -> Result<(xdsa::PublicKey, Self::Info), String> {
                 Err("attestation rejected".into())
             }
         }
 
         let signer_key = xdsa::SecretKey::generate();
 
-        let (host, ark) = memory::duplex(64 * 1024);
+        let tester = test_clock();
+        let (host, ark) = memory::duplex(64 * 1024, &tester.clock());
 
         // Server side: serve handshakes until the transport drops. The client aborts
         // mid-handshake, so the server never delivers a message.
@@ -737,9 +721,12 @@ mod tests {
         use darkbio_crypto::cwt::claims::{self, eat};
         use darkbio_trust::device::{EmulatorClaims, HardwareClaims};
         use darkbio_trust::{CRYPTO_DOMAIN_DEVICE_ATTESTATION, Realm};
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::UNIX_EPOCH;
 
-        let now = SystemTime::now()
+        let tester = test_clock();
+        let clock = tester.clock();
+        let now = clock
+            .system_time()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -747,12 +734,13 @@ mod tests {
         /// Runs a handshake with the given attestation and trusted roots.
         /// Returns the client's verification result.
         fn handshake(
+            clock: &Clock,
             signer_key: xdsa::SecretKey,
             attestation: Attestation,
             hardware: &[xdsa::PublicKey],
             emulator: &[xdsa::PublicKey],
         ) -> Result<darkbio_trust::device::Device, Error> {
-            let (host, ark) = memory::duplex(64 * 1024);
+            let (host, ark) = memory::duplex(64 * 1024, clock);
 
             let ark_thread = std::thread::spawn(move || {
                 let mut server = Server::new(ark, signer_key, attestation);
@@ -777,7 +765,7 @@ mod tests {
 
         // A hardware server attested by a hardware root is accepted with its identity
         let signer_key = xdsa::SecretKey::generate();
-        let attestation = cwt::issue(
+        let attestation = cwt::issue_at(
             &HardwareClaims {
                 sub: claims::Subject {
                     sub: "ark-1234".into(),
@@ -793,20 +781,28 @@ mod tests {
             },
             &hardware_root,
             CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+            now as i64,
         )
         .map(|cwt| Attestation::new(cwt).unwrap())
         .unwrap();
-        let device = handshake(signer_key, attestation.clone(), &hardware_roots, &[]).unwrap();
+        let device = handshake(
+            &clock,
+            signer_key,
+            attestation.clone(),
+            &hardware_roots,
+            &[],
+        )
+        .unwrap();
         assert_eq!(device.realm, Realm::Hardware);
         assert_eq!(device.serial, "ark-1234");
 
         // A hardware attestation is refused when only emulator roots are trusted
         let signer_key = xdsa::SecretKey::generate();
-        assert!(handshake(signer_key, attestation, &[], &emulator_roots).is_err());
+        assert!(handshake(&clock, signer_key, attestation, &[], &emulator_roots).is_err());
 
         // An emulated server attested by an emulator root is accepted with its expiry
         let signer_key = xdsa::SecretKey::generate();
-        let attestation = cwt::issue(
+        let attestation = cwt::issue_at(
             &EmulatorClaims {
                 sub: claims::Subject {
                     sub: "emu-1234".into(),
@@ -823,16 +819,24 @@ mod tests {
             },
             &emulator_root,
             CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+            now as i64,
         )
         .map(|cwt| Attestation::new(cwt).unwrap())
         .unwrap();
-        let device = handshake(signer_key, attestation, &hardware_roots, &emulator_roots).unwrap();
+        let device = handshake(
+            &clock,
+            signer_key,
+            attestation,
+            &hardware_roots,
+            &emulator_roots,
+        )
+        .unwrap();
         assert_eq!(device.realm, Realm::Emulator);
         assert_eq!(device.expiry, Some(now + 1000));
 
         // A never onboarded server presenting a self-signed attestation is refused
         let signer_key = xdsa::SecretKey::generate();
-        let attestation = cwt::issue(
+        let attestation = cwt::issue_at(
             &HardwareClaims {
                 sub: claims::Subject { sub: "".into() },
                 cnf: claims::Confirm::new(signer_key.public_key()),
@@ -844,10 +848,20 @@ mod tests {
             },
             &signer_key,
             CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+            now as i64,
         )
         .map(|cwt| Attestation::new(cwt).unwrap())
         .unwrap();
-        assert!(handshake(signer_key, attestation, &hardware_roots, &emulator_roots).is_err());
+        assert!(
+            handshake(
+                &clock,
+                signer_key,
+                attestation,
+                &hardware_roots,
+                &emulator_roots
+            )
+            .is_err()
+        );
     }
 
     // Tests that attestation construction accepts hardware and emulator claims
@@ -870,7 +884,13 @@ mod tests {
             hwm: claims::eat::HwModel { hw_model: vec![] },
             hwv: claims::eat::HwVersion::new("".into()),
         };
-        let cwt = cwt::issue(&emulator, &signer, CRYPTO_DOMAIN_DEVICE_ATTESTATION).unwrap();
+        let cwt = cwt::issue_at(
+            &emulator,
+            &signer,
+            CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+            crate::transport::mock::TIMESTAMP,
+        )
+        .unwrap();
         Attestation::new(cwt).expect("emulator attestation refused");
 
         let cloud = darkbio_trust::cloud::SignerClaims {
@@ -880,7 +900,13 @@ mod tests {
             exp: claims::Expiration { exp: 1 },
             cnf: claims::Confirm::new(signer.public_key()),
         };
-        let cwt = cwt::issue(&cloud, &signer, CRYPTO_DOMAIN_DEVICE_ATTESTATION).unwrap();
+        let cwt = cwt::issue_at(
+            &cloud,
+            &signer,
+            CRYPTO_DOMAIN_DEVICE_ATTESTATION,
+            crate::transport::mock::TIMESTAMP,
+        )
+        .unwrap();
         let result = Attestation::new(cwt).map(|_| ());
         assert!(
             matches!(result, Err(Error::InvalidAttestation)),
@@ -903,7 +929,8 @@ mod tests {
         let signer_pub = signer_key.public_key();
         let attestation = self_attestation(&signer_key);
 
-        let (host, ark) = memory::duplex(64 * 1024);
+        let tester = test_clock();
+        let (host, ark) = memory::duplex(64 * 1024, &tester.clock());
 
         // Server side: on the first request, push messages from a few threads
         // while waiting for the second request.

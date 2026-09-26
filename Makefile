@@ -8,6 +8,11 @@ FUZZ_TIME ?= 180
 FUZZ_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 FUZZ_SANITIZER ?= none
 
+# Build options of the fuzz runs. -O drops the debug assertions and overflow
+# checks cargo-fuzz forces on every crate, leaving them to the profiles in
+# fuzz/Cargo.toml, which keep them for the wire alone.
+FUZZ_BUILD = -O -s $(FUZZ_SANITIZER)
+
 # Environment of the fuzz feature builds. Every random draw goes through the
 # seeded backend of the mocks, see src/transport/mock/random.rs, for reproducible
 # vectors and deterministic fuzzing. A musl host also links dynamically, as
@@ -16,14 +21,19 @@ FUZZ_SANITIZER ?= none
 HOST_MUSL = $(findstring musl,$(shell rustc -vV | sed -n 's/^host: //p'))
 FUZZ_ENV = RUSTFLAGS='--cfg getrandom_backend="custom"$(if $(HOST_MUSL), -C target-feature=-crt-static)'
 
-# check runs the gates CI holds a push to, the formatting, clippy, the docs and
-# the tests of every feature combination.
+# check runs the gates CI holds a push to, the formatting, clippy, the builds,
+# the docs and the tests of every feature combination. It needs cargo-hack and
+# cargo-nextest installed.
 check:
 	cargo fmt --all -- --check
-	cargo clippy --all-features -- -D warnings
-	cargo doc --all-features --no-deps
-	cargo hack test --each-feature
-	cargo test --all-features
+	cargo clippy --all-features --all-targets -- -D warnings
+	cargo build --verbose
+	cargo hack build --each-feature
+	RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
+	cargo hack nextest run --each-feature
+	cargo nextest run --all-features
+	cargo hack test --doc --each-feature
+	cargo test --doc --all-features
 
 # coverage measures the test coverage of the library code and opens the HTML
 # report. It needs nightly to leave the test modules out of the numbers. The
@@ -39,7 +49,7 @@ coverage:
 # without seeds means a name drifted from the binary.
 fuzz-seeds:
 	rm -rf fuzz/seeds
-	WIRE_SEEDS=$(CURDIR)/fuzz/seeds cargo test --features fuzz --quiet
+	WIRE_SEEDS=$(CURDIR)/fuzz/seeds cargo nextest run --features fuzz --status-level fail --final-status-level fail
 	for target in $$(cargo +nightly fuzz list); do \
 		test -d fuzz/seeds/$$target || { echo "no seeds for $$target"; exit 1; }; \
 	done
@@ -49,14 +59,14 @@ fuzz-seeds:
 fuzz:
 	for target in $$(cargo +nightly fuzz list); do \
 		mkdir -p fuzz/corpus/$$target; \
-		$(FUZZ_ENV) cargo +nightly fuzz run -s $(FUZZ_SANITIZER) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
+		$(FUZZ_ENV) cargo +nightly fuzz run $(FUZZ_BUILD) -j $(FUZZ_JOBS) $$target fuzz/corpus/$$target fuzz/seeds/$$target -- -max_total_time=$(FUZZ_TIME) || exit 1; \
 	done
 
 # fuzz-minimize uses set cover to retain coverage features with fewer inputs,
 # keeping a corpus grown by fuzz runs small before it is committed.
 fuzz-minimize:
 	for target in $$(cargo +nightly fuzz list); do \
-		$(FUZZ_ENV) cargo +nightly fuzz cmin -s $(FUZZ_SANITIZER) $$target -- -set_cover_merge=1 || exit 1; \
+		$(FUZZ_ENV) cargo +nightly fuzz cmin $(FUZZ_BUILD) $$target -- -set_cover_merge=1 || exit 1; \
 	done
 
 # fuzz-loop runs the fuzz targets round robin until a finding stops it or the
@@ -73,7 +83,7 @@ fuzz-loop:
 vectors:
 	rm -rf vectors/client
 	$(FUZZ_ENV) CARGO_TARGET_DIR=target/vectors \
-		WIRE_VECTORS=$(CURDIR)/vectors cargo test --quiet --features fuzz mock::server
+		WIRE_VECTORS=$(CURDIR)/vectors cargo nextest run --features fuzz --status-level fail --final-status-level fail mock::server
 
 # generate writes the protobuf bindings and the message conversions derived
 # from the schema into src/protocol/generated, formatted like handwritten code.

@@ -6,14 +6,16 @@
 
 //! Portable in-memory streams for local connections, emulators and tests.
 //!
-//! These streams use only standard Rust synchronization, with no sockets or
+//! These streams synchronize through the clock's locks, with no sockets or
 //! worker threads. Split an endpoint with [`Duplex::into_halves`] for plain I/O.
 
 use crate::transport::{Read, Stream, Write};
+use darkbio_clock::Clock;
+use darkbio_clock::sync::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// One endpoint of an in-memory duplex connection, ready for a client or server.
 pub type Duplex = Stream<Reader, Writer>;
@@ -30,10 +32,10 @@ impl Duplex {
     /// on the halves are retained; new halves have no deadline until configured.
     ///
     /// ```
-    /// use darkbio_wire::memory;
+    /// use darkbio_wire::{clock::Clock, memory};
     /// use darkbio_wire::transport::Client;
     ///
-    /// let (host, bus) = memory::duplex(64 * 1024);
+    /// let (host, bus) = memory::duplex(64 * 1024, &Clock::real());
     /// let (reader, writer) = bus.into_halves();
     /// let client = Client::new(host);
     /// // Move `reader` and `writer` to the bus's input and output pumps.
@@ -45,6 +47,7 @@ impl Duplex {
 }
 
 /// Creates two connected streams with `capacity` bytes of buffering per direction.
+/// Both measure their deadlines on `clock`, and so does any transport on them.
 ///
 /// Reads wait for data and writes wait for buffer space, bounded by the deadlines
 /// installed by Wire. Partial progress never refreshes a deadline. A timeout
@@ -68,10 +71,13 @@ impl Duplex {
 /// # Panics
 ///
 /// Panics if `capacity` is zero.
-pub fn duplex(capacity: usize) -> (Duplex, Duplex) {
+pub fn duplex(capacity: usize, clock: &Clock) -> (Duplex, Duplex) {
+    // Validate capacity before allocating either direction
     assert!(capacity > 0, "duplex capacity must be nonzero");
-    let incoming = Arc::new(Pipe::new(capacity));
-    let outgoing = Arc::new(Pipe::new(capacity));
+
+    // Give both endpoints the same clock and independent buffers
+    let incoming = Arc::new(Pipe::new(capacity, clock));
+    let outgoing = Arc::new(Pipe::new(capacity, clock));
     (
         endpoint(incoming.clone(), outgoing.clone()),
         endpoint(outgoing, incoming),
@@ -105,11 +111,15 @@ pub struct Reader {
 
 impl io::Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Recheck the buffer and closure state after every wake
         let mut state = self.pipe.lock();
         loop {
+            // Empty reads and local closure need no buffered input
             if buf.is_empty() || !state.reader_open {
                 return Ok(0);
             }
+
+            // Deliver ready bytes even after the installed read deadline
             if !state.bytes.is_empty() {
                 let count = buf.len().min(state.bytes.len());
                 for (out, byte) in buf.iter_mut().zip(state.bytes.drain(..count)) {
@@ -119,15 +129,22 @@ impl io::Read for Reader {
                 self.pipe.changed.notify_all();
                 return Ok(count);
             }
+
+            // End at peer closure or wait within the remaining clock budget
             if !state.writer_open {
                 return Ok(0);
             }
-            state = self.pipe.wait(state, time_left(self.deadline)?);
+            self.pipe.check_deadline(self.deadline)?;
+            state = self.pipe.wait(state, self.deadline);
         }
     }
 }
 
 impl Read for Reader {
+    fn clock(&self) -> Clock {
+        self.pipe.clock.clone()
+    }
+
     fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
         Ok(())
@@ -140,6 +157,15 @@ impl Drop for Reader {
     }
 }
 
+#[cfg(test)]
+impl Reader {
+    /// Makes any later wait for input panic instead of blocking, so a test
+    /// expecting an immediate return fails rather than hangs.
+    pub(crate) fn forbid_waits(&self) {
+        self.pipe.lock().waits_forbidden = true;
+    }
+}
+
 /// Sending half of a [`Duplex`], sharing one deadline across writes and flushes.
 #[derive(Debug)]
 pub struct Writer {
@@ -149,15 +175,19 @@ pub struct Writer {
 
 impl io::Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Recheck capacity and the same deadline after every wake
         let mut state = self.pipe.lock();
         loop {
-            let timeout = time_left(self.deadline)?;
+            // Refuse expiry and closure before accepting any bytes
+            self.pipe.check_deadline(self.deadline)?;
             if buf.is_empty() {
                 return Ok(0);
             }
             if !state.reader_open || !state.writer_open {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
+
+            // Fill available space and wake the reader after releasing the lock
             let count = buf.len().min(self.pipe.capacity - state.bytes.len());
             if count > 0 {
                 state.bytes.extend(&buf[..count]);
@@ -165,13 +195,18 @@ impl io::Write for Writer {
                 self.pipe.changed.notify_all();
                 return Ok(count);
             }
-            state = self.pipe.wait(state, timeout);
+
+            // Wait for space without extending the deadline
+            state = self.pipe.wait(state, self.deadline);
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        // Check the installed deadline while observing a consistent pipe state
         let state = self.pipe.lock();
-        time_left(self.deadline)?;
+        self.pipe.check_deadline(self.deadline)?;
+
+        // Reject local closure or output lost when the peer closed
         if !state.writer_open || state.lost {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -180,6 +215,10 @@ impl io::Write for Writer {
 }
 
 impl Write for Writer {
+    fn clock(&self) -> Clock {
+        self.pipe.clock.clone()
+    }
+
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
         Ok(())
@@ -195,6 +234,8 @@ impl Drop for Writer {
 /// Shared bounded buffer for one direction. Waiting always releases the mutex.
 #[derive(Debug)]
 struct Pipe {
+    /// Clock used to check the installed I/O deadlines.
+    clock: Clock,
     capacity: usize,
     state: Mutex<State>,
     changed: Condvar,
@@ -208,11 +249,14 @@ struct State {
     lost: bool, // Accepted output the reader closed without consuming
     #[cfg(test)]
     waiting: usize,
+    #[cfg(test)]
+    waits_forbidden: bool, // Fails a wait instead of blocking, so a test cannot hang
 }
 
 impl Pipe {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, clock: &Clock) -> Self {
         Self {
+            clock: clock.clone(),
             capacity,
             state: Mutex::new(State {
                 bytes: VecDeque::with_capacity(capacity),
@@ -221,8 +265,10 @@ impl Pipe {
                 lost: false,
                 #[cfg(test)]
                 waiting: 0,
+                #[cfg(test)]
+                waits_forbidden: false,
             }),
-            changed: Condvar::new(),
+            changed: Condvar::new(clock),
         }
     }
 
@@ -231,22 +277,27 @@ impl Pipe {
         self.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// Releases the buffer until notified or the installed deadline is reached.
     fn wait<'a>(
         &self,
         state: MutexGuard<'a, State>,
-        timeout: Option<Duration>,
+        deadline: Option<Instant>,
     ) -> MutexGuard<'a, State> {
+        // Let tests observe the wait before it releases the mutex, or refuse it
         #[cfg(test)]
         let state = {
             let mut state = state;
+            assert!(!state.waits_forbidden, "memory pipe waited");
             state.waiting += 1;
             self.changed.notify_all();
             state
         };
-        let state = match timeout {
-            Some(timeout) => {
+
+        // Release the buffer lock until notified or the current budget runs out
+        let state = match deadline {
+            Some(deadline) => {
                 self.changed
-                    .wait_timeout(state, timeout)
+                    .wait_deadline(state, deadline)
                     .unwrap_or_else(|err| err.into_inner())
                     .0
             }
@@ -255,6 +306,8 @@ impl Pipe {
                 .wait(state)
                 .unwrap_or_else(|err| err.into_inner()),
         };
+
+        // Remove the test's waiter count after the buffer lock is retaken
         #[cfg(test)]
         let state = {
             let mut state = state;
@@ -262,6 +315,14 @@ impl Pipe {
             state
         };
         state
+    }
+
+    /// Refuses an expired deadline using the pipe's clock on every attempt.
+    fn check_deadline(&self, deadline: Option<Instant>) -> io::Result<()> {
+        if deadline.is_some_and(|deadline| self.clock.now() >= deadline) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
     }
 
     fn close_reader(&self) {
@@ -279,28 +340,19 @@ impl Pipe {
     }
 }
 
-/// Computes a fresh wait budget without extending the installed deadline.
-fn time_left(deadline: Option<Instant>) -> io::Result<Option<Duration>> {
-    deadline
-        .map(|deadline| {
-            deadline
-                .checked_duration_since(Instant::now())
-                .filter(|left| !left.is_zero())
-                .ok_or_else(|| io::ErrorKind::TimedOut.into())
-        })
-        .transpose()
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::transport::Closer;
+    use crate::transport::testing::test_clock;
+    use darkbio_clock::TestClock;
     use std::io::{Read as _, Write as _};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
-    const PATIENCE: Duration = Duration::from_secs(5);
+    /// Deadline exercised by timeout and reuse checks.
     const TIMEOUT: Duration = Duration::from_millis(50);
 
     /// Exposes standard I/O for adapter tests without closing the stream.
@@ -312,28 +364,105 @@ mod tests {
 
     /// Waits until an operation has released its mutex in a condition-variable wait.
     fn blocked(pipe: &Pipe) {
-        let deadline = Instant::now() + PATIENCE;
         let mut state = pipe.lock();
         while state.waiting == 0 {
-            let timeout = deadline.checked_duration_since(Instant::now()).unwrap();
-            state = pipe.changed.wait_timeout(state, timeout).unwrap().0;
+            state = pipe.changed.wait(state).unwrap();
         }
     }
 
+    // A blocked empty read expires when its clock reaches the installed deadline.
+    #[test]
+    fn test_blocked_read_expires_on_clock_deadline() {
+        // Park an empty read with a deadline a day ahead of real time
+        let mut tester = TestClock::new();
+        tester.advance(Duration::from_secs(86400));
+        let clock = tester.clock();
+        let (host, _peer) = duplex(1, &clock);
+        let (mut reader, _writer) = host.into_halves();
+        let deadline = clock.now() + Duration::from_secs(5);
+        reader.set_read_deadline(Some(deadline)).unwrap();
+        let reading = thread::spawn(move || reader.read(&mut [0]));
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(deadline));
+
+        // Advance exactly to expiry and observe the blocked operation returning
+        tester.advance_to(deadline);
+        assert_eq!(
+            reading.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    // A blocked full write expires when its clock reaches the installed deadline.
+    #[test]
+    fn test_blocked_write_expires_on_clock_deadline() {
+        // Fill the pipe and park another write on the same fixed deadline
+        let mut tester = TestClock::new();
+        tester.advance(Duration::from_secs(86400));
+        let clock = tester.clock();
+        let (host, _peer) = duplex(1, &clock);
+        let (_reader, mut writer) = host.into_halves();
+        writer.write_all(b"a").unwrap();
+        let deadline = clock.now() + Duration::from_secs(5);
+        writer.set_write_deadline(deadline).unwrap();
+        let writing = thread::spawn(move || writer.write(b"b"));
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(deadline));
+
+        // Advance exactly to expiry and observe the blocked operation returning
+        tester.advance_to(deadline);
+        assert_eq!(
+            writing.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    // An expired read delivers available input before reporting expiry on the empty pipe.
+    #[test]
+    fn test_read_delivers_buffered_bytes_after_deadline() {
+        // Buffer input before the installed read deadline
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let (host, peer) = duplex(1, &clock);
+        let (mut reader, _writer) = host.into_halves();
+        let (_peer_reader, mut writer) = peer.into_halves();
+        let deadline = clock.now() + Duration::from_secs(5);
+        reader.set_read_deadline(Some(deadline)).unwrap();
+        writer.write_all(b"a").unwrap();
+
+        // Read buffered bytes at expiry without entering a condvar wait
+        tester.advance_to(deadline);
+        reader.forbid_waits();
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(&byte, b"a");
+
+        // Derive expiry from the clock once input is exhausted
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    // A zero-capacity pipe rejects construction before any I/O can wait
     #[test]
     #[should_panic(expected = "duplex capacity must be nonzero")]
     fn test_zero_capacity() {
-        duplex(0);
+        duplex(0, &test_clock().clock());
     }
 
     // Partial reads and writes preserve byte order across queue wraparound. Read
     // and write deadlines remain independent, including empty I/O and flush.
     #[test]
     fn test_byte_stream_and_independent_deadlines() {
-        let (host, ark) = duplex(4);
+        // Create both directions on one paused clock
+        let tester = test_clock();
+        let clock = tester.clock();
+        let (host, ark) = duplex(4, &clock);
         let (mut host_read, mut host_write, _host_close) = halves(host);
         let (mut ark_read, mut ark_write, _ark_close) = halves(ark);
 
+        // Preserve byte order across partial writes and queue wraparound
         assert_eq!(host_read.read(&mut []).unwrap(), 0);
         assert_eq!(host_write.write(b"abcdef").unwrap(), 4);
         assert_eq!(host_write.write(&[]).unwrap(), 0);
@@ -347,8 +476,9 @@ mod tests {
         ark_read.read_exact(&mut rest).unwrap();
         assert_eq!(&rest, b"cdef");
 
+        // Deliver buffered input before reporting its expired deadline
         ark_write.write_all(b"xy").unwrap();
-        host_read.set_read_deadline(Some(Instant::now())).unwrap();
+        host_read.set_read_deadline(Some(clock.now())).unwrap();
         host_read.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"xy");
         assert_eq!(
@@ -358,7 +488,8 @@ mod tests {
         assert_eq!(host_read.read(&mut []).unwrap(), 0);
         host_write.write_all(b"q").unwrap();
 
-        host_write.set_write_deadline(Instant::now()).unwrap();
+        // Expire output while input remains usable
+        host_write.set_write_deadline(clock.now()).unwrap();
         host_read.set_read_deadline(None).unwrap();
         ark_write.write_all(b"uv").unwrap();
         host_read.read_exact(&mut first).unwrap();
@@ -374,8 +505,9 @@ mod tests {
             io::ErrorKind::TimedOut
         );
 
+        // Resume output with a fresh deadline
         host_write
-            .set_write_deadline(Instant::now() + PATIENCE)
+            .set_write_deadline(clock.now() + Duration::from_secs(5))
             .unwrap();
         host_write.write_all(b"rs").unwrap();
         host_write.flush().unwrap();
@@ -388,24 +520,30 @@ mod tests {
     // Clearing that deadline restores an indefinite read, woken by fresh output.
     #[test]
     fn test_read_timeout_and_reuse() {
-        let (host, ark) = duplex(1);
+        // Park an empty read on a deadline ahead of the paused clock
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let deadline = clock.now() + TIMEOUT;
+        let (host, ark) = duplex(1, &clock);
         let (mut reader, _host_write, _host_close) = halves(host);
         let (_ark_read, mut writer, _ark_close) = halves(ark);
         let pipe = reader.pipe.clone();
         let (done, result) = mpsc::channel();
         let timed = thread::spawn(move || {
-            let deadline = Instant::now() + TIMEOUT;
             reader.set_read_deadline(Some(deadline)).unwrap();
             let mut buf = [99];
             let error = reader.read(&mut buf).unwrap_err();
-            assert!(Instant::now() >= deadline);
+            assert!(clock.now() >= deadline);
             assert_eq!(buf, [99]);
             done.send((reader, error.kind())).unwrap();
         });
-        let (mut reader, kind) = result.recv_timeout(PATIENCE).unwrap();
+        tester.wait_blocked(1);
+        tester.advance_to(deadline);
+        let (mut reader, kind) = result.recv().unwrap();
         timed.join().unwrap();
         assert_eq!(kind, io::ErrorKind::TimedOut);
 
+        // Clear expiry and wake a new indefinite read with input
         reader.set_read_deadline(None).unwrap();
         let (done, result) = mpsc::channel();
         let reading = thread::spawn(move || {
@@ -415,7 +553,7 @@ mod tests {
         });
         blocked(&pipe);
         writer.write_all(b"x").unwrap();
-        assert_eq!(&result.recv_timeout(PATIENCE).unwrap(), b"x");
+        assert_eq!(&result.recv().unwrap(), b"x");
         reading.join().unwrap();
     }
 
@@ -423,26 +561,32 @@ mod tests {
     // write must follow that prefix, without an abandoned suffix appearing later.
     #[test]
     fn test_write_timeout_and_reuse() {
-        let (host, ark) = duplex(3);
+        // Fill the pipe and park the remaining byte until its deadline
+        let mut tester = test_clock();
+        let clock = tester.clock();
+        let deadline = clock.now() + TIMEOUT;
+        let (host, ark) = duplex(3, &clock);
         let (_host_read, mut writer, _host_close) = halves(host);
         let (mut reader, _ark_write, _ark_close) = halves(ark);
         let (done, result) = mpsc::channel();
         let writing = thread::spawn(move || {
-            let deadline = Instant::now() + TIMEOUT;
             writer.set_write_deadline(deadline).unwrap();
             let error = writer.write_all(b"abcd").unwrap_err();
-            assert!(Instant::now() >= deadline);
+            assert!(clock.now() >= deadline);
             done.send((writer, error.kind())).unwrap();
         });
-        let (mut writer, kind) = result.recv_timeout(PATIENCE).unwrap();
+        tester.wait_blocked(1);
+        tester.advance_to(deadline);
+        let (mut writer, kind) = result.recv().unwrap();
         writing.join().unwrap();
         assert_eq!(kind, io::ErrorKind::TimedOut);
         let mut prefix = [0; 3];
         reader.read_exact(&mut prefix).unwrap();
         assert_eq!(&prefix, b"abc");
 
+        // Resume output after the accepted prefix with a fresh deadline
         writer
-            .set_write_deadline(Instant::now() + PATIENCE)
+            .set_write_deadline(tester.clock().now() + Duration::from_secs(5))
             .unwrap();
         writer.write_all(b"ef").unwrap();
         drop(writer);
@@ -455,26 +599,26 @@ mod tests {
     // partial writes, while bounded reads reconstruct the original byte stream.
     #[test]
     fn test_backpressure_wakes_writer() {
-        let (host, ark) = duplex(3);
+        // Fill a paused pipe and start a writer behind its queued bytes
+        let tester = test_clock();
+        let deadline = tester.clock().now() + Duration::from_secs(5);
+        let (host, ark) = duplex(3, &tester.clock());
         let (_host_read, mut writer, _host_close) = halves(host);
         let (mut reader, _ark_write, _ark_close) = halves(ark);
         writer.write_all(b"abc").unwrap();
         let pipe = writer.pipe.clone();
         let (done, result) = mpsc::channel();
         let writing = thread::spawn(move || {
-            writer
-                .set_write_deadline(Instant::now() + PATIENCE)
-                .unwrap();
+            writer.set_write_deadline(deadline).unwrap();
             done.send(writer.write_all(b"defgh")).unwrap();
         });
+        // Drain the pipe after the writer has parked
         blocked(&pipe);
-        reader
-            .set_read_deadline(Some(Instant::now() + PATIENCE))
-            .unwrap();
+        reader.set_read_deadline(Some(deadline)).unwrap();
         let mut bytes = [0; 8];
         reader.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"abcdefgh");
-        result.recv_timeout(PATIENCE).unwrap().unwrap();
+        result.recv().unwrap().unwrap();
         writing.join().unwrap();
     }
 
@@ -483,7 +627,9 @@ mod tests {
     #[test]
     fn test_shutdown_wakes_both_directions() {
         for local in [false, true] {
-            let (host, ark) = duplex(1);
+            // Start a blocked read and a blocked write on the same clock
+            let tester = test_clock();
+            let (host, ark) = duplex(1, &tester.clock());
             let (mut reader, mut writer, closer) = halves(host);
             writer.write_all(b"a").unwrap();
             let incoming = reader.pipe.clone();
@@ -496,6 +642,7 @@ mod tests {
             let writing = thread::spawn(move || {
                 write_done.send(writer.write(b"b")).unwrap();
             });
+            // Close only after both adapter calls have parked
             blocked(&incoming);
             blocked(&outgoing);
             if local {
@@ -503,13 +650,9 @@ mod tests {
             } else {
                 drop(ark);
             }
-            assert_eq!(read_result.recv_timeout(PATIENCE).unwrap().unwrap(), 0);
+            assert_eq!(read_result.recv().unwrap().unwrap(), 0);
             assert_eq!(
-                write_result
-                    .recv_timeout(PATIENCE)
-                    .unwrap()
-                    .unwrap_err()
-                    .kind(),
+                write_result.recv().unwrap().unwrap_err().kind(),
                 io::ErrorKind::BrokenPipe
             );
             reading.join().unwrap();
@@ -521,13 +664,18 @@ mod tests {
     // drain before EOF. Keeping the handles alive must not keep the connection open.
     #[test]
     fn test_shutdown_drains_output_and_discards_input() {
-        let (host, ark) = duplex(3);
+        // Queue bytes in both directions on a paused clock
+        let tester = test_clock();
+        let clock = tester.clock();
+        let (host, ark) = duplex(3, &clock);
         let (mut host_read, mut host_write, closer) = halves(host);
         let (mut ark_read, mut ark_write, _ark_close) = halves(ark);
         host_write.write_all(b"abc").unwrap();
         ark_write.write_all(b"xy").unwrap();
-        host_read.set_read_deadline(Some(Instant::now())).unwrap();
-        ark_read.set_read_deadline(Some(Instant::now())).unwrap();
+        host_read.set_read_deadline(Some(clock.now())).unwrap();
+        ark_read.set_read_deadline(Some(clock.now())).unwrap();
+
+        // Close twice and retain only the peer's accepted input
         closer.close();
         closer.close();
         assert_eq!(host_read.read(&mut [0]).unwrap(), 0);
@@ -550,13 +698,16 @@ mod tests {
     // later flush. Only output it closed without reading is reported as lost.
     #[test]
     fn test_flush_after_peer_drained_and_closed() {
-        let (host, ark) = duplex(4);
+        // Drain the accepted output before closing the peer
+        let tester = test_clock();
+        let (host, ark) = duplex(4, &tester.clock());
         let (_host_read, mut host_write) = host.into_halves();
         let (mut ark_read, _ark_write) = ark.into_halves();
         host_write.write_all(b"ab").unwrap();
         let mut bytes = [0; 2];
         ark_read.read_exact(&mut bytes).unwrap();
         drop(ark_read);
+        // Allow a flush but reject any new output
         host_write.flush().unwrap();
         assert_eq!(
             host_write.write(b"c").unwrap_err().kind(),
@@ -568,16 +719,20 @@ mod tests {
     // its halves. Dropping one half still permits I/O in the other direction.
     #[test]
     fn test_into_halves_and_independent_drop() {
-        let (host, ark) = duplex(4);
+        // Split both streams on a paused clock
+        let tester = test_clock();
+        let (host, ark) = duplex(4, &tester.clock());
         let (mut host_read, mut host_write) = host.set_write_timeout(Duration::ZERO).into_halves();
         let (mut ark_read, mut ark_write) = ark.into_halves();
 
+        // Drop one writer and let its peer drain to EOF
         host_write.write_all(b"abc").unwrap();
         drop(host_write);
         let mut bytes = Vec::new();
         ark_read.read_to_end(&mut bytes).unwrap();
         assert_eq!(&bytes, b"abc");
 
+        // Keep the opposite direction usable until its own reader drops
         ark_write.write_all(b"xy").unwrap();
         let mut reply = [0; 2];
         host_read.read_exact(&mut reply).unwrap();
@@ -597,15 +752,18 @@ mod tests {
         use crate::transport::mock::self_attestation;
         use darkbio_crypto::xdsa;
 
+        // Connect protocol peers on a paused clock
+        let tester = test_clock();
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
-        let (host, ark) = duplex(64 * 1024);
+        let (host, ark) = duplex(64 * 1024, &tester.clock());
         let mut server = protocol::Server::new(ark, signer, attestation);
         let (client, _) = protocol::connect(host, &identity).unwrap();
         let mut session = server.accept().unwrap();
+        // Exchange a payload larger than the bounded transport pipe
         let payload: Vec<u8> = (0..256 * 1024).map(|n| n as u8).collect();
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = tester.clock().now() + Duration::from_secs(5);
         let answer = client
             .requester()
             .request(payload.clone(), deadline)
@@ -615,6 +773,7 @@ mod tests {
         let written = responder.reply(message, deadline).unwrap();
         assert_eq!(answer.wait::<Vec<u8>>().unwrap(), payload);
         written.wait().unwrap();
+        // Release both protocol owners after delivery
         client.close();
         server.close();
     }

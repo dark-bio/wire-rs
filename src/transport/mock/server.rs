@@ -714,13 +714,14 @@ impl Server {
                 ark_signer: self.identity.public_key(),
                 ark_crypto: out.crypto.public_key(),
             };
-            let Ok(ack) = cose::open::<handshake::HostAck, _>(
+            let Ok(ack) = cose::open_at::<handshake::HostAck, _>(
                 packet,
                 &auth,
                 &out.crypto,
                 &out.host_signer,
                 CRYPTO_DOMAIN_WIRE,
                 None,
+                TIMESTAMP,
             ) else {
                 continue;
             };
@@ -890,6 +891,10 @@ struct Feed {
 }
 
 impl Read for Feed {
+    fn clock(&self) -> darkbio_clock::Clock {
+        self.server.lock().unwrap().outbox.clock.clone()
+    }
+
     fn set_read_deadline(&mut self, _deadline: Option<Instant>) -> io::Result<()> {
         Ok(())
     }
@@ -1056,10 +1061,11 @@ pub fn run(steps: &[Step]) -> Summary {
         super::random::reseed(scenario);
     }
 
+    let tester = crate::transport::testing::test_clock();
     let recorder = Recorder::default();
     let outbox = Outbox {
         recorder: recorder.clone(),
-        ..Outbox::default()
+        ..Outbox::new(&tester.clock())
     };
     let server = Arc::new(Mutex::new(Server::new(
         steps,

@@ -31,11 +31,15 @@ pub trait Verifier {
     /// Session info extracted from an accepted attestation.
     type Info;
 
-    /// Verifies the device attestation, returning the server's identity key along
-    /// with any info extracted from the attestation. Transport checks the
-    /// handshake signature against that key. Rejecting the attestation aborts
-    /// the handshake.
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String>;
+    /// Verifies the device attestation at `now`, the wall time of the stream's
+    /// clock. Returns the server's identity key along with any info extracted
+    /// from the attestation. Transport checks the handshake signature against
+    /// that key. Rejecting the attestation aborts the handshake.
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        now: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Self::Info), String>;
 }
 
 /// Authenticates the handshake against this pinned identity key. The presented
@@ -43,14 +47,19 @@ pub trait Verifier {
 impl Verifier for xdsa::PublicKey {
     type Info = Attestation;
 
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        _: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Self::Info), String> {
         Ok((self.clone(), attestation.clone()))
     }
 }
 
 /// Roots trusted to attest Arks. Hardware and emulator roots are checked
-/// separately, and attestations must be valid at the current time. Self-signed
-/// attestations from devices that have not been onboarded are rejected.
+/// separately, and attestations must be valid at the stream clock's wall
+/// time. Self-signed attestations from devices that have not been onboarded
+/// are rejected.
 #[derive(Debug)]
 pub struct Roots<'a> {
     /// Roots attesting hardware Arks.
@@ -62,12 +71,18 @@ pub struct Roots<'a> {
 impl Verifier for Roots<'_> {
     type Info = trust::device::Device;
 
-    fn verify(&self, attestation: &Attestation) -> Result<(xdsa::PublicKey, Self::Info), String> {
-        let now = SystemTime::now()
+    fn verify(
+        &self,
+        attestation: &Attestation,
+        now: SystemTime,
+    ) -> Result<(xdsa::PublicKey, Self::Info), String> {
+        // Convert the supplied wall time to the trust API's Unix seconds
+        let now = now
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_secs();
 
+        // Verify the attestation and return its identity with the claims
         let device = trust::device::verify(
             attestation.as_bytes(),
             self.hardware,
@@ -163,7 +178,7 @@ impl<R: Read, W: Write> Client<R, W> {
     /// fails, the client has no session and previously issued senders are invalid.
     pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
         // Compute the deadline by which the handshake must finish
-        let deadline = Instant::now() + self.handshake_timeout;
+        let deadline = self.outbound.clock.now() + self.handshake_timeout;
 
         // Generate ephemeral client keys for this session
         let host_xdsa_sk = xdsa::SecretKey::generate();
@@ -239,14 +254,21 @@ impl<R: Read, W: Write> Client<R, W> {
         // identity key and the caller's session info
         let attestation = Attestation::new(unverified.ark_attest)?;
         let (ark_identity, info) = verifier
-            .verify(&attestation)
+            .verify(&attestation, self.outbound.clock.system_time())
             .map_err(Error::HandshakeFailed)?;
 
         // Step 2d: Verify the COSE_Sign1 signature with the discovered identity
-        let ark_hello: handshake::ArkHello =
-            cose::verify(&sign1, &auth, &ark_identity, CRYPTO_DOMAIN_WIRE, None).map_err(
-                |err| Error::HandshakeFailed(format!("server hello signature invalid: {}", err)),
-            )?;
+        let ark_hello: handshake::ArkHello = cose::verify_at(
+            &sign1,
+            &auth,
+            &ark_identity,
+            CRYPTO_DOMAIN_WIRE,
+            None,
+            0, // unused without a drift check, so the clock is not read
+        )
+        .map_err(|err| {
+            Error::HandshakeFailed(format!("server hello signature invalid: {}", err))
+        })?;
 
         // Set up the server->Client receiver context
         let enc_a2h: [u8; xhpke::ENCAP_KEY_SIZE] = ark_hello
@@ -276,27 +298,18 @@ impl<R: Read, W: Write> Client<R, W> {
             ark_signer: ark_identity,
             ark_crypto: ark_xhpke_pk.clone(),
         };
-        let ack = match timestamp {
-            Some(timestamp) => cose::seal_at(
-                &ack,
-                &auth,
-                &host_xdsa_sk,
-                &ark_xhpke_pk,
-                CRYPTO_DOMAIN_WIRE,
-                timestamp,
-            ),
-            None => cose::seal(
-                &ack,
-                &auth,
-                &host_xdsa_sk,
-                &ark_xhpke_pk,
-                CRYPTO_DOMAIN_WIRE,
-            ),
-        }
+        let ack = cose::seal_at(
+            &ack,
+            &auth,
+            &host_xdsa_sk,
+            &ark_xhpke_pk,
+            CRYPTO_DOMAIN_WIRE,
+            timestamp.unwrap_or_else(|| handshake::timestamp(&self.outbound.clock)),
+        )
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
         self.outbound.send_packet(&ack, Some(deadline))?;
-        check_deadline(deadline).map_err(Error::RecvFailed)?;
+        check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
 
         // Session established, the ack ahead of anything sealed into it
         let sender = self.new_session(sender, receiver);
@@ -407,6 +420,13 @@ impl<R: Read, W: Write> Client<R, W> {
         self.sealer = None;
     }
 
+    /// Observes a handshake reaching writer acquisition behind an already admitted send.
+    #[cfg(any(test, feature = "fuzz"))]
+    pub(crate) fn watch_writer(&self) -> impl FnOnce() + use<R, W> {
+        let outbound = self.outbound.clone();
+        move || outbound.wait_writers(1)
+    }
+
     /// Runs a test handshake with fixed keys and signing time for vector replay.
     /// Not part of the normal transport API.
     #[doc(hidden)]
@@ -425,7 +445,7 @@ impl<R: Read, W: Write> Client<R, W> {
             host_xdsa_sk,
             host_xhpke_sk,
             Some(timestamp),
-            Instant::now() + self.handshake_timeout,
+            self.outbound.clock.now() + self.handshake_timeout,
         )
     }
 
@@ -505,12 +525,13 @@ mod tests {
     use crate::transport::framing::FrameWriter;
     use crate::transport::mock::{payload, self_attestation};
     use crate::transport::server::Server;
-    use crate::transport::testing::Memory;
+    use crate::transport::testing::{Memory, test_clock};
     use crate::{memory, testing};
+    use darkbio_clock::Clock;
     use std::io::{self, Read as _};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// A pair of contexts standing in for an established session.
     fn contexts() -> (xhpke::Sender, xhpke::Receiver) {
@@ -524,12 +545,18 @@ mod tests {
     /// the test releases it. This distinguishes finished writes from a fully
     /// completed send, which must also wait for its flush.
     struct BlockedFlush {
+        /// Clock shared with the client and its release gate.
+        clock: Clock,
         entered: Option<mpsc::Sender<()>>,
-        release: mpsc::Receiver<()>,
+        release: testing::Gate,
         deadline: Option<Instant>,
     }
 
     impl Write for BlockedFlush {
+        fn clock(&self) -> Clock {
+            self.clock.clone()
+        }
+
         fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
             self.deadline = Some(deadline);
             Ok(())
@@ -538,18 +565,19 @@ mod tests {
 
     impl io::Write for BlockedFlush {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            testing::remaining(self.deadline.expect("write deadline installed"))?;
+            testing::remaining(
+                &self.clock,
+                self.deadline.expect("write deadline installed"),
+            )?;
             Ok(bytes.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
             let deadline = self.deadline.expect("write deadline installed");
-            testing::remaining(deadline)?;
+            testing::remaining(&self.clock, deadline)?;
             if let Some(entered) = self.entered.take() {
                 entered.send(()).unwrap();
-                self.release
-                    .recv_timeout(testing::remaining(deadline)?)
-                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+                self.release.wait(Some(deadline))?;
             }
             Ok(())
         }
@@ -559,15 +587,18 @@ mod tests {
     // old sender is refused, and fresh contexts can use the still-open stream.
     #[test]
     fn test_end_waits_for_flush() {
+        // Hold the first send in a flush on the client's clock
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let (entered_tx, entered) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
+        let release = testing::Gate::new(&clock);
         let mut client = Client::new(Stream::new(
-            Memory::new(io::empty()),
+            Memory::new(io::empty(), &clock),
             BlockedFlush {
+                clock: clock.clone(),
                 entered: Some(entered_tx),
-                release: release_rx,
+                release: release.clone(),
                 deadline: None,
             },
             || {},
@@ -578,28 +609,34 @@ mod tests {
             let sender = sender.clone();
             thread::spawn(move || sender.send(&payload(1)))
         };
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv().unwrap();
 
+        // Attempt session ending while the flush remains parked
         let (started_tx, started) = mpsc::channel();
         let (ended_tx, ended) = mpsc::channel();
+        let outbound = client.outbound.clone();
         let ending = thread::spawn(move || {
             started_tx.send(()).unwrap();
             client.end_session();
             ended_tx.send(()).unwrap();
             client
         });
-        started.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = ended.recv_timeout(Duration::from_millis(50));
-        release.send(()).unwrap();
+        started.recv().unwrap();
+        tester.wait_blocked(1);
+        outbound.wait_writers(1);
+        assert!(ended.try_recv().is_err());
+
+        // Release output and require the old session to refuse further sends
+        release.open();
         sending.join().unwrap().unwrap();
         let mut client = ending.join().unwrap();
-        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
-        ended.recv_timeout(Duration::from_secs(5)).unwrap();
+        ended.recv().unwrap();
         assert!(matches!(
             sender.send(&payload(2)),
             Err(Error::EncryptionFailed(_))
         ));
 
+        // Establish fresh contexts on the still-open stream
         let (crypto, receiver) = contexts();
         let fresh = client.new_session(crypto, receiver);
         fresh.send(&payload(3)).unwrap();
@@ -614,37 +651,43 @@ mod tests {
     // would time out before the test releases that flush.
     #[test]
     fn test_recv_during_blocked_flush() {
+        // Prepare an encrypted incoming frame on a paused clock
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let (mut peer, receiver) = contexts();
         let packet = sealing::seal(&mut peer, &payload(1)).unwrap();
         let mut bytes = Vec::new();
-        FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
-            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT)
+        FrameWriter::new(Memory::new(&mut bytes, &clock), Closer::new(&clock, || {}))
+            .send_packet(&packet, clock.now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         let (entered_tx, entered) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
+        let release = testing::Gate::new(&clock);
         let mut client = Client::new(Stream::new(
-            Memory::new(io::Cursor::new(bytes)),
+            Memory::new(io::Cursor::new(bytes), &clock),
             BlockedFlush {
+                clock: clock.clone(),
                 entered: Some(entered_tx),
-                release: release_rx,
+                release: release.clone(),
                 deadline: None,
             },
             || {},
         ));
         let sender = client.new_session(contexts().0, receiver);
         let sending = thread::spawn(move || sender.send(&payload(2)));
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv().unwrap();
 
+        // Receive the message while the outgoing flush is parked
+        tester.wait_blocked(1);
         let (received_tx, received) = mpsc::channel();
         let receiving = thread::spawn(move || {
             received_tx.send(client.recv()).unwrap();
             client
         });
-        let result = received.recv_timeout(Duration::from_secs(5));
-        // Release the writer even on a timeout, so a failing test can unwind.
-        release.send(()).unwrap();
+        let result = received.recv();
+
+        // Release output only after receiving has completed
+        release.open();
         sending.join().unwrap().unwrap();
         let _client = receiving.join().unwrap();
         assert_eq!(result.unwrap().unwrap(), payload(1));
@@ -656,23 +699,26 @@ mod tests {
     // and outbound transport, modeled here by retaining those references.
     #[test]
     fn test_owner_drop() {
+        // Prepare a replacement session's incoming packet on a paused clock
         testing::init_tracing();
-
+        let tester = test_clock();
+        let clock = tester.clock();
         let (mut peer, receiver) = contexts();
         let packet = sealing::seal(&mut peer, &payload(2)).unwrap();
         let mut bytes = Vec::new();
-        FrameWriter::new(Memory::new(&mut bytes), Closer::new(|| {}))
-            .send_packet(&packet, Instant::now() + DEFAULT_WRITE_TIMEOUT)
+        FrameWriter::new(Memory::new(&mut bytes, &clock), Closer::new(&clock, || {}))
+            .send_packet(&packet, clock.now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         let mut client = Client::new(Stream::new(
-            Memory::new(&bytes[..]),
-            Memory::new(Vec::new()),
+            Memory::new(&bytes[..], &clock),
+            Memory::new(Vec::new(), &clock),
             || {},
         ));
         let (crypto, old_receiver) = contexts();
         let stale = client.new_session(crypto, old_receiver);
         let old_sealer = client.sealer.as_ref().unwrap().clone();
 
+        // End the old contexts without disturbing their replacement
         let fresh = client.new_session(contexts().0, receiver);
         client.outbound.end(&old_sealer);
         drop(old_sealer);
@@ -683,6 +729,7 @@ mod tests {
         assert_eq!(client.recv().unwrap(), payload(2));
         fresh.send(&payload(3)).unwrap();
 
+        // Drop the owner while retaining internal references to its session
         let outbound = client.outbound.clone();
         let sealer = client.sealer.as_ref().unwrap().clone();
         drop(client);
@@ -701,7 +748,8 @@ mod tests {
         testing::init_tracing();
 
         // Echo every request over a bounded in-memory stream, then hang up
-        let (host, ark_stream) = memory::duplex(64 * 1024);
+        let tester = test_clock();
+        let (host, ark_stream) = memory::duplex(64 * 1024, &tester.clock());
 
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
@@ -746,21 +794,24 @@ mod tests {
     // releases the transport writer even while sender handles remain.
     #[test]
     fn test_sender_outlives_client() {
+        // Send one packet before dropping the client owner
         testing::init_tracing();
-
-        let (mut reader, writer) = testing::pipe();
+        let tester = test_clock();
+        let clock = tester.clock();
+        let (mut reader, writer) = testing::pipe(&clock);
         let (sender, receiver) = contexts();
-        let mut client = Client::new(Stream::new(Memory::new(io::empty()), writer, || {}));
+        let mut client = Client::new(Stream::new(Memory::new(io::empty(), &clock), writer, || {}));
         let sender = client.new_session(sender, receiver);
         sender.send(&payload(1)).unwrap();
         drop(client);
 
+        // Refuse later sends and drain the closed writer to EOF
         let result = sender.send(&payload(2));
         assert!(matches!(result, Err(Error::Terminated)), "{result:?}");
         // The read only returns once the writer is gone
         let mut bytes = Vec::new();
         reader
-            .set_read_deadline(Some(Instant::now() + DEFAULT_WRITE_TIMEOUT))
+            .set_read_deadline(Some(clock.now() + DEFAULT_WRITE_TIMEOUT))
             .unwrap();
         reader.read_to_end(&mut bytes).unwrap();
         assert!(!bytes.is_empty());

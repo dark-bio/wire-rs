@@ -897,9 +897,15 @@ impl Client {
         };
         let sign1 = cose::decrypt(&unframe(frame), &auth, &keys.crypto, CRYPTO_DOMAIN_WIRE)
             .expect("server hello failed to decrypt");
-        let hello: handshake::ArkHello =
-            cose::verify(&sign1, &auth, &self.identity, CRYPTO_DOMAIN_WIRE, None)
-                .expect("server hello signature invalid");
+        let hello: handshake::ArkHello = cose::verify_at(
+            &sign1,
+            &auth,
+            &self.identity,
+            CRYPTO_DOMAIN_WIRE,
+            None,
+            TIMESTAMP,
+        )
+        .expect("server hello signature invalid");
         let encap: [u8; xhpke::ENCAP_KEY_SIZE] = hello
             .a2h_encap
             .try_into()
@@ -922,6 +928,10 @@ impl Client {
 struct Feed(Arc<Mutex<Client>>);
 
 impl Read for Feed {
+    fn clock(&self) -> darkbio_clock::Clock {
+        self.0.lock().unwrap().outbox.clock.clone()
+    }
+
     fn set_read_deadline(&mut self, _deadline: Option<Instant>) -> io::Result<()> {
         // Every read completes immediately according to the script.
         Ok(())
@@ -1042,7 +1052,8 @@ pub fn run(steps: &[Step]) -> Summary {
 
     let signer = xdsa::SecretKey::generate();
     let attestation = self_attestation(&signer);
-    let outbox = Outbox::default();
+    let tester = crate::transport::testing::test_clock();
+    let outbox = Outbox::new(&tester.clock());
     let client = Arc::new(Mutex::new(Client::new(
         steps,
         signer.public_key(),

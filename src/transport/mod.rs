@@ -31,6 +31,10 @@ mod sender;
 mod server;
 mod stream;
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod clock_tests;
+
 #[cfg(any(test, feature = "fuzz"))]
 #[doc(hidden)]
 #[cfg_attr(coverage_nightly, coverage(off))]

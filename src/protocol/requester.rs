@@ -8,6 +8,7 @@
 
 use super::session::SessionInner;
 use super::{Error, Message, Promise};
+use darkbio_clock::Clock;
 use std::sync::Weak;
 use std::time::Instant;
 
@@ -16,11 +17,19 @@ use std::time::Instant;
 /// requester does not close the session or cancel operations it already submitted.
 #[derive(Clone, Debug)]
 pub struct Requester {
+    /// Clock of the session, kept here so it outlives the session.
+    clock: Clock,
     /// Session that created this requester, even after a replacement connects.
     session: Weak<SessionInner>,
 }
 
 impl Requester {
+    /// Returns the clock of this requester's session, which request deadlines are
+    /// measured on. It stays available after the session is gone.
+    pub fn clock(&self) -> Clock {
+        self.clock.clone()
+    }
+
     /// Queues a request and returns its promise without waiting for the writer or
     /// a reply. A closed session returns an error immediately; errors after queueing
     /// are returned through the promise. The outgoing queue has no capacity limit.
@@ -44,8 +53,11 @@ impl Requester {
     }
 
     /// Creates a requester from a weak reference to its session.
-    pub(super) fn new(session: Weak<SessionInner>) -> Self {
-        Self { session }
+    pub(super) fn new(session: Weak<SessionInner>, clock: &Clock) -> Self {
+        Self {
+            session,
+            clock: clock.clone(),
+        }
     }
 }
 

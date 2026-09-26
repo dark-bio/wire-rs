@@ -93,7 +93,7 @@ impl<R: Read> FrameReader<R> {
     fn next_frame(&mut self, deadline: Option<Instant>) -> Result<Range<usize>, Error> {
         'outer: loop {
             if let Some(deadline) = deadline {
-                check_deadline(deadline).map_err(Error::RecvFailed)?;
+                check_deadline(&self.reader.inner.clock(), deadline).map_err(Error::RecvFailed)?;
             }
             // Search for the frame delimiter, starting from where we left off
             if let Some(found) = memchr::memchr(0, &self.buffer[self.search..self.filled]) {
@@ -250,7 +250,7 @@ impl<W: Write> FrameWriter<W> {
 
         // Fail the frame if output finished late. Individual writes must still
         // report accepted bytes even when they return after the deadline.
-        let result = check_deadline(deadline).and(result);
+        let result = check_deadline(&self.writer.inner.clock(), deadline).and(result);
 
         // The next send needs a recovery delimiter if this one failed.
         self.resync = result.is_err();
@@ -275,7 +275,8 @@ mod tests {
     use super::*;
     use crate::testing;
     use crate::transport::DEFAULT_WRITE_TIMEOUT;
-    use crate::transport::testing::Memory;
+    use crate::transport::testing::{Memory, test_clock};
+    use darkbio_clock::Clock;
     use std::collections::VecDeque;
     use std::io::{self, Cursor};
     use std::panic::{self, AssertUnwindSafe};
@@ -285,10 +286,17 @@ mod tests {
     // read. A new attempt must still find that exact frame.
     #[test]
     fn test_deadline_preserves_buffered_frames() {
-        let mut reader = FrameReader::new(Memory::new(&[2, 1, 0, 2, 2, 0][..]), Closer::new(|| {}));
+        // Buffer two frames on a paused clock and consume the first
+        let tester = test_clock();
+        let clock = tester.clock();
+        let mut reader = FrameReader::new(
+            Memory::new(&[2, 1, 0, 2, 2, 0][..], &clock),
+            Closer::new(&clock, || {}),
+        );
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[1][..]));
+        // Reject the expired attempt without consuming the second frame
         assert!(matches!(
-            reader.next_packet(Some(Instant::now())),
+            reader.next_packet(Some(clock.now())),
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::TimedOut
         ));
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[2][..]));
@@ -298,12 +306,19 @@ mod tests {
     // expires. Exercise both a partial frame and a complete buffered frame.
     #[test]
     fn test_deadline_preserves_late_read_bytes() {
+        /// Delivers the first frame prefix after sleeping to its clock deadline.
         struct LateReader {
+            /// Clock governing the delayed read.
+            clock: Clock,
             input: Cursor<Vec<u8>>,
             first: Option<usize>,
             deadline: Option<Instant>,
         }
         impl Read for LateReader {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
                 self.deadline = deadline;
                 Ok(())
@@ -312,11 +327,7 @@ mod tests {
         impl io::Read for LateReader {
             fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
                 let len = if let Some(len) = self.first.take() {
-                    std::thread::sleep(
-                        self.deadline
-                            .unwrap()
-                            .saturating_duration_since(Instant::now()),
-                    );
+                    self.clock.sleep_until(self.deadline.unwrap());
                     len.min(bytes.len())
                 } else {
                     bytes.len()
@@ -325,16 +336,28 @@ mod tests {
             }
         }
         for first in [1, 3] {
+            // Start a read that returns bytes only after its deadline
+            let mut tester = test_clock();
+            let clock = tester.clock();
+            let deadline = clock.now() + Duration::from_millis(20);
             let mut reader = FrameReader::new(
                 LateReader {
+                    clock: clock.clone(),
                     input: Cursor::new(vec![2, 42, 0]),
                     first: Some(first),
                     deadline: None,
                 },
-                Closer::new(|| {}),
+                Closer::new(&clock, || {}),
             );
-            assert!(matches!(
-                reader.next_packet(Some(Instant::now() + Duration::from_millis(20))),
+            let result = std::thread::scope(|scope| {
+                let reading = scope.spawn(|| reader.next_packet(Some(deadline)).map(|_| ()));
+                tester.wait_blocked(1);
+                tester.advance_to(deadline);
+                reading.join().unwrap()
+            });
+
+            // Preserve the late bytes for a new attempt
+            assert!(matches!(result,
                 Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::TimedOut
             ));
             assert_eq!(reader.next_packet(None).unwrap(), Some(&[42][..]));
@@ -345,15 +368,22 @@ mod tests {
     // its eventual delimiter must not turn into a reset in the next attempt.
     #[test]
     fn test_deadline_preserves_oversized_discard() {
+        // Reject an oversized prefix on a paused clock
+        let tester = test_clock();
+        let clock = tester.clock();
         let mut input = vec![1; MAX_FRAME_SIZE + 1];
         input.extend_from_slice(&[1, 0, 2, 42, 0]);
-        let mut reader = FrameReader::new(Memory::new(Cursor::new(input)), Closer::new(|| {}));
+        let mut reader = FrameReader::new(
+            Memory::new(Cursor::new(input), &clock),
+            Closer::new(&clock, || {}),
+        );
         assert!(matches!(
             reader.next_packet(None),
             Err(Error::FrameTooLarge(_))
         ));
+        // Keep discarding across expiry until the original delimiter arrives
         assert!(matches!(
-            reader.next_packet(Some(Instant::now())),
+            reader.next_packet(Some(clock.now())),
             Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::TimedOut
         ));
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[42][..]));
@@ -362,10 +392,17 @@ mod tests {
     // Closing leaves complete buffered frames readable, then reports EOF.
     #[test]
     fn test_close_drains_buffered_frames() {
-        let closer = Closer::new(|| {});
-        let mut reader =
-            FrameReader::new(Memory::new(&[0x02, 1, 0, 0x02, 2, 0][..]), closer.clone());
+        // Read one frame while leaving another buffered
+        let tester = test_clock();
+        let clock = tester.clock();
+        let closer = Closer::new(&clock, || {});
+        let mut reader = FrameReader::new(
+            Memory::new(&[0x02, 1, 0, 0x02, 2, 0][..], &clock),
+            closer.clone(),
+        );
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[1][..]));
+
+        // Drain the buffered frame after closure before reporting EOF
         closer.close();
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[2][..]));
         assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
@@ -374,7 +411,10 @@ mod tests {
     // Tests decoding empty packets, embedded zeros and COBS length boundaries.
     #[test]
     fn test_next_packet() {
+        // Define framing boundaries on a paused clock
         testing::init_tracing();
+        let tester = test_clock();
+        let clock = tester.clock();
 
         /// Input and expected result for one framing boundary case.
         struct TestCase {
@@ -421,9 +461,12 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
+            // Decode each packet and compare it with the independent wire fixture
             let mut host_to_wire = Cursor::new(tt.input);
-
-            let mut framing = FrameReader::new(Memory::new(&mut host_to_wire), Closer::new(|| {}));
+            let mut framing = FrameReader::new(
+                Memory::new(&mut host_to_wire, &clock),
+                Closer::new(&clock, || {}),
+            );
             match tt.expected {
                 Some(expected) => {
                     let packet = framing
@@ -447,7 +490,10 @@ mod tests {
     // Packets that cannot fit the frame buffer must be refused before output.
     #[test]
     fn test_send_packet() {
+        // Define encoding boundaries on a paused clock
         testing::init_tracing();
+        let tester = test_clock();
+        let clock = tester.clock();
 
         /// Input and expected result for one framing boundary case.
         struct TestCase {
@@ -498,13 +544,16 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
+            // Encode each packet within a fixed clock deadline
             let mut wire_to_host = Cursor::new(Vec::<u8>::new());
-
-            let mut framing = FrameWriter::new(Memory::new(&mut wire_to_host), Closer::new(|| {}));
+            let mut framing = FrameWriter::new(
+                Memory::new(&mut wire_to_host, &clock),
+                Closer::new(&clock, || {}),
+            );
             match tt.expected {
                 Some(expected) => {
                     framing
-                        .send_packet(&tt.input, Instant::now() + DEFAULT_WRITE_TIMEOUT)
+                        .send_packet(&tt.input, clock.now() + DEFAULT_WRITE_TIMEOUT)
                         .unwrap();
 
                     let written = &wire_to_host.get_ref()[..];
@@ -512,7 +561,7 @@ mod tests {
                 }
                 None => {
                     let result =
-                        framing.send_packet(&tt.input, Instant::now() + DEFAULT_WRITE_TIMEOUT);
+                        framing.send_packet(&tt.input, clock.now() + DEFAULT_WRITE_TIMEOUT);
                     assert!(
                         matches!(result, Err(Error::FrameTooLarge(_))),
                         "test {i}: {result:?}"
@@ -526,7 +575,10 @@ mod tests {
     // Tests reading empty, small and maximum-sized frames from the byte stream.
     #[test]
     fn test_next_frame() {
+        // Define raw frame boundaries on a paused clock
         testing::init_tracing();
+        let tester = test_clock();
+        let clock = tester.clock();
 
         /// Raw input and the frame it must deliver, including the size boundary.
         struct TestCase {
@@ -554,9 +606,12 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
+            // Read the entire delimited frame through the memory adapter
             let mut host_to_wire = Cursor::new(tt.input);
-
-            let mut framing = FrameReader::new(Memory::new(&mut host_to_wire), Closer::new(|| {}));
+            let mut framing = FrameReader::new(
+                Memory::new(&mut host_to_wire, &clock),
+                Closer::new(&clock, || {}),
+            );
             let frame = framing.next_frame_blob().unwrap();
             assert_eq!(frame, tt.expected, "test {i}");
         }
@@ -567,12 +622,19 @@ mod tests {
     // separate reset survive. A preceding frame also exercises buffer compaction.
     #[test]
     fn test_next_frame_oversized() {
+        // Surround oversized frames with valid frames and resets
+        let tester = test_clock();
+        let clock = tester.clock();
         let mut input = b"before\0".to_vec();
         for size in [MAX_FRAME_SIZE + 1, 2 * MAX_FRAME_SIZE + 15] {
             input.extend(std::iter::repeat_n(b'a', size));
             input.extend_from_slice(b"\0after\0\0");
         }
-        let mut framing = FrameReader::new(Memory::new(Cursor::new(input)), Closer::new(|| {}));
+        let mut framing = FrameReader::new(
+            Memory::new(Cursor::new(input), &clock),
+            Closer::new(&clock, || {}),
+        );
+        // Report each oversized frame once and preserve its successors
         assert_eq!(framing.next_frame_blob().unwrap(), b"before");
         for _ in 0..2 {
             assert!(matches!(
@@ -590,7 +652,10 @@ mod tests {
     // Overflow must be reported before another read, even without a delimiter.
     #[test]
     fn test_next_frame_discard_resumes() {
+        // Define interrupted discard cases on a paused clock
         testing::init_tracing();
+        let tester = test_clock();
+        let clock = tester.clock();
 
         /// Reader handing out one mock result per read.
         struct Mock(VecDeque<io::Result<Vec<u8>>>);
@@ -639,8 +704,10 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
-            let mut framing =
-                FrameReader::new(Memory::new(Mock(tt.reads.into())), Closer::new(|| {}));
+            let mut framing = FrameReader::new(
+                Memory::new(Mock(tt.reads.into()), &clock),
+                Closer::new(&clock, || {}),
+            );
             assert!(matches!(
                 framing.next_frame_blob(),
                 Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
@@ -663,7 +730,10 @@ mod tests {
             Ok(Vec::new()),
             Ok(b"tail\0foo\0".to_vec()),
         ];
-        let mut framing = FrameReader::new(Memory::new(Mock(reads.into())), Closer::new(|| {}));
+        let mut framing = FrameReader::new(
+            Memory::new(Mock(reads.into()), &clock),
+            Closer::new(&clock, || {}),
+        );
         assert!(matches!(
             framing.next_frame_blob(),
             Err(Error::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1
@@ -676,7 +746,10 @@ mod tests {
     // including a maximum-sized frame that fills the entire combined buffer.
     #[test]
     fn test_send_frame() {
+        // Define raw output boundaries on a paused clock
         testing::init_tracing();
+        let tester = test_clock();
+        let clock = tester.clock();
 
         /// Input and expected result for one framing boundary case.
         struct TestCase {
@@ -706,11 +779,13 @@ mod tests {
         for (i, tt) in tests.into_iter().enumerate() {
             for resync in [false, true] {
                 let mut wire_to_host = Vec::new();
-                let mut framing =
-                    FrameWriter::new(Memory::new(&mut wire_to_host), Closer::new(|| {}));
+                let mut framing = FrameWriter::new(
+                    Memory::new(&mut wire_to_host, &clock),
+                    Closer::new(&clock, || {}),
+                );
                 framing.resync = resync;
                 framing
-                    .send_frame_blob(tt.input, Instant::now() + DEFAULT_WRITE_TIMEOUT)
+                    .send_frame_blob(tt.input, clock.now() + DEFAULT_WRITE_TIMEOUT)
                     .unwrap();
 
                 let mut expected = Vec::new();
@@ -730,12 +805,18 @@ mod tests {
         /// Collects bytes and delays one flush until its deadline has elapsed,
         /// modeling a successful adapter call whose return was scheduled late.
         struct LateFlush {
+            /// Clock governing the delayed flush.
+            clock: Clock,
             bytes: Vec<u8>,
             deadline: Option<Instant>,
             delay: bool,
         }
 
         impl Write for LateFlush {
+            fn clock(&self) -> Clock {
+                self.clock.clone()
+            }
+
             fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
                 self.deadline = Some(deadline);
                 Ok(())
@@ -750,28 +831,39 @@ mod tests {
             fn flush(&mut self) -> io::Result<()> {
                 if std::mem::take(&mut self.delay) {
                     let deadline = self.deadline.expect("deadline installed");
-                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    self.clock.sleep_until(deadline);
                 }
                 Ok(())
             }
         }
 
+        // Park a flush until its frame deadline on the paused clock
+        let mut tester = test_clock();
+        let clock = tester.clock();
         let mut framing = FrameWriter::new(
             LateFlush {
+                clock: clock.clone(),
                 bytes: Vec::new(),
                 deadline: None,
                 delay: true,
             },
-            Closer::new(|| {}),
+            Closer::new(&clock, || {}),
         );
-        let result = framing.send_frame_blob(b"old", Instant::now() + Duration::from_millis(100));
+        let deadline = clock.now() + Duration::from_millis(100);
+        let result = std::thread::scope(|scope| {
+            let writing = scope.spawn(|| framing.send_frame_blob(b"old", deadline));
+            tester.wait_blocked(1);
+            tester.advance_to(deadline);
+            writing.join().unwrap()
+        });
         assert!(
             matches!(result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut)
         );
         assert_eq!(framing.writer.inner.bytes, b"old\0");
 
+        // Resynchronize the next send with a fresh deadline
         framing
-            .send_frame_blob(b"new", Instant::now() + DEFAULT_WRITE_TIMEOUT)
+            .send_frame_blob(b"new", clock.now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         assert_eq!(framing.writer.inner.bytes, b"old\0\0new\0");
     }
@@ -781,7 +873,10 @@ mod tests {
     // Reusing a complete transport after a panic is not supported.
     #[test]
     fn test_send_panic() {
+        // Prepare a writer that panics once on a paused clock
         testing::init_tracing();
+        let tester = test_clock();
+        let clock = tester.clock();
 
         /// Writer panicking on its first write and collecting the ones after.
         struct Panicky {
@@ -803,19 +898,23 @@ mod tests {
             }
         }
         let mut framing = FrameWriter::new(
-            Memory::new(Panicky {
-                armed: true,
-                written: Vec::new(),
-            }),
-            Closer::new(|| {}),
+            Memory::new(
+                Panicky {
+                    armed: true,
+                    written: Vec::new(),
+                },
+                &clock,
+            ),
+            Closer::new(&clock, || {}),
         );
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            framing.send_packet(&[1, 2, 3], Instant::now() + DEFAULT_WRITE_TIMEOUT)
+            framing.send_packet(&[1, 2, 3], clock.now() + DEFAULT_WRITE_TIMEOUT)
         }));
         assert!(result.is_err());
 
+        // Require a recovery delimiter when the isolated framer is reused
         framing
-            .send_packet(&[1, 2, 3], Instant::now() + DEFAULT_WRITE_TIMEOUT)
+            .send_packet(&[1, 2, 3], clock.now() + DEFAULT_WRITE_TIMEOUT)
             .unwrap();
         assert_eq!(
             framing.writer.inner.inner.written,
