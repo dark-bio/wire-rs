@@ -770,10 +770,11 @@ pub fn run(scenario: Scenario) {
                 peers.client.send_frame_blob(&[]).unwrap();
             }
             assert!(matches!(peers.event(), Event::Disconnected));
+            // Check the deadline the server installs on its pipe. Taking the ACK's
+            // fault notifies the pipe, and the clock unlists a wait while it wakes.
             peers.outgoing.wait_blocked(Operation::Read);
-            peers.tester.wait_blocked(1);
             assert_eq!(
-                peers.tester.next_deadline(),
+                peers.outgoing.state.lock().unwrap().read_deadline,
                 Some(started + HANDSHAKE_TIMEOUT)
             );
             peers.tester.advance_to(started + HANDSHAKE_TIMEOUT);
