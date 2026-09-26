@@ -394,9 +394,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-clock"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6dfe007aaf937583067b54de578e3879bd5caaa509fd51c78d91d32f9bf3adf"
+checksum = "b5722bbf6e80f8681f36b6d0f0e6f5c81ba719fe6e7773b6e66ef8ba9d8e8c62"
 dependencies = [
  "crossbeam-channel",
 ]
