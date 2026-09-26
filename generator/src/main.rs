@@ -59,8 +59,8 @@ fn main() {
         )
         .unwrap();
         for field in &message.field {
-            // The reader tells unknown content from the envelope's own fields by
-            // their tag range, so the layout is enforced here
+            // The reader distinguishes unknown content from the envelope's own
+            // fields by their tag range, so the layout is enforced here
             let content = field.oneof_index == Some(oneof as i32);
             assert_eq!(
                 field.number() >= 0x100,
