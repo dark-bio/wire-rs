@@ -5,11 +5,13 @@
 // license that can be found in the LICENSE file.
 
 //! Deterministic randomness for vector generation and fuzzing.
-//! With getrandom's custom backend selected, random draws, including crypto,
-//! use a separate ChaCha20 stream on each thread. The recorder reseeds from
-//! the scenario name; fuzzers reseed for each input. This makes random values
-//! repeatable when the sequence of draws on each thread stays the same.
-//! Thread scheduling and timing can still vary between runs.
+//!
+//! With getrandom's custom backend selected, every draw through that backend,
+//! the crypto's included, uses a separate ChaCha20 stream on each thread. The
+//! vector recorder reseeds from the scenario name, and fuzz targets that draw
+//! randomness reseed for each input. Random values repeat when the sequence of
+//! draws on each thread stays the same. Thread scheduling and timing can still
+//! vary between runs.
 
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
@@ -38,6 +40,9 @@ pub unsafe extern "Rust" fn __getrandom_v03_custom(
     dest: *mut u8,
     len: usize,
 ) -> Result<(), getrandom::Error> {
+    // The caller hands over `len` writable bytes that no other pointer
+    // accesses during this call. They may be uninitialized, which the slice
+    // constructor formally forbids, even though the stream only writes them.
     let buf = unsafe { std::slice::from_raw_parts_mut(dest, len) };
     STREAM.with(|stream| stream.borrow_mut().fill_bytes(buf));
     Ok(())

@@ -4,6 +4,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Client side of the transport, with the trust policies that check the
+//! server's device attestation.
+
 use crate::LogId;
 use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
@@ -24,7 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
-/// Trust policy for the device attestation presented during a handshake.
+/// Trust policy for the device attestation that a server presents during a
+/// handshake.
+///
 /// The caller decides which roots to trust and whether to allow self-signed
 /// attestations or recovery overrides. Transport enforces that decision.
 pub trait Verifier {
@@ -32,9 +37,11 @@ pub trait Verifier {
     type Info;
 
     /// Verifies the device attestation at `now`, the wall time of the stream's
-    /// clock. Returns the server's identity key along with any info extracted
-    /// from the attestation. Transport checks the handshake signature against
-    /// that key. Rejecting the attestation aborts the handshake.
+    /// clock.
+    ///
+    /// Returns the server's identity key along with any info extracted from
+    /// the attestation. Transport checks the handshake signature against that
+    /// key. Rejecting the attestation aborts the handshake.
     fn verify(
         &self,
         attestation: &Attestation,
@@ -42,8 +49,10 @@ pub trait Verifier {
     ) -> Result<(xdsa::PublicKey, Self::Info), String>;
 }
 
-/// Authenticates the handshake against this pinned identity key. The presented
-/// attestation is returned unchanged, without checking who issued it.
+/// Authenticates the handshake against this pinned identity key.
+///
+/// The presented attestation is returned unchanged, without checking who
+/// issued it.
 impl Verifier for xdsa::PublicKey {
     type Info = Attestation;
 
@@ -56,10 +65,11 @@ impl Verifier for xdsa::PublicKey {
     }
 }
 
-/// Roots trusted to attest Arks. Hardware and emulator roots are checked
-/// separately, and attestations must be valid at the stream clock's wall
-/// time. Self-signed attestations from devices that have not been onboarded
-/// are rejected.
+/// Roots trusted to attest Arks.
+///
+/// Hardware and emulator roots are checked separately, and attestations must
+/// be valid at the stream clock's wall time. Self-signed attestations from
+/// devices that have not been onboarded are rejected.
 #[derive(Debug)]
 pub struct Roots<'a> {
     /// Roots attesting hardware Arks.
@@ -93,31 +103,42 @@ impl Verifier for Roots<'_> {
         Ok((device.identity.clone(), device))
     }
 }
+
 /// Client side of the wire, exchanging encrypted messages over a byte stream.
-/// [`Client::connect`] sends a reset and runs the handshake. It returns a
-/// [`Sender`] for outbound messages. [`Client::recv`] decrypts inbound messages.
 ///
-/// An empty frame from the server means it has no session with the client anymore.
-/// The client ends its session and returns [`Error::SessionReset`]. The caller
-/// can then reconnect.
+/// [`Client::connect`] sends a reset and runs the handshake, returning a
+/// [`Sender`] for outbound messages. [`Client::recv`] decrypts inbound
+/// messages.
+///
+/// An empty frame from the server means it holds no session with this client.
+/// [`Client::recv`] then ends the client's session and returns
+/// [`Error::SessionReset`], after which the caller can reconnect.
 ///
 /// Transport checks the shape of the device attestation. A [`Verifier`] decides
 /// whether to trust the server presenting it.
 pub struct Client<R: Read, W: Write> {
-    handshake_timeout: Duration, // Budget for each new handshake attempt
+    /// Budget for each new handshake attempt.
+    handshake_timeout: Duration,
 
-    reader: FrameReader<R>, // COBS framed transport for ingress data
-    receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this client
-    sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
-    outbound: Arc<Outbound<W>>, // Outgoing transport, shared with the senders
-    log_id: LogId,          // Label of the current session in log lines, unset before the first
+    /// COBS frame reader for the data the server sends.
+    reader: FrameReader<R>,
+    /// Receive context of the current session, used only by this client.
+    receiver: Option<xhpke::Receiver>,
+    /// Send context of the current session, shared with active sends.
+    sealer: Option<Arc<Mutex<xhpke::Sender>>>,
+    /// Outgoing transport, which the senders reach through weak references.
+    outbound: Arc<Outbound<W>>,
+    /// Label of the latest session in log lines, zero before the first one.
+    log_id: LogId,
 }
 
 impl<R: Read, W: Write> Client<R, W> {
-    /// Creates a client owning the byte stream and its shutdown operation, without
-    /// an encrypted session. Call [`Client::connect`] to establish one.
-    /// Output uses the stream's configured write timeout; its adapter must
-    /// enforce deadlines and the shutdown cancellation contract.
+    /// Creates a client that owns the byte stream and its shutdown operation,
+    /// without an encrypted session.
+    ///
+    /// Call [`Client::connect`] to establish one. Output uses the stream's
+    /// configured write timeout. The stream's [`Read`] and [`Write`] adapters
+    /// must enforce deadlines and let shutdown cancel blocked I/O.
     pub fn new(stream: Stream<R, W>) -> Self {
         let (reader, writer, close, timeout) = stream.into_parts();
 
@@ -133,11 +154,13 @@ impl<R: Read, W: Write> Client<R, W> {
         }
     }
 
-    /// Sets the budget for each subsequent handshake, starting when connect is
-    /// called. Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]. Output and peer replies
-    /// share one deadline; progress and stale frames do not refresh it. Each
-    /// outgoing frame is also limited by the stream's write timeout. Waiting for
-    /// locks and verifier callbacks can extend the call beyond the deadline.
+    /// Sets the budget for each later handshake, counted from the call to
+    /// [`Client::connect`].
+    ///
+    /// Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]. Output and peer replies share
+    /// one deadline; progress and stale frames do not refresh it. Each outgoing
+    /// frame is also limited by the stream's write timeout. Waiting for locks
+    /// and verifier callbacks can extend the call beyond the deadline.
     ///
     /// Zero expires attempts immediately. A duration too large to add to an
     /// [`Instant`] panics when the next handshake's deadline is constructed.
@@ -146,24 +169,29 @@ impl<R: Read, W: Write> Client<R, W> {
         self
     }
 
-    /// A handle that permanently closes the stream from another thread.
+    /// Returns a handle that permanently closes the stream from another thread.
     pub fn closer(&self) -> Closer {
         self.outbound.closer()
     }
 
-    /// Permanently closes the stream and waits for adapter shutdown. Senders
-    /// observe closure through write failure; buffered messages remain readable.
-    /// See [`Closer::close`].
+    /// Permanently closes the stream and waits for adapter shutdown.
+    ///
+    /// Senders observe closure through write failure, and buffered messages
+    /// remain readable. See [`Closer::close`].
     pub fn close(&self) {
         self.outbound.close();
     }
 
-    /// Establishes an encrypted session over the supplied stream, ending any
-    /// previous session first. Sends a reset and drives the handshake:
+    /// Establishes an encrypted session over the stream, ending any previous
+    /// session first.
     ///
-    ///   1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
-    ///   2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
-    ///   3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
+    /// Sends a reset and drives the handshake:
+    ///
+    /// ```text
+    /// 1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
+    /// 2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
+    /// 3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
+    /// ```
     ///
     /// The verifier receives the server's device attestation. Its accepted info
     /// is returned alongside the new sender. That sender belongs to this session
@@ -174,8 +202,15 @@ impl<R: Read, W: Write> Client<R, W> {
     /// to progress. Backpressure can instead fail an outgoing frame on timeout.
     ///
     /// The handshake uses one configured deadline, shared by output and peer
-    /// waits. Existing writer-lock cleanup may extend the call. If connecting
-    /// fails, the client has no session and previously issued senders are invalid.
+    /// waits. Waiting for writes already in flight may extend the call. If
+    /// connecting fails, the client has no session and every sender it issued
+    /// before is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handshake or write timeout is too large to add to an
+    /// [`Instant`], or if signing reads a wall time before the Unix epoch from
+    /// the stream's clock.
     pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
         // Compute the deadline by which the handshake must finish
         let deadline = self.outbound.clock.now() + self.handshake_timeout;
@@ -188,8 +223,10 @@ impl<R: Read, W: Write> Client<R, W> {
     }
 
     /// Ends any previous session, sends a reset and drives the handshake with the
-    /// given ephemeral keys. Returns the new session's sender and verified info.
-    /// The optional signing time makes the exchange deterministic for test vectors.
+    /// given ephemeral keys.
+    ///
+    /// Returns the new session's sender and verified info. The optional signing
+    /// time makes the exchange deterministic for test vectors.
     fn handshake<V: Verifier>(
         &mut self,
         verifier: &V,
@@ -198,11 +235,12 @@ impl<R: Read, W: Write> Client<R, W> {
         timestamp: Option<i64>,
         deadline: Instant,
     ) -> Result<(Sender<W>, V::Info), Error> {
+        // Derive the public halves of this attempt's keys
         let host_xdsa_pk = host_xdsa_sk.public_key();
         let host_xhpke_pk = host_xhpke_sk.public_key();
         debug!("starting wire handshake");
 
-        // Message 1: Send HostHello (plain CBOR, COBS-framed)
+        // Message 1: Encode the HostHello as plain CBOR
         let hello = cbor::encode(&handshake::HostHello {
             host_signer: host_xdsa_pk.clone(),
             host_crypto: host_xhpke_pk.clone(),
@@ -212,8 +250,8 @@ impl<R: Read, W: Write> Client<R, W> {
             Error::HandshakeFailed(format!("failed to encode client hello: {}", err))
         })?;
 
-        // Retire the old binding and serialize reset/hello after admitted sends.
-        // The client starts reading only once this output has finished.
+        // Retire the old binding and send the reset and hello after admitted
+        // sends. The client starts reading only once this output has finished.
         self.receiver = None;
         self.sealer = None;
         self.outbound.send_reset(deadline)?;
@@ -270,19 +308,18 @@ impl<R: Read, W: Write> Client<R, W> {
             Error::HandshakeFailed(format!("server hello signature invalid: {}", err))
         })?;
 
-        // Set up the server->Client receiver context
+        // Set up the server-to-client receive context
         let enc_a2h: [u8; xhpke::ENCAP_KEY_SIZE] = ark_hello
             .a2h_encap
             .try_into()
             .map_err(|_| Error::HandshakeFailed("invalid a2h_encap size".into()))?;
-
         let receiver = host_xhpke_sk
             .new_receiver(&enc_a2h, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST)
             .map_err(|err| {
                 Error::HandshakeFailed(format!("client receiver setup failed: {}", err))
             })?;
 
-        // Set up the Client->server sender context
+        // Set up the client-to-server send context
         let ark_xhpke_pk = ark_hello.ark_crypto;
         let (sender, enc_h2a) = ark_xhpke_pk
             .new_sender(CRYPTO_DOMAIN_WIRE_HOST_TO_ARK)
@@ -290,7 +327,7 @@ impl<R: Read, W: Write> Client<R, W> {
                 Error::HandshakeFailed(format!("client sender setup failed: {}", err))
             })?;
 
-        // Message 3: Send HostAck (COSE seal'd, COBS-framed)
+        // Message 3: Seal the HostAck
         let ack = handshake::HostAck {
             h2a_encap: enc_h2a.to_vec(),
         };
@@ -308,6 +345,7 @@ impl<R: Read, W: Write> Client<R, W> {
         )
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
+        // Send the ack, failing an attempt that finished past its deadline
         self.outbound.send_packet(&ack, Some(deadline))?;
         check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
 
@@ -321,13 +359,15 @@ impl<R: Read, W: Write> Client<R, W> {
         Ok((sender, info))
     }
 
-    /// Reads and decrypts the next ark-to-host message. Invalid or oversized
-    /// frames end the session because its encryption sequence may be lost.
-    /// Decryption failures also end the session.
-    /// An empty frame means the server dropped the session and ends it here too.
-    /// Adapter read failures and EOF also end the session. Idle read timeouts are
-    /// retried internally. Call [`Self::connect`] to establish a new session after failure.
-    /// Without a receive context, returns an error without reading the stream.
+    /// Reads and decrypts the next ark-to-host message.
+    ///
+    /// Invalid or oversized frames end the session, since its encryption
+    /// sequence may be lost. Decryption failures also end the session. An empty
+    /// frame means the server dropped the session, which ends here too with
+    /// [`Error::SessionReset`]. Adapter read failures and EOF also end the
+    /// session, while idle read timeouts are retried internally. Call
+    /// [`Self::connect`] to establish a new session after a failure. Without a
+    /// session, returns an error without reading the stream.
     ///
     /// After decryption, message acceptance is ordered with session ending
     /// without waiting for the writer. A concurrent send failure can cause a
@@ -335,6 +375,7 @@ impl<R: Read, W: Write> Client<R, W> {
     /// may reach this caller after another thread ends the session. Returning
     /// a receive error does wait for outgoing writes to finish.
     pub fn recv(&mut self) -> Result<Vec<u8>, Error> {
+        // Refuse to read without a session
         let receiver = self
             .receiver
             .as_mut()
@@ -358,6 +399,9 @@ impl<R: Read, W: Write> Client<R, W> {
             }
             Ok(Some(packet)) => packet,
         };
+
+        // Finish after decrypting, ordering message acceptance with a send
+        // failure without ever waiting for the writer on a successful receive
         let sealer = self
             .sealer
             .as_ref()
@@ -384,6 +428,7 @@ impl<R: Read, W: Write> Client<R, W> {
     }
 
     /// Stores the negotiated contexts and returns a sender for the new session.
+    ///
     /// The sending context's allocation identifies the session. The client owns
     /// both contexts and shares the sending context with active sends. Idle
     /// senders hold weak references and keep neither context nor stream alive.
@@ -404,14 +449,16 @@ impl<R: Read, W: Write> Client<R, W> {
     }
 
     /// Ends the current binding before releasing the client's crypto contexts.
-    /// Waits for the writer. After this returns, no write or flush for that
-    /// session is running or can start. A send that gets the writer first may
-    /// finish. A send still sealing after removal cannot write its packet.
-    /// This takes no encryption lock and does not wait for crypto work.
+    ///
+    /// Waits for the writer while a session exists. After this returns, no
+    /// write or flush for that session is running or can start. A send that
+    /// gets the writer first may finish. A send still sealing after removal
+    /// cannot write its packet. This takes no encryption lock and does not wait
+    /// for crypto work.
     ///
     /// This does not close the stream or send a notification. An active write
-    /// may delay ending until its frame deadline. Another thread can use the
-    /// Closer to cancel I/O without taking the writer lock.
+    /// may delay ending until its frame deadline. Another thread can use a
+    /// [`Closer`] to cancel I/O without taking the writer lock.
     fn end_session(&mut self) {
         if let Some(sealer) = self.sealer.as_ref() {
             self.outbound.end(sealer);
@@ -420,15 +467,17 @@ impl<R: Read, W: Write> Client<R, W> {
         self.sealer = None;
     }
 
-    /// Observes a handshake reaching writer acquisition behind an already admitted send.
+    /// Returns a waiter that blocks until a call waits for the writer, such as a
+    /// handshake queued behind an admitted send.
     #[cfg(any(test, feature = "fuzz"))]
     pub(crate) fn watch_writer(&self) -> impl FnOnce() + use<R, W> {
         let outbound = self.outbound.clone();
         move || outbound.wait_writers(1)
     }
 
-    /// Runs a test handshake with fixed keys and signing time for vector replay.
-    /// Not part of the normal transport API.
+    /// Runs a handshake with fixed keys and signing time, for vector replay.
+    ///
+    /// It exists for test vectors and is not part of the normal transport API.
     #[doc(hidden)]
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
@@ -488,8 +537,11 @@ impl<R: Read, W: Write> Client<R, W> {
 
 impl<R: Read, W: Write> Drop for Client<R, W> {
     /// Closes the stream to cancel blocked I/O, then ends the binding before
-    /// releasing the contexts. Shutdown must precede waiting for the writer.
-    /// Idle senders hold weak references and cannot extend the stream's lifetime.
+    /// releasing the contexts.
+    ///
+    /// Shutdown must come before waiting for the writer, which a blocked write
+    /// could otherwise hold until its deadline. Idle senders hold weak
+    /// references and cannot extend the stream's lifetime.
     fn drop(&mut self) {
         self.outbound.close();
         self.end_session();
@@ -508,7 +560,7 @@ impl<R: Read, W: Write> fmt::Debug for Client<R, W> {
     }
 }
 
-/// Hex encodes a fingerprint for the session log line.
+/// Encodes a fingerprint as lowercase hexadecimal for the session log line.
 fn hex(fingerprint: &xdsa::Fingerprint) -> String {
     fingerprint
         .to_bytes()
@@ -517,6 +569,7 @@ fn hex(fingerprint: &xdsa::Fingerprint) -> String {
         .collect()
 }
 
+/// Tests of the client's session ending, receiving and sending.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -533,7 +586,8 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    /// A pair of contexts standing in for an established session.
+    /// Creates a matching pair of contexts standing in for an established
+    /// session.
     fn contexts() -> (xhpke::Sender, xhpke::Receiver) {
         let secret = xhpke::SecretKey::generate();
         let (sender, encap) = secret.public_key().new_sender(b"test").unwrap();
@@ -541,14 +595,19 @@ mod tests {
         (sender, receiver)
     }
 
-    /// Writer accepting bytes immediately but holding its first flush until
-    /// the test releases it. This distinguishes finished writes from a fully
-    /// completed send, which must also wait for its flush.
+    /// Writer that accepts bytes at once but holds its first flush until the
+    /// test releases it.
+    ///
+    /// This distinguishes finished writes from a fully completed send, which
+    /// must also wait for its flush.
     struct BlockedFlush {
         /// Clock shared with the client and its release gate.
         clock: Clock,
+        /// Signal sent when the first flush starts, taken by that flush.
         entered: Option<mpsc::Sender<()>>,
+        /// Gate that holds the first flush until the test opens it.
         release: testing::Gate,
+        /// Latest installed write deadline.
         deadline: Option<Instant>,
     }
 
@@ -583,8 +642,7 @@ mod tests {
         }
     }
 
-    // Tests that ending waits through an active flush. After it returns the
-    // old sender is refused, and fresh contexts can use the still-open stream.
+    /// Tests that ending a session waits for an active flush.
     #[test]
     fn test_end_waits_for_flush() {
         // Hold the first send in a flush on the client's clock
@@ -646,9 +704,11 @@ mod tests {
         ));
     }
 
-    // Tests that a real receive reads, decrypts and returns a message while an
-    // outgoing flush is blocked. Waiting for the writer on the success path
-    // would time out before the test releases that flush.
+    /// Tests that a receive returns a decrypted message while an outgoing flush
+    /// is blocked.
+    ///
+    /// Waiting for the writer on the success path would deadlock, since the
+    /// test releases that flush only after the receive returns.
     #[test]
     fn test_recv_during_blocked_flush() {
         // Prepare an encrypted incoming frame on a paused clock
@@ -693,10 +753,8 @@ mod tests {
         assert_eq!(result.unwrap().unwrap(), payload(1));
     }
 
-    // Tests that releasing an old session's contexts cannot invalidate its
-    // replacement, which can still receive and send. Dropping the client ends
-    // the replacement even while active operations retain its sending context
-    // and outbound transport, modeled here by retaining those references.
+    /// Tests that releasing an old session's contexts leaves its replacement
+    /// working, and that dropping the client ends that replacement.
     #[test]
     fn test_owner_drop() {
         // Prepare a replacement session's incoming packet on a paused clock
@@ -729,7 +787,8 @@ mod tests {
         assert_eq!(client.recv().unwrap(), payload(2));
         fresh.send(&payload(3)).unwrap();
 
-        // Drop the owner while retaining internal references to its session
+        // Drop the owner while retaining its sending context and outgoing
+        // transport, as active operations would
         let outbound = client.outbound.clone();
         let sealer = client.sealer.as_ref().unwrap().clone();
         drop(client);
@@ -740,17 +799,18 @@ mod tests {
         ));
     }
 
-    // Tests sending from other threads while the client blocks in a read.
-    // The server must receive every message in encryption order to decrypt
-    // and echo it successfully.
+    /// Tests that other threads can send while the client blocks in a read.
+    ///
+    /// The server must receive every message in encryption order to decrypt
+    /// and echo it.
     #[test]
     fn test_senders() {
         testing::init_tracing();
 
-        // Echo every request over a bounded in-memory stream, then hang up
+        // Connect to a server that echoes 100 requests over a bounded in-memory
+        // stream, then hangs up
         let tester = test_clock();
         let (host, ark_stream) = memory::duplex(64 * 1024, &tester.clock());
-
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
@@ -782,6 +842,7 @@ mod tests {
         }
         ark.join().unwrap();
 
+        // Require every message back, whichever thread sent it
         echoes.sort_unstable();
         let mut expected: Vec<Vec<u8>> = (0..4)
             .flat_map(|thread| (0..25).map(move |i| payload(thread * 100 + i)))
@@ -790,8 +851,8 @@ mod tests {
         assert_eq!(echoes, expected);
     }
 
-    // Tests that dropping the client ends the session for its senders and
-    // releases the transport writer even while sender handles remain.
+    /// Tests that dropping the client ends the session for its senders and
+    /// releases the transport writer even while sender handles remain.
     #[test]
     fn test_sender_outlives_client() {
         // Send one packet before dropping the client owner

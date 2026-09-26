@@ -28,10 +28,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Establishes a client session, verifies the peer and returns the verifier's info.
-/// Takes ownership of the stream and constructs the transport internally. Failure
-/// closes the client stream; the application can open another stream and reconnect.
-/// The verifier is only borrowed during this blocking call.
-/// Failure to start a required worker or an escaping worker panic aborts the process.
+///
+/// Takes ownership of the stream and constructs the transport internally.
+/// Failure closes the client stream, and the application can open another
+/// stream and reconnect. The verifier is only borrowed during this blocking
+/// call. Failure to start a required worker or an escaping worker panic aborts
+/// the process.
 pub fn connect<R, W, V>(stream: Stream<R, W>, verifier: &V) -> Result<(Session, V::Info), Error>
 where
     R: Read + Send + 'static,
@@ -66,9 +68,10 @@ where
     Ok((session, info))
 }
 
-/// Receives and handles messages for one client session. The reader retains its
-/// session state until it exits; closing the session shuts down the stream and
-/// wakes a blocked transport read.
+/// Receives and handles messages for one client session.
+///
+/// The reader retains its session state until it exits. Closing the session
+/// shuts down the stream and wakes a blocked transport read.
 fn run_reader<R: Read, W: Write>(mut client: transport::Client<R, W>, session: Arc<SessionInner>) {
     loop {
         let result = client
@@ -77,7 +80,7 @@ fn run_reader<R: Read, W: Write>(mut client: transport::Client<R, W>, session: A
             .and_then(|bytes| session.handle_message(bytes));
         if let Err(error) = result {
             // Receive and decode failures close this client session and its
-            // stream, waking any other blocked transport I/O.
+            // stream, waking any other blocked transport I/O
             session.close(error);
             break;
         }
@@ -91,7 +94,7 @@ fn run_reader<R: Read, W: Write>(mut client: transport::Client<R, W>, session: A
 /// table. The host/server role and envelope direction are handled internally.
 ///
 /// Closing or dropping the session fails pending promises, discards queued requests,
-/// and wakes blocked `recv()` calls. Completed promises keep their results.
+/// and wakes blocked [`Self::recv`] calls. Completed promises keep their results.
 /// Application jobs keep running, but their handles still refer to the closed
 /// session and cannot send messages through a replacement session.
 ///
@@ -116,14 +119,15 @@ impl Session {
     }
 
     /// Sets the timeout for automatic `UNANSWERED` and `UNKNOWN` replies.
+    ///
     /// Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`]. Replies already queued keep
     /// their deadlines.
     ///
     /// The budget starts when a responder is dropped or an unknown request is
-    /// received, and includes queueing.
-    /// Expiry discards a queued reply; a write already started still runs under the
-    /// transport's independent timeout. Explicit request/reply deadlines are
-    /// unaffected. Zero or an unrepresentable deadline expires immediately.
+    /// received, and includes queueing. Expiry discards a queued reply, while a
+    /// write already started still runs under the transport's independent
+    /// timeout. Explicit request and reply deadlines are unaffected. Zero or an
+    /// unrepresentable deadline expires immediately.
     /// Use [`super::Server::set_autoreply_timeout`] to also set the timeout for
     /// future server sessions.
     pub fn set_autoreply_timeout(self, timeout: Duration) -> Self {
@@ -132,6 +136,7 @@ impl Session {
     }
 
     /// Sets the maximum accepted peer requests and buffered incoming bytes together.
+    ///
     /// Defaults to [`DEFAULT_MAX_INBOUND_REQUESTS`] and [`DEFAULT_MAX_INBOUND_BYTES`].
     ///
     /// `requests` counts queued requests, held responders and queued replies,
@@ -140,9 +145,10 @@ impl Session {
     /// Zero refuses all peer requests but still allows responses to our requests.
     ///
     /// `bytes` counts the full encoded envelopes of queued requests and unread
-    /// responses. `recv()`, `wait()` or dropping a response promise releases that
-    /// space in the budget. Zero allows no buffered envelopes. Decoded application
-    /// data, outgoing messages and transport buffers are excluded.
+    /// responses. [`Self::recv`], [`Promise::wait`] or dropping a response promise
+    /// releases that space in the budget. Zero allows no buffered envelopes.
+    /// Decoded application data, outgoing messages and transport buffers are
+    /// excluded.
     ///
     /// Exceeding either limit closes this session with
     /// [`Error::InboundRequestLimitExceeded`] or [`Error::InboundByteLimitExceeded`].
@@ -161,9 +167,10 @@ impl Session {
         Requester::new(Arc::downgrade(&self.inner), &self.inner.clock)
     }
 
-    /// Blocks for the next peer request and its [`Responder`]. Closing the session
-    /// wakes this call with the error that closed it. The caller decides how to
-    /// handle each request.
+    /// Blocks for the next peer request and its [`Responder`].
+    ///
+    /// Closing the session wakes this call with the error that closed it. The
+    /// caller decides how to handle each request.
     ///
     /// Taking a request removes its bytes from the inbound byte count before
     /// decoding it. The request still counts toward the inbound request limit
@@ -171,8 +178,9 @@ impl Session {
     /// and closes this session, which runs the notify callbacks of its pending
     /// promises on the calling thread.
     ///
-    /// If another thread closes the session after `recv()` takes a request from
-    /// the queue, `recv()` can still return it. Replying after closure returns an error.
+    /// If another thread closes the session after this call takes a request from
+    /// the queue, it can still return that request. Replying after closure
+    /// returns an error.
     pub fn recv(&mut self) -> Result<(Message, Responder), Error> {
         self.inner.recv()
     }
@@ -183,11 +191,14 @@ impl Session {
         Closer::session(Arc::downgrade(&self.inner))
     }
 
-    /// Closes this session. Repeated calls have no further effect. This does not
-    /// wait for application jobs or guarantee the peer has observed closure.
-    /// Discards queued messages and fails pending promises. A transport write
-    /// already started may still finish, but cannot change a completed promise's
-    /// result or affect a replacement session.
+    /// Closes this session, discarding queued messages and failing pending
+    /// promises.
+    ///
+    /// Repeated calls have no further effect. A client session also closes its
+    /// stream, waiting for adapter calls in progress to return. This does not
+    /// wait for application jobs or guarantee the peer has observed closure. A
+    /// transport write already started may still finish, but cannot change a
+    /// completed promise's result or affect a replacement session.
     pub fn close(&self) {
         self.inner.close(Error::Closed);
     }
@@ -201,8 +212,9 @@ impl Drop for Session {
 }
 
 impl fmt::Debug for Session {
-    /// Shows the session label and whether the session is still open. A state
-    /// lock held elsewhere leaves the state out.
+    /// Shows the session label and whether the session is still open.
+    ///
+    /// A state lock held elsewhere leaves the state out.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut session = f.debug_struct("Session");
         session.field("id", &self.inner.log_id);
@@ -213,45 +225,56 @@ impl fmt::Debug for Session {
     }
 }
 
-/// Queues and pending operations for one session. Requesters, responders, and
-/// closers hold weak references to this object, even after a new session connects.
+/// Queues and pending operations for one session.
+///
+/// Requesters, responders and closers hold weak references to this object,
+/// even after a new session connects.
 pub(super) struct SessionInner {
     /// Clock inherited from the stream that established this session.
     pub(super) clock: Clock,
-    /// Protects the queues, pending operations, and transition to `State::Closed`.
+    /// Queues, pending operations and the transition to [`State::Closed`],
+    /// under one lock.
     state: Mutex<State>,
-    /// Wakes `recv()`, the writer, and the deadline worker when `state` changes.
+    /// Signal waking [`Self::recv`], the writer and the deadline worker when
+    /// `state` changes.
     changed: Condvar,
-    /// Incoming bytes held by queued requests and unread responses. Accepting
-    /// messages and changing limits hold `state`. Consumers can release bytes
-    /// without that lock. Unread promises keep this counter alive after closure.
+    /// Incoming bytes held by queued requests and unread responses.
+    ///
+    /// Accepting messages and changing limits hold `state`. Consumers can
+    /// release bytes without that lock. Unread promises keep this counter alive
+    /// after closure.
     retained_bytes: Arc<AtomicUsize>,
     /// Envelope direction and request parity, fixed for the whole session.
     side: Side,
     /// Label of the transport session in log lines, unset without a transport.
     pub(super) log_id: LogId,
-    /// Closes the client's stream. Server sessions and tests without a stream
-    /// leave this empty; a server's stream is closed by `Server`.
+    /// Closer of the client's stream.
+    ///
+    /// Server sessions and tests without a stream leave it empty, since
+    /// [`Server`](super::Server) closes a server's stream.
     stream_closer: Option<transport::Closer>,
-    /// Lets tests wait for worker threads to exit.
+    /// Tracker letting tests wait for worker threads to exit.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
-    /// Notifies tests when the last `Arc<SessionInner>` is dropped.
+    /// Channel notifying tests when the last `Arc<SessionInner>` is dropped.
     #[cfg(any(test, feature = "fuzz"))]
     drop_hook: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    /// Pauses the writer before `sender.disconnect()` in replacement tests.
+    /// Hook pausing the writer before `sender.disconnect()` in replacement tests.
     #[cfg(any(test, feature = "fuzz"))]
     disconnect_hook:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// An open session's queues, or the error that closed the session.
-// Keep the same inline state layout in tests; the wait hook crosses Clippy's
-// size threshold for the difference between variants.
+///
+/// Test and fuzz builds keep the same inline layout, although their wait hook
+/// crosses Clippy's size threshold for the difference between variants.
 #[cfg_attr(any(test, feature = "fuzz"), allow(clippy::large_enum_variant))]
 enum State {
-    /// Holds queued messages and pending operations. `close()` replaces this
-    /// with `Closed`, then drops the queues after releasing the state lock.
+    /// Open session with its queued messages and pending operations.
+    ///
+    /// [`State::close`] replaces it with [`State::Closed`], and the caller drops
+    /// the queues after releasing the state lock.
     Open {
         /// Ceiling for accepted requests, including application-held responders.
         max_inbound_requests: usize,
@@ -262,29 +285,38 @@ enum State {
 
         /// Peer requests awaiting application receipt, paired with their request IDs.
         incoming: VecDeque<(u64, IncomingEnvelope)>,
-        /// Rejects duplicate incoming IDs while the receive queue, responder,
-        /// or queued reply holds them. Taking a reply into the writer or
-        /// discarding an expired reply releases its ID. Release happens before
-        /// writing: the peer can receive the reply and reuse its ID before our
+        /// IDs of accepted peer requests, whose count the request limit applies to.
+        ///
+        /// A duplicate ID is rejected while the receive queue, a responder or a
+        /// queued reply holds it. Taking a reply into the writer or discarding
+        /// an expired reply releases its ID. Release happens before writing,
+        /// since the peer can receive the reply and reuse its ID before our
         /// local flush returns.
         reserved_ids: HashSet<u64>,
 
         /// Requests and replies waiting for the writer to take them.
         outgoing: VecDeque<OutgoingMessage>,
-        /// Next locally allocated ID, or exhaustion. Never wraps or reuses an ID.
+        /// Next locally allocated ID, or `None` once exhausted, never wrapping
+        /// or reusing an ID.
         next_id: Option<u64>,
-        /// Maps outgoing request IDs to operation keys. Entries remain after
-        /// a promise times out, until the peer responds or the session closes.
+        /// Operation keys of sent requests, by wire ID.
+        ///
+        /// An entry stays after its promise times out, until the peer responds
+        /// or the session closes. A request that fails to encode is removed at
+        /// once.
         outstanding: HashMap<u64, OperationKey>,
-        /// Operations waiting to send a result to their promise. Each is removed
-        /// before sending that result, so a promise is completed only once.
+        /// Operations waiting to send a result to their promise.
+        ///
+        /// Each is removed before sending that result, so a promise is completed
+        /// only once.
         operations: HashMap<OperationKey, PendingOperation>,
 
         /// One-shot test notification sent under the state lock before waiting.
         #[cfg(any(test, feature = "fuzz"))]
         wait_hook: Option<std::sync::mpsc::Sender<()>>,
     },
-    /// Keeps the first closing reason for every subsequent operation.
+    /// Closed session, with the first closing reason returned to every later
+    /// operation.
     Closed(Error),
 }
 
@@ -329,8 +361,9 @@ impl SessionInner {
         }
     }
 
-    /// Changes the timeout for subsequent automatic replies. Queued replies
-    /// keep their original deadlines.
+    /// Changes the timeout for subsequent automatic replies.
+    ///
+    /// Queued replies keep their original deadlines.
     pub(super) fn set_autoreply_timeout(&self, timeout: Duration) {
         let mut state = self.state.lock().expect("session state not poisoned");
         if let State::Open {
@@ -341,8 +374,9 @@ impl SessionInner {
         }
     }
 
-    /// Updates both limits and closes the session if usage is too high. Holds the
-    /// same lock used to accept incoming messages.
+    /// Updates both limits and closes the session if usage is too high.
+    ///
+    /// It holds the same lock used to accept incoming messages.
     pub(super) fn set_inbound_limits(
         &self,
         requests: usize,
@@ -386,8 +420,10 @@ impl SessionInner {
         }
     }
 
-    /// Counts the envelope's original bytes under the session lock. Decoding or
-    /// dropping it later releases those bytes to this session's counter.
+    /// Counts the envelope's original bytes under the session lock.
+    ///
+    /// Decoding or dropping it later releases those bytes to this session's
+    /// counter.
     fn retain_incoming(
         self: &Arc<Self>,
         bytes: Bytes,
@@ -404,10 +440,11 @@ impl SessionInner {
         )
     }
 
-    /// Takes the next request from `incoming` and creates its responder. If the
-    /// queue is empty, waits on `changed`. Closing the session wakes the wait and
-    /// returns the error stored in `State::Closed`.
-    /// Decodes after releasing the lock so the reader can keep receiving messages.
+    /// Takes the next request from `incoming` and creates its responder.
+    ///
+    /// If the queue is empty, it waits on `changed`. Closing the session wakes
+    /// the wait and returns the error stored in [`State::Closed`]. It decodes
+    /// after releasing the lock, so the reader can keep receiving messages.
     fn recv(self: &Arc<Self>) -> Result<(Message, Responder), Error> {
         let mut state = self.state.lock().expect("session state not poisoned");
         let (message, responder) = loop {
@@ -441,8 +478,10 @@ impl SessionInner {
     }
 
     /// Replaces `Open` with `Closed` and fails pending promises under the state lock.
-    /// Expired operations receive `Timeout`; the rest receive the closing error.
-    /// Every call wakes `changed` and finishes any required stream shutdown.
+    ///
+    /// Expired operations receive [`Error::Timeout`], and the rest receive the
+    /// closing error. Every call wakes `changed` and finishes any required
+    /// stream shutdown.
     pub(super) fn close(&self, error: Error) {
         // Publish closing results while preserving callbacks past the lock scope
         let mut notifications = Notifications::default();
@@ -464,7 +503,9 @@ impl SessionInner {
     }
 
     /// Logs the end of the session with its reason, the operations it failed
-    /// and the messages it dropped. Orderly endings are informational.
+    /// and the messages it dropped.
+    ///
+    /// Orderly endings are informational, and failures are warnings.
     fn log_closed(&self, error: &Error, pending: usize, queued: usize) {
         match error {
             Error::Closed => tracing::info!(
@@ -493,7 +534,7 @@ impl SessionInner {
     /// Drops queued work and wakes waiters outside the session lock.
     fn finish_close(&self, removed: Option<State>) {
         // Wake local waiters and drop queued work before adapter shutdown, which
-        // may wait for transport I/O already running to return.
+        // may wait for transport I/O already running to return
         self.changed.notify_all();
         drop(removed);
         if let Some(stream_closer) = &self.stream_closer {
@@ -501,8 +542,9 @@ impl SessionInner {
         }
     }
 
-    /// Queues an `UNANSWERED` reply when a responder is dropped. The writer
-    /// sends the reply later.
+    /// Queues an `UNANSWERED` reply when a responder is dropped.
+    ///
+    /// The writer sends the reply later.
     pub(super) fn reply_unanswered(self: &Arc<Self>, id: u64) {
         self.autoreply(
             id,
@@ -515,7 +557,9 @@ impl SessionInner {
     }
 
     /// Queues an `UNKNOWN` reply to a request whose content this build does not
-    /// know, the application never seeing it. The writer sends the reply later.
+    /// know, the application never seeing it.
+    ///
+    /// The writer sends the reply later.
     fn reply_unknown(self: &Arc<Self>, id: u64) {
         self.autoreply(
             id,
@@ -524,11 +568,13 @@ impl SessionInner {
         );
     }
 
-    /// Queues an automatic reply under the configured autoreply timeout. The
-    /// budget starts on entry, before acquiring the session lock, and includes
-    /// queueing. An unrepresentable deadline expires immediately instead of
-    /// panicking from `Drop`.
+    /// Queues an automatic reply under the configured autoreply timeout.
+    ///
+    /// The budget starts on entry, before acquiring the session lock, and
+    /// includes queueing. An unrepresentable deadline expires immediately
+    /// instead of panicking from `Drop`. A closed session queues nothing.
     fn autoreply(self: &Arc<Self>, id: u64, reason: &str, error: schema::Error) {
+        // Start the budget on entry, then read the timeout of an open session
         let now = self.now();
         let timeout = {
             let state = self.state.lock().expect("session state not poisoned");
@@ -547,8 +593,10 @@ impl SessionInner {
         let _ = self.reply(id, Err(error), deadline);
     }
 
-    /// Creates a promise and queues a request through `enqueue()`. If the deadline
-    /// has already passed, the promise gets `Timeout` and nothing is queued.
+    /// Creates a promise and queues a request through [`Self::enqueue`].
+    ///
+    /// If the deadline has already passed, the promise gets [`Error::Timeout`]
+    /// and nothing is queued.
     pub(super) fn request(
         self: &Arc<Self>,
         request: Message,
@@ -566,8 +614,10 @@ impl SessionInner {
         Ok(promise)
     }
 
-    /// Queues a reply to `id` through `enqueue()`. Its promise waits for the write
-    /// and flush to finish, or fails if its deadline expires first.
+    /// Queues a reply to `id` through [`Self::enqueue`].
+    ///
+    /// Its promise waits for the write and flush to finish, or fails if its
+    /// deadline expires first.
     pub(super) fn reply(
         self: &Arc<Self>,
         id: u64,
@@ -586,9 +636,10 @@ impl SessionInner {
         Ok(promise)
     }
 
-    /// Adds a `PendingOperation` and its `OutgoingMessage` under the state lock.
-    /// A closed session returns its error directly; an expired deadline fails
-    /// the promise.
+    /// Adds a [`PendingOperation`] and its [`OutgoingMessage`] under the state lock.
+    ///
+    /// A closed session returns its error directly. An expired deadline fails
+    /// the promise instead, releasing the ID of an expired reply.
     fn enqueue(
         self: &Arc<Self>,
         body: OutgoingBody,
@@ -607,6 +658,8 @@ impl SessionInner {
                 } => (operations, outgoing, reserved_ids),
                 State::Closed(error) => return Err(error.clone()),
             };
+
+            // Fail an expired operation at once, releasing a reply's reserved ID
             let now = self.now();
             if now >= operation.deadline {
                 if let OutgoingBody::Reply { id, .. } = body {
@@ -615,6 +668,8 @@ impl SessionInner {
                 notifications.push(operation.fail(Error::Timeout, now));
                 return Ok(());
             }
+
+            // Queue the message and track its operation under a fresh key
             let key = OperationKey::new();
             outgoing.push_back(OutgoingMessage {
                 body,
@@ -633,9 +688,11 @@ impl SessionInner {
         Ok(())
     }
 
-    /// Fails expired operations and removes their queued messages. A promise waiter
-    /// can call this if the deadline worker has not yet processed its timeout.
-    /// Requests already sent remain in `outstanding` until answered or closed.
+    /// Fails expired operations and removes their queued messages.
+    ///
+    /// A promise waiter can call this if the deadline worker has not yet
+    /// processed its timeout. Requests already sent remain in `outstanding`
+    /// until answered or closed.
     pub(super) fn expire(&self) {
         // Drop the state guard before notifying completed promises
         let mut notifications = Notifications::default();
@@ -656,7 +713,8 @@ impl SessionInner {
         }
     }
 
-    /// Takes the next unexpired `OutgoingMessage` for tests that drive writing themselves.
+    /// Takes the next unexpired [`OutgoingMessage`] for tests that drive writing
+    /// themselves.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn take_outgoing(&self) -> Option<OutgoingMessage> {
         // Settle expired operations before selecting queued work
@@ -681,8 +739,11 @@ impl SessionInner {
         }
     }
 
-    /// Records a write result under the state lock. A successful request write
-    /// leaves its operation waiting for an answer; a reply write completes it.
+    /// Records a write result under the state lock.
+    ///
+    /// A successful request write leaves its operation waiting for an answer,
+    /// while a reply write completes it. A failed or late write fails the
+    /// promise.
     pub(super) fn record_write(&self, key: &OperationKey, result: Result<(), Error>) {
         // Find the operation while deferring callbacks past the state guard
         let mut notifications = Notifications::default();
@@ -706,6 +767,7 @@ impl SessionInner {
     }
 
     /// Supplies a response to a fixture operation without depending on wire IDs.
+    ///
     /// The fixture still encodes and retains bytes, matching real promise behavior.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn record_response(
@@ -760,15 +822,19 @@ impl SessionInner {
         }
     }
 
-    /// Returns the stream clock's time. Deadline checks hold `state`, and
-    /// `reply_unanswered()` also calls this before waiting for that lock.
+    /// Returns the stream clock's time.
+    ///
+    /// Deadline checks hold `state`, and [`Self::autoreply`] also calls this
+    /// before waiting for that lock.
     fn now(&self) -> Instant {
         self.clock.now()
     }
 
-    /// Checks the outer envelope and routes its original bytes. `recv()` and
-    /// `wait()` decode nested payloads. Unknown and late responses are discarded
-    /// without decoding their bodies. The reader closes the session on error.
+    /// Checks the outer envelope and routes its original bytes.
+    ///
+    /// [`Self::recv`] and [`Promise::wait`] decode nested payloads. Unmatched and
+    /// late responses are discarded without decoding their bodies. The reader
+    /// closes the session on error.
     pub(super) fn handle_message(self: &Arc<Self>, bytes: Vec<u8>) -> Result<(), Error> {
         // Decode routing metadata before taking the session lock
         let bytes = Bytes::from(bytes.into_boxed_slice());
@@ -790,7 +856,7 @@ impl SessionInner {
                         ));
                     }
                     // Unknown content reserves a slot for its automatic reply,
-                    // which is queued once this lock is released.
+                    // which is queued once this lock is released
                     self.admit_request(&mut state, header, bytes)?;
                     if header.unknown {
                         unknown = Some(header.id);
@@ -809,6 +875,7 @@ impl SessionInner {
                         };
                         return Err(error.clone());
                     };
+
                     // A sent request keeps its ID here until answered, so an ID
                     // without an operation belongs to a request that timed out
                     if let Some(key) = outstanding.remove(&header.id) {
@@ -840,8 +907,10 @@ impl SessionInner {
     }
 
     /// Reserves a request slot and buffers known content under the session lock.
+    ///
     /// Unknown content keeps only its ID for the automatic reply. If a limit is
-    /// exceeded, admission leaves the queues untouched. Never waits for the application.
+    /// exceeded, admission leaves the queues untouched. It never waits for the
+    /// application.
     fn admit_request(
         self: &Arc<Self>,
         state: &mut State,
@@ -861,6 +930,8 @@ impl SessionInner {
             };
             return Err(error.clone());
         };
+
+        // Refuse an ID still in use, then a request beyond the limit
         if reserved_ids.contains(&header.id) {
             return Err(self.side.malformed(
                 Some(header),
@@ -879,6 +950,8 @@ impl SessionInner {
             );
             return Err(Error::InboundRequestLimitExceeded(*max_inbound_requests));
         }
+
+        // Buffer known content, while unknown content keeps only its ID
         let payload = header.payload.unwrap_or("none");
         let message = if header.unknown {
             None
@@ -894,9 +967,15 @@ impl SessionInner {
     }
 
     /// Waits for and takes the next queued message, or returns `None` on closure.
-    /// Under the state lock, assigns each request an ID and records its operation
-    /// key in `outstanding`, so `handle_message()` can match the peer's response
-    /// even if it arrives before the write finishes.
+    ///
+    /// Under the state lock, it assigns each request an ID and records its
+    /// operation key in `outstanding`. [`Self::handle_message`] can then match
+    /// the peer's response, even one arriving before the write finishes.
+    ///
+    /// # Panics
+    ///
+    /// Panics once the session has used up its request IDs, which aborts the
+    /// process when the writer calls it.
     pub(super) fn next_outgoing(&self) -> Option<(u64, OutgoingMessage)> {
         // Keep callback ownership outside the lock across every queue check
         let mut notifications = Notifications::default();
@@ -929,8 +1008,8 @@ impl SessionInner {
                     OutgoingBody::Request(_) => {
                         let id = next_id.expect("wire request IDs exhausted");
                         *next_id = id.checked_add(2);
-                        // Store the ID before releasing the lock: a response can
-                        // arrive before the outgoing send finishes locally.
+                        // Store the ID before releasing the lock, since a response
+                        // can arrive before the outgoing send finishes locally
                         outstanding.insert(id, outgoing.operation.key.clone());
                         if let Some(operation) = operations.get_mut(&outgoing.operation.key) {
                             operation.log_id = Some(LogId::from(id));
@@ -956,11 +1035,14 @@ impl SessionInner {
         }
     }
 
-    /// Sends queued messages through `sender`. Transport errors close the session;
-    /// messages that cannot be encoded fail only their own promise.
+    /// Sends queued messages through `sender` until the session closes.
+    ///
+    /// Transport errors close the session, while messages that cannot be encoded
+    /// fail only their own promise. On exit, it disconnects the transport
+    /// session this sender belongs to.
     fn run_writer(&self, sender: transport::Sender<impl Write>) {
         while let Some((id, outgoing)) = self.next_outgoing() {
-            // next_outgoing() released the state lock. The reader and deadline
+            // `next_outgoing` released the state lock. The reader and deadline
             // worker can continue while encoding or sending this message blocks.
             let request = matches!(outgoing.body, OutgoingBody::Request(_));
             let kind = if request { "request" } else { "reply" };
@@ -978,16 +1060,19 @@ impl SessionInner {
                 tracing::trace!("sending {} {} ({})", kind, id, payload);
                 sender.send(&bytes).map_err(Error::from)
             });
+
+            // Close the session on a wire failure, and log a local refusal
             match &result {
                 Ok(()) => {}
                 Err(Error::Transport(error)) => {
                     // Wire failure ends the session even if this operation's promise
-                    // has already timed out while the transport write was blocked.
+                    // has already timed out while the transport write was blocked
                     self.close(Error::Transport(error.clone()));
                     break;
                 }
                 Err(error) => tracing::debug!("not sending {} {}: {}", kind, id, error),
             }
+
             {
                 // Remaining failures are local encoding refusals. No request was
                 // sent, so there is no future answer to retain an ID for.
@@ -999,15 +1084,19 @@ impl SessionInner {
                     outstanding.remove(&id);
                 }
             }
+
             // Report this operation's write result, if it is still pending.
             // A response or timeout may have completed it during the write.
             outgoing.operation.record_write(result);
         }
+
+        // Let replacement tests pause the writer before it disconnects
         #[cfg(any(test, feature = "fuzz"))]
         if let Some((entered, released)) = self.disconnect_hook.lock().unwrap().take() {
             let _ = entered.send(());
             let _ = released.recv();
         }
+
         // Disconnect the session this sender belongs to. The transport ignores
         // this call if a new handshake has already replaced that session.
         if let Err(error) = sender.disconnect() {
@@ -1020,7 +1109,9 @@ impl SessionInner {
     }
 
     /// Expires pending operations even when no caller is waiting on a promise.
-    /// Waits on `changed` until the next deadline or until new work arrives.
+    ///
+    /// It waits on `changed` until the next deadline or until new work arrives,
+    /// and returns once the session closes.
     pub(super) fn run_deadlines(&self) {
         // Keep callbacks outside the guard even when the session closes
         let mut notifications = Notifications::default();
@@ -1062,8 +1153,10 @@ impl SessionInner {
 }
 
 impl Session {
-    /// Creates the session and starts its writer and deadline threads. Only
-    /// client sessions receive a stream closer; `Server` closes server streams.
+    /// Creates the session and starts its writer and deadline threads.
+    ///
+    /// Only client sessions receive a stream closer, since
+    /// [`Server`](super::Server) closes server streams.
     pub(super) fn start<W: Write + Send + 'static>(
         side: Side,
         clock: Clock,
@@ -1119,7 +1212,9 @@ impl State {
     }
 
     /// Stops accepting messages and fails pending operations under the session lock.
-    /// Returns the old queues to be dropped after releasing the lock.
+    ///
+    /// Returns the old queues to be dropped after releasing the lock. An already
+    /// closed session keeps its first reason and returns `None`.
     fn close(
         &mut self,
         error: Error,
@@ -1141,8 +1236,8 @@ impl State {
         Some(removed)
     }
 
-    /// Removes expired entries from `operations`, sends `Timeout` to their
-    /// promises, and discards any messages they still have in `outgoing`.
+    /// Removes expired entries from `operations`, sends [`Error::Timeout`] to
+    /// their promises, and discards any messages they still have in `outgoing`.
     fn expire(&mut self, now: Instant, notifications: &mut Notifications) {
         if let Self::Open {
             operations,
@@ -1179,16 +1274,16 @@ impl State {
     }
 }
 
-// These fixtures let tests drive time, incoming requests, and write results.
+// Workerless sessions let tests drive time, requests and writes themselves
 #[cfg(any(test, feature = "fuzz"))]
 impl Session {
-    /// Creates a session without a stream or workers for lifecycle scenarios.
+    /// Creates a server session without a stream or workers.
     #[cfg(test)]
     pub(super) fn fixture() -> Self {
         Self::fixture_for(Side::Server)
     }
 
-    /// Creates either envelope direction without a stream or workers.
+    /// Creates a session for either side, without a stream or workers.
     #[cfg(test)]
     pub(super) fn fixture_for(side: Side) -> Self {
         Self::fixture_with_clock(side, crate::transport::testing::test_clock().clock())
@@ -1210,8 +1305,11 @@ impl Session {
 
 #[cfg(any(test, feature = "fuzz"))]
 impl SessionInner {
-    /// Pauses the writer before `sender.disconnect()`, so a test can connect a
+    /// Arms a pause of the writer before it disconnects, so a test can connect a
     /// replacement session before letting the old writer finish.
+    ///
+    /// The returned receiver signals that the writer paused, and the sender
+    /// releases it.
     pub(super) fn pause_disconnect(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -1229,6 +1327,10 @@ impl SessionInner {
     }
 
     /// Moves a fresh scenario session to its last allocatable request ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session is closed or has requests waiting for responses.
     pub(super) fn use_last_request_id(&self) {
         let mut state = self.state.lock().unwrap();
         let State::Open {
@@ -1247,8 +1349,14 @@ impl SessionInner {
         });
     }
 
-    /// Waits for the reader to remove a previously sent request's ID. Tests use
-    /// this to leave a completed promise unread before changing limits or sessions.
+    /// Waits for the reader to remove the ID of a request sent earlier.
+    ///
+    /// Tests use this to leave a completed promise unread before changing limits
+    /// or sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session closes before the reader removes the ID.
     pub(super) fn wait_response(&self, id: u64) {
         // Wait until the reader removes the request or the session closes
         let mut state = self.state.lock().unwrap();
@@ -1267,6 +1375,10 @@ impl SessionInner {
     }
 
     /// Returns the sorted request IDs still waiting for peer responses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session is closed.
     pub(super) fn outstanding_ids(&self) -> Vec<u64> {
         let state = self.state.lock().unwrap();
         let State::Open { outstanding, .. } = &*state else {
@@ -1278,8 +1390,12 @@ impl SessionInner {
     }
 
     /// Supplies a request directly to the fixture's admission path, independently
-    /// of parity (wire routing is covered by the connection scenarios).
+    /// of parity.
+    ///
+    /// The connection scenarios cover wire routing. A failed admission closes
+    /// the session and returns its error.
     pub(super) fn inject_request(self: &Arc<Self>, id: u64, message: Message) -> Result<(), Error> {
+        // Encode the request as the peer would send it
         let peer = match self.side {
             Side::Client => Side::Server,
             Side::Server => Side::Client,
@@ -1289,6 +1405,8 @@ impl SessionInner {
             .expect("fixture request belongs to peer");
         let bytes = Bytes::from(bytes.into_boxed_slice());
         let header = self.side.decode_header(bytes.clone())?;
+
+        // Admit it as the reader would, closing the session on failure
         let result = {
             let mut state = self.state.lock().expect("session state not poisoned");
             self.admit_request(&mut state, header, bytes)
@@ -1311,11 +1429,13 @@ impl SessionInner {
     }
 
     /// Arms a one-shot notification for the next receive waiting on an empty queue.
+    ///
     /// The notification is sent while holding the lock, immediately before the
     /// condition-variable wait releases it, so a later close cannot run too early.
     ///
     /// # Panics
-    /// The fixture must still be open and have no queued request.
+    ///
+    /// Panics if the fixture is closed or already has a queued request.
     pub(super) fn watch_recv_wait(&self) -> std::sync::mpsc::Receiver<()> {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut state = self.state.lock().expect("session state not poisoned");
@@ -1343,7 +1463,8 @@ impl Drop for SessionInner {
     }
 }
 
-/// Checks session ownership bounds and compiles the client construction API.
+/// Checks callback lock release and session ownership bounds, and compiles the
+/// client construction API.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -1352,7 +1473,8 @@ mod tests {
     use crate::transport::{Read, Stream, Verifier, Write};
     use std::fmt::Debug;
 
-    /// The deadline worker releases both locks before notifying and parking again.
+    /// Checks that the deadline worker releases both locks before notifying and
+    /// parking again.
     #[test]
     fn test_deadline_callback_releases_locks_before_worker_parks() {
         use std::sync::mpsc;
@@ -1385,7 +1507,8 @@ mod tests {
         assert!(matches!(promise.wait::<Vec<u8>>(), Err(Error::Timeout)));
     }
 
-    /// Callbacks and their captures run with both locks free on the thread responsible for notification.
+    /// Checks that callbacks and their captures run with both locks free, on the
+    /// thread responsible for notification.
     #[test]
     fn test_notification_releases_locks_on_every_settlement_path() {
         use crate::protocol::Promise;
@@ -1393,13 +1516,14 @@ mod tests {
         use std::thread::{self, ThreadId};
         use std::time::Duration;
 
-        /// Checks callback execution and capture destruction against both locks.
+        /// Capture checking callback execution and its own destruction against
+        /// both locks.
         struct Capture {
             /// Session whose state must be unlocked during notification.
             session: Arc<SessionInner>,
-            /// Attempts to acquire the promise's notification lock.
+            /// Probe attempting to acquire the promise's notification lock.
             notification: Box<dyn Fn() -> bool + Send>,
-            /// Reports lock availability and the executing thread.
+            /// Channel reporting lock availability and the executing thread.
             observed: mpsc::Sender<(bool, bool, ThreadId)>,
         }
 
@@ -1518,10 +1642,12 @@ mod tests {
                     None
                 };
 
-                // Publish through the chosen path and verify registration before or after it
+                // Publish through the chosen path and verify registration before
+                // or after it
                 check(promise, inner.clone(), completed, path, || match path {
                     "response" | "response limit" | "late response" => {
-                        // Let response completion detect expiry without the deadline worker
+                        // Let response completion detect expiry without the
+                        // deadline worker
                         if path == "late response" {
                             tester.advance_to(deadline);
                         }
@@ -1576,7 +1702,8 @@ mod tests {
     /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be printable and transferable to a background thread.
+        /// Requires an owned value to be printable and transferable to a
+        /// background thread.
         fn movable<T: Debug + Send + 'static>() {}
         movable::<Session>();
     }

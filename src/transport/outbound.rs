@@ -4,9 +4,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Output and session boundaries of one byte stream. The writer lock orders
-//! frames, handshakes and session ending. A separate binding lock orders receive
-//! completion against those boundaries without waiting for output.
+//! Output and session boundaries of one byte stream.
+//!
+//! The writer lock orders frames, handshakes and session ending. A separate
+//! binding lock orders receive completion against those boundaries without
+//! waiting for output.
 
 use super::framing::FrameWriter;
 use super::{Closer, Error, Sender, Write};
@@ -21,15 +23,19 @@ use tracing::{trace, warn};
 /// Side of the wire served by the writer, determining how failures are signaled.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
-    /// Sends a reset when starting another handshake.
+    /// Client side, which notifies no failures and starts every handshake with
+    /// a reset instead.
     Client,
-    /// Attempts an empty frame after failed sends, using their remaining budget.
-    /// Timeouts skip this notification.
+    /// Server side, which answers a failed send or a local disconnect with an
+    /// empty frame.
+    ///
+    /// A failed send's notification uses the frame's remaining budget, and a
+    /// timeout skips it.
     Server,
 }
 
 impl Side {
-    /// Name of this direction's messages in traces.
+    /// Returns the name of this side's outgoing messages in traces.
     fn label(self) -> &'static str {
         match self {
             Self::Client => "host-to-ark",
@@ -39,9 +45,11 @@ impl Side {
 }
 
 /// Shared output, session binding and permanent closure of a byte stream.
+///
 /// The binding identifies the encryption context allowed to use the stream.
-/// The client/server owns this value and its crypto contexts. Idle senders hold
-/// weak references. Active sends temporarily retain the output and sending context.
+/// The client or server owns this value and its crypto contexts. Idle senders
+/// hold weak references. Active sends temporarily retain the output and the
+/// sending context.
 ///
 /// Every binding change holds the writer lock first, then the binding lock.
 /// Receive completion takes only the binding lock. That lock is never held
@@ -49,15 +57,26 @@ impl Side {
 /// overlap a preceding write, and receiving can progress during blocked output.
 /// Panics and poisoned locks are fatal to this transport. It must not be reused.
 pub(crate) struct Outbound<W: Write> {
-    /// Observes calls waiting to acquire the writer in concurrency tests.
+    /// Count of calls waiting to acquire the writer, with its wakeup, for
+    /// concurrency tests.
     #[cfg(any(test, feature = "fuzz"))]
     writer_waits: (Mutex<usize>, std::sync::Condvar),
-    writer: Mutex<FrameWriter<W>>, // Serializes complete writes, flushes and binding changes
-    binding: Mutex<Weak<Mutex<xhpke::Sender>>>, // Sole authority for the current session
-    timeout: Duration,             // Time budget for each frame, including partial writes and flush
-    side: Side,                    // Whether a failed send needs an empty frame notification
-    closer: Closer,                // Shutdown independent of encryption, writer and binding locks
-    pub(super) clock: Clock,       // Clock of the stream, which the handshakes read too
+    /// Frame writer whose lock serializes complete writes, flushes and binding
+    /// changes.
+    writer: Mutex<FrameWriter<W>>,
+    /// Weak reference to the current session's sending context, the sole
+    /// record of which session may write and accept messages.
+    binding: Mutex<Weak<Mutex<xhpke::Sender>>>,
+    /// Time budget for each frame, covering partial writes and flush.
+    timeout: Duration,
+    /// Side of the wire, deciding whether a failed send needs an empty frame
+    /// notification.
+    side: Side,
+    /// Shutdown handle that takes none of the encryption, writer or binding
+    /// locks.
+    closer: Closer,
+    /// Clock of the stream, which the handshakes read too.
+    pub(super) clock: Clock,
 }
 
 impl<W: Write> Outbound<W> {
@@ -75,7 +94,8 @@ impl<W: Write> Outbound<W> {
         }
     }
 
-    /// Binds a sending context and issues its sender under the writer lock.
+    /// Binds a sending context under the writer lock and returns its sender.
+    ///
     /// Replacing the binding ends the previous session before new messages can
     /// be written or accepted. The caller retains the context. The binding and
     /// idle senders hold weak references. This performs no crypto or stream I/O.
@@ -92,6 +112,7 @@ impl<W: Write> Outbound<W> {
     }
 
     /// Ends this context's session while leaving any replacement session alone.
+    ///
     /// Always waits for the writer lock, including on repeated or obsolete calls.
     /// Once this returns, no write or flush for the context remains in progress
     /// or can start. Sealing may still finish, but its packet will be refused.
@@ -103,9 +124,12 @@ impl<W: Write> Outbound<W> {
         self.lock().end(sealer);
     }
 
-    /// Ends the session identified by `sealer` and, on the server, sends Dropped.
-    /// Both happen under the writer lock, so a new handshake cannot start between
-    /// removing the binding and sending the notification. An old sealer does nothing.
+    /// Ends the session that `sealer` identifies and, on the server, sends an
+    /// empty frame to notify the client.
+    ///
+    /// Both happen under the writer lock, so a handshake cannot start between
+    /// removing the binding and sending the notification. An obsolete sealer
+    /// changes nothing.
     pub(crate) fn disconnect(&self, sealer: &Arc<Mutex<xhpke::Sender>>) -> Result<(), Error> {
         let mut writer = self.lock();
         if writer.end(sealer) && self.side == Side::Server {
@@ -121,10 +145,11 @@ impl<W: Write> Outbound<W> {
         self.lock().unbind();
     }
 
-    /// Completes a decrypted receive under the binding lock. Accepts the supplied
-    /// result only for the current binding. An obsolete binding returns an
-    /// ended-session error instead. On any error, the caller must end its session
-    /// and release its crypto contexts.
+    /// Completes a decrypted receive under the binding lock, accepting the
+    /// supplied result only for the current binding.
+    ///
+    /// An obsolete binding returns an ended-session error instead. On any error,
+    /// the caller must end its session and release its crypto contexts.
     ///
     /// Reading and decryption happen before acquiring this lock. Acceptance is
     /// ordered with session ending and replacement. An accepted result may reach
@@ -144,9 +169,11 @@ impl<W: Write> Outbound<W> {
     }
 
     /// Refuses an oversized message without waiting for the writer or ending the
-    /// session. Sealing has not advanced its sequence. Returns the size error
-    /// only while this binding is current. An obsolete sender receives an
-    /// ended-session error instead.
+    /// session.
+    ///
+    /// Sealing has not advanced its sequence. Returns the size error only while
+    /// this binding is current. An obsolete sender receives an ended-session
+    /// error instead.
     pub(super) fn refuse_oversized(
         &self,
         sealer: &Arc<Mutex<xhpke::Sender>>,
@@ -166,14 +193,18 @@ impl<W: Write> Outbound<W> {
     }
 
     /// Permanently closes the byte stream and waits for adapter shutdown.
+    ///
     /// Takes no send lock, so it can cancel I/O that blocks session ending.
-    /// Buffered receives remain available. Closure alone does not remove the binding.
+    /// Buffered receives remain available. Closure alone does not remove the
+    /// binding.
     pub(crate) fn close(&self) {
         self.closer.close();
     }
 
-    /// Removes the binding and sends a reset under the writer lock. Old sends
-    /// cannot write after the reset. The deadline limits the frame's write budget.
+    /// Removes the binding and sends a reset under the writer lock.
+    ///
+    /// Old sends cannot write after the reset. The deadline can shorten the
+    /// frame's write budget.
     pub(super) fn send_reset(&self, deadline: Instant) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
@@ -182,8 +213,10 @@ impl<W: Write> Outbound<W> {
             .send_reset(deadline.min(self.clock.now() + self.timeout))
     }
 
-    /// Removes the binding and sends an empty notification. An optional deadline
-    /// limits this output; otherwise the frame uses the configured write budget.
+    /// Removes the binding and sends an empty frame notification.
+    ///
+    /// The frame uses the configured write budget, which an optional deadline
+    /// can shorten.
     pub(crate) fn send_dropped(&self, limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
@@ -192,8 +225,10 @@ impl<W: Write> Outbound<W> {
         writer.framer.send_dropped(deadline)
     }
 
-    /// Writes an unsealed packet after the owner has removed the binding. The
-    /// optional deadline limits output and any best-effort failure notification.
+    /// Writes an unsealed packet after the owner has removed the binding.
+    ///
+    /// The optional deadline can shorten the write budget, which also bounds any
+    /// best-effort failure notification.
     pub(super) fn send_packet(&self, packet: &[u8], limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
         let budget = self.clock.now() + self.timeout;
@@ -215,9 +250,11 @@ impl<W: Write> Outbound<W> {
             .send_frame_blob(frame, self.clock.now() + self.timeout)
     }
 
-    /// Acquires exclusive output ownership. A sender retains its encryption
-    /// guard until this returns, preserving sealing order through the handoff.
-    /// A poisoned writer is an implementation failure and is not recovered.
+    /// Acquires exclusive output ownership.
+    ///
+    /// A sender retains its encryption guard until this returns, preserving
+    /// sealing order through the handoff. A poisoned writer is an
+    /// implementation failure and is not recovered.
     pub(super) fn lock(&self) -> Writer<'_, W> {
         // Let tests fence writer acquisition while another call owns the lock
         #[cfg(any(test, feature = "fuzz"))]
@@ -248,11 +285,15 @@ impl<W: Write> Outbound<W> {
     }
 }
 
-/// Holds the framer lock and allows changes to its binding. Other operations
-/// cannot change the binding while this guard exists, even when the binding
-/// mutex is unlocked. Dropping the guard only releases the writer lock.
+/// Guard over the frame writer that allows changes to the binding.
+///
+/// Other operations cannot change the binding while this guard exists, even
+/// when the binding mutex is unlocked. Dropping the guard only releases the
+/// writer lock.
 pub(super) struct Writer<'a, W: Write> {
+    /// Transport whose binding this guard may change.
     outbound: &'a Outbound<W>,
+    /// Held lock on the transport's frame writer.
     framer: MutexGuard<'a, FrameWriter<W>>,
 }
 
@@ -275,9 +316,11 @@ impl<W: Write> Writer<'_, W> {
             .expect("binding lock not poisoned") = Weak::new();
     }
 
-    /// Removes this binding while owning the writer. Returns true only when a
-    /// binding was removed, allowing one failure notification under this guard.
-    /// Returns false if the session had already ended or been replaced.
+    /// Removes this context's binding while owning the writer.
+    ///
+    /// Returns true only when it removed the binding, which allows one failure
+    /// notification under this guard. Returns false if the session had already
+    /// ended or been replaced.
     pub(super) fn end(&mut self, sealer: &Arc<Mutex<xhpke::Sender>>) -> bool {
         let mut binding = self
             .outbound
@@ -293,6 +336,7 @@ impl<W: Write> Writer<'_, W> {
     }
 
     /// Writes and flushes a sealed message only into its matching binding.
+    ///
     /// Releases the binding lock before I/O. The writer guard still prevents
     /// binding changes until the complete write and flush have finished.
     /// On failure, removes the binding while still holding the writer. A server
@@ -304,6 +348,7 @@ impl<W: Write> Writer<'_, W> {
         packet: &[u8],
         log_id: LogId,
     ) -> Result<(), Error> {
+        // Refuse a packet sealed for an ended or replaced session
         {
             let binding = self
                 .outbound
@@ -314,6 +359,8 @@ impl<W: Write> Writer<'_, W> {
                 return Err(Error::EncryptionFailed("session ended".into()));
             }
         }
+
+        // Write within a fresh frame budget, ending the session on failure
         let deadline = self.outbound.clock.now() + self.outbound.timeout;
         if let Err(err) = self.framer.send_packet(packet, deadline) {
             if self.end(sealer) {
@@ -331,8 +378,10 @@ impl<W: Write> Writer<'_, W> {
     }
 
     /// Notifies a client about failed server output within the frame's remaining
-    /// budget. Skips notification after any timeout, including one reported before
-    /// the local clock reaches the deadline. For other failures, the framer
+    /// budget.
+    ///
+    /// Skips notification after any timeout, including one reported before the
+    /// local clock reaches the deadline. For other failures, the framer
     /// terminates any partial frame before sending the signal. Notification
     /// errors never replace the original operation's error.
     fn notify_failure(&mut self, error: &Error, deadline: Instant) {
@@ -345,6 +394,7 @@ impl<W: Write> Writer<'_, W> {
     }
 }
 
+/// Tests of session binding, receive acceptance and failure notification.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -390,23 +440,28 @@ mod tests {
         }
     }
 
-    /// Matching encryption contexts for one direction of a test session.
+    /// Creates matching encryption contexts for one direction of a test session.
     fn contexts() -> (xhpke::Sender, xhpke::Receiver) {
         let key = xhpke::SecretKey::generate();
         let (sender, encap) = key.public_key().new_sender(b"test").unwrap();
         (sender, key.new_receiver(&encap, b"test").unwrap())
     }
 
-    // Tests the budget across an output failure and its notification, for both
-    // session data and handshake output. The adapter records exact deadlines
-    // after a partial write so a fresh notification budget cannot go unnoticed.
+    /// Tests that a failure notification keeps the failed frame's deadline, for
+    /// both session data and handshake output.
+    ///
+    /// The adapter records exact deadlines after a partial write, so a fresh
+    /// notification budget cannot go unnoticed.
     #[test]
     fn test_failure_notification_keeps_frame_deadline() {
-        /// Records adapter deadlines and fails the second partial write once.
+        /// Writer that records adapter deadlines and fails the second partial
+        /// write once.
         struct Probe {
             /// Clock used by the outgoing transport under test.
             clock: Clock,
+            /// Deadline in force at each write and flush, in call order.
             calls: Arc<Mutex<Vec<Instant>>>,
+            /// Latest installed write deadline.
             deadline: Option<Instant>,
         }
 
@@ -429,7 +484,7 @@ mod tests {
                     1 => Ok(1),
                     2 => Err(io::Error::new(io::ErrorKind::BrokenPipe, "frame failed")),
                     3 => {
-                        assert_eq!(bytes, [0, 0]); // Resynchronization and notification together.
+                        assert_eq!(bytes, [0, 0]); // resynchronization and notification together
                         Ok(bytes.len())
                     }
                     _ => panic!("unexpected additional write"),
@@ -471,9 +526,10 @@ mod tests {
             assert!(
                 matches!(result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::BrokenPipe)
             );
+
             // Require failure notification to retain the original deadline
             let calls = calls.lock().unwrap();
-            assert_eq!(calls.len(), 4); // Partial write, failure, resync with signal, flush.
+            assert_eq!(calls.len(), 4); // partial write, failure, resync with signal, flush
             assert!(calls.iter().all(|deadline| *deadline == calls[0]));
             drop(calls);
             assert!(matches!(
@@ -483,12 +539,12 @@ mod tests {
         }
     }
 
-    // Tests that failing to install the frame deadline ends the session before
-    // byte I/O. The sender reports the original error. Later sends and receive
-    // completions must fail for the ended session.
+    /// Tests that failing to install the frame deadline ends the session before
+    /// any byte I/O.
     #[test]
     fn test_deadline_setter_failure_ends_session() {
-        /// Rejects output configuration and records attempts without accepting bytes.
+        /// Writer that rejects every deadline and counts the attempts, accepting
+        /// no bytes.
         struct Refused(
             /// Number of deadline installation attempts.
             Arc<Mutex<usize>>,
@@ -534,6 +590,9 @@ mod tests {
             Err(Error::SendFailed(err))
                 if err.kind() == io::ErrorKind::TimedOut && err.to_string() == "deadline refused"
         ));
+
+        // Refuse the ended session's later sends and receive completions, with
+        // no further deadline attempt
         assert!(matches!(
             sender.send(b"late"),
             Err(Error::EncryptionFailed(_))
@@ -545,9 +604,8 @@ mod tests {
         assert_eq!(*settings.lock().unwrap(), 1);
     }
 
-    // Tests both orders of receive acceptance and a send failure. A message
-    // accepted first remains a completed result. A second message is decrypted
-    // before the failure but presented for acceptance afterward. It is refused.
+    /// Tests that a receive accepted before a send failure stands, while one
+    /// presented for acceptance after it is refused.
     #[test]
     fn test_receive_acceptance_after_send_failure() {
         // Prepare a send failure on a paused clock
@@ -583,8 +641,7 @@ mod tests {
         ));
     }
 
-    // Tests that ending does not wait for crypto. The sending context remains
-    // locked until ending completes, after which its sender cannot write.
+    /// Tests that ending a session does not wait for the encryption lock.
     #[test]
     fn test_end_while_sealing() {
         // Retain the encryption lock while session ending runs
@@ -621,9 +678,11 @@ mod tests {
         ));
     }
 
-    // Tests that repeated end calls wait for the winning writer even after it
-    // removes the binding, as when that writer is still sending a notification.
-    // Both callers must remain blocked until the test releases that writer.
+    /// Tests that repeated end calls wait for the writer's holder even after it
+    /// removed the binding.
+    ///
+    /// The holder models a writer still sending a notification. Both callers
+    /// must remain blocked until the test releases it.
     #[test]
     fn test_repeated_end_waits_for_writer() {
         // End the binding while retaining writer ownership
@@ -652,6 +711,8 @@ mod tests {
             }
         });
         holding.recv().unwrap();
+
+        // Start two end calls behind the held writer
         let (started_tx, started) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
         let ending: Vec<_> = (0..2)
@@ -687,9 +748,11 @@ mod tests {
         }
     }
 
-    // Tests that a delayed failure notification cannot enter a subsequent
-    // handshake or session, and repeated failures notify only once. Retaining
-    // the old context models an operation delayed beyond session replacement.
+    /// Tests that a delayed failure notification cannot enter a later handshake
+    /// or session, and that repeated failures notify once.
+    ///
+    /// Retaining the old context models an operation delayed beyond session
+    /// replacement.
     #[test]
     fn test_old_notification_cannot_cross_handshake() {
         // Record output on a paused clock while retaining the old context
@@ -718,12 +781,13 @@ mod tests {
         fail();
         fail();
 
-        // Only the first failure notifies, and none can cross the new handshake.
+        // Only the first failure notifies, and none can cross the new handshake
         assert_eq!(*collector.0.lock().unwrap(), [0]);
         outbound.unbind();
         outbound.send_packet(b"hello", None).unwrap();
         fail();
 
+        // Fail the old context again once a replacement session is bound
         let (crypto, mut peer) = contexts();
         let replacement = Arc::new(Mutex::new(crypto));
         let sender = outbound.bind(&replacement);
@@ -731,6 +795,8 @@ mod tests {
         drop(old);
         sender.send(&payload(1)).unwrap();
 
+        // Require exactly the notification, the hello and the replacement's
+        // message, in that order
         let bytes = collector.0.lock().unwrap().clone();
         let mut reader =
             FrameReader::new(Memory::new(&bytes[..], &clock), Closer::new(&clock, || {}));

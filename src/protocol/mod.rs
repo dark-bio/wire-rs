@@ -8,8 +8,9 @@
 //!
 //! A reader receives messages from each connection. Each session also has a writer
 //! that sends queued messages and a deadline worker that times out operations.
-//! Incoming requests and unread responses stay encoded until `recv()` or `wait()`.
-//! Invalid payloads close their original session when decoded.
+//! Incoming requests and unread responses stay encoded until [`Session::recv`]
+//! or [`Promise::wait`] takes them. Invalid payloads close their original
+//! session when decoded.
 //!
 //! Each session limits accepted peer requests and buffered incoming bytes. Set
 //! both with [`Session::set_inbound_limits`] or [`Server::set_inbound_limits`].
@@ -23,6 +24,7 @@
 //! owns its receive queue and closes when dropped. Its [`Requester`] and
 //! [`Responder`] handles always target that session, even after it closes and
 //! another session connects.
+//!
 //! Both sides use the same handle types. Sessions exchange [`Message`], the union
 //! of every body in the [`schema`]. The [`schema::host_to_ark::Content`] and
 //! [`schema::ark_to_host::Content`] oneofs hold what each side may send. Convert
@@ -35,9 +37,9 @@
 //! having asked for it.
 //!
 //! Requests and replies return promises without waiting for I/O. Their deadlines
-//! include time in the outgoing queue; `wait()` does not restart the timeout.
-//! Transport write timeouts are independent: a request can still reach the peer
-//! after its promise expires. The reader and writer run independently of the
+//! include time in the outgoing queue, and waiting does not restart the timeout.
+//! Transport write timeouts are independent, so a request can still reach the
+//! peer after its promise expires. The reader and writer run independently of the
 //! application, but the application must keep receiving and answering requests
 //! while its own requests wait for replies. All waiting is blocking; no async
 //! runtime is required. Every request expects a reply, including notifications.
@@ -74,34 +76,42 @@ pub use session::{Session, connect};
 
 use std::time::Duration;
 
-/// Default timeout for sending an automatic reply, `UNANSWERED` when a responder
-/// is dropped or `UNKNOWN` to a request this build does not know. Starts when
-/// the responder is dropped or the request arrives and includes time in the
-/// outgoing queue. Configure it with [`Session::set_autoreply_timeout`] or
+/// Default timeout of 5 s for sending an automatic reply.
+///
+/// An automatic reply is `UNANSWERED` when a responder is dropped, or `UNKNOWN`
+/// to a request this build does not know. The timeout starts when the responder
+/// is dropped or the request arrives, and includes time in the outgoing queue.
+/// Configure it with [`Session::set_autoreply_timeout`] or
 /// [`Server::set_autoreply_timeout`]. Transport write timeouts are independent.
 pub const DEFAULT_AUTOREPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default limit of 1,024 accepted peer requests per session. A request counts
-/// while queued, held by a responder, or waiting to send its reply. The slot is
-/// freed when the writer takes the reply or the reply is discarded.
-/// Configure it with [`Session::set_inbound_limits`] or
+/// Default limit of 1,024 accepted peer requests per session.
+///
+/// A request counts while queued, held by a responder, or waiting to send its
+/// reply. The slot is freed when the writer takes the reply or the reply is
+/// discarded. Configure it with [`Session::set_inbound_limits`] or
 /// [`Server::set_inbound_limits`]. Zero admits no peer requests.
 pub const DEFAULT_MAX_INBOUND_REQUESTS: usize = 1024;
 
 /// Default limit of 16 MiB for queued requests and unread response promises.
-/// Counts their full encoded envelopes. Taking or dropping an envelope reduces
-/// the byte count.
-/// Decoded application data, outgoing messages and transport buffers are excluded.
-/// Configure it with [`Session::set_inbound_limits`] or
-/// [`Server::set_inbound_limits`]. Zero permits no retained envelope bytes.
+///
+/// The limit counts their full encoded envelopes, and taking or dropping an
+/// envelope releases its bytes. Decoded application data, outgoing messages
+/// and transport buffers are excluded. Configure it with
+/// [`Session::set_inbound_limits`] or [`Server::set_inbound_limits`]. Zero
+/// permits no retained envelope bytes.
 pub const DEFAULT_MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 
-/// Protobuf bindings of the protocol, generated from `proto/wire.proto` and
-/// excluded from the lints of handwritten code. Every message implements
-/// `prost::Message` for raw encoding. Applications exchange the bodies through
-/// [`Message`], converting to the `host_to_ark` and `ark_to_host` oneofs to
-/// dispatch on one direction. The `HostToArk` and `ArkToHost` envelopes are the
-/// wire form, handled by the session internally.
+/// Protobuf bindings of the protocol, generated from `proto/wire.proto`.
+///
+/// The bindings are excluded from the lints of handwritten code. Every message
+/// implements [`prost::Message`] for raw encoding. Applications exchange the
+/// bodies through [`Message`], converting to the
+/// [`host_to_ark::Content`](schema::host_to_ark::Content) and
+/// [`ark_to_host::Content`](schema::ark_to_host::Content) oneofs to dispatch on
+/// one direction. The [`HostToArk`](schema::HostToArk) and
+/// [`ArkToHost`](schema::ArkToHost) envelopes are the wire form, handled by the
+/// session internally.
 #[allow(clippy::all)]
 #[allow(rustdoc::broken_intra_doc_links)]
 pub mod schema {

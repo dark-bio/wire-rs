@@ -23,6 +23,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 /// Owner of a persistent server stream, accepting successive sessions.
+///
 /// Closing or dropping the server ends its active session and shuts down the
 /// physical stream. Closing an individual [`Session`] keeps this owner and
 /// its stream available for another handshake.
@@ -33,9 +34,11 @@ pub struct Server {
 
 impl Server {
     /// Takes ownership of a stream and constructs its transport internally.
-    /// The attester supplies the current device attestation for each handshake.
-    /// Starts its persistent reader immediately. Failure to start a required
-    /// worker or an escaping worker panic aborts the process.
+    ///
+    /// The signer is the server's identity key, which must match the key embedded
+    /// in the attestation. The attester supplies the current device attestation
+    /// for each handshake. The persistent reader starts immediately. Failure to
+    /// start a required worker or an escaping worker panic aborts the process.
     pub fn new<R, W, A>(stream: Stream<R, W>, signer: xdsa::SecretKey, attester: A) -> Self
     where
         R: Read + Send + 'static,
@@ -78,8 +81,10 @@ impl Server {
     }
 
     /// Sets the timeout for automatic `UNANSWERED` and `UNKNOWN` replies in the
-    /// current and future sessions. Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`].
-    /// Applies even before `accept()`. Replies already queued keep their deadlines.
+    /// current and future sessions.
+    ///
+    /// Defaults to [`DEFAULT_AUTOREPLY_TIMEOUT`]. Applies even before
+    /// [`Self::accept`]. Replies already queued keep their deadlines.
     ///
     /// See [`Session::set_autoreply_timeout`] for when the timeout starts and
     /// expires. Changing a session's timeout leaves the server's default unchanged.
@@ -91,8 +96,10 @@ impl Server {
 
     /// Sets both per-session inbound limits, initially
     /// [`DEFAULT_MAX_INBOUND_REQUESTS`] and [`DEFAULT_MAX_INBOUND_BYTES`].
-    /// Applies to the current session, even before `accept()`, and future sessions.
-    /// Lowering either limit below usage closes that session. The server stays open.
+    ///
+    /// Applies to the current session, even before [`Self::accept`], and future
+    /// sessions. Lowering either limit below usage closes that session. The
+    /// server stays open.
     ///
     /// See [`Session::set_inbound_limits`] for what each limit counts. Changing a
     /// session's limits leaves the server's defaults unchanged. This method also
@@ -102,9 +109,11 @@ impl Server {
         self
     }
 
-    /// Blocks until a session is established or the server ends. Recoverable
-    /// handshake failures leave the stream available for another attempt. A
-    /// replacement session closes the previous one; old handles still refer to it.
+    /// Blocks until a session is established or the server ends.
+    ///
+    /// Recoverable handshake failures leave the stream available for another
+    /// attempt. A replacement session closes the previous one, and old handles
+    /// still refer to it.
     ///
     /// The reader runs before acceptance. A returned session may already have
     /// queued requests or be closed, including from exceeding an inbound limit.
@@ -143,16 +152,21 @@ impl Server {
         Closer::server(Arc::downgrade(&self.inner))
     }
 
-    /// Permanently closes this server and its active session, wakes blocked
-    /// acceptance and receive calls, and fails unresolved operations. Idempotent.
-    /// Does not join application jobs or guarantee the peer has observed closure.
+    /// Permanently closes this server and its active session.
+    ///
+    /// It wakes blocked acceptance and receive calls and fails unresolved
+    /// operations. It also closes the stream, waiting for adapter calls in
+    /// progress to return. Repeated calls have no further effect. It does not
+    /// join application jobs or guarantee the peer has observed closure.
     pub fn close(&self) {
         self.inner.close(Error::Closed);
     }
 }
 
-/// Receives transport events across successive server sessions. Weak references
-/// let closed sessions be freed while this reader waits for another handshake.
+/// Receives transport events across successive server sessions.
+///
+/// Weak references let closed sessions be freed while this reader waits for
+/// another handshake.
 fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
     mut transport: transport::Server<R, W, A>,
     server_ref: Weak<ServerInner>,
@@ -166,7 +180,7 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
             break;
         };
         match result {
-            // A successful handshake gets its own session and workers.
+            // A successful handshake gets its own session and workers
             Ok(transport::Event::Connected(sender)) => {
                 let session = Session::start(
                     Side::Server,
@@ -181,13 +195,14 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
                     break;
                 }
             }
-            // Disconnecting closes the session while keeping the server stream.
+            // Disconnecting closes the session while keeping the server stream
             Ok(transport::Event::Disconnected) => {
                 if let Some(session) = current.upgrade() {
                     session.close(transport::Error::SessionReset.into());
                 }
                 current = Weak::new();
             }
+            // A message goes to the current session, which closes if handling fails
             Ok(transport::Event::Message(bytes)) => {
                 if let Some(session) = current.upgrade()
                     && let Err(error) = session.handle_message(bytes)
@@ -195,7 +210,8 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
                     session.close(error);
                 }
             }
-            // A failed handshake leaves the reader available for the next reset.
+            // A handshake that timed out or failed to write leaves the reader
+            // available for the next reset
             Err(transport::Error::RecvFailed(error))
                 if error.kind() == std::io::ErrorKind::TimedOut =>
             {
@@ -204,6 +220,7 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
             Err(transport::Error::SendFailed(error)) => {
                 tracing::debug!("wire handshake output failed: {}", error);
             }
+            // Any other failure ends the server and its stream
             Err(error) => {
                 server.close(error.into());
                 break;
@@ -220,8 +237,9 @@ impl Drop for Server {
 }
 
 impl fmt::Debug for Server {
-    /// Shows whether the server still accepts sessions. A state lock held
-    /// elsewhere leaves the state out.
+    /// Shows whether the server still accepts sessions.
+    ///
+    /// A state lock held elsewhere leaves the state out.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut server = f.debug_struct("Server");
         if let Ok(state) = self.inner.state.try_lock() {
@@ -231,26 +249,30 @@ impl fmt::Debug for Server {
     }
 }
 
-/// Server lifetime and the at-most-one session waiting for accept. The reader
-/// attaches replacements in transport order. Accepted sessions own themselves;
-/// the server retains only a weak reference for server shutdown.
+/// Shared server state, holding at most one session waiting for acceptance.
+///
+/// The reader attaches replacements in transport order. Accepted sessions own
+/// themselves, and the server retains only a weak reference for server shutdown.
 pub(super) struct ServerInner {
     /// Clock inherited by every session accepted on this stream.
     clock: Clock,
-    /// Protects the attached session, pending acceptance, and server closure.
+    /// Attached session, pending acceptance and server closure, under one lock.
     state: Mutex<State>,
-    /// Wakes `accept()` when a session is attached or the server closes.
+    /// Signal waking [`Server::accept`] when a session is attached or the
+    /// server closes.
     changed: Condvar,
-    /// Closes the server's stream. Empty in tests that supply sessions directly.
+    /// Closer of the server's stream, empty in tests that supply sessions directly.
     stream_closer: Option<transport::Closer>,
-    /// Lets tests wait for the reader and all session workers to exit.
+    /// Tracker letting tests wait for the reader and all session workers to exit.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) workers: Arc<worker::Tracker>,
 }
 
-/// Sessions waiting for acceptance, or the error that closed the server.
+/// Server policy and the session waiting for acceptance, or the error that
+/// closed the server.
 enum State {
-    /// Tracks the current session and keeps its owner until `accept()` takes it.
+    /// Open server, tracking the current session and keeping its owner until
+    /// [`Server::accept`] takes it.
     Open {
         /// Request ceiling applied to the attached session and future sessions.
         max_inbound_requests: usize,
@@ -258,16 +280,19 @@ enum State {
         max_inbound_bytes: usize,
         /// Automatic reply timeout applied to the current and future sessions.
         autoreply_timeout: Duration,
-        /// Lets server closure close the session after `accept()` returns it.
+        /// Current session, which server closure closes even after
+        /// [`Server::accept`] returns it.
         session: Weak<SessionInner>,
-        /// Session waiting for `accept()`. A new handshake replaces it.
+        /// Session waiting for [`Server::accept`], replaced by a newer handshake.
         ready: Option<Session>,
         /// One-shot test notification sent under the server lock before waiting.
         #[cfg(any(test, feature = "fuzz"))]
         wait_hook: Option<std::sync::mpsc::Sender<()>>,
     },
-    /// Saves the closing error and attached session. Repeated `close()` calls
-    /// can finish closing that session if the first closer is still doing so.
+    /// Closed server, with its closing error and the session attached at the time.
+    ///
+    /// Repeated [`ServerInner::close`] calls can finish closing that session if
+    /// the first closer is still doing so.
     Closed {
         /// First reason the server ended; later closes cannot replace it.
         reason: Error,
@@ -277,7 +302,9 @@ enum State {
 }
 
 impl ServerInner {
-    /// Updates the current session and default under the attachment lock.
+    /// Updates the current session's timeout and the default under the
+    /// attachment lock.
+    ///
     /// Lock order is server then session, as with inbound limit updates.
     fn set_autoreply_timeout(&self, timeout: Duration) {
         let mut state = self.state.lock().expect("server state not poisoned");
@@ -294,9 +321,12 @@ impl ServerInner {
         }
     }
 
-    /// Serializes policy changes with attachment. Lock order is server then
-    /// session; session methods never acquire the server lock. Server sessions
-    /// have no stream closer, so applying their limits cannot wait for stream I/O.
+    /// Updates the current session's limits and the defaults under the
+    /// attachment lock.
+    ///
+    /// Lock order is server then session, and session methods never acquire
+    /// the server lock. Server sessions have no stream closer, so applying
+    /// their limits cannot wait for stream I/O.
     fn set_inbound_limits(&self, requests: usize, bytes: usize) {
         // Defer session callbacks until the server's policy lock is released too
         let mut notifications = Notifications::default();
@@ -316,12 +346,14 @@ impl ServerInner {
         }
     }
 
-    /// Refuses attachment/acceptance before closing the attached session.
-    /// Releases the server lock before closing or dropping a `Session`, since
-    /// those operations take the session's own lock.
+    /// Closes the server, refusing attachment and acceptance before closing the
+    /// attached session.
+    ///
+    /// The server lock is released before closing or dropping a [`Session`],
+    /// since those operations take the session's own lock.
     pub(super) fn close(&self, error: Error) {
-        // Stop attach() and accept() by switching to Closed. Save the attached
-        // session so repeated close() calls can finish closing it too.
+        // Stop `attach` and `accept` by switching to `Closed`. Save the attached
+        // session so repeated `close` calls can finish closing it too.
         let (session, reason, ready) = {
             let mut state = self.state.lock().expect("server state not poisoned");
             match &mut *state {
@@ -344,6 +376,7 @@ impl ServerInner {
                 }
             }
         };
+
         // Release the server lock before taking the session's lock. Wake local
         // callers before closing the stream, which waits for active I/O to return.
         if let Some(session) = session {
@@ -356,11 +389,13 @@ impl ServerInner {
         }
     }
 
-    /// Closes the previous session and makes this one available to `accept()`.
+    /// Closes the previous session and makes this one available to
+    /// [`Server::accept`].
+    ///
     /// Only the reader, or the test fixture replacing it, calls this method.
     fn attach(&self, session: Session) -> Result<(), Error> {
         // Take an Arc to the previous session, then release the server lock
-        // before closing that session.
+        // before closing that session
         let previous = {
             let state = self.state.lock().expect("server state not poisoned");
             match &*state {
@@ -376,6 +411,7 @@ impl ServerInner {
             );
             previous.close(transport::Error::SessionReset.into());
         }
+
         // Another thread may have closed the server while we closed the old
         // session. Check again under the lock before installing the new one.
         let mut notifications = Notifications::default();
@@ -392,7 +428,7 @@ impl ServerInner {
                     ..
                 } => {
                     // Apply the current policy before exposing this session or
-                    // letting the reader deliver its first message.
+                    // letting the reader deliver its first message
                     session.inner.set_inbound_limits(
                         *max_inbound_requests,
                         *max_inbound_bytes,
@@ -404,17 +440,19 @@ impl ServerInner {
                 }
             }
         };
+
+        // Wake a blocked accept, then drop the owner of a previous session that
+        // accept never took
         self.changed.notify_all();
-        // A previous session that accept never took still needs its owner dropped.
         drop(previous);
         Ok(())
     }
 }
 
-/// Supplies sessions in tests in place of the server's transport reader.
+/// Fixture supplying sessions in tests in place of the server's transport reader.
 #[cfg(any(test, feature = "fuzz"))]
 pub(super) struct SessionSource {
-    /// Server that receives sessions created by `open()`.
+    /// Server that receives sessions created by [`SessionSource::open`].
     server_ref: Weak<ServerInner>,
 }
 
@@ -445,9 +483,11 @@ impl Server {
 
 #[cfg(any(test, feature = "fuzz"))]
 impl SessionSource {
-    /// Creates a session and passes it to `attach()`, just as the reader does
-    /// after a handshake. Returns its weak reference so tests can deliver messages
-    /// to it even after another session connects.
+    /// Creates a session and passes it to [`ServerInner::attach`], just as the
+    /// reader does after a handshake.
+    ///
+    /// Returns its weak reference so tests can deliver messages to it even
+    /// after another session connects.
     pub(super) fn open(&mut self) -> Result<Weak<SessionInner>, Error> {
         let server = self.server_ref.upgrade().ok_or(Error::Closed)?;
         let session = Session::fixture_with_clock(Side::Server, server.clock.clone());
@@ -469,12 +509,17 @@ impl Drop for SessionSource {
 
 #[cfg(any(test, feature = "fuzz"))]
 impl ServerInner {
-    /// Arms a one-shot notification for `accept()` waiting without a ready session.
-    /// Sent while holding `state`, just before `accept()` waits on `changed`.
-    /// Tests can then attach a session or close the server without using sleeps.
+    /// Arms a one-shot notification for [`Server::accept`] waiting without a
+    /// ready session.
+    ///
+    /// It is sent while holding `state`, just before acceptance waits on
+    /// `changed`. Tests can then attach a session or close the server without
+    /// using sleeps.
     ///
     /// # Panics
-    /// The fixture must still be open and have no session waiting for acceptance.
+    ///
+    /// Panics if the fixture is closed or already has a session waiting for
+    /// acceptance.
     pub(super) fn watch_accept_wait(&self) -> std::sync::mpsc::Receiver<()> {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut state = self.state.lock().expect("server state not poisoned");
@@ -490,7 +535,8 @@ impl ServerInner {
     }
 }
 
-/// Checks server ownership bounds and compiles server construction and acceptance.
+/// Checks server policy callbacks and ownership bounds, and compiles server
+/// construction and acceptance.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -500,7 +546,8 @@ mod tests {
     use darkbio_crypto::xdsa;
     use std::fmt::Debug;
 
-    /// A server policy closure runs promise callbacks after releasing the server lock.
+    /// Checks that a server policy change closing its session runs promise
+    /// callbacks outside the server lock.
     #[test]
     fn test_limit_callback_releases_server_lock() {
         use darkbio_clock::TestClock;
@@ -560,7 +607,8 @@ mod tests {
     /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be printable and transferable to a background thread.
+        /// Requires an owned value to be printable and transferable to a
+        /// background thread.
         fn movable<T: Debug + Send + 'static>() {}
         movable::<Server>();
     }

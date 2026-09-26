@@ -4,6 +4,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Server side of the transport, with the device attestation it presents and
+//! the events it reports.
+
 use crate::LogId;
 use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
@@ -23,11 +26,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-/// Device attestation presented during the handshake. The CWT must contain
-/// hardware or emulator claims as defined by darkbio-trust. Construction checks
-/// that shape; the client's verifier decides whether to trust the attestation.
+/// Device attestation that a server presents during the handshake.
+///
+/// The CWT must carry hardware or emulator claims, as defined in
+/// [`trust::device`]. Construction checks that shape, and the client's
+/// [`Verifier`](crate::transport::Verifier) decides whether to trust it.
 #[derive(Clone)]
-pub struct Attestation(Vec<u8>);
+pub struct Attestation(
+    /// Encoded CWT whose claim shape was checked at construction.
+    Vec<u8>,
+);
 
 impl Attestation {
     /// Wraps a CWT after checking that it decodes as a device attestation.
@@ -40,7 +48,7 @@ impl Attestation {
         Ok(Self(cwt))
     }
 
-    /// CWT bytes of the attestation.
+    /// Returns the attestation's CWT bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -60,12 +68,16 @@ impl fmt::Debug for Attestation {
     }
 }
 
-/// Supplies the server's device attestation on every handshake. This lets the
-/// server pick up a new attestation after onboarding without recreating transport.
+/// Source of the server's device attestation, asked on every handshake.
+///
+/// Asking every time lets the server pick up a new attestation after onboarding
+/// without recreating the transport.
 pub trait Attester {
-    /// Returns the device attestation to present to the client (e.g. a root-signed
-    /// CWT read from disk, or a self-signed fallback for pre-onboarding devices).
-    /// The identity key it embeds must be the one signing the wire's handshake.
+    /// Returns the device attestation to present to the client.
+    ///
+    /// It can be a root-signed CWT read from disk, or a self-signed fallback for
+    /// a device that has not been onboarded. The identity key it embeds must
+    /// match the signer passed to [`Server::new`].
     fn attest(&mut self) -> Attestation;
 }
 
@@ -76,20 +88,27 @@ impl Attester for Attestation {
     }
 }
 
-/// A decrypted message or encrypted session transition returned by [`Server::recv`].
-/// Events arrive in receive order and refer to sessions over the existing byte
-/// stream. Permanent stream closure is observed through I/O results.
+/// Decrypted message or session transition returned by [`Server::recv`].
+///
+/// Events arrive in receive order and refer to sessions over the same byte
+/// stream. Permanent stream closure produces no event, since [`Server::recv`]
+/// returns an error for it.
 pub enum Event<W: Write> {
-    /// A handshake completed and established an encrypted session. The sender
-    /// belongs to that session and cannot send into a later replacement.
-    /// Concurrent send failure or stream closure may make it unusable before
-    /// the caller handles the event.
+    /// Completed handshake, with the sender of the encrypted session it
+    /// established.
+    ///
+    /// The sender belongs to that session and cannot send into a later
+    /// replacement. Stream closure from another thread can make it unusable
+    /// before the caller handles the event.
     Connected(Sender<W>),
 
-    /// The previously opened session ended through a peer reset, invalid
-    /// incoming data or an observed send failure. After a peer reset, the next
-    /// receive call runs the handshake. A local [`Server::disconnect`] does not emit this
-    /// event. Permanent stream closure is reported through I/O results instead.
+    /// End of the session that the last [`Event::Connected`] opened.
+    ///
+    /// A peer reset, invalid incoming data or a failed send ends it, and a
+    /// failed send is reported once receiving progresses. After a peer reset,
+    /// the next receive call runs the handshake. A local [`Server::disconnect`]
+    /// emits no such event, and permanent stream closure is reported as an
+    /// error instead.
     Disconnected,
 
     /// A decrypted message from the client.
@@ -108,7 +127,9 @@ impl<W: Write> fmt::Debug for Event<W> {
 }
 
 /// Server side of the wire, accepting encrypted sessions over a supplied byte
-/// stream. [`Server::recv`] handles client resets and handshakes. Each successful
+/// stream.
+///
+/// [`Server::recv`] handles client resets and handshakes. Each successful
 /// handshake returns a sender through [`Event::Connected`]. Later reads deliver
 /// decrypted messages or report that the session ended.
 /// [`Server::disconnect`] ends a session while leaving the stream available for
@@ -122,30 +143,44 @@ impl<W: Write> fmt::Debug for Event<W> {
 /// prompt a standalone notification.
 ///
 /// An [`Attester`] supplies the device attestation. Transport forwards it to the
-/// client, whose verifier decides whether to trust it.
+/// client, whose [`Verifier`](crate::transport::Verifier) decides whether to
+/// trust it.
 pub struct Server<R: Read, W: Write, A: Attester> {
-    reader: FrameReader<R>,     // COBS framed transport for ingress data
-    outbound: Arc<Outbound<W>>, // Outgoing transport, shared with the senders
+    /// COBS frame reader for the data the client sends.
+    reader: FrameReader<R>,
+    /// Outgoing transport, which the senders reach through weak references.
+    outbound: Arc<Outbound<W>>,
 
-    signer: xdsa::SecretKey, // Server's identity key, signing the ArkHello
-    attester: A,             // Source of the device attestation for handshakes
+    /// Server's identity key, which signs the ArkHello.
+    signer: xdsa::SecretKey,
+    /// Source of the device attestation for each handshake.
+    attester: A,
 
-    receiver: Option<xhpke::Receiver>, // Receive context used exclusively by this server
-    sealer: Option<Arc<Mutex<xhpke::Sender>>>, // Send context shared with active sends
+    /// Receive context of the current session, used only by this server.
+    receiver: Option<xhpke::Receiver>,
+    /// Send context of the current session, shared with active sends.
+    sealer: Option<Arc<Mutex<xhpke::Sender>>>,
 
-    handshake_timeout: Duration, // Budget for each new handshake attempt
-    handshake_deadline: Option<Instant>, // Deadline of the handshake requested by a reset
-    log_id: LogId, // Label of the current session in log lines, unset before the first
+    /// Budget for each new handshake attempt.
+    handshake_timeout: Duration,
+    /// Deadline of the handshake that a received reset requested, unset while
+    /// none is pending.
+    handshake_deadline: Option<Instant>,
+    /// Label of the latest session in log lines, zero before the first one.
+    log_id: LogId,
 
+    /// Fixed ArkHello signing time for test vectors, unset to read the clock.
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
-    timestamp: Option<i64>, // Test signing time for ArkHello; otherwise use the clock
+    timestamp: Option<i64>,
 }
 
 impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
-    /// Creates a server owning the byte stream and its shutdown operation.
+    /// Creates a server that owns the byte stream and its shutdown operation.
+    ///
     /// The signer is the server's identity key. It must match the key embedded
     /// in the device attestation. Output uses the stream's configured write
-    /// timeout. The adapter must enforce deadlines and shutdown cancellation.
+    /// timeout. The stream's [`Read`] and [`Write`] adapters must enforce
+    /// deadlines and let shutdown cancel blocked I/O.
     pub fn new(stream: Stream<R, W>, signer: xdsa::SecretKey, attester: A) -> Self {
         let (reader, writer, close, timeout) = stream.into_parts();
         let outbound = Arc::new(Outbound::new(writer, Side::Server, close.clone(), timeout));
@@ -164,13 +199,15 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         }
     }
 
-    /// Sets the budget for each subsequent handshake, starting when a reset is
-    /// received. Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]. Output and peer
-    /// replies share one deadline; progress and repeated resets within the attempt
-    /// do not refresh it. An already pending handshake keeps its deadline. Each
+    /// Sets the budget for each later handshake, counted from the reset that
+    /// requests it.
+    ///
+    /// Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]. Output and peer replies share
+    /// one deadline; progress and repeated resets within the attempt do not
+    /// refresh it. An already pending handshake keeps its deadline. Each
     /// outgoing frame is also limited by the stream's write timeout. Waiting for
     /// locks and attester callbacks can extend the call beyond the deadline.
-    /// Time between recv calls also consumes the budget.
+    /// Time between [`Server::recv`] calls also consumes the budget.
     ///
     /// Zero expires attempts immediately. A duration too large to add to an
     /// [`Instant`] panics when the next handshake's deadline is constructed.
@@ -179,20 +216,23 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         self
     }
 
-    /// A handle that permanently closes the stream from another thread.
+    /// Returns a handle that permanently closes the stream from another thread.
     pub fn closer(&self) -> Closer {
         self.outbound.closer()
     }
 
-    /// Permanently closes the stream and waits for adapter shutdown. Senders
-    /// observe closure through write failure; buffered messages remain readable.
-    /// See [`Closer::close`].
+    /// Permanently closes the stream and waits for adapter shutdown.
+    ///
+    /// Senders observe closure through write failure, and buffered messages
+    /// remain readable. See [`Closer::close`].
     pub fn close(&self) {
         self.outbound.close();
     }
 
-    /// Creates a test server with a fixed ArkHello signing time for vector replay.
-    /// Not part of the normal transport API.
+    /// Creates a server that signs every ArkHello at a fixed time, for vector
+    /// replay.
+    ///
+    /// It exists for test vectors and is not part of the normal transport API.
     #[doc(hidden)]
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
@@ -208,19 +248,24 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         server
     }
 
-    /// Receives a decrypted message or a session transition. A client reset
-    /// starts a handshake, whose completion returns [`Event::Connected`] with
-    /// a sender before any messages from that session are delivered.
+    /// Receives the next decrypted message or session transition.
+    ///
+    /// A client reset starts a handshake, whose completion returns
+    /// [`Event::Connected`] with a sender before any messages from that session
+    /// are delivered.
     ///
     /// A client reset or invalid incoming data ends the current session and
     /// returns [`Event::Disconnected`]. Oversized frames count as invalid data.
-    /// After a reset, the next call runs the handshake under one configured
-    /// deadline starting at that reset. Repeated resets within that attempt do
-    /// not refresh it. Expiry returns `RecvFailed(TimedOut)` and a fresh reset
-    /// can start another attempt. A send failure also ends
-    /// the session, but does not wake a blocked read. It is reported once
-    /// receiving progresses. Sessions ended by a local disconnect are not
-    /// reported again.
+    /// A send failure also ends the session, but does not wake a blocked read.
+    /// It is reported once receiving progresses. Sessions ended by a local
+    /// disconnect are not reported again.
+    ///
+    /// The handshake after a reset runs under one configured deadline, starting
+    /// at that reset. It runs in the same call, or in the next one when the
+    /// reset ended a session. Repeated resets within the attempt do not refresh
+    /// the deadline. Expiry returns a `TimedOut` I/O error, as
+    /// [`Error::SendFailed`] while writing and as [`Error::RecvFailed`]
+    /// otherwise. A fresh reset can start another attempt.
     ///
     /// After decryption, message acceptance is ordered with session ending
     /// without waiting for the writer. A concurrent send failure can cause a
@@ -240,6 +285,12 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// configured write timeout. A notification sent while handling a failed
     /// write shares that frame's remaining budget and is skipped after timeout.
     /// These output failures do not themselves close the byte stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handshake or write timeout is too large to add to an
+    /// [`Instant`], or if a handshake reads a wall time before the Unix epoch
+    /// from the stream's clock.
     pub fn recv(&mut self) -> Result<Event<W>, Error> {
         // Continue until a message, session transition or I/O error is ready.
         // Empty frames request a handshake on the next pass.
@@ -250,23 +301,24 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // Transport errors propagate immediately
                     Err(Error::Terminated) => return Err(Error::Terminated),
                     Err(Error::RecvFailed(err)) => return Err(Error::RecvFailed(err)),
-                    // Outbound already attempted notification within the failed
-                    // frame's budget; a fresh attempt here could block again.
+                    // Outbound already attempted a notification within the failed
+                    // frame's budget, and another attempt here could block again
                     Err(Error::SendFailed(err)) => return Err(Error::SendFailed(err)),
 
-                    // Notify the client that the handshake did not establish a session
+                    // Notify the client that the handshake established no session
                     Err(err) => {
                         warn!("dropping wire handshake: {}", err);
                         if let Err(err) = self.outbound.send_dropped(Some(deadline)) {
                             warn!("failed to signal dropped handshake: {}", err);
                         }
                         // Do not swallow an attempt deadline exhausted during
-                        // authentication or its failure notification.
+                        // authentication or its failure notification
                         check_deadline(&self.outbound.clock, deadline)
                             .map_err(Error::RecvFailed)?;
                     }
                     // Report the completed handshake before reading messages.
-                    // The caller can now send without waiting for a client request.
+                    // The caller can send at once, without waiting for a client
+                    // request.
                     Ok((sender, receiver)) => {
                         let sender = self.new_session(sender, receiver);
                         info!("wire session {} established", self.log_id);
@@ -275,6 +327,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 }
                 continue;
             }
+
             // Retrieve the next COBS encoded packet
             let packet = match self.reader.next_packet(None) {
                 // Transport errors propagate immediately
@@ -283,7 +336,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 
                 // A reset can terminate a partial frame and cause a framing error.
                 // The frame may also have carried a sealed message. End any active
-                // session because its encryption sequence can no longer be trusted.
+                // session, since its encryption sequence cannot be followed past it.
                 Err(err) => {
                     let ended = self.end_session();
                     if ended {
@@ -298,7 +351,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     continue;
                 }
                 // A reset ends any active session. Run the handshake on the next
-                // receive call if we return an event, or on the next loop pass.
+                // receive call if this one returns an event, or on the next pass.
                 Ok(None) => {
                     self.handshake_deadline =
                         Some(self.outbound.clock.now() + self.handshake_timeout);
@@ -312,6 +365,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // Valid COBS packet
                 Ok(Some(packet)) => packet,
             };
+
+            // Answer data outside a session with an empty frame and skip it
             let receiver = match self.receiver.as_mut() {
                 None => {
                     debug!("discarding data outside session");
@@ -320,8 +375,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 }
                 Some(receiver) => receiver,
             };
+
             // Finish after decrypting, ordering message acceptance with a send
-            // failure without ever waiting for the writer on a successful receive.
+            // failure without ever waiting for the writer on a successful receive
             let sealer = self
                 .sealer
                 .as_ref()
@@ -350,6 +406,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     }
 
     /// Stores the negotiated contexts and returns a sender for the new session.
+    ///
     /// The sending context's allocation identifies the session. The server owns
     /// both contexts and shares the sending context with active sends. Idle
     /// senders hold weak references and keep neither context nor stream alive.
@@ -368,19 +425,21 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     }
 
     /// Ends the current binding before releasing the server's crypto contexts.
-    /// Waits for the writer. After this returns, no write or flush for that
-    /// session is running or can start. A send that gets the writer first may
-    /// finish. A send still sealing after removal cannot write its packet.
-    /// This takes no encryption lock and does not wait for crypto work.
+    ///
+    /// Waits for the writer while a session exists. After this returns, no
+    /// write or flush for that session is running or can start. A send that
+    /// gets the writer first may finish. A send still sealing after removal
+    /// cannot write its packet. This takes no encryption lock and does not wait
+    /// for crypto work.
     ///
     /// This does not close the stream or send a notification. An active write
-    /// may delay ending until its frame deadline. Another thread can use the
-    /// Closer to cancel I/O without taking the writer lock.
+    /// may delay ending until its frame deadline. Another thread can use a
+    /// [`Closer`] to cancel I/O without taking the writer lock.
     ///
     /// Returns true if it removed a receive context, even if a send failure
     /// already ended the binding. The receive loop uses this removal to emit
-    /// Disconnected once. Local disconnect ignores the result because its caller
-    /// already knows the session ended.
+    /// [`Event::Disconnected`] once. Local disconnect uses the result only for
+    /// its log line, since its caller already knows the session ended.
     fn end_session(&mut self) -> bool {
         if let Some(sealer) = self.sealer.as_ref() {
             self.outbound.end(sealer);
@@ -389,21 +448,25 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         self.receiver.take().is_some()
     }
 
-    /// Sends an empty frame to notify the client it has no session. Logs failures.
+    /// Sends an empty frame to notify the client that it has no session,
+    /// logging any failure.
     fn send_dropped(&self) {
         if let Err(err) = self.outbound.send_dropped(None) {
             warn!("failed to signal dropped session: {}", err);
         }
     }
 
-    /// Ends the encrypted session and notifies the client with an empty frame.
-    /// The stream remains available for the client to connect again. Notification
-    /// failures are logged. This does not produce a Disconnected event because
-    /// the caller already knows the session ended.
+    /// Ends the current session, if any, and notifies the client with an empty
+    /// frame.
+    ///
+    /// The stream remains available for the client to connect again.
+    /// Notification failures are logged. This produces no
+    /// [`Event::Disconnected`], since the caller already knows the session
+    /// ended.
     ///
     /// Waits for the current writer and its flush, then retires the binding.
-    /// The notification gets its own frame budget. Another thread can use the
-    /// Closer to cancel output earlier.
+    /// The notification gets its own frame budget. Another thread can use a
+    /// [`Closer`] to cancel output earlier.
     pub fn disconnect(&mut self) {
         if self.end_session() {
             debug!("wire session {} dropped locally", self.log_id);
@@ -411,13 +474,21 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         self.send_dropped();
     }
 
-    /// Responds to the handshake after a session reset, establishing the
-    /// HPKE contexts of both directions:
+    /// Responds to the handshake after a session reset, establishing the HPKE
+    /// contexts of both directions.
     ///
-    ///   1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
-    ///   2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
-    ///   3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
+    /// The exchange takes three messages:
+    ///
+    /// ```text
+    /// 1. Client -> Server: HostHello { host_signer, host_crypto }           (plain CBOR)
+    /// 2. Server -> Client: ArkHello  { ark_attest, ark_crypto, a2h_encap }  (cose::seal)
+    /// 3. Client -> Server: HostAck   { h2a_encap }                          (cose::seal)
+    /// ```
+    ///
+    /// Empty frames before the HostHello are skipped, and one in place of the
+    /// HostAck restarts the exchange. All steps share one deadline.
     fn handshake(&mut self, deadline: Instant) -> Result<(xhpke::Sender, xhpke::Receiver), Error> {
+        // Wait for earlier writes and drop any binding before answering
         self.outbound.unbind();
         loop {
             // Message 1: Read the HostHello (skip any trailing empty reset frames)
@@ -432,7 +503,6 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             // Generate ephemeral keys and set up server-to-client encryption
             let ark_crypto_key = xhpke::SecretKey::generate();
             let ark_crypto_pub = ark_crypto_key.public_key();
-
             let (sender, a2h_encap) = host_hello
                 .host_crypto
                 .new_sender(CRYPTO_DOMAIN_WIRE_ARK_TO_HOST)
@@ -450,6 +520,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 host_signer: host_hello.host_signer.clone(),
                 host_crypto: host_hello.host_crypto.clone(),
             };
+            // Sign at the clock's wall time, unless a test fixed the signing time
             #[cfg(not(any(test, feature = "bench", feature = "fuzz")))]
             let timestamp = handshake::timestamp(&self.outbound.clock);
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
@@ -467,7 +538,6 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             let ark_hello = sealed.map_err(|err| {
                 Error::HandshakeFailed(format!("failed to seal server hello: {}", err))
             })?;
-
             self.outbound.send_packet(&ark_hello, Some(deadline))?;
 
             // Message 3: Read and open HostAck. An empty frame is another reset;
@@ -495,14 +565,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 .h2a_encap
                 .try_into()
                 .map_err(|_| Error::HandshakeFailed("invalid h2a_encap size".into()))?;
-
             let receiver = ark_crypto_key
                 .new_receiver(&enc_h2a, CRYPTO_DOMAIN_WIRE_HOST_TO_ARK)
                 .map_err(|err| {
                     Error::HandshakeFailed(format!("server receiver setup failed: {}", err))
                 })?;
 
-            // Session established
+            // Hand back the contexts unless the exchange finished past its deadline
             check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
             return Ok((sender, receiver));
         }
@@ -511,8 +580,11 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
 
 impl<R: Read, W: Write, A: Attester> Drop for Server<R, W, A> {
     /// Closes the stream to cancel blocked I/O, then ends the binding before
-    /// releasing the contexts. Shutdown must precede waiting for the writer.
-    /// Idle senders hold weak references and cannot extend the stream's lifetime.
+    /// releasing the contexts.
+    ///
+    /// Shutdown must come before waiting for the writer, which a blocked write
+    /// could otherwise hold until its deadline. Idle senders hold weak
+    /// references and cannot extend the stream's lifetime.
     fn drop(&mut self) {
         self.outbound.close();
         self.end_session();
@@ -531,6 +603,7 @@ impl<R: Read, W: Write, A: Attester> fmt::Debug for Server<R, W, A> {
     }
 }
 
+/// Tests of the server, its attestation and its sessions with the real client.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -542,7 +615,8 @@ mod tests {
     use darkbio_clock::Clock;
     use darkbio_cobs as cobs;
 
-    /// Self-signed attestation for a device that has not been onboarded.
+    /// Issues a self-signed attestation for a device that has not been
+    /// onboarded.
     fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
         use darkbio_crypto::cwt::claims::{self, eat};
 
@@ -574,10 +648,12 @@ mod tests {
         buf
     }
 
-    // Tests that an oversized server hello produces one failure notification.
-    // It never reaches adapter I/O, so the handshake owns that notification;
-    // the writer must not emit another one with its own budget. Dummy attestation
-    // bytes isolate the framing limit: the server forwards them without parsing.
+    /// Tests that an oversized server hello produces one failure notification.
+    ///
+    /// The hello never reaches adapter I/O, so the handshake owns that
+    /// notification, and the writer must not emit another with its own budget.
+    /// Dummy attestation bytes isolate the framing limit, since the server
+    /// forwards them without parsing.
     #[test]
     fn test_oversized_hello_notifies_once() {
         // Prepare an oversized server hello on a paused clock
@@ -608,10 +684,8 @@ mod tests {
         assert_eq!(output, [0]);
     }
 
-    // Tests the two real sides against each other. The handshake hands the
-    // attestation to the client's verifier unchanged and a request gets its
-    // response. The server's signal for a dropped session then surfaces on the
-    // client as a reset, which a fresh handshake recovers from.
+    /// Tests that the real client and server exchange messages, and that a fresh
+    /// handshake recovers from a dropped session.
     #[test]
     fn test_message_round_trip() {
         // Connect both peers on one paused in-memory stream
@@ -621,10 +695,9 @@ mod tests {
         let signer_pub = signer_key.public_key();
         let attestation = self_attestation(&signer_key);
         let presented = attestation.clone();
-
         let (host, ark) = memory::duplex(64 * 1024, &tester.clock());
 
-        // Server side: receive two messages (across two sessions), echo each back.
+        // Receive two messages on the Ark side across two sessions, echoing each
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark, signer_key, attestation);
             let mut sender = None;
@@ -637,7 +710,7 @@ mod tests {
             requests
         });
 
-        // Session 1: handshake, checking the attestation, exchange one message.
+        // Open the first session, check the attestation and exchange one message
         let mut client = Client::new(host);
         let (sender, attest) = client.connect(&signer_pub).unwrap();
         assert_eq!(attest.as_bytes(), presented.as_bytes());
@@ -656,16 +729,17 @@ mod tests {
             "{result:?}"
         );
 
-        // Session 2: new handshake on the same wire, exchange one message.
+        // Open a second session on the same stream and exchange one message
         let (sender, _) = client.connect(&signer_pub).unwrap();
         sender.send(&payload(2)).unwrap();
         assert_eq!(client.recv().unwrap(), payload(2));
 
+        // Require the server to have received both messages in order
         let requests = ark_thread.join().unwrap();
         assert_eq!(requests, vec![payload(1), payload(2)]);
     }
 
-    // Tests that an untrusting verifier rejects the session on the client side.
+    /// Tests that an untrusting verifier rejects the session on the client side.
     #[test]
     fn test_verifier_rejects() {
         testing::init_tracing();
@@ -685,13 +759,13 @@ mod tests {
             }
         }
 
+        // Connect both peers on one paused in-memory stream
         let signer_key = xdsa::SecretKey::generate();
-
         let tester = test_clock();
         let (host, ark) = memory::duplex(64 * 1024, &tester.clock());
 
-        // Server side: serve handshakes until the transport drops. The client aborts
-        // mid-handshake, so the server never delivers a message.
+        // Serve handshakes on the Ark side until the transport drops. The client
+        // aborts mid-handshake, so the server never delivers a message.
         let ark_thread = std::thread::spawn(move || {
             let attestation = self_attestation(&signer_key);
             let mut server = Server::new(ark, signer_key, attestation);
@@ -699,19 +773,18 @@ mod tests {
             testing::served(&mut server, &mut sender)
         });
 
-        // Client side: refuse the attestation in the verifier.
+        // Refuse the attestation in the client's verifier
         let mut client = Client::new(host);
         let result = client.connect(&Untrusting);
         assert!(result.is_err());
 
-        // Dropping the client tears down the transport, unblocking the server.
+        // Dropping the client tears down the transport, unblocking the server
         drop(client);
         assert!(ark_thread.join().unwrap().is_err());
     }
 
-    // Tests that the roots verifier accepts hardware and emulator attestations
-    // under the configured roots and returns the verified identity. Unknown
-    // roots and self-signed attestations are refused.
+    /// Tests that the roots verifier accepts attestations under the trusted
+    /// roots and refuses the others.
     #[test]
     fn test_roots_verifier() {
         testing::init_tracing();
@@ -723,6 +796,7 @@ mod tests {
         use darkbio_trust::{CRYPTO_DOMAIN_DEVICE_ATTESTATION, Realm};
         use std::time::UNIX_EPOCH;
 
+        // Issue every attestation at the paused clock's wall time
         let tester = test_clock();
         let clock = tester.clock();
         let now = clock
@@ -731,8 +805,8 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        /// Runs a handshake with the given attestation and trusted roots.
-        /// Returns the client's verification result.
+        /// Runs a handshake with the given attestation and trusted roots,
+        /// returning the client's verification result.
         fn handshake(
             clock: &Clock,
             signer_key: xdsa::SecretKey,
@@ -740,8 +814,9 @@ mod tests {
             hardware: &[xdsa::PublicKey],
             emulator: &[xdsa::PublicKey],
         ) -> Result<darkbio_trust::device::Device, Error> {
+            // Serve a fresh stream on the Ark side while the client verifies
+            // the attestation through the roots
             let (host, ark) = memory::duplex(64 * 1024, clock);
-
             let ark_thread = std::thread::spawn(move || {
                 let mut server = Server::new(ark, signer_key, attestation);
                 let mut sender = None;
@@ -758,12 +833,14 @@ mod tests {
             result
         }
 
+        // Trust one hardware root and one emulator root
         let hardware_root = xdsa::SecretKey::generate();
         let emulator_root = xdsa::SecretKey::generate();
         let hardware_roots = [hardware_root.public_key()];
         let emulator_roots = [emulator_root.public_key()];
 
-        // A hardware server attested by a hardware root is accepted with its identity
+        // A hardware server attested by a hardware root is accepted with its
+        // identity
         let signer_key = xdsa::SecretKey::generate();
         let attestation = cwt::issue_at(
             &HardwareClaims {
@@ -800,7 +877,8 @@ mod tests {
         let signer_key = xdsa::SecretKey::generate();
         assert!(handshake(&clock, signer_key, attestation, &[], &emulator_roots).is_err());
 
-        // An emulated server attested by an emulator root is accepted with its expiry
+        // An emulated server attested by an emulator root is accepted with its
+        // expiry
         let signer_key = xdsa::SecretKey::generate();
         let attestation = cwt::issue_at(
             &EmulatorClaims {
@@ -864,16 +942,18 @@ mod tests {
         );
     }
 
-    // Tests that attestation construction accepts hardware and emulator claims
-    // and rejects junk or CWTs containing other claim types.
+    /// Tests that attestation construction accepts hardware and emulator claims
+    /// and rejects junk or CWTs carrying other claim types.
     #[test]
     fn test_attestation_shapes() {
         use darkbio_crypto::cwt::claims;
         use darkbio_trust::CRYPTO_DOMAIN_DEVICE_ATTESTATION;
 
+        // Accept hardware claims through the self-signed helper
         let signer = xdsa::SecretKey::generate();
         let _ = self_attestation(&signer);
 
+        // Accept emulator claims
         let emulator = darkbio_trust::device::EmulatorClaims {
             sub: claims::Subject { sub: "".into() },
             cnf: claims::Confirm::new(signer.public_key()),
@@ -893,6 +973,7 @@ mod tests {
         .unwrap();
         Attestation::new(cwt).expect("emulator attestation refused");
 
+        // Refuse the claims of a cloud signer and bytes that are no CWT at all
         let cloud = darkbio_trust::cloud::SignerClaims {
             iss: claims::Issuer { iss: "".into() },
             sub: claims::Subject { sub: "".into() },
@@ -919,21 +1000,22 @@ mod tests {
         );
     }
 
-    // Tests sending from other threads while the server blocks in a read.
-    // The client must receive every message in encryption order to decrypt it.
+    /// Tests that other threads can send while the server blocks in a read.
+    ///
+    /// The client must receive every message in encryption order to decrypt it.
     #[test]
     fn test_senders() {
         testing::init_tracing();
 
+        // Connect both peers on one paused in-memory stream
         let signer_key = xdsa::SecretKey::generate();
         let signer_pub = signer_key.public_key();
         let attestation = self_attestation(&signer_key);
-
         let tester = test_clock();
         let (host, ark) = memory::duplex(64 * 1024, &tester.clock());
 
-        // Server side: on the first request, push messages from a few threads
-        // while waiting for the second request.
+        // After the first request, push messages on the Ark side from a few
+        // threads while the server waits for the second request
         let ark_thread = std::thread::spawn(move || {
             let mut server = Server::new(ark, signer_key, attestation);
             let mut sender = None;
@@ -956,11 +1038,12 @@ mod tests {
             stop
         });
 
-        // Client side: request the push, receive it all, then request the stop.
+        // Request the push from the client
         let mut client = Client::new(host);
         let (sender, _) = client.connect(&signer_pub).unwrap();
         sender.send(&payload(1)).unwrap();
 
+        // Receive every pushed message, whichever thread sent it
         let mut pushed: Vec<Vec<u8>> = (0..100).map(|_| client.recv().unwrap()).collect();
         pushed.sort_unstable();
         let mut expected: Vec<Vec<u8>> = (0..4)
@@ -969,6 +1052,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(pushed, expected);
 
+        // Request the stop, which the server returns once its pushers finish
         sender.send(&payload(2)).unwrap();
         assert_eq!(ark_thread.join().unwrap(), payload(2));
     }

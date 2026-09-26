@@ -32,17 +32,24 @@ use tracing::debug;
 /// Data already buffered by the transport may still be received after closing.
 ///
 /// Dropping the stream closes it. Passing it to a client or server transfers
-/// that responsibility to the transport owner. Closer handles do not keep the
-/// reader or writer alive, and dropping a handle does not close the stream.
+/// that responsibility to the transport owner. [`Closer`] handles do not keep
+/// the reader or writer alive, and dropping a handle does not close the stream.
 pub struct Stream<R: Read, W: Write> {
-    clock: Clock,       // Shared by both adapters and the transport on them
-    io: Option<(R, W)>, // Taken when ownership passes to the transport
+    /// Clock shared by both adapters and the transport on them.
+    clock: Clock,
+    /// Reader and writer, taken when ownership passes to the transport.
+    io: Option<(R, W)>,
+    /// Handle closing this stream, cloned for every caller that asks.
     closer: Closer,
-    timeout: Duration, // One budget for the frame's writes and flush
+    /// One budget for each frame's writes and flush.
+    timeout: Duration,
 }
 
 impl<R: Read, W: Write> Stream<R, W> {
     /// Bundles the two I/O directions with their shutdown operation.
+    ///
+    /// Each frame gets [`DEFAULT_WRITE_TIMEOUT`] to write and flush until
+    /// [`Self::set_write_timeout`] changes it.
     ///
     /// # Panics
     ///
@@ -71,11 +78,12 @@ impl<R: Read, W: Write> Stream<R, W> {
     }
 
     /// Sets the budget for writing and flushing one complete frame, including
-    /// any delimiter needed after failed output. Progress does not restart it.
-    /// The budget begins after acquiring the writer and includes frame encoding.
-    /// Waiting for locks, encryption and peer replies is outside this budget.
-    /// Handshake frames also share the overall handshake deadline, which can
-    /// shorten this write budget.
+    /// any delimiter needed after failed output.
+    ///
+    /// Progress does not restart it. The budget begins after acquiring the
+    /// writer and includes frame encoding. Waiting for locks, encryption and
+    /// peer replies is outside this budget. Handshake frames also share the
+    /// overall handshake deadline, which can shorten this write budget.
     ///
     /// Zero refuses output immediately. A duration too large to add to an
     /// [`Instant`] panics when an outgoing frame's deadline is constructed.
@@ -84,18 +92,22 @@ impl<R: Read, W: Write> Stream<R, W> {
         self
     }
 
-    /// A handle that can close the stream from another thread.
+    /// Returns a handle that can close the stream from another thread.
     pub fn closer(&self) -> Closer {
         self.closer.clone()
     }
 
     /// Permanently closes the stream and waits for shutdown and admitted adapter
-    /// operations to finish. Concurrent close calls wait for the same completion.
+    /// operations to finish.
+    ///
+    /// Concurrent close calls wait for the same completion. See
+    /// [`Closer::close`].
     pub fn close(&self) {
         self.closer.close();
     }
 
-    /// Transfers ownership to a transport without closing the stream.
+    /// Hands the adapters, a closer and the write budget to a transport
+    /// without closing the stream.
     pub(crate) fn into_parts(mut self) -> (R, W, Closer, Duration) {
         let (reader, writer) = self.io.take().expect("stream consumed once");
         (reader, writer, self.closer.clone(), self.timeout)
@@ -122,39 +134,54 @@ impl<R: Read, W: Write> fmt::Debug for Stream<R, W> {
 
 /// A cloneable handle that permanently closes a byte stream.
 #[derive(Clone)]
-pub struct Closer(Arc<Shutdown>);
+pub struct Closer(
+    /// Shutdown coordination shared by every clone.
+    Arc<Shutdown>,
+);
 
-/// Shared shutdown coordination. The state lock orders I/O admission and closure.
-/// Adapter operations and the shutdown callback run without this lock. The
-/// condition variable wakes waiting closers as those operations finish.
+/// Shutdown coordination shared by every handle of one stream.
+///
+/// The state lock orders I/O admission and closure. Adapter operations and the
+/// shutdown callback run without this lock.
 struct Shutdown {
+    /// Lifecycle, active operations and the pending shutdown callback.
     state: Mutex<State>,
+    /// Signal waking closers as admitted operations and shutdown finish.
     changed: Condvar,
 }
 
-/// Lifecycle of a byte stream. Closing refuses new adapter operations. Closed
-/// additionally guarantees that shutdown and all admitted operations have finished.
+/// Lifecycle phase of a byte stream.
+///
+/// Closing refuses new adapter operations. Closed also guarantees that
+/// shutdown and all admitted operations have finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Adapter I/O may be admitted and shutdown has not been requested.
+    /// Stream admitting adapter I/O, with no shutdown requested.
     Open,
-    /// One closer runs shutdown. Other closers wait and new I/O is refused.
+    /// Shutdown run by one closer while other closers wait and new I/O is
+    /// refused.
     Closing,
-    /// The callback and every admitted adapter call have returned.
+    /// End state, reached once the callback and every admitted adapter call
+    /// have returned.
     Closed,
 }
 
-/// Stream lifecycle and active adapter operations under one lock. The first
-/// closer takes the shutdown action. Each admitted operation increments the
-/// active count and decrements it on completion. Closed requires a zero count.
+/// Stream lifecycle and active adapter operations, guarded by one lock.
+///
+/// Each admitted operation increments the active count and decrements it on
+/// completion. Closed requires a zero count.
 struct State {
+    /// Current lifecycle phase.
     phase: Phase,
-    active: usize, // Admitted adapter operations that shutdown must wait for
+    /// Admitted adapter operations that shutdown must wait for.
+    active: usize,
+    /// Shutdown callback, taken by the first closer.
     action: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Closer {
-    /// Creates the shutdown coordinator before either I/O half can be used.
+    /// Creates the coordinator of an open stream, whose closers wait on `clock`
+    /// and whose first closer runs `shutdown`.
     pub(super) fn new(clock: &Clock, shutdown: impl FnOnce() + Send + 'static) -> Self {
         Self(Arc::new(Shutdown {
             state: Mutex::new(State {
@@ -166,15 +193,17 @@ impl Closer {
         }))
     }
 
-    /// Permanently closes the stream. Every caller waits until the shutdown
-    /// callback and all admitted adapter calls have returned. This includes
-    /// deadline setters, reads, writes and flushes.
-    /// New I/O is refused as soon as closing begins. This does not join the
-    /// threads using the transport or wait for application handlers.
+    /// Permanently closes the stream.
     ///
-    /// The callback runs once, without holding a state or I/O lock. It must return
-    /// promptly and release blocked I/O, including reads with no deadline.
-    /// Calling close from adapter I/O or the callback would wait on itself.
+    /// Every caller waits until the shutdown callback and all admitted adapter
+    /// calls have returned. This includes deadline setters, reads, writes and
+    /// flushes. New I/O is refused as soon as closing begins. This does not join
+    /// the threads using the transport or wait for application handlers.
+    ///
+    /// The callback runs once, without holding a state or I/O lock. It must
+    /// return promptly and release blocked I/O, including reads with no
+    /// deadline. Calling close from adapter I/O or the callback would wait on
+    /// itself.
     pub fn close(&self) {
         // Wait for another closer to finish or take responsibility for shutdown
         let action = {
@@ -203,7 +232,7 @@ impl Closer {
             }
         };
 
-        // The first closer runs shutdown without holding the state lock.
+        // The first closer runs shutdown without holding the state lock
         action();
 
         // Wait until all admitted adapter operations return
@@ -221,7 +250,11 @@ impl Closer {
         self.0.changed.notify_all();
     }
 
-    /// Admits one adapter call atomically with the decision to start closing.
+    /// Admits one adapter call while the stream is open, or returns `None` once
+    /// closing has begun.
+    ///
+    /// Admission and the decision to start closing are ordered under the state
+    /// lock.
     fn enter(&self) -> Option<Activity<'_>> {
         let mut state = self.0.state.lock().expect("stream state not poisoned");
         if state.phase != Phase::Open {
@@ -233,8 +266,9 @@ impl Closer {
 }
 
 impl fmt::Debug for Closer {
-    /// Shows the lifecycle phase and the admitted adapter operations. A state
-    /// lock held elsewhere is reported instead of waited for.
+    /// Shows the lifecycle phase and the admitted adapter operations.
+    ///
+    /// A state lock held elsewhere is reported instead of waited for.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut closer = f.debug_struct("Closer");
         match self.0.state.try_lock() {
@@ -247,9 +281,13 @@ impl fmt::Debug for Closer {
     }
 }
 
-/// Tracks one admitted adapter operation until return or unwind. Dropping it
-/// decrements the active count without acquiring an I/O lock.
-struct Activity<'a>(&'a Closer);
+/// Guard for one admitted adapter operation, held until it returns or unwinds.
+///
+/// Dropping it decrements the active count without acquiring an I/O lock.
+struct Activity<'a>(
+    /// Coordinator that admitted the operation.
+    &'a Closer,
+);
 
 impl Drop for Activity<'_> {
     fn drop(&mut self) {
@@ -261,24 +299,29 @@ impl Drop for Activity<'_> {
     }
 }
 
-/// Reader admitting each adapter call under the shutdown coordinator's lock.
+/// Reader admitting each adapter call through the shutdown coordinator.
 pub(super) struct ReadHalf<R> {
+    /// Reading adapter of the stream.
     pub(super) inner: R,
+    /// Coordinator admitting each deadline setter and read call.
     pub(super) closer: Closer,
 }
 
 impl<R: Read> ReadHalf<R> {
-    /// Reads with the optional handshake deadline. Ordinary reads wait for data
-    /// or adapter shutdown. Timeouts and interruptions retry within the deadline.
-    /// A successful read reports its bytes even if it finishes late, so the framer
-    /// can retain them before surfacing expiry. Closure refuses new I/O with EOF.
+    /// Reads with the optional handshake deadline.
+    ///
+    /// Ordinary reads wait for data or adapter shutdown. Timeouts and
+    /// interruptions retry within the deadline. A successful read reports its
+    /// bytes even if it finishes late, so the framer can retain them before
+    /// surfacing expiry. Closure refuses new I/O with EOF.
     pub(super) fn read(&mut self, buf: &mut [u8], deadline: Option<Instant>) -> io::Result<usize> {
         loop {
             // Refuse an operation whose deadline has expired
             if let Some(deadline) = deadline {
                 check_deadline(&self.inner.clock(), deadline)?;
             }
-            // Keep the setter and read accounted for until both have returned.
+
+            // Keep the setter and read accounted for until both have returned
             let result = {
                 let Some(_active) = self.closer.enter() else {
                     return Ok(0);
@@ -286,6 +329,7 @@ impl<R: Read> ReadHalf<R> {
                 self.inner.set_read_deadline(deadline)?;
                 self.inner.read(buf)
             };
+
             // Retry an idle timeout or interrupted read. Other errors return.
             match result {
                 Err(err)
@@ -302,27 +346,32 @@ impl<R: Read> ReadHalf<R> {
     }
 }
 
-/// Writer admitting each partial write and flush under the shutdown lock.
+/// Writer admitting each deadline setter, partial write and flush through the
+/// shutdown coordinator.
 pub(super) struct WriteHalf<W> {
+    /// Writing adapter of the stream.
     pub(super) inner: W,
+    /// Coordinator admitting each deadline setter, write and flush call.
     pub(super) closer: Closer,
 }
 
 impl<W: Write> WriteHalf<W> {
-    /// Writes all bytes and flushes them under one absolute deadline. Installs
-    /// the deadline once before I/O. Each partial write and flush checks
-    /// expiration and closure before calling the adapter.
-    /// Interrupted writes are retried. Zero progress fails with `WriteZero`.
-    /// Setter and flush errors are not retried.
+    /// Writes all bytes and flushes them under one absolute deadline.
     ///
-    /// An admitted call may finish after closure begins. Failure
-    /// can leave a written prefix. The framer checks the deadline again after
-    /// this operation returns, so a late flush fails the complete frame.
+    /// Installs the deadline once before I/O. Each partial write and flush
+    /// checks expiration and closure before calling the adapter. Interrupted
+    /// writes are retried. Zero progress fails with
+    /// [`WriteZero`](io::ErrorKind::WriteZero). Setter and flush errors are not
+    /// retried.
+    ///
+    /// An admitted call may finish after closure begins. Failure can leave a
+    /// written prefix. The framer checks the deadline again after this
+    /// operation returns, so a late flush fails the complete frame.
     pub(super) fn write(&mut self, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
         // Refuse an operation whose deadline has expired
         check_deadline(&self.inner.clock(), deadline)?;
 
-        // Account for the deadline setter so shutdown waits for it too.
+        // Account for the deadline setter so shutdown waits for it too
         {
             let _active = self
                 .closer
@@ -330,9 +379,10 @@ impl<W: Write> WriteHalf<W> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))?;
             self.inner.set_write_deadline(deadline)?;
         }
+
         // Keep writing while bytes remain; flush only after the complete write
         while !bytes.is_empty() {
-            // Recheck the deadline before each partial write.
+            // Recheck the deadline before each partial write
             check_deadline(&self.inner.clock(), deadline)?;
 
             // Attempt to write as much data as possible
@@ -350,9 +400,9 @@ impl<W: Write> WriteHalf<W> {
                 Err(err) => return Err(err),
             }
         }
+
         // Flush is part of the same operation and gets its own admission
         check_deadline(&self.inner.clock(), deadline)?;
-
         let _active = self
             .closer
             .enter()
@@ -361,6 +411,7 @@ impl<W: Write> WriteHalf<W> {
     }
 }
 
+/// Checks stream ownership, shutdown, I/O admission and output deadlines.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -373,7 +424,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    // Concurrent closers park on the stream clock until admitted I/O is released.
+    /// Checks that concurrent closers park on the stream clock until admitted
+    /// I/O is released.
     #[test]
     fn test_concurrent_closers_wait_on_stream_clock() {
         // Keep an admitted operation alive while two threads close the stream
@@ -403,7 +455,7 @@ mod tests {
     fn test_debug_capabilities() {
         use crate::transport::{Attestation, Event, Roots, Sender, Server};
 
-        /// Requires a value to be printable.
+        /// Requires a type to be printable.
         fn printable<T: fmt::Debug>() {}
         printable::<Stream<Box<dyn Read>, Box<dyn Write>>>();
         printable::<Closer>();
@@ -415,8 +467,8 @@ mod tests {
         printable::<Roots<'static>>();
     }
 
-    // A memory reader can deliver ready bytes after its own deadline, but the
-    // transport must reject an expired attempt before consuming those bytes.
+    /// Checks that the transport refuses an expired read before consuming bytes
+    /// a memory reader would still deliver after its own deadline.
     #[test]
     fn test_memory_reader_keeps_transport_deadline() {
         // Queue bytes on a clock a day ahead of real time
@@ -430,6 +482,7 @@ mod tests {
             inner: reader,
             closer,
         };
+
         // Refuse an expired read without consuming the available bytes
         let mut bytes = [0; 3];
         assert_eq!(
@@ -449,14 +502,19 @@ mod tests {
     struct Adapter {
         /// Clock shared by the adapter and shutdown gate.
         clock: Clock,
+        /// Channel notifying the test that an adapter call has started.
         entered: mpsc::Sender<()>,
+        /// Gate the shutdown callback opens to release the held call.
         released: testing::Gate,
+        /// Whether the held call returns an adapter failure.
         fails: bool,
+        /// Latest deadline installed by either direction's setter.
         deadline: Option<Instant>,
     }
 
     impl Adapter {
-        /// Waits for the test's release without exceeding this adapter call's deadline.
+        /// Reports entry and waits for shutdown to release the call within its
+        /// deadline, then returns the selected result.
         fn wait(&self, deadline: Option<Instant>) -> io::Result<()> {
             self.entered.send(()).unwrap();
             self.released.wait(deadline)?;
@@ -536,6 +594,7 @@ mod tests {
                 )
             }
         });
+
         // Close only after the adapter has parked and preserve its result
         entries.recv().unwrap();
         tester.wait_blocked(1);
@@ -550,9 +609,8 @@ mod tests {
         }
     }
 
-    // Tests that shutdown preserves admitted read and final flush results,
-    // including original errors. An admitted write can accept its bytes after
-    // closing starts, but the full operation then refuses the subsequent flush.
+    /// Checks that shutdown preserves the results of an admitted read and final
+    /// flush, including their errors.
     #[test]
     fn test_admitted_io_preserves_results_during_shutdown() {
         for fails in [false, true] {
@@ -563,6 +621,8 @@ mod tests {
                 assert_eq!(buf, [0x5a]);
                 Ok(())
             });
+
+            // Let an admitted write finish, then refuse the flush after it
             during_shutdown(fails, move |inner, closer| {
                 let deadline = inner.clock.now() + Duration::from_secs(5);
                 let result = WriteHalf { inner, closer }.write(&[1, 2, 3], deadline);
@@ -573,6 +633,8 @@ mod tests {
                     Ok(())
                 }
             });
+
+            // Preserve the admitted final flush's result across shutdown
             during_shutdown(fails, |inner, closer| {
                 let deadline = inner.clock.now() + Duration::from_secs(5);
                 WriteHalf { inner, closer }.write(&[], deadline)
@@ -580,9 +642,8 @@ mod tests {
         }
     }
 
-    // Tests that handing a stream to a client transfers shutdown responsibility
-    // without closing it. Dropping either owner invokes shutdown exactly once,
-    // and repeated closes do nothing.
+    /// Checks that handing a stream to a client keeps it open, and dropping
+    /// either owner runs shutdown exactly once despite repeated closes.
     #[test]
     fn test_ownership_and_repeated_close() {
         // Transfer a paused stream to its client without closing it
@@ -606,6 +667,7 @@ mod tests {
             0,
             "handoff must keep the stream open"
         );
+
         // Close once when its owner drops and ignore repeated closes
         drop(client);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -632,9 +694,8 @@ mod tests {
         );
     }
 
-    // Tests that concurrent close calls and owner drop all wait for shutdown.
-    // Hold the callback until every caller has started, then check that none
-    // returns before the callback is released.
+    /// Checks that concurrent close calls and the owner's drop all wait for the
+    /// shutdown callback to return.
     #[test]
     fn test_every_closer_waits_for_the_shutdown_callback() {
         // Park the shutdown callback on the stream's paused clock
@@ -698,27 +759,33 @@ mod tests {
     /// Adapter operation held in flight while the test requests shutdown.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum BlockAt {
-        /// Hold a raw read until the test releases it.
+        /// Raw read held until the test releases it.
         Read,
-        /// Hold a raw write until the test releases it.
+        /// Raw write held until the test releases it.
         Write,
-        /// Hold a flush until the test releases it.
+        /// Flush held until the test releases it.
         Flush,
     }
 
-    /// Holds one adapter operation until the test releases it. This keeps I/O in
-    /// progress long enough to observe shutdown.
+    /// Barrier holding one adapter operation until the test releases it.
+    ///
+    /// This keeps I/O in progress long enough to observe shutdown.
     struct Gate {
         /// Clock shared with both gated adapters.
         clock: Clock,
+        /// Operation this barrier holds.
         at: BlockAt,
+        /// Channel notifying the test that the held operation started.
         entered: mpsc::Sender<()>,
+        /// Gate the test opens to let the held operation finish.
         released: testing::Gate,
+        /// Read, write and flush calls made through either half.
         calls: AtomicUsize,
     }
 
     impl Gate {
-        /// Holds the selected operation until released or its supplied deadline expires.
+        /// Counts an adapter call and holds the selected operation until
+        /// released or its supplied deadline expires.
         fn call(&self, at: BlockAt, deadline: Option<Instant>) -> io::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if at == self.at {
@@ -736,7 +803,9 @@ mod tests {
 
     /// Adapter half sharing a gate with the test driver.
     struct GatedAdapter {
+        /// Barrier shared with the other half and the test.
         gate: Arc<Gate>,
+        /// Latest deadline installed through either setter.
         deadline: Option<Instant>,
     }
 
@@ -786,9 +855,8 @@ mod tests {
         }
     }
 
-    // Tests that close waits for an admitted read, write or flush even after
-    // the shutdown callback returns. A gate holds each operation independently;
-    // subsequent I/O must never reach the closed adapter.
+    /// Checks that close waits for an admitted read, write or flush after the
+    /// shutdown callback returns, and later I/O never reaches the adapter.
     #[test]
     fn test_every_closer_waits_for_active_io_and_refuses_new_io() {
         for at in [BlockAt::Read, BlockAt::Write, BlockAt::Flush] {
@@ -871,15 +939,22 @@ mod tests {
         }
     }
 
-    /// Accepts one byte per write and can hold flush until its supplied deadline.
+    /// Writer accepting one byte per write, able to hold its flush until the
+    /// supplied deadline.
+    ///
     /// Recorded deadlines reveal whether partial progress restarts the budget.
     struct BudgetWriter {
         /// Clock governing writes and the deliberately stalled flush.
         clock: Clock,
+        /// Bytes accepted so far.
         bytes: Vec<u8>,
+        /// Deadline each accepted write and each flush saw.
         deadlines: Vec<Instant>,
+        /// Whether flush sleeps until its deadline and then times out.
         stall_flush: bool,
+        /// Latest installed write deadline.
         deadline: Option<Instant>,
+        /// Number of deadline setter calls.
         settings: usize,
     }
 
@@ -915,8 +990,8 @@ mod tests {
         }
     }
 
-    // Tests that partial writes and a blocked flush share one absolute deadline,
-    // a timeout leaves the stream reusable, and a zero budget never calls I/O.
+    /// Checks that partial writes and a stalled flush share one absolute
+    /// deadline, a timeout leaves the stream reusable and a zero budget skips I/O.
     #[test]
     fn test_output_deadline_and_reuse() {
         // Start a partial write whose flush parks until its clock deadline
@@ -970,21 +1045,28 @@ mod tests {
         writer.closer.close();
     }
 
-    // Tests the complete write operation with interruption and partial progress:
-    // retries retain the unsent suffix, zero progress fails without flushing,
-    // and an interrupted flush is returned directly rather than retried.
+    /// Checks that write retries keep the unsent suffix, zero progress fails
+    /// without flushing and an interrupted flush is returned without a retry.
     #[test]
     fn test_partial_write_retries_and_failures() {
-        /// Scripts adapter results and records offered and accepted byte sequences.
+        /// Writer replaying scripted results while recording offered and
+        /// accepted bytes.
         struct Script {
             /// Clock governing every scripted partial write.
             clock: Clock,
+            /// Results the next writes return, in order.
             results: std::collections::VecDeque<io::Result<usize>>,
+            /// Bytes offered to each write call.
             offered: Vec<Vec<u8>>,
+            /// Bytes the writes accepted, in order.
             accepted: Vec<u8>,
+            /// Whether the flush fails as interrupted.
             interrupted_flush: bool,
+            /// Number of flush calls.
             flushes: usize,
+            /// Number of deadline setter calls.
             settings: usize,
+            /// Latest installed write deadline.
             deadline: Option<Instant>,
         }
 
@@ -1059,6 +1141,7 @@ mod tests {
             } else {
                 result.unwrap();
             }
+
             // Retain the unsent suffix across retries and configure the deadline once
             assert_eq!(
                 writer.inner.offered,
@@ -1074,21 +1157,26 @@ mod tests {
         }
     }
 
-    // Tests that a failed deadline setter prevents byte I/O and preserves its
-    // error, including Interrupted and TimedOut. Only retryable errors from an
-    // actual read may start another attempt.
+    /// Checks that a failed deadline setter prevents byte I/O and keeps its
+    /// error, even an `Interrupted` or `TimedOut` one.
+    ///
+    /// Only retryable errors from an actual read may start another attempt.
     #[test]
     fn test_deadline_setter_failure_prevents_io() {
-        /// Rejects deadline installation and panics if byte I/O is attempted.
+        /// Adapter refusing deadline installation, panicking if byte I/O is
+        /// attempted.
         struct Refused {
             /// Clock shared by the test's adapters and closer.
             clock: Clock,
+            /// Number of deadline setter calls.
             settings: usize,
+            /// Error kind the setter fails with.
             kind: io::ErrorKind,
         }
 
         impl Refused {
-            /// Fails once so an incorrect retry fails the test promptly.
+            /// Fails the setter call, panicking on a second one so an incorrect
+            /// retry fails the test promptly.
             fn reject(&mut self) -> io::Result<()> {
                 self.settings += 1;
                 assert_eq!(self.settings, 1, "deadline setter failure retried");
@@ -1173,16 +1261,21 @@ mod tests {
         }
     }
 
-    // Tests that a partial write returning after its deadline leaves its
-    // accepted byte intact but fails the complete operation. Depending on the
-    // input length, either the remaining write or flush is refused before I/O.
+    /// Checks that a partial write returning after its deadline keeps its
+    /// accepted byte but fails the complete operation.
+    ///
+    /// Depending on the input length, either the remaining write or the flush
+    /// is refused before I/O.
     #[test]
     fn test_late_write_preserves_progress() {
-        /// Accepts one byte but delays returning until its installed deadline.
+        /// Writer accepting one byte per write, returning only at its installed
+        /// deadline.
         struct LateWriter {
             /// Clock governing the late partial write.
             clock: Clock,
+            /// Latest installed write deadline.
             deadline: Option<Instant>,
+            /// Bytes accepted so far.
             bytes: Vec<u8>,
         }
 

@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! Real transport scenarios using the transport runner's gated byte pipes.
+//!
 //! Scripts can run both protocol peers or inspect one peer through a raw transport.
 
 use super::session::Job;
@@ -28,10 +29,13 @@ use std::time::Duration;
 
 /// Default protocol timeout for scenarios that do not specify one.
 const BUDGET: Duration = Duration::from_secs(3);
-/// Transport write timeout, independent of protocol request deadlines.
+/// Transport write timeout of both streams and handshake timeout of the raw
+/// client, independent of protocol request deadlines.
 const WRITE_BUDGET: Duration = Duration::from_millis(500);
 
-/// Which peers run the protocol API; the other peer, if any, uses raw envelopes.
+/// Choice of the peers that run the protocol API.
+///
+/// The other peer, if any, sends raw envelopes through its transport.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Mode {
@@ -52,13 +56,13 @@ enum Failure {
     Timeout,
     /// An adapter or encrypted session failed.
     Transport,
-    /// A peer application error.
+    /// The peer answered with an application error of this code.
     Remote(u64),
     /// A submitted body has no field in this wire direction.
     Direction,
     /// A submitted envelope exceeds the transport's plaintext limit.
     Large,
-    /// Invalid peer envelope or duplicate outstanding request ID.
+    /// Invalid envelope or payload from the peer, or a reused active request ID.
     Malformed,
     /// The inbound request limit closed the session.
     Requests,
@@ -66,7 +70,8 @@ enum Failure {
     Bytes,
 }
 
-/// Maps public errors into the script's expected outcomes.
+/// Maps a public error to the script's expected outcome, panicking on errors
+/// no script expects.
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
@@ -87,7 +92,7 @@ fn failure(error: Error) -> Failure {
 enum EnvelopeShape {
     /// Opaque develop body carrying one distinguishing byte.
     Content(u8),
-    /// Error-only response.
+    /// Error-only envelope carrying this code.
     Error(u64),
     /// A valid envelope containing a truncated nested protobuf body.
     MalformedBody,
@@ -101,125 +106,150 @@ enum EnvelopeShape {
     Invalid,
 }
 
-/// Serial script with explicit starts and completions for concurrent API calls.
+/// Script step, with explicit starts and completions for concurrent API calls.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step {
-    /// Advances the scenario clock after its current protocol workers park.
+    /// Clock advance in milliseconds, taken once the protocol workers park.
     Advance(u64),
-    // Session setup and limits.
-    /// Reconnect the raw client and accept a replacement under this label.
+
+    /// Reconnect of the raw client, accepting the replacement under this label.
     Reconnect(u8),
-    /// Require a failed raw handshake before testing another attempt.
+    /// Raw client handshake that times out after the server's output takes its
+    /// armed fault.
     FailedReconnect,
-    /// Inject a read timeout after ArkHello, while the server awaits HostAck.
+    /// Read timeout injected into the server after its ArkHello, while it awaits
+    /// the HostAck.
     HandshakeReadTimeout,
-    /// Changes both inbound limits through the public session setter.
+    /// Inbound request and byte limits for the labeled session, through its
+    /// public setter.
     InboundLimits(u8, usize, usize),
-    /// Changes both server limits for the current and future sessions.
+    /// Inbound request and byte limits for the server's current and future
+    /// sessions.
     ServerInboundLimits(usize, usize),
-    /// Checks accepted requests and retained bytes after earlier work has completed.
+    /// Expected accepted requests and retained bytes of the labeled session.
     Usage(u8, usize, usize),
 
-    // Requests and replies.
-    /// Round-trip a concrete schema body through the public typed waiting API.
+    /// Typed round trip of a schema body from session 0 to session 1, which needs
+    /// both protocol peers.
     TypedExchange,
-    /// Request from session label, save promise in slot, payload tag, deadline ms.
+    /// Request from the labeled session, with its promise slot, body tag and
+    /// deadline in milliseconds.
     Request(u8, u8, u8, u64),
-    /// Submit a body belonging to the opposite wire direction.
+    /// Request from the labeled session with a body only its peer may send, its
+    /// promise saved in a slot.
     WrongDirection(u8, u8),
-    /// Submit a body beyond the plaintext limit.
+    /// Request from the labeled session with a body beyond the plaintext limit,
+    /// its promise saved in a slot.
     Oversized(u8, u8),
-    /// Receive a request and retain its responder in the given slot.
+    /// Receipt of a request with this tag on the labeled session, its responder
+    /// saved in a slot.
     Receive(u8, u8, u8),
-    /// Receives a queued request and requires a specific failure without a wait hook.
+    /// Receive on the labeled session that must fail with this error.
+    ///
+    /// Unlike [`Self::StartReceive`], it arms no wait hook, so it works on a
+    /// nonempty queue or a closed session.
     ReceiveError(u8, Failure),
-    /// Begin a blocked receive on the labeled session.
+    /// Receive started in the background on the labeled session, returning once
+    /// the call waits on an empty queue.
     StartReceive(u8),
-    /// Require the blocked receive to finish with this failure.
+    /// Expected failure of the labeled session's background receive.
     ReceiveFailed(u8, Failure),
-    /// Reply through a responder, retaining its write promise.
+    /// Reply through a saved responder with a body tag or an error code, its
+    /// write promise saved in a slot and its deadline in milliseconds.
     Reply(u8, u8, Result<u8, u64>, u64),
-    /// Reply with a body invalid for the labeled session's wire direction.
+    /// Reply through a saved responder with a body only the labeled session's
+    /// peer may send, its write promise saved in a slot.
     WrongDirectionReply(u8, u8, u8),
-    /// Reply with a body beyond the plaintext limit, retaining its write promise.
+    /// Reply through a saved responder with a body beyond the plaintext limit,
+    /// its write promise saved in a slot.
     OversizedReply(u8, u8),
-    /// Drop a responder to queue the automatic error.
+    /// Dropped responder, which queues the automatic error reply.
     Abandon(u8),
 
-    // Promise completion.
-    /// Registers a request promise to send a token without consuming its result.
+    /// Notification that sends a token once a saved request promise settles,
+    /// leaving its result unread.
     Notify(u8, u8),
-    /// Registers a reply promise to send a token without consuming its result.
+    /// Notification that sends a token once a saved reply promise settles,
+    /// leaving its result unread.
     NotifyWrite(u8, u8),
-    /// Waits for a completion token without servicing deadlines or taking bytes.
+    /// Expected next completion token, awaited without servicing deadlines or
+    /// taking bytes.
     Notified(u8),
-    /// Checks that no additional completion tokens have been queued.
+    /// Absence of any queued completion token.
     NoNotifications,
-    /// Waits for response delivery without consuming its buffered bytes.
+    /// Processing of the response to this ID by the labeled session's reader,
+    /// awaited while its bytes stay buffered.
     ResponseReceived(u8, u64),
-    /// Reads the request's result channel directly, so its deadline worker must
-    /// deliver any timeout without help from `Promise::wait()`.
+    /// Expected result of a saved request promise, read without servicing its
+    /// deadline.
+    ///
+    /// The deadline worker must deliver any timeout without help from
+    /// `Promise::wait()`.
     Answer(u8, Result<u8, Failure>),
-    /// The promise may fail from local closure or from the peer closing its stream.
+    /// Expected failure of a saved request promise, from local closure or from
+    /// the peer closing its stream.
     AnswerClosed(u8),
-    /// Drops the promise, leaving the request in progress.
+    /// Dropped request promise, leaving its request in progress.
     DropPromise(u8),
-    /// Reads the reply's result channel directly, without calling `Promise::wait()`.
+    /// Expected result of a saved reply promise, read without calling
+    /// `Promise::wait()`.
     Written(u8, Result<(), Failure>),
 
-    // Raw peer traffic and request IDs.
-    /// Send a chosen ID and shape from the raw peer.
+    /// Envelope of a chosen ID and shape, sent by the raw peer.
     Send(u64, EnvelopeShape),
-    /// Send invalid traffic; peer shutdown may race the sender's final flush.
-    /// Following receive/promise assertions must prove the actual rejection.
+    /// Envelope from the raw peer that the protocol peer must refuse.
+    ///
+    /// The send may fail, since its final flush can race the protocol peer's
+    /// shutdown. Later receive or promise steps must prove the rejection.
     Reject(u64, EnvelopeShape),
-    /// Inspect a raw received ID and shape.
+    /// Expected ID and shape of the next envelope the raw peer receives.
     Read(u64, EnvelopeShape),
-    /// Start the local allocator at its final valid ID.
+    /// Jump of the labeled session's request IDs to the last one it can allocate.
     LastId(u8),
-    /// Check the request IDs still awaiting peer responses.
+    /// Expected sorted IDs of the labeled session's unanswered requests.
     Outstanding(u8, Vec<u64>),
 
-    // I/O faults and gates.
-    /// Pause or resume one physical direction (0 host output, 1 Ark output).
+    /// Pause or resumption of one operation on a pipe, 0 carrying host output
+    /// and 1 carrying Ark output.
     Pause(u8, Operation, bool),
-    /// Wait until the selected adapter operation is actually blocked.
+    /// Blocked operation on a pipe, awaited before the script goes on.
     Blocked(u8, Operation),
-    /// Fail the next matching adapter operation.
+    /// Error injected into the next matching operation on a pipe.
     Fault(u8, Operation, io::ErrorKind),
-    /// Pause the session writer just before it calls `Sender::disconnect()`.
+    /// Gate that pauses the labeled session's writer just before it calls
+    /// [`Sender::disconnect`](transport::Sender::disconnect).
     PauseDisconnect(u8),
-    /// Wait until the writer is paused before `Sender::disconnect()`.
+    /// Arrival of the labeled session's writer at its disconnect gate.
     DisconnectPaused(u8),
-    /// Let the paused writer call `Sender::disconnect()`.
+    /// Release of the paused writer, letting it call
+    /// [`Sender::disconnect`](transport::Sender::disconnect).
     ResumeDisconnect(u8),
 
-    // Closure and release.
-    /// Close this session through its saved `Closer`.
+    /// Close of the labeled session through its saved [`Closer`].
     Close(u8),
-    /// Drop a session owner with its worker and handle references still alive.
+    /// Dropped session owner, which closes the session while saved handles remain.
     Drop(u8),
-    /// Require a request through an old `Requester` to fail.
+    /// Refused request through the labeled session's saved [`Requester`].
     Refused(u8),
-    /// Check that the session's weak reference stops upgrading after its workers exit.
+    /// Awaited drop of the labeled session's last state reference.
     Released(u8),
-    /// Close the server and all protocol connections.
+    /// Closure of the server, every saved session and both streams.
     Shutdown,
-    /// Require all threads to exit after physical shutdown.
+    /// Awaited exit of every tracked protocol worker.
     Stopped,
-    /// Start a protocol worker that panics to test that the process aborts.
+    /// Panicking worker on the labeled session, which must abort the process.
     WorkerPanic(u8),
 }
 
 /// Transport owner and bound sender retained by the scripted remote peer.
 enum RawPeer {
-    /// Raw host can re-handshake on the same open pipe.
+    /// Raw host, which can handshake again on the same open pipes.
     Client(
         Box<transport::Client<Adapter, Adapter>>,
         transport::Sender<Adapter>,
     ),
-    /// Raw Ark supplies arbitrary server envelopes.
+    /// Raw Ark, which sends arbitrary server envelopes.
     Server(
         Box<transport::Server<Adapter, Adapter, Attestation>>,
         transport::Sender<Adapter>,
@@ -229,6 +259,7 @@ enum RawPeer {
 impl RawPeer {
     /// Sends an envelope without applying the protocol's validation rules.
     fn send(&self, id: u64, body: EnvelopeShape) -> Result<(), transport::Error> {
+        // Send a truncated nested body or error, built through the opaque view
         if matches!(
             body,
             EnvelopeShape::MalformedBody | EnvelopeShape::MalformedError
@@ -242,6 +273,8 @@ impl RawPeer {
                 Self::Client(_, sender) | Self::Server(_, sender) => sender.send(&bytes),
             };
         }
+
+        // Pick the content tag and the error that the other shapes carry
         let (tag, error) = match body {
             EnvelopeShape::Content(tag) => (Some(tag), None),
             EnvelopeShape::Error(code) => (
@@ -261,6 +294,9 @@ impl RawPeer {
             EnvelopeShape::Neither | EnvelopeShape::Invalid => (None, None),
             EnvelopeShape::MalformedBody | EnvelopeShape::MalformedError => unreachable!(),
         };
+
+        // Send them in an envelope of this peer's direction, or send a lone
+        // truncated field instead
         let bytes = if body == EnvelopeShape::Invalid {
             vec![0x80]
         } else {
@@ -284,8 +320,10 @@ impl RawPeer {
         }
     }
 
-    /// Receives and extracts one raw peer result for script assertions.
+    /// Receives the next envelope and returns its ID and shape, panicking on
+    /// anything but a develop body or an error.
     fn read(&mut self) -> (u64, EnvelopeShape) {
+        // Decode the next envelope the protocol peer sent
         let (id, error, content) = match self {
             Self::Client(client, _) => {
                 let envelope = ArkToHost::decode(client.recv().unwrap().as_slice()).unwrap();
@@ -307,6 +345,8 @@ impl RawPeer {
                 )
             }
         };
+
+        // Reduce it to the shapes that scripts compare
         let body = match (content, error) {
             (Some(Message::Develop(bytes)), None) => EnvelopeShape::Content(bytes[0]),
             (None, Some(error)) => EnvelopeShape::Error(error.code),
@@ -333,13 +373,14 @@ struct Driver {
 
     /// Owners keyed by script labels, including retained predecessors.
     sessions: HashMap<u8, Session>,
-    /// Weak references used to check that closed sessions are freed.
+    /// Weak session states, for test hooks and for checking that closed sessions
+    /// are freed.
     states: HashMap<u8, Weak<SessionInner>>,
     /// Requester handles kept after dropping their sessions.
     requesters: HashMap<u8, Requester>,
     /// Closer handles saved for each session.
     closers: HashMap<u8, Closer>,
-    /// Calls left blocked while later script steps change state.
+    /// Receive calls left blocked while later script steps change state.
     receiving: HashMap<u8, ReceiveJob>,
 
     /// Responders saved for reply or drop steps.
@@ -351,12 +392,13 @@ struct Driver {
     /// Shared completion events, observed independently of the saved promises.
     notifications: (mpsc::Sender<u8>, mpsc::Receiver<u8>),
 
-    /// Gates that pause old writers before `Sender::disconnect()` while a new
-    /// session connects.
+    /// Gates that pause old writers before
+    /// [`Sender::disconnect`](transport::Sender::disconnect) while a new session
+    /// connects.
     disconnects: HashMap<u8, (mpsc::Receiver<()>, mpsc::Sender<()>)>,
     /// Trackers used to wait for each connection's workers to finish.
     workers: Vec<Arc<Tracker>>,
-    /// Physical closers used on scenario cleanup.
+    /// Closers of both streams, used by shutdown steps and on scenario cleanup.
     shutdown: [transport::Closer; 2],
 }
 
@@ -366,7 +408,7 @@ type ReceiveJob = Job<(Session, Result<(Message, Responder), Error>)>;
 impl Driver {
     /// Constructs peers on shared transport gates, with space for a full handshake.
     fn new(mode: Mode) -> Self {
-        // Give both gated pipes the scenario's paused clock
+        // Build both streams on gated pipes sharing the scenario's paused clock
         let tester = crate::transport::testing::test_clock();
         let pipes = [
             Pipe::new(64 * 1024, &tester.clock()),
@@ -459,7 +501,8 @@ impl Driver {
         driver
     }
 
-    /// Saves a session and its requester, closer, and weak state reference.
+    /// Saves a session and its requester, closer and weak state under an unused
+    /// label.
     fn save(&mut self, label: u8, session: Session) {
         self.requesters.insert(label, session.requester());
         self.closers.insert(label, session.closer());
@@ -467,7 +510,7 @@ impl Driver {
         assert!(self.sessions.insert(label, session).is_none());
     }
 
-    /// Permanently ends protocol owners before cancelling remaining physical I/O.
+    /// Permanently ends protocol owners before canceling remaining physical I/O.
     fn shutdown(&self) {
         if let Some(server) = &self.server {
             server.close();
@@ -499,10 +542,11 @@ impl Driver {
                 let Some(RawPeer::Client(client, _)) = &mut self.raw else {
                     panic!("raw client required")
                 };
-                // Expire the raw client's read after failed server output leaves it
-                // parked. Time moves only once the server's hello has taken the write
-                // fault. A hello that expires first skips the fault, leaving it to fail
-                // the next handshake, whose client then waits on this stopped clock.
+                // Expire the raw client's read after failed server output leaves
+                // it parked. Time moves only once the server's hello has taken
+                // the write fault. A hello that expires first skips the fault,
+                // leaving it to fail the next handshake, whose client then waits
+                // on this stopped clock.
                 let deadline = self.tester.clock().now() + WRITE_BUDGET;
                 std::thread::scope(|scope| {
                     let connecting = scope.spawn(|| client.connect(&self.identity));
@@ -513,6 +557,7 @@ impl Driver {
                 });
             }
             Step::HandshakeReadTimeout => {
+                // Fail the server's next read deadline once its hello flush blocks
                 let incoming = self.pipes[0].clone();
                 let outgoing = self.pipes[1].clone();
                 outgoing.pause(Operation::Flush, true);
@@ -521,6 +566,9 @@ impl Driver {
                     incoming.fail_read_deadline(io::ErrorKind::TimedOut);
                     outgoing.pause(Operation::Flush, false);
                 });
+
+                // Run the raw handshake, which the client may finish on its side
+                // even though the server fails
                 let Some(RawPeer::Client(client, _)) = &mut self.raw else {
                     panic!("raw client required")
                 };
@@ -622,6 +670,7 @@ impl Driver {
                 self.sessions.insert(label, session);
             }
             Step::StartReceive(label) => {
+                // Arm the wait hook first, so the step returns once the call waits
                 let mut session = self.sessions.remove(&label).unwrap();
                 let waiting = session.inner.watch_recv_wait();
                 self.receiving.insert(
@@ -791,21 +840,33 @@ impl Driver {
 }
 
 impl Drop for Driver {
-    /// Closes the pipes even if an assertion panics. On success, also checks that
-    /// every protocol worker exits.
+    /// Closes the pipes, even after a failed assertion, and waits for every
+    /// protocol worker to exit.
     fn drop(&mut self) {
+        // Release the writers held before their disconnect, then close everything
         self.disconnects.clear();
         self.shutdown();
+
         // The server tracker also counts workers from replaced sessions and
-        // sessions the application never accepted.
+        // sessions the application never accepted
         for workers in &self.workers {
             workers.wait_stopped();
         }
     }
 }
 
-/// Keeps one write in flight and both explicit and automatic replies queued
-/// while inbound admission or deferred decoding closes the session.
+/// Builds a script that closes the labeled session through an inbound limit or
+/// a deferred decoding failure while its output is blocked.
+///
+/// One request stays blocked in the given write or flush phase, with an explicit
+/// reply, an automatic reply and a second request queued behind it. The closing
+/// `reason` must fail both requests and the explicit reply, and free the inbound
+/// usage.
+///
+/// # Panics
+///
+/// Panics unless `reason` is [`Failure::Requests`], [`Failure::Bytes`] or
+/// [`Failure::Malformed`].
 fn blocked_inbound_steps(
     local: u8,
     own: u64,
@@ -816,6 +877,9 @@ fn blocked_inbound_steps(
 ) -> Vec<Step> {
     use EnvelopeShape::*;
     use Step::*;
+
+    // Tighten the limits and block a first request, whose frame the peer reads
+    // when only its flush is blocked
     let mut steps = vec![
         InboundLimits(local, 3, 100),
         Pause(outgoing, phase, true),
@@ -825,9 +889,13 @@ fn blocked_inbound_steps(
     if phase == Operation::Flush {
         steps.push(Read(own, Content(10)));
     }
+
+    // Buffer a malformed response for the decoding failure to come
     if reason == Failure::Malformed {
         steps.extend([Send(own, MalformedBody), ResponseReceived(local, own)]);
     }
+
+    // Queue an explicit reply, an automatic reply and a second request
     steps.extend([
         Send(peer, Content(11)),
         Receive(local, 11, 0),
@@ -837,12 +905,17 @@ fn blocked_inbound_steps(
         Abandon(1),
         Request(local, 1, 14, 3000),
     ]);
+
+    // Set a limit that the next peer request exceeds, unless decoding is to fail
     match reason {
         Failure::Requests => steps.push(InboundLimits(local, 2, 100)),
         Failure::Bytes => steps.push(InboundLimits(local, 3, 0)),
         Failure::Malformed => {}
         _ => unreachable!("inbound closing reason required"),
     }
+
+    // Close the session while a receive waits, by decoding the malformed
+    // response or by sending one more peer request
     steps.push(StartReceive(local));
     if reason == Failure::Malformed {
         steps.push(Answer(0, Err(reason)));
@@ -853,6 +926,8 @@ fn blocked_inbound_steps(
     if reason != Failure::Malformed {
         steps.push(Answer(0, Err(reason)));
     }
+
+    // Require the queued work to fail and the inbound usage to drop to zero
     steps.extend([
         Answer(1, Err(reason)),
         Written(0, Err(reason)),
@@ -862,7 +937,8 @@ fn blocked_inbound_steps(
     steps
 }
 
-/// Runs a script with automatic cleanup and step diagnostics on failure.
+/// Runs a script on a fresh driver, logging each step so a failure shows where
+/// it stopped.
 fn run(mode: Mode, steps: &[Step]) {
     #[cfg(test)]
     crate::testing::init_tracing();

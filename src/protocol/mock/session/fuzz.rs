@@ -4,9 +4,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Turns arbitrary actions into valid scripts with independently predicted results.
-//! The model uses integer time and a ledger of operations; it never reads session
-//! internals to decide which result, queued message or deadline to expect.
+//! Fuzz model turning arbitrary actions into session scripts with independently
+//! predicted results.
+//!
+//! The model uses integer time and a ledger of operations. It never reads
+//! session internals to decide which result, queued message or deadline to
+//! expect.
 //!
 //! The fixture supplies requests and write results directly, so duplicate wire
 //! IDs and transport failures that end a whole session belong to the connection
@@ -19,8 +22,11 @@ use crate::transport::mock::MAX_STEPS;
 use prost::Message as _;
 use std::time::Duration;
 
-/// One mutation-friendly action. Selectors wrap over previously created objects,
-/// including closed sessions and completed operations. Missing objects are a no-op.
+/// Mutation-friendly fuzz action, which the model turns into script steps.
+///
+/// Selectors wrap over the objects created so far, including closed sessions
+/// and completed operations. An action with nothing to act on only adds the
+/// model's usual checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub struct Action {
@@ -30,54 +36,91 @@ pub struct Action {
     pub slot: u8,
     /// Body tag, result selector, request limit or choice of concurrent execution.
     pub value: u8,
-    /// Relative deadline, clock advance or autoreply timeout in milliseconds,
-    /// or the retained-byte limit.
+    /// Relative deadline, clock advance or autoreply timeout in milliseconds, or
+    /// the retained-byte limit.
+    ///
+    /// Other actions read it as a variant selector or a batch size.
     pub budget: u8,
 }
 
-/// Public operations and independently scheduled transport/deadline completions.
+/// Public operation or independently scheduled completion that an action
+/// performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Kind {
-    // Session setup and policy.
+    /// New session attached and accepted, or an acceptance parked for a later
+    /// attach or closure to end.
+    ///
+    /// An ended server refuses the attach.
     Open,
-    /// Changes both inbound limits, including below live usage.
+    /// Both inbound limits of the selected session, set from the value and the
+    /// budget, possibly below live usage.
     InboundLimits,
+    /// Automatic reply timeout of the selected session, set from the budget in
+    /// milliseconds.
     AutoreplyTimeout,
 
-    // Requests and replies.
+    /// Request from the selected session, with the value as its body tag and the
+    /// budget as its relative deadline.
     Request,
+    /// One request delivered to the selected session and received, possibly
+    /// through a receive already waiting.
+    ///
+    /// A closed session refuses the delivery or fails the receive instead.
     Receive,
-    /// Queues several requests before retrieving any of their bodies.
+    /// Batch of one to four requests, all queued before any of them is received.
     IncomingBatch,
+    /// Reply through the selected responder, possibly raced against closure.
     Reply,
+    /// Drop of the selected responder, which queues an automatic reply.
     Abandon,
+    /// Next queued message of the selected session taken for writing, or every
+    /// queued automatic reply at once.
     Outgoing,
+    /// Write result for the selected operation, possibly raced against closure.
     Written,
+    /// Peer answer to the selected request, possibly raced against closure.
     Answer,
 
-    // Promise completion and deadlines.
+    /// Wait on the selected promise, parked until the promise settles.
     Wait,
+    /// Drop of the selected promise, leaving its operation running.
     DropPromise,
+    /// Clock advance by the budget in milliseconds.
     Advance,
+    /// Call to `expire()` on the selected session.
     Expire,
 
-    // Closure.
+    /// Closure of the selected session, possibly raced against a request or
+    /// another closure, or ending a waiting receive.
     Close,
+    /// Drop of the selected session's owner, or a closure once the owner is
+    /// gone.
     Drop,
+    /// Closure of the server, possibly raced against itself or an attach, and
+    /// sometimes followed by dropping the server owner.
     CloseServer,
+    /// Drop of the session source, which ends the server as a stopped reader
+    /// would.
     DropSource,
 
-    /// Observes completion through a token while retaining the promise and bytes.
+    /// Notification registered on the selected promise, observing completion
+    /// without consuming the promise or its bytes.
     Notify,
 }
 
-/// Default autoreply timeout of a fresh session, in script milliseconds.
+/// Automatic reply timeout in milliseconds that the model expects a fresh
+/// session to use.
 const DEFAULT_AUTOREPLY_TIMEOUT: u64 = 5000;
 
+/// Model of one session, as the script expects it to behave.
 struct Session {
+    /// Failure that calls through the session's handles report, or none while
+    /// it is open.
     reason: Option<Failure>,
+    /// Whether the driver still holds the session's owner.
     owner: bool,
+    /// Automatic reply timeout in milliseconds, applied to replies queued later.
     autoreply_timeout: u64,
     /// Current limit on accepted peer requests.
     max_requests: usize,
@@ -85,32 +128,46 @@ struct Session {
     max_bytes: usize,
 }
 
+/// Model of one request or reply, from submission to its promise's result.
 struct Operation {
+    /// Index of the session that owns the operation.
     session: usize,
+    /// Content the operation queues, as the script expects to take it.
     body: ExpectedMessage,
+    /// Absolute deadline in script milliseconds.
     deadline: u64,
 
+    /// Whether the message still waits in the session's outgoing queue.
     queued: bool,
+    /// Whether the writer took the message, so write results and answers can
+    /// arrive for it.
     writing: bool,
 
+    /// Settled result, carrying the answer's body tag for a request and zero for
+    /// a written reply.
     result: Option<Result<u8, Failure>>,
     /// Encoded bytes held by this response until its promise is read or dropped.
     response_bytes: usize,
-    /// The driver still owns the promise, either directly or in a waiting job.
+    /// Whether the driver still owns the promise, directly or in a waiting job.
     retained: bool,
-    /// A waiting job owns the promise until a later action collects its result.
+    /// Whether a waiting job owns the promise until a later action collects its
+    /// result.
     parked: bool,
-    /// Registration is single-use; the generator must never trigger its panic.
+    /// Whether a notification is registered on the promise, which the model
+    /// never repeats since a second registration panics.
     notified: bool,
-    /// A completion token is queued but has not yet been checked by the driver.
+    /// Whether a completion token was sent and awaits the next notification
+    /// check.
     notification: bool,
 }
 
 impl Operation {
+    /// Checks whether the operation is a request rather than a reply.
     fn request(&self) -> bool {
         matches!(self.body, ExpectedMessage::Request(_))
     }
 
+    /// Checks whether the operation is an automatic `UNANSWERED` reply.
     fn abandonment(&self) -> bool {
         matches!(
             self.body,
@@ -118,6 +175,10 @@ impl Operation {
         )
     }
 
+    /// Settles the operation unless it already has a result, turning a result
+    /// at or after the deadline into `Timeout`.
+    ///
+    /// A retained promise with a registration also sends its token.
     fn complete(&mut self, now: u64, result: Result<u8, Failure>) {
         if self.result.is_none() {
             self.result = Some(if now >= self.deadline {
@@ -130,25 +191,42 @@ impl Operation {
     }
 }
 
+/// Ledger predicting each action's outcome and recording the script steps.
 #[derive(Default)]
 struct Model {
+    /// Reason the server ended, or none while it is open.
     server: Option<Failure>,
+    /// Whether the session source still exists.
     source: bool,
-    /// Acceptance owns the server until an attach or closure wakes it.
+    /// Whether a parked acceptance owns the server until an attach or closure
+    /// wakes it.
     accepting: bool,
-    /// The server owner was dropped; its weak closer and source may remain.
+    /// Whether the server owner was dropped, while the driver keeps its closer
+    /// and source.
     server_dropped: bool,
 
+    /// Every session opened so far, indexed by script label.
     sessions: Vec<Session>,
+    /// Owning session of each responder slot, emptied once the responder
+    /// replies or drops.
+    ///
+    /// A slot's index doubles as its request's wire ID.
     responders: Vec<Option<usize>>,
+    /// Every request and reply submitted so far.
+    ///
+    /// An operation's index serves as its promise slot, outgoing slot and
+    /// notification token.
     operations: Vec<Operation>,
 
+    /// Current script time in milliseconds.
     time: u64,
+    /// Script steps generated so far.
     steps: Vec<Step>,
 }
 
 impl Model {
-    /// Counts requests held by responders and queued replies.
+    /// Counts the session's requests held by responders or queued replies, zero
+    /// once it has ended.
     fn request_usage(&self, session: usize) -> usize {
         if self.sessions[session].reason.is_some() {
             return 0;
@@ -166,7 +244,8 @@ impl Model {
                 .count()
     }
 
-    /// Counts buffered response bytes until their promises are read or dropped.
+    /// Counts the response bytes that the session's retained promises still
+    /// hold, which outlive the session's end.
     fn byte_usage(&self, session: usize) -> usize {
         self.operations
             .iter()
@@ -175,8 +254,11 @@ impl Model {
             .sum()
     }
 
-    /// Joins completed waits before checking byte counts. Pending waits stay
-    /// blocked and can overlap later completions or session closure.
+    /// Finishes the parked waits whose promises have settled, releasing their
+    /// bytes before the usage checks.
+    ///
+    /// Pending waits stay blocked and can overlap later completions or session
+    /// closure.
     fn collect_waiters(&mut self) {
         for (id, operation) in self.operations.iter_mut().enumerate() {
             if operation.parked
@@ -193,7 +275,8 @@ impl Model {
         }
     }
 
-    /// Checks completion events separately from waits so observation keeps bytes.
+    /// Checks the tokens sent since the last action, which leave the promises
+    /// and their bytes in place.
     fn collect_notifications(&mut self) {
         let tokens = self
             .operations
@@ -206,9 +289,13 @@ impl Model {
         self.steps.push(Step::Notifications(tokens));
     }
 
-    /// Queues a batch before receiving it, predicting overflow from original
-    /// envelope lengths. Failed admission closes and discards the entire inbox.
+    /// Delivers a batch of requests and then receives them, predicting limit
+    /// failures from the encoded envelope lengths.
+    ///
+    /// A refused request closes the session, discarding the requests queued
+    /// before it. With `parked`, a receive starts waiting before each delivery.
     fn incoming(&mut self, session: usize, count: u8, value: u8, parked: bool) {
+        // Deliver each request, refusing the first one past either limit
         let base = self.responders.len();
         let mut bytes = self.byte_usage(session);
         for offset in 0..usize::from(count) {
@@ -243,6 +330,8 @@ impl Model {
             }
             self.steps.push(Step::Deliver(session as u8, id, tag));
         }
+
+        // Receive the batch, saving each responder under its request ID
         for offset in 0..usize::from(count) {
             let slot = (base + offset) as u8;
             let tag = value.wrapping_add(offset as u8);
@@ -255,6 +344,8 @@ impl Model {
         }
     }
 
+    /// Ends the session with this reason unless it already ended, failing its
+    /// pending operations and emptying its queue.
     fn close(&mut self, session: usize, reason: Failure) {
         if self.sessions[session].reason.is_none() {
             self.sessions[session].reason = Some(reason);
@@ -267,6 +358,8 @@ impl Model {
         }
     }
 
+    /// Times out the session's operations whose deadline has passed and drops
+    /// their queued messages.
     fn expire(&mut self, session: usize) {
         for operation in &mut self.operations {
             if operation.session == session && self.time >= operation.deadline {
@@ -276,6 +369,8 @@ impl Model {
         }
     }
 
+    /// Records a new request or reply, settled at once with `Timeout` if its
+    /// deadline has already passed.
     fn enqueue(&mut self, session: usize, body: ExpectedMessage, deadline: u64, retained: bool) {
         self.operations.push(Operation {
             session,
@@ -294,8 +389,11 @@ impl Model {
         });
     }
 
-    /// Whether a completion can race with closure. The promise must still be
-    /// pending, its deadline in the future, and both owners available to the driver.
+    /// Checks whether a completion of the operation can race with closure.
+    ///
+    /// The promise must be pending and held by the driver outside a wait, with
+    /// its deadline in the future. Its session must be open with the owner held.
+    /// A request also needs byte room for the racing answer.
     fn raceable(&self, operation: usize) -> bool {
         let operation = &self.operations[operation];
         let session = &self.sessions[operation.session];
@@ -313,14 +411,20 @@ impl Model {
     fn consume(&mut self, operation: usize) {
         let operation = &mut self.operations[operation];
         // Race steps settle and wait on the promise before returning, so its
-        // registered event is sent even though the model releases ownership now.
+        // registered token is sent even though the model releases the promise here
         operation.notification = operation.notified;
         operation.retained = false;
         operation.queued = false;
         operation.writing = false;
     }
 
+    /// Turns one action into script steps, updating the ledger with the outcome
+    /// it predicts.
+    ///
+    /// Every action ends with checks of the settled waits, the sent tokens, and
+    /// each held session's earliest deadline and usage.
     fn step(&mut self, action: Action) {
+        // Wrap each selector over the objects created so far
         let Action {
             kind,
             slot,
@@ -331,15 +435,18 @@ impl Model {
         let operation = slot as usize % self.operations.len().max(1);
         let responder = slot as usize % self.responders.len().max(1);
         let deadline = self.time + u64::from(budget);
+
+        // Emit the action's steps and predict its outcome
         match kind {
             Kind::Open if self.source => {
                 if let Some(reason) = self.server {
                     self.steps.push(Step::RefuseOpen(reason));
                 } else if !self.accepting && budget % 3 == 2 {
-                    // Leave acceptance blocked, for a later attach or closure to end.
+                    // Leave acceptance blocked, for a later attach or closure to end
                     self.steps.push(Step::StartAccept);
                     self.accepting = true;
                 } else {
+                    // Reset the last session, then attach and accept a new one
                     if !self.sessions.is_empty() {
                         self.close(self.sessions.len() - 1, Failure::Reset);
                     }
@@ -371,6 +478,8 @@ impl Model {
                 self.sessions[session].max_bytes = bytes;
                 self.steps
                     .push(Step::InboundLimits(session as u8, requests, bytes));
+
+                // Close a session over either limit, checking requests first
                 if self.request_usage(session) > requests {
                     self.close(session, Failure::Requests);
                 } else if self.byte_usage(session) > bytes {
@@ -399,7 +508,7 @@ impl Model {
             }
             Kind::Receive if !self.sessions.is_empty() && self.sessions[session].owner => {
                 if let Some(reason) = self.sessions[session].reason {
-                    // A closed session refuses delivery and wakes its receivers.
+                    // A closed session refuses delivery and wakes its receivers
                     self.steps.push(if budget & 1 == 0 {
                         Step::RefuseDelivery(session as u8, reason)
                     } else {
@@ -434,7 +543,7 @@ impl Model {
                     } else if let Some(reason) = self.sessions[session].reason {
                         self.steps.push(Step::RefuseReply(responder as u8, reason));
                     } else if value % 4 == 3 {
-                        // Closure fails the reply whether submission wins or loses.
+                        // Closure fails the reply whether submission wins or loses
                         self.steps
                             .push(Step::RaceReplyClose(session as u8, responder as u8));
                         self.close(session, Failure::Closed);
@@ -460,6 +569,7 @@ impl Model {
                 }
             }
             Kind::Outgoing if !self.sessions.is_empty() && self.sessions[session].owner => {
+                // Taking a message expires overdue work first, as the session does
                 self.expire(session);
                 let queued: Vec<usize> = self
                     .operations
@@ -471,7 +581,7 @@ impl Model {
                 let abandoned = !queued.is_empty()
                     && queued.iter().all(|&id| self.operations[id].abandonment());
                 if value & 1 == 1 && abandoned {
-                    // Drain automatic replies when no application messages remain.
+                    // Drain automatic replies when no application messages remain
                     let ids = queued
                         .iter()
                         .map(|&id| match self.operations[id].body {
@@ -503,7 +613,7 @@ impl Model {
                     && !self.operations[operation].request()
                     && self.raceable(operation)
                 {
-                    // Either the write result or closure may settle the promise.
+                    // Either the write result or closure may settle the promise
                     self.steps.push(Step::RaceWriteClose(
                         owner as u8,
                         operation as u8,
@@ -518,6 +628,9 @@ impl Model {
                         _ => Ok(()),
                     };
                     self.steps.push(Step::Written(operation as u8, result));
+
+                    // Settle the operation, unless a request written in time
+                    // still awaits its answer
                     let now = self.time;
                     let pending = &mut self.operations[operation];
                     if result.is_err() || !pending.request() || now >= pending.deadline {
@@ -532,7 +645,7 @@ impl Model {
             {
                 let owner = self.operations[operation].session;
                 if value % 8 == 7 && self.raceable(operation) {
-                    // Either the peer answer or closure may settle the promise.
+                    // Either the peer answer or closure may settle the promise
                     self.steps.push(Step::RaceAnswerClose(
                         owner as u8,
                         operation as u8,
@@ -551,6 +664,9 @@ impl Model {
                         Err(Failure::Remote(code)) => Step::Answer(operation as u8, Err(code)),
                         _ => Step::AnswerOther(operation as u8),
                     });
+
+                    // Charge an answer in time to a held promise, closing the
+                    // session if the answer overflows the byte limit
                     let bytes = answer_size(result);
                     let pending = &self.operations[operation];
                     let retain = pending.result.is_none()
@@ -598,7 +714,8 @@ impl Model {
             {
                 let request = self.operations[operation].request();
                 // Waiting expires overdue operations in the same session before
-                // blocking. collect_waiters() joins it once a result is available.
+                // blocking. `collect_waiters()` finishes the wait once a result is
+                // available.
                 self.expire(self.operations[operation].session);
                 self.operations[operation].parked = true;
                 self.steps.push(if request {
@@ -635,8 +752,8 @@ impl Model {
                     ]);
                     self.close(session, Failure::Closed);
                     self.sessions[session].owner = false;
-                    // Weak handles to a freed session report Closed, while settled
-                    // promises retain the reason that ended the original session.
+                    // Weak handles to a freed session report `Closed`, while settled
+                    // promises keep the reason that ended the original session
                     self.sessions[session].reason = Some(Failure::Closed);
                 } else {
                     let open = self.sessions[session].reason.is_none();
@@ -644,7 +761,7 @@ impl Model {
                         0 if open => self.steps.push(Step::RaceRequestClose(session as u8)),
                         1 => self.steps.push(Step::RaceCloses(session as u8)),
                         // Close under a receive already blocked on an empty queue,
-                        // which has to wake with the reason that ended the session.
+                        // which has to wake with the reason that ended the session
                         2 if open && self.sessions[session].owner => self.steps.extend([
                             Step::StartReceive(session as u8),
                             Step::CloseSession(session as u8),
@@ -657,7 +774,7 @@ impl Model {
             }
             Kind::CloseServer | Kind::DropSource => {
                 // Racing an attach needs an already closed session, so the reason
-                // ending it cannot depend on which thread wins.
+                // ending it cannot depend on which thread wins
                 let raced = kind == Kind::CloseServer
                     && value % 4 == 2
                     && self.source
@@ -679,6 +796,9 @@ impl Model {
                 } else {
                     None
                 };
+
+                // The first reason sticks, ending the current session and any
+                // parked acceptance
                 if let Some(reason) = reason {
                     let reason = *self.server.get_or_insert(reason);
                     if !self.sessions.is_empty() {
@@ -686,7 +806,7 @@ impl Model {
                     }
                     if std::mem::take(&mut self.accepting) {
                         // An attach may have won the race and handed over a session,
-                        // which acceptance then finds already closed.
+                        // which acceptance then finds already closed
                         self.steps.push(if raced {
                             Step::FinishAcceptClosed
                         } else {
@@ -701,6 +821,9 @@ impl Model {
             }
             _ => {}
         }
+
+        // Check the settled waits, the sent tokens, and each held session's
+        // earliest deadline and usage
         self.collect_waiters();
         self.collect_notifications();
         for (session, state) in self.sessions.iter().enumerate() {
@@ -722,8 +845,15 @@ impl Model {
     }
 }
 
-/// Measures the fixture's original answer encoding with the schema codec. The
-/// ledger stores this length; it never consults production budget counters.
+/// Returns the encoded length of a scripted peer answer, measured with the schema
+/// codec as the fixture sends it.
+///
+/// The ledger charges this length and never reads the session's own byte
+/// counters.
+///
+/// # Panics
+///
+/// Panics on a result no peer answer carries, such as `Timeout`.
 fn answer_size(result: Result<u8, Failure>) -> usize {
     let (err, content) = match result {
         Ok(tag) => (None, Some(host_to_ark::Content::Develop(vec![tag]))),
@@ -748,12 +878,22 @@ fn answer_size(result: Result<u8, Failure>) -> usize {
     .encoded_len()
 }
 
-/// Executes up to [`MAX_STEPS`] arbitrary actions, then closes all owners and
-/// checks every retained promise, including the ones parked in a blocking wait.
-/// Simulated time never requires sleeps or deadline races.
+/// Runs up to [`MAX_STEPS`] fuzz actions as one session script and checks every
+/// predicted outcome.
+///
+/// A first session opens before the actions and the server closes after them.
+/// Every promise the model still holds is then waited on. Simulated time never
+/// requires sleeps or deadline races.
+///
+/// # Panics
+///
+/// Panics when the session behaves differently from the model's prediction.
 pub fn run(actions: &[Action]) {
+    // Record the actions under the seed corpus when `WIRE_SEEDS` is set
     #[cfg(feature = "fuzz")]
     super::super::seed::seed(super::super::seed::SESSION_TARGET, actions);
+
+    // Open a first session, run the actions and close the server
     let mut model = Model {
         source: true,
         ..Model::default()
@@ -773,6 +913,8 @@ pub fn run(actions: &[Action]) {
         value: 0,
         budget: 0,
     });
+
+    // Wait on every promise still held, then run the script against the fixture
     for (id, operation) in model.operations.iter().enumerate() {
         if !operation.retained {
             continue;
@@ -786,7 +928,7 @@ pub fn run(actions: &[Action]) {
         );
         model.steps.push(if operation.request() {
             // An answered request can also hand back the message enum itself,
-            // leaving the variant check to the application.
+            // leaving the variant check to the application
             match result {
                 Ok(tag) if id % 2 == 1 => Step::WaitMessage(id as u8, tag),
                 result => Step::Wait(id as u8, result),

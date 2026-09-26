@@ -17,19 +17,21 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// One endpoint of an in-memory duplex connection, ready for a client or server.
+/// One endpoint of an in-memory duplex connection, ready for a
+/// [`Client`](crate::transport::Client) or [`Server`](crate::transport::Server).
 pub type Duplex = Stream<Reader, Writer>;
 
 impl Duplex {
     /// Takes the reader and writer out of the stream without closing either half.
     ///
     /// Each half closes its own direction on drop. Dropping the writer lets the
-    /// peer drain accepted output before EOF; dropping the reader refuses further
-    /// peer writes. Obtain a [`crate::transport::Closer`] with [`Self::closer`] before splitting
-    /// if you need to shut down both halves from another thread.
+    /// peer drain accepted output before EOF; dropping the reader refuses
+    /// further peer writes. Obtain a [`crate::transport::Closer`] with
+    /// [`Self::closer`] before splitting if you need to shut down both halves
+    /// from another thread.
     ///
-    /// The stream's write timeout is discarded. Any deadlines already installed
-    /// on the halves are retained; new halves have no deadline until configured.
+    /// The stream's write timeout is discarded, and the halves have no deadline
+    /// until one is configured.
     ///
     /// ```
     /// use darkbio_wire::{clock::Clock, memory};
@@ -46,27 +48,31 @@ impl Duplex {
     }
 }
 
-/// Creates two connected streams with `capacity` bytes of buffering per direction.
-/// Both measure their deadlines on `clock`, and so does any transport on them.
+/// Creates two connected streams with `capacity` bytes of buffering per
+/// direction.
 ///
-/// Reads wait for data and writes wait for buffer space, bounded by the deadlines
-/// installed by Wire. Partial progress never refreshes a deadline. A timeout
-/// leaves the connection reusable and preserves any bytes already accepted.
-/// Flush checks its deadline but does not wait for the peer to consume output.
-/// Reads deliver available bytes, EOF and empty reads even after their deadline;
-/// the deadline only limits waiting for input. Writes and flushes refuse expired
-/// deadlines even if buffer space is available. Wire enforces its own deadlines
-/// before calling either half.
+/// Both measure their deadlines on `clock`, and so does any transport on them.
+/// Reads wait for data and writes wait for buffer space, bounded by the
+/// deadlines the transport installs. Partial progress never refreshes a
+/// deadline. A timeout leaves the connection reusable and preserves any bytes
+/// already accepted. Flush checks its deadline but does not wait for the peer
+/// to consume output. Reads deliver available bytes, EOF and empty reads even
+/// after their deadline; the deadline only limits waiting for input. Writes and
+/// flushes refuse expired deadlines even if buffer space is available. The
+/// transport enforces its own deadlines before calling either half.
 ///
 /// Closing or dropping an endpoint wakes blocked I/O on both sides. Its unread
-/// input is discarded; the peer can drain its accepted output before receiving
-/// EOF. Further nonempty writes fail with [`io::ErrorKind::BrokenPipe`]. A flush
-/// fails the same way only if the peer closed with accepted output still unread.
-/// Output the peer had consumed before closing flushes fine afterwards.
+/// input is discarded, while the peer can still drain the endpoint's accepted
+/// output before receiving EOF. Further nonempty writes on either side fail
+/// with [`io::ErrorKind::BrokenPipe`]. So do flushes on the closed endpoint.
+/// The peer's flush fails the same way only if the endpoint closed with some of
+/// the peer's output unread. Output the endpoint had consumed before closing
+/// flushes fine afterwards.
 ///
 /// Both peers must run concurrently when exchanging data. Allow enough capacity
-/// for the handshake's initial output; `64 * 1024` is a useful starting point.
-/// Small buffers can cause handshake backpressure, just as a real stream can.
+/// for the handshake's initial output; 64 KiB (`64 * 1024`) is a useful
+/// starting point. Small buffers can cause handshake backpressure, just as a
+/// real stream can.
 ///
 /// # Panics
 ///
@@ -105,11 +111,17 @@ fn endpoint(incoming: Arc<Pipe>, outgoing: Arc<Pipe>) -> Duplex {
 /// Receiving half of a [`Duplex`], with an independently configured read deadline.
 #[derive(Debug)]
 pub struct Reader {
+    /// Buffer this half reads from, shared with the peer's writer.
     pipe: Arc<Pipe>,
+    /// Latest read deadline, or `None` to wait without one.
     deadline: Option<Instant>,
 }
 
 impl io::Read for Reader {
+    /// Reads the buffered bytes, waiting for more until the read deadline.
+    ///
+    /// Buffered bytes are delivered even past the deadline. An empty `buf`, a
+    /// closed reader or a closed peer with nothing buffered returns zero.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Recheck the buffer and closure state after every wake
         let mut state = self.pipe.lock();
@@ -152,6 +164,7 @@ impl Read for Reader {
 }
 
 impl Drop for Reader {
+    /// Closes this reading direction and discards its unread bytes.
     fn drop(&mut self) {
         self.pipe.close_reader();
     }
@@ -169,11 +182,19 @@ impl Reader {
 /// Sending half of a [`Duplex`], sharing one deadline across writes and flushes.
 #[derive(Debug)]
 pub struct Writer {
+    /// Buffer this half writes into, shared with the peer's reader.
     pipe: Arc<Pipe>,
+    /// Latest write deadline, or `None` before the first is set.
     deadline: Option<Instant>,
 }
 
 impl io::Write for Writer {
+    /// Appends as many bytes as fit, waiting for space until the write
+    /// deadline.
+    ///
+    /// An expired deadline fails before accepting any bytes, even with space
+    /// free. An empty `buf` then returns zero, and a closed end fails with
+    /// [`io::ErrorKind::BrokenPipe`].
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Recheck capacity and the same deadline after every wake
         let mut state = self.pipe.lock();
@@ -201,6 +222,11 @@ impl io::Write for Writer {
         }
     }
 
+    /// Checks the write deadline and that no output was lost, without waiting
+    /// for the peer to read.
+    ///
+    /// It fails with [`io::ErrorKind::BrokenPipe`] after local closure, or when
+    /// the reader closed with output unread.
     fn flush(&mut self) -> io::Result<()> {
         // Check the installed deadline while observing a consistent pipe state
         let state = self.pipe.lock();
@@ -226,34 +252,50 @@ impl Write for Writer {
 }
 
 impl Drop for Writer {
+    /// Closes this writing direction, so the reader gets EOF once the buffer
+    /// drains.
     fn drop(&mut self) {
         self.pipe.close_writer();
     }
 }
 
-/// Shared bounded buffer for one direction. Waiting always releases the mutex.
+/// Shared bounded buffer for one direction.
+///
+/// Waiting always releases the mutex.
 #[derive(Debug)]
 struct Pipe {
     /// Clock used to check the installed I/O deadlines.
     clock: Clock,
+    /// Most bytes the buffer holds before writers wait.
     capacity: usize,
+    /// Buffered bytes and the open state of both ends.
     state: Mutex<State>,
+    /// Signal waking readers and writers when the buffer or either end changes.
     changed: Condvar,
 }
 
+/// Contents of a pipe and the open state of its two ends.
 #[derive(Debug)]
 struct State {
+    /// Bytes written and not yet read.
     bytes: VecDeque<u8>,
+    /// Whether the reading end is open.
     reader_open: bool,
+    /// Whether the writing end is open.
     writer_open: bool,
-    lost: bool, // Accepted output the reader closed without consuming
+    /// Whether the reader closed with accepted output still unconsumed.
+    lost: bool,
+    /// Operations parked in a wait, counted for tests to observe.
     #[cfg(test)]
     waiting: usize,
+    /// Whether a wait fails instead of blocking, so a test cannot hang.
     #[cfg(test)]
-    waits_forbidden: bool, // Fails a wait instead of blocking, so a test cannot hang
+    waits_forbidden: bool,
 }
 
 impl Pipe {
+    /// Creates an open, empty pipe holding up to `capacity` bytes, waiting on
+    /// `clock`.
     fn new(capacity: usize, clock: &Clock) -> Self {
         Self {
             clock: clock.clone(),
@@ -272,8 +314,9 @@ impl Pipe {
         }
     }
 
+    /// Locks the pipe state, recovering it from a poisoned mutex.
     fn lock(&self) -> MutexGuard<'_, State> {
-        // Shutdown must remain usable even after a panic in an I/O operation.
+        // Shutdown must remain usable even after a panic in an I/O operation
         self.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 
@@ -325,6 +368,8 @@ impl Pipe {
         Ok(())
     }
 
+    /// Closes the reading end and discards unread bytes, marking them lost for
+    /// the writer's flush, then wakes both ends.
     fn close_reader(&self) {
         let mut state = self.lock();
         state.reader_open = false;
@@ -334,12 +379,16 @@ impl Pipe {
         self.changed.notify_all();
     }
 
+    /// Closes the writing end, so the reader gets EOF once the buffer drains,
+    /// then wakes both ends.
     fn close_writer(&self) {
         self.lock().writer_open = false;
         self.changed.notify_all();
     }
 }
 
+/// Checks the in-memory streams' byte order, deadlines, backpressure and
+/// shutdown.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -352,10 +401,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// Deadline exercised by timeout and reuse checks.
+    /// Budget of 50 ms for the timeout and reuse checks.
     const TIMEOUT: Duration = Duration::from_millis(50);
 
-    /// Exposes standard I/O for adapter tests without closing the stream.
+    /// Splits a stream into its halves and a closer, without closing it.
     fn halves(stream: Duplex) -> (Reader, Writer, Closer) {
         let closer = stream.closer();
         let (reader, writer) = stream.into_halves();
@@ -370,7 +419,8 @@ mod tests {
         }
     }
 
-    // A blocked empty read expires when its clock reaches the installed deadline.
+    /// Checks that a read blocked on an empty pipe expires when its clock
+    /// reaches the installed deadline.
     #[test]
     fn test_blocked_read_expires_on_clock_deadline() {
         // Park an empty read with a deadline a day ahead of real time
@@ -393,7 +443,8 @@ mod tests {
         );
     }
 
-    // A blocked full write expires when its clock reaches the installed deadline.
+    /// Checks that a write blocked on a full pipe expires when its clock
+    /// reaches the installed deadline.
     #[test]
     fn test_blocked_write_expires_on_clock_deadline() {
         // Fill the pipe and park another write on the same fixed deadline
@@ -417,7 +468,8 @@ mod tests {
         );
     }
 
-    // An expired read delivers available input before reporting expiry on the empty pipe.
+    /// Checks that an expired read delivers available input before reporting
+    /// expiry on the empty pipe.
     #[test]
     fn test_read_delivers_buffered_bytes_after_deadline() {
         // Buffer input before the installed read deadline
@@ -444,15 +496,18 @@ mod tests {
         );
     }
 
-    // A zero-capacity pipe rejects construction before any I/O can wait
+    /// Checks that a zero-capacity pipe is rejected at construction, before
+    /// any I/O can wait.
     #[test]
     #[should_panic(expected = "duplex capacity must be nonzero")]
     fn test_zero_capacity() {
         duplex(0, &test_clock().clock());
     }
 
-    // Partial reads and writes preserve byte order across queue wraparound. Read
-    // and write deadlines remain independent, including empty I/O and flush.
+    /// Checks that partial reads and writes keep byte order across queue
+    /// wraparound, with independent read and write deadlines.
+    ///
+    /// The deadlines stay independent for empty I/O and flush too.
     #[test]
     fn test_byte_stream_and_independent_deadlines() {
         // Create both directions on one paused clock
@@ -466,7 +521,7 @@ mod tests {
         assert_eq!(host_read.read(&mut []).unwrap(), 0);
         assert_eq!(host_write.write(b"abcdef").unwrap(), 4);
         assert_eq!(host_write.write(&[]).unwrap(), 0);
-        // Flush succeeds even while the queue is full.
+        // Flush succeeds even while the queue is full
         host_write.flush().unwrap();
         let mut first = [0; 2];
         ark_read.read_exact(&mut first).unwrap();
@@ -516,8 +571,8 @@ mod tests {
         assert_eq!(&accepted, b"qrs");
     }
 
-    // An idle timed read neither reports EOF nor changes the caller's buffer.
-    // Clearing that deadline restores an indefinite read, woken by fresh output.
+    /// Checks that an idle timed read expires without EOF or buffer changes,
+    /// and clearing its deadline restores an indefinite read.
     #[test]
     fn test_read_timeout_and_reuse() {
         // Park an empty read on a deadline ahead of the paused clock
@@ -557,8 +612,8 @@ mod tests {
         reading.join().unwrap();
     }
 
-    // write_all can accept a prefix before timing out on backpressure. A later
-    // write must follow that prefix, without an abandoned suffix appearing later.
+    /// Checks that a later write follows the prefix a `write_all` accepted
+    /// before timing out, without the abandoned suffix appearing afterwards.
     #[test]
     fn test_write_timeout_and_reuse() {
         // Fill the pipe and park the remaining byte until its deadline
@@ -595,8 +650,8 @@ mod tests {
         assert_eq!(&suffix, b"ef");
     }
 
-    // Draining a full queue wakes its writer and permits progress through multiple
-    // partial writes, while bounded reads reconstruct the original byte stream.
+    /// Checks that draining a full queue wakes its writer through several
+    /// partial writes, while bounded reads rebuild the original byte stream.
     #[test]
     fn test_backpressure_wakes_writer() {
         // Fill a paused pipe and start a writer behind its queued bytes
@@ -612,6 +667,7 @@ mod tests {
             writer.set_write_deadline(deadline).unwrap();
             done.send(writer.write_all(b"defgh")).unwrap();
         });
+
         // Drain the pipe after the writer has parked
         blocked(&pipe);
         reader.set_read_deadline(Some(deadline)).unwrap();
@@ -622,8 +678,8 @@ mod tests {
         writing.join().unwrap();
     }
 
-    // Explicit local shutdown and dropping the peer both release already blocked
-    // reads and writes, including operations that have no deadline at all.
+    /// Checks that a local shutdown and dropping the peer both release blocked
+    /// reads and writes, including ones without a deadline.
     #[test]
     fn test_shutdown_wakes_both_directions() {
         for local in [false, true] {
@@ -642,6 +698,7 @@ mod tests {
             let writing = thread::spawn(move || {
                 write_done.send(writer.write(b"b")).unwrap();
             });
+
             // Close only after both adapter calls have parked
             blocked(&incoming);
             blocked(&outgoing);
@@ -660,8 +717,8 @@ mod tests {
         }
     }
 
-    // Closing discards local input but preserves accepted output for the peer to
-    // drain before EOF. Keeping the handles alive must not keep the connection open.
+    /// Checks that closing discards local input but lets the peer drain accepted
+    /// output before EOF, even while the halves are still held.
     #[test]
     fn test_shutdown_drains_output_and_discards_input() {
         // Queue bytes in both directions on a paused clock
@@ -694,8 +751,8 @@ mod tests {
         }
     }
 
-    // A peer that consumed every accepted byte before closing does not fail a
-    // later flush. Only output it closed without reading is reported as lost.
+    /// Checks that a flush succeeds after the peer consumed every accepted byte
+    /// and closed, while new output fails.
     #[test]
     fn test_flush_after_peer_drained_and_closed() {
         // Drain the accepted output before closing the peer
@@ -707,6 +764,7 @@ mod tests {
         let mut bytes = [0; 2];
         ark_read.read_exact(&mut bytes).unwrap();
         drop(ark_read);
+
         // Allow a flush but reject any new output
         host_write.flush().unwrap();
         assert_eq!(
@@ -715,8 +773,8 @@ mod tests {
         );
     }
 
-    // Splitting drops the stream's closer and output budget without closing
-    // its halves. Dropping one half still permits I/O in the other direction.
+    /// Checks that splitting discards the write budget without closing the
+    /// halves, and dropping one half leaves the other direction usable.
     #[test]
     fn test_into_halves_and_independent_drop() {
         // Split both streams on a paused clock
@@ -744,8 +802,8 @@ mod tests {
         );
     }
 
-    // Real protocol workers exchange a message larger than the pipe in both
-    // directions, then close while their transport readers are waiting for input.
+    /// Checks that protocol peers exchange a message larger than the pipe both
+    /// ways, then close while their transport readers wait for input.
     #[test]
     fn test_protocol_round_trip() {
         use crate::protocol::{self, Message};
@@ -761,6 +819,7 @@ mod tests {
         let mut server = protocol::Server::new(ark, signer, attestation);
         let (client, _) = protocol::connect(host, &identity).unwrap();
         let mut session = server.accept().unwrap();
+
         // Exchange a payload larger than the bounded transport pipe
         let payload: Vec<u8> = (0..256 * 1024).map(|n| n as u8).collect();
         let deadline = tester.clock().now() + Duration::from_secs(5);
@@ -773,6 +832,7 @@ mod tests {
         let written = responder.reply(message, deadline).unwrap();
         assert_eq!(answer.wait::<Vec<u8>>().unwrap(), payload);
         written.wait().unwrap();
+
         // Release both protocol owners after delivery
         client.close();
         server.close();

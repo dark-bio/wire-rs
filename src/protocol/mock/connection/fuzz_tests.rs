@@ -11,8 +11,9 @@ use super::*;
 /// Repeated failed handshakes keep each flush gate bound to its own attempt.
 #[test]
 fn test_connection_fuzz_repeated_handshake_timeouts() {
-    // CI crash-448f502ce99548911982fe206e1b63f888716b00: a new flush gate must
-    // not catch the preceding action's output while injecting an ACK timeout.
+    // A new flush gate must not catch the preceding action's output while
+    // injecting an ACK timeout. The actions come from the CI fuzz crash
+    // `crash-448f502ce99548911982fe206e1b63f888716b00`.
     let mut actions = vec![Action {
         kind: Kind::ResponseBeforeFailure,
         slot: 0,
@@ -136,7 +137,8 @@ fn test_connection_fuzz_actions() {
     }
 }
 
-/// Seed every deferred decoding path and both limits in each live role.
+/// Every malformed shape and inbound limit failure closes the session as
+/// predicted in each role.
 #[test]
 fn test_connection_fuzz_inbound_limits() {
     for slot in 0..2 {

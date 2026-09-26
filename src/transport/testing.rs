@@ -15,7 +15,9 @@ use darkbio_clock::Clock;
 use std::io;
 use std::time::Instant;
 
-/// Adds independent read and write deadlines to nonblocking memory I/O.
+/// Adapter adding independent read and write deadlines to nonblocking memory
+/// I/O.
+///
 /// Neither direction has a deadline until its setter is called. Replacing an
 /// expired deadline allows further operations on the same buffer.
 #[derive(Debug)]
@@ -31,7 +33,8 @@ pub struct Memory<T> {
 }
 
 impl<T> Memory<T> {
-    /// Wraps a nonblocking memory reader or writer with no initial deadlines.
+    /// Wraps a nonblocking memory reader or writer with no initial deadlines,
+    /// measuring later ones on `clock`.
     pub fn new(inner: T, clock: &Clock) -> Self {
         Self {
             inner,
@@ -100,15 +103,15 @@ pub fn test_clock() -> darkbio_clock::TestClock {
     tester
 }
 
+/// Checks the memory adapter's deadlines.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::time::Duration;
 
-    // Tests standard I/O helpers against independent read and write deadlines.
-    // Expiry must leave the buffer untouched and a replacement deadline must
-    // permit reuse, including flush after an earlier write deadline expired.
+    /// Checks that read and write deadlines expire independently without
+    /// touching the buffer, and that replacing one allows reuse.
     #[test]
     fn test_independent_deadlines_and_reuse() {
         // Expire only reads while writes still update the buffer

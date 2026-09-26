@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! Encodes scenario scripts as seeds for the fuzzers' `Arbitrary` decoders.
+//!
 //! When `WIRE_SEEDS` names a directory, each scenario run writes its script
 //! into the corresponding target's seed corpus.
 
@@ -16,23 +17,30 @@ use std::path::Path;
 /// Environment variable naming the directory the seeds are written into.
 pub const ENV: &str = "WIRE_SEEDS";
 
-/// Target that drives the real server with mock client scripts.
-/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
-/// every binary has seeds.
+/// Fuzz target that drives the real server with mock client scripts.
+///
+/// The name must match the target's binary in `fuzz/Cargo.toml`, and
+/// `make fuzz-seeds` checks that every binary has seeds.
 pub const TRANSPORT_SERVER: &str = "transport-server";
 
-/// Target that drives the real client with mock server scripts.
-/// Must match its binary name in fuzz/Cargo.toml; `make fuzz-seeds` checks that
-/// every binary has seeds.
+/// Fuzz target that drives the real client with mock server scripts.
+///
+/// The name must match the target's binary in `fuzz/Cargo.toml`, and
+/// `make fuzz-seeds` checks that every binary has seeds.
 pub const TRANSPORT_CLIENT: &str = "transport-client";
 
 /// Fuzz target running real peers over bounded duplex pipes, with concurrent
-/// reconnects and operation deadlines. Each scenario seeds one complete run.
+/// reconnects and operation deadlines.
+///
+/// Each scenario seeds one complete run. The name must match the target's
+/// binary in `fuzz/Cargo.toml`, and `make fuzz-seeds` checks that every binary
+/// has seeds.
 pub const TRANSPORT_DUPLEX: &str = "transport-duplex";
 
-/// Encodes scripts in the format decoded by arbitrary 1.4.
+/// Seed bytes being encoded in the format that arbitrary 1.4 decodes.
+///
 /// Integers use little-endian order. Each vector element starts with a
-/// continuation byte. Enum selection scales a u32 by the variant count and
+/// continuation byte. Enum selection scales a `u32` by the variant count and
 /// uses the upper 32 bits of the product as the variant index.
 pub struct Seed(Vec<u8>);
 
@@ -69,17 +77,24 @@ impl Seed {
     }
 }
 
-/// A scenario or step that can encode itself for the fuzzers.
+/// Scenario, step or action that can encode itself for the fuzzers.
 pub trait Seedable: for<'a> Arbitrary<'a> + PartialEq + std::fmt::Debug {
     /// Appends this value's encoding so `Arbitrary` reconstructs the same step.
     fn seed(&self, seed: &mut Seed);
 }
 
 /// Writes a script under `WIRE_SEEDS/<target>`, if `WIRE_SEEDS` is set.
-/// First checks that the encoded bytes decode back into the same script.
+///
 /// A content hash names the file, so an unchanged script keeps the same path.
+///
+/// # Panics
+///
+/// Panics if seeding is on and the encoding does not decode back into the
+/// same script, which means a [`Seedable`] implementation disagrees with the
+/// derived decoder.
 pub fn seed<S: Seedable>(target: &str, steps: &[S]) {
     write(target, || {
+        // Put a continuation flag before each step and a final one after them
         let mut seed = Seed(Vec::new());
         for step in steps {
             seed.flag(true);
@@ -87,6 +102,7 @@ pub fn seed<S: Seedable>(target: &str, steps: &[S]) {
         }
         seed.flag(false);
 
+        // Check the round trip before the seed reaches the corpus
         let decoded = Vec::<S>::arbitrary_take_rest(Unstructured::new(&seed.0))
             .expect("seed failed to decode");
         assert_eq!(decoded, steps, "seed decoded into another script");
@@ -99,6 +115,8 @@ pub fn write(target: &str, encode: impl FnOnce() -> Vec<u8>) {
     let Some(root) = std::env::var_os(ENV) else {
         return;
     };
+
+    // Name the file after the SHA-256 hash of its bytes
     let bytes = encode();
     let dir = Path::new(&root).join(target);
     std::fs::create_dir_all(&dir).expect("failed to create the seed directory");
@@ -127,6 +145,7 @@ impl Seedable for duplex::Scenario {
     fn seed(&self, seed: &mut Seed) {
         use duplex::Scenario;
 
+        /// Number of `Scenario` variants the derived decoder chooses between.
         const COUNT: u32 = 10;
         match self {
             Scenario::FailedPrelude { read } => {
@@ -181,6 +200,7 @@ impl Seedable for client::Step {
     fn seed(&self, seed: &mut Seed) {
         use client::Step;
 
+        /// Number of `Step` variants the derived decoder chooses between.
         const COUNT: u32 = 34;
         match self {
             Step::Reset => seed.variant(0, COUNT),
@@ -253,6 +273,7 @@ impl Seedable for server::Step {
     fn seed(&self, seed: &mut Seed) {
         use server::Step;
 
+        /// Number of `Step` variants the derived decoder chooses between.
         const COUNT: u32 = 34;
         match self {
             Step::Handshake => seed.variant(0, COUNT),

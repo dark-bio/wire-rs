@@ -13,6 +13,7 @@ use std::sync::Weak;
 use std::time::Instant;
 
 /// Handle for answering one incoming request through the session that received it.
+///
 /// The handler selects the success content, without a static request/response map.
 /// This handle cannot keep its session open or address a replacement session.
 ///
@@ -26,7 +27,8 @@ use std::time::Instant;
 /// reply keeps that slot until the writer takes it or the reply is discarded.
 /// See [`super::Session::set_inbound_limits`].
 ///
-/// Both [`Self::reply`] and [`Self::fail`] consume the responder, so it cannot be reused:
+/// Both [`Self::reply`] and [`Self::fail`] consume the responder, so it cannot
+/// be reused:
 ///
 /// ```compile_fail,E0382
 /// use darkbio_wire::protocol::{Responder, schema};
@@ -50,21 +52,25 @@ pub struct Responder {
     clock: Clock,
     /// Session that received the request; holding a responder cannot keep it open.
     session: Weak<SessionInner>,
-    /// Request ID to answer. Cleared after queueing a reply so `Drop` does nothing.
+    /// Request ID to answer, cleared after queueing a reply so dropping does
+    /// nothing.
     id: Option<u64>,
 }
 
 impl Responder {
     /// Returns the clock of this responder's session, which reply deadlines are
-    /// measured on. It stays available after the session is gone.
+    /// measured on.
+    ///
+    /// It stays available after the session is gone.
     pub fn clock(&self) -> Clock {
         self.clock.clone()
     }
 
-    /// Queues a successful response and consumes the responder. Returns a promise
-    /// for writing and flushing it. A closed session returns an error immediately.
-    /// The deadline includes time in the queue and I/O. Waiting on the promise
-    /// does not restart it.
+    /// Queues a successful response and consumes the responder.
+    ///
+    /// Returns a promise for writing and flushing it. A closed session returns
+    /// an error immediately. The deadline includes time in the queue and I/O.
+    /// Waiting on the promise does not restart it.
     ///
     /// A message invalid for this session's direction fails the promise with
     /// [`Error::WrongDirection`].
@@ -80,9 +86,11 @@ impl Responder {
         self.enqueue(Ok(response.into()), deadline)
     }
 
-    /// Queues an error response and consumes the responder. The deadline and write
-    /// promise work as in [`Self::reply`]. The error itself does not close the session.
-    /// Accepts an application error implementing [`super::CodedError`] directly. Use
+    /// Queues an error response and consumes the responder.
+    ///
+    /// The deadline and write promise work as in [`Self::reply`]. The error
+    /// itself does not close the session. It accepts an application error
+    /// implementing [`super::CodedError`] directly. Use
     /// [`schema::Error::reserved`] for a named protocol error or
     /// [`schema::Error::new`] for a bare numeric code.
     pub fn fail(
@@ -104,11 +112,12 @@ impl Responder {
             result,
             deadline,
         )?;
-        self.id = None; // Prevent Drop from also queueing UNANSWERED.
+        self.id = None; // keeps drop from also queueing UNANSWERED
         Ok(promise)
     }
 
-    /// Creates a responder for the request taken by `Session::recv()`.
+    /// Creates a responder for the request taken by
+    /// [`Session::recv`](super::Session::recv).
     pub(super) fn new(session: Weak<SessionInner>, clock: &Clock, id: u64) -> Self {
         Self {
             clock: clock.clone(),
@@ -120,7 +129,9 @@ impl Responder {
 
 impl Drop for Responder {
     /// Queues `UNANSWERED` if this responder still has an ID and its session is
-    /// open. The writer sends the error later.
+    /// open.
+    ///
+    /// The writer sends the error later.
     fn drop(&mut self) {
         if let Some(id) = self.id.take()
             && let Some(session) = self.session.upgrade()
@@ -152,7 +163,8 @@ mod tests {
             .wait()
     }
 
-    /// Compiles immediate replies, a background reverse request and responder abandonment.
+    /// Compiles immediate replies, a background reverse request and responder
+    /// abandonment.
     #[allow(dead_code)]
     fn receive_on_server(session: &mut Session, deadline: Instant) -> Result<(), Error> {
         let (request, responder): (Message, Responder) = session.recv()?;
@@ -163,7 +175,7 @@ mod tests {
                 written.wait()?;
             }
             Message::Develop(bytes) => {
-                // Opaque development traffic is supported in both directions.
+                // Opaque development traffic is supported in both directions
                 let requester = session.requester();
                 std::thread::spawn(move || -> Result<(), Error> {
                     let answer: Vec<u8> = requester.request(bytes, deadline)?.wait()?;
@@ -171,7 +183,7 @@ mod tests {
                     Ok(())
                 });
             }
-            _ => drop(responder), // Schedules the standard unanswered error.
+            _ => drop(responder), // schedules the standard unanswered error
         }
         Ok(())
     }
@@ -180,7 +192,8 @@ mod tests {
     /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be printable and transferable to a background thread.
+        /// Requires an owned value to be printable and transferable to a
+        /// background thread.
         fn movable<T: Debug + Send + 'static>() {}
         movable::<Responder>();
     }

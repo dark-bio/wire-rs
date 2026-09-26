@@ -53,7 +53,7 @@ fn attestation(signer: &xdsa::SecretKey, wall: SystemTime) -> Attestation {
     .unwrap()
 }
 
-// Checks that a stream refuses a reader and a writer on different clocks.
+/// Checks that a stream refuses a reader and a writer on different clocks.
 #[test]
 #[should_panic(expected = "stream halves must use the same clock")]
 fn test_stream_rejects_different_clocks() {
@@ -69,11 +69,12 @@ fn test_stream_rejects_different_clocks() {
     let _ = Stream::new(reader, writer, || {});
 }
 
-// Checks that memory halves report their clock through boxed and borrowed
-// adapters, and that the stream and the halves measure deadlines on it.
+/// Checks that memory halves report their clock through boxed and borrowed
+/// adapters, and that the stream and the halves measure deadlines on it.
 #[test]
 fn test_memory_and_adapter_wrappers_keep_the_clock() {
-    // Run a day ahead of real time, so a deadline checked in real time never expires
+    // Run a day ahead of real time, so a deadline checked in real time never
+    // expires, and require both memory ends and their halves to report the clock
     let mut tester = TestClock::new();
     tester.advance(Duration::from_secs(86400));
     let clock = tester.clock();
@@ -110,7 +111,8 @@ fn test_memory_and_adapter_wrappers_keep_the_clock() {
         Some(&b"in"[..])
     );
 
-    // Refuse framed I/O once the clock reaches that deadline, even with a frame buffered
+    // Refuse framed I/O once the clock reaches that deadline, even with a frame
+    // buffered
     tester.advance(Duration::from_secs(2));
     assert!(matches!(
         reader.next_packet(Some(deadline)),
@@ -142,7 +144,8 @@ fn test_memory_and_adapter_wrappers_keep_the_clock() {
     );
 }
 
-// A framed read blocked in its adapter expires through the stream reader's clock check.
+/// Checks that a framed read blocked in its adapter expires through the stream
+/// reader's clock check.
 #[test]
 fn test_blocked_framed_read_expires_on_stream_clock() {
     // Park an empty framed read a day ahead of real time
@@ -156,7 +159,8 @@ fn test_blocked_framed_read_expires_on_stream_clock() {
     tester.wait_blocked(1);
     assert_eq!(tester.next_deadline(), Some(deadline));
 
-    // Pass expiry and require the reader to return instead of retrying adapter timeouts
+    // Pass expiry and require the reader to return instead of retrying adapter
+    // timeouts
     tester.advance_to(deadline + Duration::from_nanos(1));
     assert!(matches!(
         reading.join().unwrap(),
@@ -164,8 +168,8 @@ fn test_blocked_framed_read_expires_on_stream_clock() {
     ));
 }
 
-// Checks that a client verifies the attestation and signs its ack at the wall
-// time of the stream's clock.
+/// Checks that a client verifies the attestation and signs its ack at the wall
+/// time of the stream's clock.
 #[test]
 fn test_client_handshake_uses_clock_wall_time() {
     /// Verifier requiring the exact wall time, then applying the roots policy.
@@ -187,7 +191,8 @@ fn test_client_handshake_uses_clock_wall_time() {
             // Require the exact wall time, before the roots round it to seconds
             assert_eq!(now, self.wall);
 
-            // Verify through the roots, which reject the attestation at any other second
+            // Verify through the roots, which reject the attestation at any
+            // other second
             Roots {
                 hardware: &[],
                 emulator: std::slice::from_ref(&self.root),
@@ -196,7 +201,8 @@ fn test_client_handshake_uses_clock_wall_time() {
         }
     }
 
-    // Run a day ahead of real time, with the wall time in 2009 and a fraction of a second
+    // Run a day ahead of real time, with the wall time in 2009 and a fraction of
+    // a second
     let mut tester = TestClock::new();
     tester.advance(Duration::from_secs(86400));
     let wall = UNIX_EPOCH + Duration::new(1_234_567_890, 123_456_789);
@@ -270,8 +276,8 @@ fn test_client_handshake_uses_clock_wall_time() {
     peer.join().unwrap();
 }
 
-// Checks that a server signs its hello at the wall time of the stream's clock,
-// and opens the client's ack without reading that time.
+/// Checks that a server signs its hello at the wall time of the stream's clock,
+/// and opens the client's ack without reading that time.
 #[test]
 fn test_server_handshake_uses_clock_wall_time() {
     // Run a day ahead of real time, with the wall time in 2012
@@ -284,6 +290,8 @@ fn test_server_handshake_uses_clock_wall_time() {
     let identity = signer.public_key();
     let attest = attestation(&signer, wall);
     let (host, ark) = memory::duplex(64 * 1024, &clock);
+
+    // Serve one handshake on the Ark side
     let peer = thread::spawn(move || {
         let mut server = Server::new(ark, signer, attest);
         assert!(matches!(server.recv().unwrap(), Event::Connected(_)));
@@ -343,14 +351,15 @@ fn test_server_handshake_uses_clock_wall_time() {
     )
     .unwrap();
 
-    // Deliver it at a wall time before 1970, which the server's unchecked open must not read
+    // Deliver it at a wall time before 1970, which the server's unchecked open
+    // must not read
     tester.set_system_time(UNIX_EPOCH - Duration::from_secs(1));
     writer.send_packet(&ack, deadline).unwrap();
     peer.join().unwrap();
 }
 
-// Checks that sessions and their handles report the stream's clock, also after
-// the session is gone, and time out requests on it.
+/// Checks that sessions and their handles report the stream's clock, also after
+/// the session is gone, and time out requests on it.
 #[test]
 fn test_protocol_handles_keep_the_stream_clock() {
     // Connect both protocol peers over a memory connection a day ahead of real time
@@ -403,7 +412,8 @@ fn test_protocol_handles_keep_the_stream_clock() {
     assert_eq!(responder.clock(), clock);
 }
 
-// Server acceptance parks on the stream clock until a client establishes a session.
+/// Checks that server acceptance parks on the stream clock until a client
+/// establishes a session.
 #[test]
 fn test_server_accept_waits_on_stream_clock() {
     // Start acceptance before the client has sent a handshake
@@ -430,7 +440,8 @@ fn test_server_accept_waits_on_stream_clock() {
     drop(server);
 }
 
-// The deadline worker settles a request on clock advance while nobody waits on its promise.
+/// Checks that the deadline worker settles a request on clock advance while
+/// nobody waits on its promise.
 #[test]
 fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
     // Establish both protocol peers a day ahead of real time
@@ -452,7 +463,8 @@ fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
     let (_, first_responder) = session.recv().unwrap();
     tester.wait_blocked(6);
 
-    // Submit an earlier deadline, which the parked worker must recompute its wait for
+    // Submit an earlier deadline, which the parked worker must recompute its
+    // wait for
     let deadline = clock.now() + Duration::from_secs(5);
     let mut promise = client.requester().request(vec![2], deadline).unwrap();
     let (events, observed) = mpsc::channel();
@@ -463,7 +475,8 @@ fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
     tester.wait_blocked(6);
     assert!(observed.try_recv().is_err());
 
-    // Observe worker notification before any call that could synchronously expire work
+    // Observe worker notification before any call that could synchronously
+    // expire work
     tester.advance_to(deadline);
     observed.recv().unwrap();
     assert!(matches!(
@@ -471,7 +484,8 @@ fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
         Err(protocol::Error::Timeout)
     ));
 
-    // Keep the later request alive until its own deadline and observe worker settlement
+    // Keep the later request alive until its own deadline and observe worker
+    // settlement
     let mut first = first;
     let (events, observed) = mpsc::channel();
     first.notify(move || {

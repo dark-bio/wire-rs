@@ -37,24 +37,30 @@ pub const MAX_STEPS: usize = 64;
 /// independent of the clock.
 pub const TIMESTAMP: i64 = 0;
 
-/// Handshake budget of the peer under test in the scripted runners. The models
-/// predict every result from the script alone. The clock must therefore never
-/// expire a handshake that a slow script is still feeding.
+/// Handshake budget of the peer under test in the scripted runners.
+///
+/// The models predict every result from the script alone. The clock must
+/// therefore never expire a handshake that a slow script is still feeding.
 pub const SCRIPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// Message one byte past the send limit, used to assert refusal without advancing
-/// encryption or touching the writer. Shared so fuzz steps need no large allocation.
+/// Message one byte past [`MAX_MESSAGE_SIZE`], used to assert refusal without
+/// advancing encryption or touching the writer.
+///
+/// It is a constant, so fuzz steps need no large allocation.
 pub(super) const OVERSIZED_MESSAGE: &[u8] = &[0x42; MAX_MESSAGE_SIZE + 1];
 
 /// Encodes a tag as eight big-endian bytes to identify a test message.
+///
 /// The transport treats this payload as opaque bytes.
 pub fn payload(tag: u64) -> Vec<u8> {
     tag.to_be_bytes().to_vec()
 }
 
-/// Attempts a scripted send through the most recently delivered sender.
-/// Before any successful handshake, the driver itself refuses the attempt;
-/// no sender exists to call. Retaining ended senders exercises their refusal.
+/// Sends a message through a scripted sender, if there is one.
+///
+/// Without a sender, as before the first handshake, the call fails with the
+/// same [`Error::EncryptionFailed`] an ended session returns. Drivers keep
+/// ended senders around to exercise that refusal.
 pub(super) fn send<W: Write>(sender: Option<&Sender<W>>, message: &[u8]) -> Result<(), Error> {
     match sender {
         Some(sender) => sender.send(message),
@@ -63,7 +69,9 @@ pub(super) fn send<W: Write>(sender: Option<&Sender<W>>, message: &[u8]) -> Resu
 }
 
 /// Creates a self-signed device attestation for a server without onboarding.
-/// It embeds the server's handshake signing key.
+///
+/// It embeds the signer's public key, so the same signer must sign the
+/// handshake.
 pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
     let claims = darkbio_trust::device::HardwareClaims {
         sub: claims::Subject { sub: "".into() },
@@ -85,7 +93,8 @@ pub fn self_attestation(signer: &xdsa::SecretKey) -> Attestation {
 }
 
 /// Creates a cloud signer attestation under the device attestation domain.
-/// Its claims have the wrong shape for a device, so the transport rejects it
+///
+/// Its claims have the wrong shape for a device, so the client rejects it
 /// before calling the verifier.
 pub fn cloud_attestation(signer: &xdsa::SecretKey) -> Vec<u8> {
     let claims = darkbio_trust::cloud::SignerClaims {
@@ -104,7 +113,7 @@ pub fn cloud_attestation(signer: &xdsa::SecretKey) -> Vec<u8> {
     .unwrap()
 }
 
-/// COBS encodes a packet and appends its frame delimiter.
+/// Encodes a packet with COBS and appends its frame delimiter.
 pub fn frame(packet: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; cobs::encode_buffer(packet.len())];
     let n = cobs::encode(packet, &mut buf).unwrap();
@@ -113,8 +122,12 @@ pub fn frame(packet: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// COBS decodes a frame whose delimiter has already been removed.
-/// Panics if the side under test wrote an invalid frame.
+/// Decodes a COBS frame whose delimiter has already been removed.
+///
+/// # Panics
+///
+/// Panics if the frame is not valid COBS, as when the side under test wrote a
+/// broken frame.
 pub fn unframe(frame: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; cobs::decode_buffer(frame.len())];
     let n = cobs::decode(frame, &mut buf).expect("side under test wrote an undecodable frame");
@@ -127,10 +140,15 @@ pub fn would_block() -> io::Error {
     io::ErrorKind::WouldBlock.into()
 }
 
-/// Shared transcript for the current run. Contains `None` when recording is off.
+/// Shared transcript for the current run.
+///
+/// It holds `None` when recording is off.
 pub type Recorder = Arc<Mutex<Option<Vector>>>;
 
 /// Logs an event into the transcript, if the run is recorded.
+///
+/// The closure runs only when recording, so unrecorded runs never build the
+/// event.
 pub fn trace(recorder: &Recorder, event: impl FnOnce() -> Event) {
     if let Some(vector) = recorder.lock().unwrap().as_mut() {
         vector.log(event());
@@ -138,47 +156,64 @@ pub fn trace(recorder: &Recorder, event: impl FnOnce() -> Event) {
 }
 
 /// Point where a scripted output failure occurs.
-/// A recovery delimiter belongs to the same write as its frame.
-/// Only `Start` applies to a lone delimiter; `Middle` needs at least three bytes,
-/// while `Delimiter` and `Flush` also apply to a two-delimiter signal.
+///
+/// A recovery delimiter belongs to the same write as its frame. Only
+/// [`Start`](CutPoint::Start) applies to a lone delimiter.
+/// [`Middle`](CutPoint::Middle) needs at least three bytes, while
+/// [`Delimiter`](CutPoint::Delimiter) and [`Flush`](CutPoint::Flush) also
+/// apply to a two-delimiter signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum CutPoint {
-    /// Fails before accepting any bytes.
+    /// Failure before any bytes are accepted.
     Start,
-    /// Accepts `1 + min(n, len - 3)` bytes of a write at least three bytes long.
-    /// Zero accepts its first byte, which can be only the recovery delimiter.
-    /// Larger offsets clamp before the final body byte and frame delimiter.
+    /// Failure after `1 + min(n, len - 3)` bytes of a write at least three
+    /// bytes long.
+    ///
+    /// An offset of zero accepts only the first byte, which is the recovery
+    /// delimiter when one leads the write. Larger offsets clamp, leaving the
+    /// final body byte and the frame delimiter unwritten.
     Middle(u16),
-    /// Accepts everything except the final delimiter, then fails.
+    /// Failure after everything but the final delimiter is accepted.
     Delimiter,
-    /// Accepts all bytes, then fails during flush.
+    /// Failure during the flush, after all bytes are accepted.
     Flush,
 }
 
-/// Captures output for the mock peer to consume.
+/// Output adapter capturing what the peer under test writes, for the mock to
+/// consume.
+///
 /// Scripts can inject partial writes, timeouts and persistent write failures.
+/// Clones share the captured bytes and the armed faults.
 #[derive(Clone)]
 pub struct Outbox {
     /// Clock shared with the scripted input adapter.
     clock: Clock,
+    /// Captured bytes and armed faults, shared by every clone.
     shared: Arc<Mutex<OutputState>>,
-    recorder: Recorder, // Transcript the writes are logged into
+    /// Transcript the writes are logged into, when the run is recorded.
+    recorder: Recorder,
 }
 
 /// Captured bytes and injected faults under one lock.
 #[derive(Default)]
 struct OutputState {
+    /// Accepted bytes not yet taken as frames.
     bytes: Vec<u8>,
+    /// Whether writes fail with `BrokenPipe` until cleared.
     broken: bool,
+    /// Cut armed for the next write it applies to.
     cut: Option<CutPoint>,
+    /// Whether the armed cut reports `TimedOut` instead of `BrokenPipe`.
     timeout: bool,
-    write_error: Option<io::ErrorKind>, // Deferred until the call after accepted bytes
+    /// Error deferred to the call after a write that accepted bytes.
+    write_error: Option<io::ErrorKind>,
+    /// Error the next flush returns, armed by a [`CutPoint::Flush`] cut.
     flush_error: Option<io::ErrorKind>,
 }
 
 impl Outbox {
-    /// Creates empty output on the scenario's clock.
+    /// Creates empty output on the scenario's clock, with recording off.
     pub fn new(clock: &Clock) -> Self {
         Self {
             clock: clock.clone(),
@@ -188,10 +223,11 @@ impl Outbox {
     }
 
     /// Removes and returns all delimited frames, without their delimiters.
-    /// Keeps any unfinished tail until a later write supplies its delimiter.
+    ///
+    /// Any unfinished tail stays until a later write supplies its delimiter.
     pub fn take_frames(&self) -> Vec<Vec<u8>> {
         let mut state = self.shared.lock().unwrap();
-        // The final piece is the unfinished tail, or empty after a delimiter.
+        // The final piece is the unfinished tail, or empty after a delimiter
         let mut frames: Vec<Vec<u8>> = state.bytes.split(|&b| b == 0).map(<[u8]>::to_vec).collect();
         let tail = frames.pop().expect("split yields at least one piece");
         state.bytes = tail;
@@ -208,7 +244,8 @@ impl Outbox {
         self.shared.lock().unwrap().broken = broken;
     }
 
-    /// Arms a failure for the next write to which this cut point applies.
+    /// Arms a `BrokenPipe` failure for the next write this cut point applies to.
+    ///
     /// The cut takes priority over a persistent write failure.
     pub fn set_cut(&self, point: CutPoint) {
         let mut state = self.shared.lock().unwrap();
@@ -217,16 +254,22 @@ impl Outbox {
     }
 
     /// Arms a timeout at the selected cut point.
-    /// Returns `TimedOut` without sleeping so scripted timeout tests stay fast.
+    ///
+    /// The failing write or flush reports `TimedOut` at once, whatever the
+    /// deadline, so scripted timeout tests need no clock advances.
     pub fn set_timeout(&self, point: CutPoint) {
         let mut state = self.shared.lock().unwrap();
         state.cut = Some(point);
         state.timeout = true;
     }
 
-    /// Chooses how many bytes to accept and which error to report afterwards.
-    /// An applicable cut takes priority over a persistent write failure.
+    /// Chooses how many bytes of a write to accept and which error follows them.
+    ///
+    /// An applicable cut takes priority over a persistent write failure. A
+    /// [`CutPoint::Flush`] cut accepts the write and arms its error for the
+    /// flush instead.
     fn accept(state: &mut OutputState, buf: &[u8]) -> (usize, Option<io::ErrorKind>) {
+        // Fire an armed cut if it applies to this write, disarming it
         if let Some(point) = state.cut {
             let accepted = match point {
                 CutPoint::Start => Some(0),
@@ -247,6 +290,8 @@ impl Outbox {
                 return (accepted, Some(error));
             }
         }
+
+        // Without a cut, a broken stream refuses the whole write
         if state.broken {
             return (0, Some(io::ErrorKind::BrokenPipe));
         }
@@ -271,10 +316,13 @@ impl Write for Outbox {
 
 impl io::Write for Outbox {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Fail on an error deferred by the previous write
         let mut state = self.shared.lock().unwrap();
         if let Some(error) = state.write_error.take() {
             return Err(error.into());
         }
+
+        // Capture the accepted prefix and log it together with any failure
         let (accepted, error) = Self::accept(&mut state, buf);
         state.bytes.extend_from_slice(&buf[..accepted]);
         trace(&self.recorder, || match error {
@@ -286,8 +334,9 @@ impl io::Write for Outbox {
                 failed: error.is_some(),
             },
         });
+
         // The transcript records accepted bytes and failure as one event.
-        // Standard I/O reports them separately: Ok(n), then an error.
+        // Standard I/O reports them separately, as `Ok(n)` and then an error.
         match error {
             Some(error) if accepted > 0 => {
                 state.write_error = Some(error);
@@ -316,15 +365,17 @@ impl io::Write for Outbox {
     }
 }
 
+/// Tests of the scripted output adapter.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
     use std::time::Duration;
 
-    // Tests that a scripted partial failure follows the standard write contract:
-    // accepted bytes return Ok(n), the next call fails without accepting more,
-    // and a fresh frame can complete the prefix on the same adapter.
+    /// Tests that a scripted partial failure follows the standard write contract.
+    ///
+    /// Accepted bytes return `Ok(n)`, and the next call fails without accepting
+    /// more. A fresh frame can then complete the prefix on the same adapter.
     #[test]
     fn test_partial_write_reports_progress_before_failure() {
         // Inject a partial failure on a paused clock
@@ -352,9 +403,10 @@ mod tests {
         assert_eq!(outbox.take_frames(), vec![vec![1, 2]]);
     }
 
-    // Tests abandoning output between accepting bytes and observing its error.
-    // Starting another output operation discards the abandoned error, even when
-    // it reuses the original deadline for a failure notification.
+    /// Tests that starting new output discards the error of abandoned output.
+    ///
+    /// The new operation may reuse the original deadline, as a failure
+    /// notification does.
     #[test]
     fn test_new_output_discards_abandoned_fault() {
         for cut in [CutPoint::Delimiter, CutPoint::Flush] {
@@ -364,10 +416,10 @@ mod tests {
             let mut outbox = Outbox::new(&clock);
             let deadline = clock.now() + Duration::from_secs(1);
             outbox.set_cut(cut);
-            // Start another output operation with the same deadline
             outbox.set_write_deadline(deadline).unwrap();
             assert!(outbox.write(&[1, 2, 0]).unwrap() > 0);
 
+            // Start another output operation with the same deadline
             outbox.set_write_deadline(deadline).unwrap();
             outbox.write_all(&[0]).unwrap();
             outbox.flush().unwrap();

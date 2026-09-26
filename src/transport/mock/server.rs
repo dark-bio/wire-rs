@@ -4,13 +4,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Mock server driving a real `Client`. Script steps call client methods,
-//! queue incoming frames, or inject I/O failures. The read adapter advances the
-//! script as the client consumes its input. The mock parses every client write,
-//! answers HostHellos, and decrypts requests with real keys.
+//! Mock server driving a real [`Client`](crate::transport::Client) through
+//! a script.
 //!
-//! A separate model predicts each call's result and the client's session state
-//! from the frames delivered to it. Any difference from those predictions panics.
+//! Script steps call client methods, queue incoming frames, or inject I/O
+//! failures. The read adapter advances the script as the client consumes its
+//! input. The mock parses every client write, answers HostHellos, and decrypts
+//! requests with real keys.
+//!
+//! A separate model predicts each call's result and the client's session
+//! state from the frames delivered to it. Any difference from those
+//! predictions panics.
 
 use super::vector::{Event, ReadError, Vector};
 use super::{
@@ -31,112 +35,156 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// One scripted client call, incoming frame, or I/O fault. A step that needs a
-/// missing session or HostHello sends junk instead, so arbitrary sequences are valid.
+/// One scripted client call, incoming frame, read setting, or I/O fault.
+///
+/// A step that needs a missing session or HostHello sends junk instead, so
+/// arbitrary sequences are valid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Step {
-    // Calls through the client and its senders.
-    /// The client runs a handshake.
+    /// A client handshake with fresh ephemeral keys.
     Handshake,
-    /// The client sends a request tagged by the byte.
+    /// A request tagged by the byte, sent through the client's current sender.
     Send(u8),
-    /// Sends a message one byte over the conservative send limit.
+    /// A message one byte over
+    /// [`MAX_MESSAGE_SIZE`](crate::transport::MAX_MESSAGE_SIZE), sent through
+    /// the current sender.
     SendOversized,
-    /// The client reads the next message.
+    /// A client receive of the next message.
     Recv,
-    /// Retains the current sender separately, replacing any previously retained
-    /// handle. With no sender, clears the retained slot.
+    /// A copy of the current sender, kept in a separate slot.
+    ///
+    /// The copy replaces any handle retained before. Without a current sender,
+    /// the slot is cleared.
     Retain,
-    /// Sends through the retained handle, which may belong to an earlier session.
-    /// Without a retained sender, the driver models refusal before any I/O.
+    /// A request tagged by the byte, sent through the retained handle.
+    ///
+    /// The handle may belong to an earlier session. Without a retained sender,
+    /// the driver models refusal before any I/O.
     SendRetained(u8),
 
-    // Handshake input.
-    /// A valid ArkHello answering the latest HostHello. Junk if there was none.
+    /// A valid ArkHello answering the latest HostHello.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     Hello,
-    /// An ArkHello sealed to a key the client never had. Junk without a HostHello.
+    /// An ArkHello sealed to a key the client never had.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloStale,
     /// An ArkHello for the latest HostHello with a flipped ciphertext byte.
-    /// Junk if there was no hello.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloTampered,
-    /// An ArkHello bound to another client's keys, simulating a substituted
-    /// HostHello. Junk without a HostHello to answer.
+    /// An ArkHello bound to another client's signing key, simulating a
+    /// substituted HostHello.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloBadAuth,
     /// An ArkHello signed by a key other than the server's pinned identity.
-    /// Junk without a HostHello to answer.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloBadSigner,
-    /// An ArkHello for the latest HostHello whose sealed payload is not an
-    /// ArkHello at all. Junk if there was no hello.
+    /// An ArkHello for the latest HostHello whose sealed payload is a HostAck.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloBadPayload,
     /// An ArkHello for the latest HostHello carrying an encryption key that
-    /// fails validation. Junk if there was no hello.
+    /// fails validation.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloBadKey,
     /// An ArkHello for the latest HostHello with an encapsulated key of the
-    /// wrong size. Junk if there was no hello.
+    /// wrong size.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloBadEncap,
     /// An ArkHello carrying a cloud attestation instead of a device attestation.
-    /// Junk without a HostHello to answer.
+    ///
+    /// Without a HostHello to answer, the step sends junk.
     HelloBadAttest,
 
-    // Session input.
-    /// A sealed reply tagged by the byte. Junk without a session.
+    /// A sealed reply tagged by the byte.
+    ///
+    /// Without a server session, the step sends junk.
     Reply(u8),
-    /// The last sealed reply, repeated. Nothing if none was sent yet.
+    /// A repeat of the last sealed reply.
+    ///
+    /// The step does nothing before the first reply.
     ReplyReplay,
-    /// A sealed reply with a flipped ciphertext byte. Junk without a session.
+    /// A sealed reply with a flipped ciphertext byte.
+    ///
+    /// Without a server session, the step sends junk.
     ReplyTampered,
-    /// A sealed packet that is not a protobuf message. Junk without a session.
+    /// A sealed packet that is not a protobuf message.
+    ///
+    /// Without a server session, the step sends junk.
     Garbage,
     /// The empty frame signaling a dropped session.
     Dropped,
 
-    // Malformed and partial frames.
-    /// The bytes COBS encoded into a frame, decodable but meaningless.
+    /// A frame COBS encoding the bytes, decodable but meaningless.
     Junk(Vec<u8>),
     /// A frame failing COBS decoding.
     Undecodable,
-    /// The last valid frame produced cut short, keeping at least one byte.
-    /// Nothing if none was produced yet.
+    /// The last valid frame produced, cut short but keeping at least one byte.
+    ///
+    /// The byte picks the cut. The step does nothing before the first valid
+    /// frame.
     Truncated(u8),
-    /// A valid ArkHello without its delimiter. A following zero completes the
-    /// hello. So does a frame encoding the empty packet when the hello's encoding
-    /// ends in a full run, as COBS implies no zero after one. Any other frame
-    /// merges into its bytes and makes it invalid.
+    /// A valid ArkHello without its delimiter, or junk without a HostHello.
+    ///
+    /// A following zero completes the hello. So does a frame encoding the empty
+    /// packet when the hello's encoding ends in a full run, as COBS implies no
+    /// zero after one. Any other frame merges into its bytes and makes it
+    /// invalid.
     Partial,
-    /// A frame past the size limit, delimiter included. Receiving it ends a
-    /// session; a handshake drains it and continues waiting for its ArkHello.
-    /// Any preceding partial ArkHello belongs to the same oversized frame.
+    /// A delimited frame one byte past [`MAX_FRAME_SIZE`].
+    ///
+    /// Receiving it ends a session; a handshake drains it and continues waiting
+    /// for its ArkHello. Any preceding partial ArkHello belongs to the same
+    /// oversized frame.
     Oversized,
 
-    // Read scheduling and faults.
-    /// Limits each read to this many bytes. Zero removes the limit.
+    /// A limit of this many bytes on each read.
+    ///
+    /// Zero removes the limit.
     Chunk(u8),
-    /// Batches up to this many frames into one read. Stops when a frame determines
-    /// the current call's result, or the next step needs a separate action.
+    /// A batch of up to this many frames handed over in one read.
+    ///
+    /// The batch stops at the frame that determines the current call's result,
+    /// or before a step that needs a separate action.
     Batch(u8),
-    /// The read fails with `WouldBlock`.
+    /// A read failing with `WouldBlock`, which ends the active call.
     Yield,
-    /// The read returns `Interrupted`. Framing retries without ending the call.
+    /// A read returning `Interrupted`.
+    ///
+    /// The transport retries the read without ending the call.
     Interrupt,
-    /// An adapter read returns an early timeout. Receiving retries without ending the session.
+    /// An early read timeout from the adapter.
+    ///
+    /// The transport retries the read without ending the call.
     ReadTimeout,
 
-    // Write faults.
-    /// The client's writes fail until a Heal step.
+    /// Client writes failing until a [`Heal`](Step::Heal) step.
     Break,
-    /// The client's writes work again.
+    /// An end to any persistent write failure, leaving an armed cut in place.
     Heal,
-    /// Cuts the next matching client write. If requested, all later writes fail
-    /// until a Heal step.
-    Cut { point: CutPoint, then_broken: bool },
-    /// The next matching output operation expires after the selected prefix.
-    /// The stream remains reusable after the failed send or handshake.
+    /// A cut at the point, on the next client write it applies to.
+    Cut {
+        /// Place in the write where the cut falls.
+        point: CutPoint,
+        /// Whether client writes also fail until a [`Heal`](Step::Heal) step.
+        then_broken: bool,
+    },
+    /// A timeout at the point, on the next client write it applies to.
+    ///
+    /// The stream stays reusable after the failed send or handshake.
     Timeout(CutPoint),
 }
 
 impl Step {
-    /// Whether the step is a call into the client rather than a server frame.
+    /// Checks whether the driver runs the step against the client or its
+    /// senders.
     fn is_call(&self) -> bool {
         matches!(
             self,
@@ -149,7 +197,8 @@ impl Step {
         )
     }
 
-    /// Whether this step can join an input batch without driver or I/O changes.
+    /// Checks whether the step can join an input batch without driver or I/O
+    /// changes.
     fn queues_frame(&self) -> bool {
         !matches!(
             self,
@@ -175,58 +224,73 @@ impl Step {
 /// Error kinds the model distinguishes in the client's results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// [`Error::FrameTooLarge`], a frame exceeding the receive limit.
+    /// A frame exceeding the receive limit, reported as
+    /// [`Error::FrameTooLarge`].
     FrameTooLarge,
-    /// [`Error::FrameDecodingFailed`], a frame failing COBS decoding.
+    /// A frame failing COBS decoding, reported as [`Error::FrameDecodingFailed`].
     FrameDecoding,
-    /// [`Error::SendFailed`], a failed output operation or deadline setup.
+    /// A failed output operation or deadline setup, reported as
+    /// [`Error::SendFailed`].
     Send,
-    /// [`Error::RecvFailed`], the transport failing a read.
+    /// A failed read, reported as [`Error::RecvFailed`].
     Recv,
-    /// [`Error::Terminated`], the transport ending.
+    /// The end of the transport, reported as [`Error::Terminated`].
     Terminated,
-    /// [`Error::SessionReset`], the server signaling that it has no session.
+    /// The server's signal that it has no session, reported as
+    /// [`Error::SessionReset`].
     SessionReset,
-    /// [`Error::InvalidAttestation`], an attestation of the wrong shape.
+    /// An attestation of the wrong shape, reported as
+    /// [`Error::InvalidAttestation`].
     InvalidAttestation,
-    /// [`Error::HandshakeFailed`], a handshake refused or given up on.
+    /// A handshake reply the client rejects, reported as
+    /// [`Error::HandshakeFailed`].
     Handshake,
-    /// [`Error::EncryptionFailed`], from failed decryption or an ended session.
+    /// A failed decryption or a call without a live session, reported as
+    /// [`Error::EncryptionFailed`].
     Encryption,
 }
 
 /// Final session state and observed counts for scenario assertions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
-    pub established: bool, // Whether the client ended up with a session
-    pub handshakes: usize, // Handshakes that succeeded
-    pub messages: usize,   // Messages the client read
-    pub resets: usize,     // Session resets the client surfaced
-    pub failures: usize,   // Failed handshakes and receives, excluding session resets
-    pub reads: usize,      // Reads that handed the client bytes
+    /// Whether the client ended the script with a session.
+    pub established: bool,
+    /// Number of handshakes that succeeded.
+    pub handshakes: usize,
+    /// Number of messages the client received.
+    pub messages: usize,
+    /// Number of session resets the client reported.
+    pub resets: usize,
+    /// Number of failed handshakes and receives, session resets excluded.
+    pub failures: usize,
+    /// Number of reads that handed the client bytes.
+    pub reads: usize,
 }
 
-/// Defect to introduce into ArkHello. A stale recipient makes the client skip
-/// the frame; other defects in its own reply make it reject the handshake.
+/// Defect to introduce into an ArkHello.
+///
+/// A stale recipient makes the client skip the frame; other defects in the
+/// reply to its own hello make it reject the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flaw {
-    /// Nothing, a valid ArkHello.
+    /// No defect, a valid ArkHello.
     None,
-    /// Sealed to a key the client never had.
+    /// A recipient key the client never had.
     Stale,
-    /// A flipped ciphertext byte prevents decryption.
+    /// A flipped ciphertext byte that prevents decryption.
     Tampered,
-    /// Bound to another client's keys, as a substituted hello would be.
+    /// Authenticated data naming another client's signing key, as a substituted
+    /// hello would carry.
     Auth,
-    /// Signed by a key other than the server's identity.
+    /// A signature by a key other than the server's identity.
     Signer,
-    /// A sealed payload that is not an ArkHello at all.
+    /// A sealed HostAck payload in place of an ArkHello.
     Payload,
     /// An encryption key failing validation.
     Key,
     /// An encapsulated key of the wrong size.
     Encap,
-    /// A well formed attestation of the wrong shape.
+    /// A well-formed attestation of the wrong shape.
     Attest,
 }
 
@@ -235,16 +299,25 @@ enum Flaw {
 enum Frame {
     /// The first byte exceeding the frame limit, reported before its delimiter.
     Oversized,
-    /// An ArkHello for this handshake generation, with the selected defect.
-    ArkHello { generation: u64, flaw: Flaw },
-    /// A packet sealed in the server's session with the sequence number.
+    /// An ArkHello for the handshake generation, with the selected defect.
+    ArkHello {
+        /// Generation of the HostHello the hello answers, zero for a stale one.
+        generation: u64,
+        /// Defect the hello carries.
+        flaw: Flaw,
+    },
+    /// A packet sealed in a server session under a sequence number.
     Sealed {
+        /// Generation of the server session that sealed the packet.
         session: u64,
+        /// Sequence number of the packet in that session.
         seq: u64,
+        /// Tag of the reply, zero for garbage.
         tag: u8,
+        /// Whether the plaintext is garbage rather than a tagged payload.
         garbage: bool,
     },
-    /// The empty frame.
+    /// The empty frame signaling a dropped session.
     Dropped,
     /// A decodable frame meaning nothing.
     Junk,
@@ -254,27 +327,38 @@ enum Frame {
 
 /// Unterminated input retained until the next frame delimiter.
 enum Partial {
-    /// The stream is at a frame boundary.
+    /// A stream at a frame boundary.
     None,
-    /// An ArkHello for this generation, completed successfully only if the next
-    /// byte is a delimiter, or if its encoding ends in a full run and the next
-    /// frame encodes the empty packet.
+    /// An unterminated ArkHello for the generation, with its bytes so far.
+    ///
+    /// A lone delimiter completes it, as does a frame encoding the empty packet
+    /// when the hello's encoding ends in a full run. Other input makes it
+    /// invalid.
     Hello(u64, Vec<u8>),
     /// Bytes no delimiter can complete into anything valid.
     Junk(Vec<u8>),
-    /// The size failure was already reported; remaining bytes are discarded
-    /// through the next delimiter without reporting another frame.
+    /// An oversized frame whose size failure is already reported.
+    ///
+    /// Its remaining bytes are discarded through the next delimiter without
+    /// reporting another frame.
     Discarding,
 }
 
 /// Client call whose result the incoming frames must determine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
-    /// No active call. Reading a frame in this state is a bug.
+    /// No active call.
+    ///
+    /// The model panics if the client reads in this state.
     None,
-    /// A handshake awaiting the ArkHello of the generation. Older frames are
-    /// drained regardless of their count until the matching hello arrives.
-    Handshake { generation: u64 },
+    /// A handshake awaiting the ArkHello of the generation.
+    ///
+    /// Older frames are drained regardless of their count until the matching
+    /// hello arrives.
+    Handshake {
+        /// Generation of the HostHello this handshake writes.
+        generation: u64,
+    },
     /// A read of the next message.
     Recv,
 }
@@ -282,63 +366,105 @@ enum Call {
 /// Predicted client result, including the delivered bytes for a successful read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Expect {
-    /// The call succeeds, with the message if it was a read.
+    /// Success, with the message if the call was a read.
     Ok(Option<Vec<u8>>),
-    /// The call fails with the error kind.
+    /// Failure with the error kind.
     Err(Kind),
 }
 
 /// Keys and sending context retained until a HostAck answers this ArkHello.
 struct Outstanding {
+    /// Generation of the HostHello the ArkHello answers.
     generation: u64,
+    /// Ephemeral secret key the ArkHello announced, which opens the HostAck.
     crypto: xhpke::SecretKey,
+    /// Ark-to-host context for the session the HostAck establishes.
     sender: xhpke::Sender,
+    /// Client signing key from the HostHello, which verifies the HostAck.
     host_signer: xdsa::PublicKey,
 }
 
 /// Mock server's session contexts and outgoing sequence count.
 struct ServerSession {
-    id: u64, // Generation of the hello it answered
+    /// Generation of the HostHello the session answered.
+    id: u64,
+    /// Ark-to-host context sealing replies.
     sender: xhpke::Sender,
+    /// Host-to-ark context opening requests.
     receiver: xhpke::Receiver,
-    seq: u64, // Packets sealed so far
+    /// Number of packets sealed so far.
+    seq: u64,
 }
 
 /// Mock server along with the model of the client it drives.
 pub struct Server {
+    /// Script steps not run yet.
     steps: VecDeque<Step>,
+    /// Identity key signing the ArkHellos, pinned by the client.
     identity: xdsa::SecretKey,
+    /// Self-signed device attestation embedding the identity.
     attestation: Attestation,
-    outbox: Outbox,                            // Frames the client wrote
-    recorder: Recorder,                        // Transcript of the run, if recorded
-    queue: VecDeque<(Vec<u8>, Option<Frame>)>, // Input bytes and optional modeled result, including early size errors
-    bytes: Vec<u8>,                            // Bytes of the frame being handed over
-    offset: usize,                             // Position within the current input batch
-    chunk: usize,                              // Maximum bytes per read; zero means unlimited
-    batch: usize,                              // Frames remaining in the current input batch
-    broken: bool,                              // Whether the client's writes fail
-    cut: Option<CutPoint>,                     // Cut armed for the next matching client write
-    fragment: bool,   // Whether a frame cut in the middle awaits its terminator
-    partial: Partial, // Unterminated frame in front of the client
+    /// Output the client writes into, with the scripted write faults.
+    outbox: Outbox,
+    /// Transcript of the run, when it is recorded.
+    recorder: Recorder,
+    /// Input bytes waiting for delivery, each with the frame the model
+    /// predicts for them.
+    ///
+    /// A partial frame predicts nothing until it completes or grows past the
+    /// size limit.
+    queue: VecDeque<(Vec<u8>, Option<Frame>)>,
+    /// Bytes of the current input batch, handed over across reads.
+    bytes: Vec<u8>,
+    /// Position of the next byte to hand over within the batch.
+    offset: usize,
+    /// Maximum bytes handed over per read, zero for no limit.
+    chunk: usize,
+    /// Frames the next read may combine, set by a [`Step::Batch`] and used up
+    /// by that read.
+    batch: usize,
+    /// Whether the client's writes fail persistently.
+    broken: bool,
+    /// Cut or timeout armed for the next client write it applies to.
+    cut: Option<CutPoint>,
+    /// Whether output cut in the middle of a frame awaits the terminating
+    /// reset.
+    fragment: bool,
+    /// Unterminated input at the end of the scripted stream.
+    partial: Partial,
 
-    call: Call,                  // Active client call consuming incoming frames
-    expect: Option<Expect>,      // Predicted result once a frame determines it
-    client_session: Option<u64>, // Generation of the client's live session
-    client_receiver: bool,       // Receive context retained even after a local send failure
-    client_seq: u64,             // Packets the client opened in it
+    /// Client call consuming incoming frames.
+    call: Call,
+    /// Predicted result of the call, once a frame or read failure determines it.
+    expect: Option<Expect>,
+    /// Generation of the client's live session.
+    client_session: Option<u64>,
+    /// Whether the client holds a receive context, which a local send failure
+    /// leaves in place.
+    client_receiver: bool,
+    /// Number of packets the client opened in its session.
+    client_seq: u64,
 
-    generation: u64, // Hellos parsed from the outbox
-    latest_hello: Option<(xdsa::PublicKey, xhpke::PublicKey)>, // Keys of the last one
-    outstanding: Vec<Outstanding>, // ArkHellos awaiting an ack
-    session: Option<ServerSession>, // Live session on the server's side
-    last_reply: Option<(Vec<u8>, Frame)>, // Last sealed reply, framed
-    last_valid: Option<Vec<u8>>, // Last valid frame produced, delimiter stripped
+    /// Number of HostHellos parsed from the outbox.
+    generation: u64,
+    /// Signing and encryption keys of the latest HostHello.
+    latest_hello: Option<(xdsa::PublicKey, xhpke::PublicKey)>,
+    /// Valid ArkHellos awaiting a HostAck.
+    outstanding: Vec<Outstanding>,
+    /// Mock server's live session.
+    session: Option<ServerSession>,
+    /// Last sealed reply with its modeled frame, for replaying.
+    last_reply: Option<(Vec<u8>, Frame)>,
+    /// Last valid frame produced, without its delimiter, for truncating.
+    last_valid: Option<Vec<u8>>,
 
+    /// Observed counts and final session state the run returns.
     summary: Summary,
 }
 
 impl Server {
-    /// Starts an idle model with a bounded script, fresh identity, and transcript.
+    /// Creates an idle model with a fresh identity, keeping the first
+    /// [`MAX_STEPS`] steps of the script.
     fn new(steps: &[Step], outbox: Outbox, recorder: Recorder) -> Self {
         let identity = xdsa::SecretKey::generate();
         let attestation = self_attestation(&identity);
@@ -372,10 +498,15 @@ impl Server {
         }
     }
 
-    /// Executes one server step and queues any resulting input. Processes client
-    /// output first, so a response uses the latest HostHello or established session.
+    /// Runs one server step and queues any input it produces.
+    ///
+    /// Client output is parsed first, so a response answers the latest
+    /// HostHello or uses the established session.
     fn execute(&mut self, step: Step) {
+        // Catch up on client output before producing a response to it
         self.ingest();
+
+        // Produce the step's bytes and frame, or apply a setting and return
         let produced = match step {
             Step::Hello => self.ark_hello(Flaw::None),
             Step::HelloStale => self.ark_hello(Flaw::Stale),
@@ -398,6 +529,7 @@ impl Server {
             Step::Undecodable => (vec![0xff, 0x01, 0x00], Frame::Undecodable),
             Step::Truncated(n) => match self.last_valid.clone() {
                 Some(valid) => {
+                    // Cut the frame short, keeping at least one byte
                     let keep = match valid.len() {
                         0..=1 => 1,
                         len => 1 + n as usize % (len - 1),
@@ -409,6 +541,7 @@ impl Server {
                 None => return,
             },
             Step::Partial => {
+                // Hold back the delimiter, merging into earlier partial input
                 let (mut bytes, frame) = self.ark_hello(Flaw::None);
                 bytes.pop();
                 let mut overflow = None;
@@ -481,6 +614,7 @@ impl Server {
                 )
             }
         };
+
         // Combine this frame with any earlier partial input. A lone delimiter
         // completes a pending hello, as does the empty packet after a full run.
         // Other combinations become invalid or too large.
@@ -516,8 +650,12 @@ impl Server {
         self.queue.push_back((bytes, frame));
     }
 
-    /// Creates ArkHello for the latest HostHello with the selected defect.
+    /// Creates an ArkHello for the latest HostHello with the selected defect.
+    ///
+    /// Without a HostHello, returns junk instead. Only a flawless hello awaits
+    /// a HostAck and can be truncated later.
     fn ark_hello(&mut self, flaw: Flaw) -> (Vec<u8>, Frame) {
+        // Answer the latest HostHello with a fresh key, recorded for replay
         let Some((host_signer, host_crypto)) = self.latest_hello.clone() else {
             return self.junk(b"server hello without a client hello");
         };
@@ -529,6 +667,7 @@ impl Server {
             .new_sender(CRYPTO_DOMAIN_WIRE_ARK_TO_HOST)
             .unwrap();
 
+        // Build the payload and authenticated data, with any defect they carry
         let payload = handshake::ArkHello {
             ark_attest: match flaw {
                 Flaw::Attest => cloud_attestation(&self.identity),
@@ -547,6 +686,8 @@ impl Server {
             },
             host_crypto: host_crypto.clone(),
         };
+
+        // Seal, swapping in a defective signer, recipient or payload
         let stranger_signer = xdsa::SecretKey::generate();
         let signer = match flaw {
             Flaw::Signer => &stranger_signer,
@@ -594,7 +735,7 @@ impl Server {
             *sealed.last_mut().unwrap() ^= 0xff;
         }
 
-        // Generation zero cannot match any client handshake.
+        // Generation zero cannot match any client handshake
         let generation = match flaw {
             Flaw::Stale => 0,
             _ => self.generation,
@@ -615,7 +756,10 @@ impl Server {
     }
 
     /// Seals a tagged reply or untagged bytes in the mock server's session.
+    ///
+    /// Without a session, returns junk instead.
     fn reply(&mut self, tag: Option<u8>) -> (Vec<u8>, Frame) {
+        // Seal the payload, or a garbage byte, under the next sequence number
         let Some(session) = self.session.as_mut() else {
             return self.junk(b"reply without a session");
         };
@@ -632,6 +776,7 @@ impl Server {
         };
         session.seq += 1;
 
+        // Frame the packet and keep it for truncating and replaying
         let produced = (frame(&packet), sealed);
         self.record(&produced.0);
         self.last_reply = Some(produced.clone());
@@ -644,6 +789,9 @@ impl Server {
     }
 
     /// Seals a reply, then flips a ciphertext byte so the client cannot open it.
+    ///
+    /// Without a session, returns junk instead. The reply still uses up a
+    /// sequence number.
     fn tampered_reply(&mut self) -> (Vec<u8>, Frame) {
         let Some(session) = self.session.as_mut() else {
             return self.junk(b"tampered reply without a session");
@@ -655,7 +803,7 @@ impl Server {
         (frame(&packet), Frame::Junk)
     }
 
-    /// A valid COBS frame of meaningless content.
+    /// Frames the text as junk, a valid COBS frame of meaningless content.
     fn junk(&self, text: &[u8]) -> (Vec<u8>, Frame) {
         (frame(text), Frame::Junk)
     }
@@ -673,9 +821,11 @@ impl Server {
 
     /// Parses new client output, tracking HostHellos and HostAcks and verifying
     /// that requests open in the mock server's session.
+    ///
+    /// Panics on a frame the mock cannot interpret.
     fn ingest(&mut self) {
         for framed in self.outbox.take_frames() {
-            // Empty reset frames carry no keys or request bytes to track.
+            // Empty reset frames carry no keys or request bytes to track
             if framed.is_empty() {
                 continue;
             }
@@ -705,9 +855,13 @@ impl Server {
         }
     }
 
-    /// Tries pending ArkHello keys against HostAck. A match establishes the mock
-    /// server's session and removes that pending response.
+    /// Tries the pending ArkHello keys against a HostAck, returning whether one
+    /// matched.
+    ///
+    /// A match establishes the mock server's session and removes that pending
+    /// ArkHello.
     fn ack(&mut self, packet: &[u8]) -> bool {
+        // Try each pending hello's keys, newest first
         for i in (0..self.outstanding.len()).rev() {
             let out = &self.outstanding[i];
             let auth = handshake::HostAckAuth {
@@ -725,6 +879,8 @@ impl Server {
             ) else {
                 continue;
             };
+
+            // Open the session that hello offered, retiring its keys
             let encap: [u8; xhpke::ENCAP_KEY_SIZE] = ack
                 .h2a_encap
                 .try_into()
@@ -745,8 +901,10 @@ impl Server {
         false
     }
 
-    /// Predicts the client's reaction to incoming bytes. Records the call's
-    /// result once a frame determines it.
+    /// Predicts the client's reaction to an incoming frame.
+    ///
+    /// Records the call's result once a frame determines it. Panics if no call
+    /// is reading.
     fn consume(&mut self, frame: Frame) {
         match self.call {
             Call::Handshake { generation } => {
@@ -755,8 +913,8 @@ impl Server {
                         generation: answered,
                         flaw,
                     } if answered == generation => match flaw {
-                        // Valid ArkHello still fails the call if HostAck cannot
-                        // be written and flushed successfully.
+                        // A valid ArkHello still fails the call if the HostAck
+                        // cannot be written and flushed
                         Flaw::None if self.broken || self.cut.is_some() => {
                             self.apply_cut();
                             Expect::Err(Kind::Send)
@@ -775,6 +933,8 @@ impl Server {
                     // draining until the hello for this attempt arrives.
                     _ => return,
                 };
+
+                // Success opens the client's session at sequence zero
                 if result == Expect::Ok(None) {
                     self.client_session = Some(generation);
                     self.client_receiver = true;
@@ -797,7 +957,7 @@ impl Server {
                         Expect::Err(Kind::FrameDecoding)
                     }
                     // A local send failure leaves the receive context present,
-                    // so framing errors still take precedence in that case.
+                    // so framing errors still come first in that case
                     (None, _) => Expect::Err(Kind::Encryption),
                     (
                         Some(id),
@@ -809,14 +969,15 @@ impl Server {
                         },
                     ) if session == id && seq == self.client_seq => {
                         self.client_seq += 1;
-                        // Transport delivers opaque bytes without inspecting their format.
+                        // Transport delivers opaque bytes without inspecting
+                        // their format
                         if garbage {
                             Expect::Ok(Some(vec![0x07]))
                         } else {
                             Expect::Ok(Some(payload(tag as u64)))
                         }
                     }
-                    // Failed decryption ends the session.
+                    // Failed decryption ends the session
                     (Some(_), _) => {
                         self.client_session = None;
                         Expect::Err(Kind::Encryption)
@@ -828,9 +989,11 @@ impl Server {
         }
     }
 
-    /// Consumes a cut applied to client output. A middle cut leaves a fragment
-    /// for the next reset to terminate. Other cuts leave no bytes or a complete
-    /// body that the server can verify once its delimiter arrives.
+    /// Consumes a cut applied to client output.
+    ///
+    /// A middle cut leaves a fragment for the next reset to terminate. Other
+    /// cuts leave no bytes or a complete body that the server can verify once
+    /// its delimiter arrives.
     fn apply_cut(&mut self) {
         if let Some(CutPoint::Middle(_)) = self.cut.take() {
             self.fragment = true;
@@ -838,6 +1001,8 @@ impl Server {
     }
 
     /// Predicts a read error or EOF ending the active call and client session.
+    ///
+    /// Panics if no call is reading.
     fn interrupt(&mut self, kind: Kind) {
         match self.call {
             Call::Handshake { .. } => self.settle(Expect::Err(kind)),
@@ -850,6 +1015,8 @@ impl Server {
     }
 
     /// Records the predicted result of the call in progress.
+    ///
+    /// Panics if the call was already settled.
     fn settle(&mut self, result: Expect) {
         assert!(self.expect.is_none(), "call settled twice");
         self.expect = Some(result);
@@ -857,6 +1024,8 @@ impl Server {
     }
 
     /// Checks a completed call against its prediction, then processes its output.
+    ///
+    /// Panics if the model never settled the call or predicted another result.
     fn finish(&mut self, result: Result<Option<Vec<u8>>, Kind>) {
         let expected = self
             .expect
@@ -872,7 +1041,9 @@ impl Server {
     }
 
     /// Advances to the next client call, executing earlier server steps to queue
-    /// input. Read faults have no effect while no client call is reading.
+    /// input.
+    ///
+    /// Read faults have no effect while no client call is reading.
     fn next_call(&mut self) -> Option<Step> {
         loop {
             match self.steps.pop_front() {
@@ -887,6 +1058,7 @@ impl Server {
 
 /// Read adapter that advances the mock server's script as the client reads.
 struct Feed {
+    /// Mock server and model, shared with the driver.
     server: Arc<Mutex<Server>>,
 }
 
@@ -904,7 +1076,7 @@ impl io::Read for Feed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut server = self.server.lock().unwrap();
         loop {
-            // Deliver the current batch, respecting any per-read size limit.
+            // Deliver the current batch, respecting any per-read size limit
             if !server.bytes.is_empty() {
                 let mut n = buf.len().min(server.bytes.len() - server.offset);
                 if server.chunk > 0 {
@@ -919,6 +1091,7 @@ impl io::Read for Feed {
                 server.summary.reads += 1;
                 return Ok(n);
             }
+
             // Predict the next queued input's result before delivering its bytes.
             // Oversized input ends a receive before its remainder is drained;
             // ordinary partial input has no result until completed or oversized.
@@ -953,7 +1126,9 @@ impl io::Read for Feed {
                 });
                 continue;
             }
-            // Advance until a step queues input or ends this read with an error.
+
+            // Advance until a step queues input, or ends this read with EOF or
+            // an error
             match server.steps.front() {
                 None => {
                     server.interrupt(Kind::Terminated);
@@ -1003,8 +1178,11 @@ impl io::Read for Feed {
 /// The client under test, reading the script and writing into the outbox.
 type Client = crate::transport::Client<Feed, Outbox>;
 
-/// Classifies truncated or merged input by size and COBS validity. Input that
-/// still decodes is junk to the client; it cannot form a valid encrypted packet.
+/// Returns the frame the model predicts for truncated or merged input, judged
+/// by size and COBS validity.
+///
+/// Input that still decodes is junk to the client, since it cannot form a
+/// valid encrypted packet.
 fn classify(bytes: &[u8]) -> Frame {
     if bytes.len() > MAX_FRAME_SIZE {
         return Frame::Oversized;
@@ -1017,6 +1195,8 @@ fn classify(bytes: &[u8]) -> Frame {
 }
 
 /// Maps a client error onto the kind the model predicts.
+///
+/// Panics on an error the model never predicts.
 fn kind(err: Error) -> Kind {
     match err {
         Error::FrameTooLarge(_) => Kind::FrameTooLarge,
@@ -1033,7 +1213,10 @@ fn kind(err: Error) -> Kind {
 }
 
 /// Checks that the current sender is usable exactly when the model expects a
-/// session. An oversized send checks admission without sealing or writing bytes.
+/// session.
+///
+/// An oversized send checks admission without sealing or writing bytes. Panics
+/// on a mismatch.
 pub(super) fn check_session<W: Write>(sender: Option<&Sender<W>>, established: bool) {
     let refused = super::send(sender, OVERSIZED_MESSAGE);
     match refused {
@@ -1047,9 +1230,15 @@ pub(super) fn check_session<W: Write>(sender: Option<&Sender<W>>, established: b
     }
 }
 
-/// Runs a script against a real client and returns the observed counts. Panics
-/// if client output or method results differ from the model.
+/// Runs a script against a real client and returns the observed counts.
+///
+/// Only the first [`MAX_STEPS`] steps run.
+///
+/// # Panics
+///
+/// Panics if client output or call results differ from the model.
 pub fn run(steps: &[Step]) -> Summary {
+    // Save the script as a fuzz seed when seeds are being collected
     #[cfg(feature = "fuzz")]
     super::seed::seed(super::seed::TRANSPORT_CLIENT, steps);
 
@@ -1061,6 +1250,7 @@ pub fn run(steps: &[Step]) -> Summary {
         super::random::reseed(scenario);
     }
 
+    // Connect a real client to the mock server on a paused clock
     let tester = crate::transport::testing::test_clock();
     let recorder = Recorder::default();
     let outbox = Outbox {
@@ -1096,25 +1286,30 @@ pub fn run(steps: &[Step]) -> Summary {
         server.lock().unwrap().attestation.as_bytes().to_vec(),
     );
 
+    // Drive each client call and check it against the model
     let mut sender = None;
     let mut retained = None;
-    let mut retained_session = None; // Model identity captured with the retained handle
+    let mut retained_session = None; // model's session at the last retain
     loop {
         let call = server.lock().unwrap().next_call();
         let Some(call) = call else { break };
 
         match call {
             Step::Handshake => {
+                // Drop the sender and receive context the handshake retires
                 sender = None;
                 server.lock().unwrap().client_receiver = false;
-                // Scripted output faults fail the reset or HostHello. The read
-                // phase starts after both writes, so no scripted input is consumed.
+
+                // Generate the attempt's keys, recording them for replay
                 let signer = xdsa::SecretKey::generate();
                 let crypto = xhpke::SecretKey::generate();
                 trace(&recorder, || Event::Handshake {
                     xdsa: signer.to_bytes().to_vec(),
                     xhpke: crypto.to_bytes().to_vec(),
                 });
+
+                // Scripted output faults fail the reset or HostHello. Reading
+                // starts after both writes, so no scripted input is consumed.
                 let failing = {
                     let server = server.lock().unwrap();
                     server.broken || server.cut.is_some()
@@ -1145,6 +1340,8 @@ pub fn run(steps: &[Step]) -> Summary {
                     }
                     continue;
                 }
+
+                // Expect the ArkHello for the HostHello this attempt writes
                 {
                     let mut server = server.lock().unwrap();
                     server.client_session = None;
@@ -1152,6 +1349,8 @@ pub fn run(steps: &[Step]) -> Summary {
                         generation: server.generation + 1,
                     };
                 }
+
+                // Run the handshake, then count and check its result
                 let result = client.handshake_with_keys(&identity, signer, crypto, TIMESTAMP);
                 trace(&recorder, || match &result {
                     Ok(_) => Event::Ok { message: None },
@@ -1178,6 +1377,7 @@ pub fn run(steps: &[Step]) -> Summary {
                 trace(&recorder, || Event::Retain);
             }
             Step::SendOversized => {
+                // Send one byte over the limit through the current sender
                 let established = server.lock().unwrap().client_session.is_some();
                 trace(&recorder, || Event::Send {
                     message: OVERSIZED_MESSAGE.to_vec(),
@@ -1186,6 +1386,9 @@ pub fn run(steps: &[Step]) -> Summary {
                 trace(&recorder, || Event::Err {
                     kind: <&str>::from(result.as_ref().unwrap_err()).into(),
                 });
+
+                // A session refuses the message by size and stays usable.
+                // Without a session, the refusal names the missing session.
                 match result {
                     Err(Error::PacketTooLarge(size)) if established => {
                         assert_eq!(size, OVERSIZED_MESSAGE.len())
@@ -1197,10 +1400,12 @@ pub fn run(steps: &[Step]) -> Summary {
                 server.lock().unwrap().ingest();
             }
             Step::Send(tag) | Step::SendRetained(tag) => {
+                // Check the current sender against the model's session
                 let established = server.lock().unwrap().client_session.is_some();
                 trace(&recorder, || Event::Session { established });
                 check_session(sender.as_ref(), established);
 
+                // Pick the handle and whether a send through it is admitted
                 let use_retained = matches!(call, Step::SendRetained(_));
                 let admitted = established
                     && (!use_retained || retained_session == server.lock().unwrap().client_session);
@@ -1224,6 +1429,8 @@ pub fn run(steps: &[Step]) -> Summary {
                         (false, _) => Err(Kind::Encryption),
                     }
                 };
+
+                // Send the tagged request and compare the result
                 let request = payload(tag as u64);
                 trace(&recorder, || {
                     if use_retained {
@@ -1248,6 +1455,7 @@ pub fn run(steps: &[Step]) -> Summary {
                 server.lock().unwrap().ingest();
             }
             Step::Recv => {
+                // Without a receive context, the client refuses before reading
                 {
                     let mut server = server.lock().unwrap();
                     server.call = Call::Recv;
@@ -1255,6 +1463,8 @@ pub fn run(steps: &[Step]) -> Summary {
                         server.settle(Expect::Err(Kind::Encryption));
                     }
                 }
+
+                // Receive through the client, recording the call and its result
                 trace(&recorder, || Event::Recv);
                 let result = client.recv();
                 trace(&recorder, || match &result {
@@ -1265,6 +1475,9 @@ pub fn run(steps: &[Step]) -> Summary {
                         kind: <&str>::from(err).into(),
                     },
                 });
+
+                // Any failure releases the receive context. Count the result
+                // and check it against the model.
                 let result = result.map(Some).map_err(kind);
                 let mut server = server.lock().unwrap();
                 if result.is_err() {
@@ -1280,6 +1493,8 @@ pub fn run(steps: &[Step]) -> Summary {
             _ => unreachable!("only calls reach the driver"),
         }
     }
+
+    // Check the final session against the model
     let mut server = server.lock().unwrap();
     server.ingest();
     let established = server.client_session.is_some();
@@ -1287,6 +1502,8 @@ pub fn run(steps: &[Step]) -> Summary {
     check_session(sender.as_ref(), established);
     server.summary.established = established;
 
+    // Write the transcript and, in tests, check that it survives its encoding
+    // and replays
     if let Some(vector) = recorder.lock().unwrap().as_ref() {
         vector.write();
         #[cfg(test)]

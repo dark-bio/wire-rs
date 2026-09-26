@@ -10,8 +10,9 @@
 //! turn arbitrary actions into those steps, with regression scripts in neighboring
 //! `tests` modules. The envelope runner checks peer bytes directly.
 //!
-//! With `WIRE_SEEDS` set, the runners record each scenario through the encoders
-//! in `seed.rs`. `make fuzz-seeds` runs the tests to regenerate `fuzz/seeds`.
+//! With the `fuzz` feature and `WIRE_SEEDS` set, the fuzz runners and the
+//! envelope runner record every input through the encoders in `seed.rs`.
+//! `make fuzz-seeds` runs the tests to regenerate `fuzz/seeds`.
 
 pub mod connection;
 pub mod envelope;

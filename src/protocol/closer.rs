@@ -14,7 +14,8 @@ use std::sync::Weak;
 /// From [`super::Session::closer`], it closes that session, with the semantics of
 /// [`super::Session::close`]. From [`super::Server::closer`], it closes the server
 /// and its active session, with the semantics of [`super::Server::close`].
-/// Its target never changes: a session's closer cannot affect a successor session.
+/// Its target never changes, so a session's closer cannot affect a successor
+/// session.
 ///
 /// This handle does not keep its owner open. Dropping it does not close anything.
 #[derive(Clone, Debug)]
@@ -23,7 +24,7 @@ pub struct Closer {
     target: Target,
 }
 
-/// The session or server targeted by a `Closer`.
+/// Session or server targeted by a [`Closer`].
 #[derive(Clone, Debug)]
 enum Target {
     /// One session, even after another session connects to the same server.
@@ -33,7 +34,9 @@ enum Target {
 }
 
 impl Closer {
-    /// Closes the original owner. Repeated calls have no further effect.
+    /// Closes the session or server that created this handle.
+    ///
+    /// Repeated calls have no further effect.
     pub fn close(&self) {
         match &self.target {
             Target::Session(target) => {
@@ -49,14 +52,14 @@ impl Closer {
         }
     }
 
-    /// Creates a closer for one session using a weak reference.
+    /// Creates a closer targeting one session without keeping it alive.
     pub(super) fn session(target: Weak<SessionInner>) -> Self {
         Self {
             target: Target::Session(target),
         }
     }
 
-    /// Creates a closer for one server using a weak reference.
+    /// Creates a closer targeting one server without keeping it alive.
     pub(super) fn server(target: Weak<ServerInner>) -> Self {
         Self {
             target: Target::Server(target),

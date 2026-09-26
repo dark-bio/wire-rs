@@ -25,9 +25,9 @@ use std::time::Instant;
 /// Completed results remain available after the session closes.
 ///
 /// A buffered response counts toward the session's inbound byte limit until
-/// `wait()` or drop. It stays encoded until `wait()` decodes it. Late answers and
-/// answers with no matching request are discarded. Answers whose promises were
-/// dropped are also discarded. Their payloads are never decoded.
+/// [`Promise::wait`] or drop. It stays encoded until waiting decodes it. Late
+/// answers and answers with no matching request are discarded. Answers whose
+/// promises were dropped are also discarded. Their payloads are never decoded.
 ///
 /// Each promise returns its result once:
 ///
@@ -40,18 +40,23 @@ use std::time::Instant;
 /// }
 /// ```
 pub struct Promise<T> {
-    /// Receives one result from the corresponding `PendingOperation`. A buffered
-    /// result remains available even after the session is dropped.
+    /// Channel receiving one result from the corresponding
+    /// [`PendingOperation`](super::operation::PendingOperation).
+    ///
+    /// A buffered result remains available even after the session is dropped.
     result: mpsc::Receiver<Result<PromiseResult, Error>>,
     /// Completion and its optional notification, independent of session lifetime.
     notification: Arc<Mutex<NotificationState>>,
-    /// Registration is single-use even after the notification has been sent.
+    /// Whether a callback was registered, since registration is single-use even
+    /// after the notification has been sent.
     registered: bool,
-    /// Public result type; responses stay encoded until `wait()`.
+    /// Marker for the public result type, since the channel carries responses
+    /// still encoded.
     value: PhantomData<fn() -> T>,
-    /// Lets the waiter service expired operations before receiving its result.
+    /// Session whose expired operations the waiter settles before receiving
+    /// its result.
     session: Weak<SessionInner>,
-    /// Deadline supplied with the request or reply. `wait()` does not restart it.
+    /// Deadline supplied with the request or reply, which waiting does not restart.
     deadline: Instant,
     /// One-shot notification just before entering the blocking receive.
     #[cfg(any(test, feature = "fuzz"))]
@@ -59,13 +64,15 @@ pub struct Promise<T> {
 }
 
 impl Promise<Message> {
-    /// Blocks for completion, then decodes the response. The response must be
-    /// accepted before the request's original deadline. Decoding is outside that
-    /// deadline. An accepted response remains available after the deadline or closure.
+    /// Blocks for completion, then decodes the response.
+    ///
+    /// The response must be accepted before the request's original deadline.
+    /// Decoding is outside that deadline. An accepted response remains available
+    /// after the deadline or closure.
     ///
     /// Taking the response removes its bytes from the inbound byte count before
-    /// decoding it. Invalid protobuf returns [`Error::Malformed`] and closes its
-    /// original session.
+    /// decoding it. A peer's error answer returns [`Error::Remote`]. Invalid
+    /// protobuf returns [`Error::Malformed`] and closes its original session.
     ///
     /// Selects the expected response type at this call, either through inference
     /// or `wait::<Response>()`. Message extraction checks the content variant and
@@ -79,7 +86,8 @@ impl Promise<Message> {
         T::try_from(self.wait_result()?.response()?).map_err(Error::from)
     }
 
-    /// Observes reader/deadline worker completion without servicing deadlines itself.
+    /// Waits for the reader or the deadline worker to settle the promise,
+    /// without servicing deadlines itself.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn wait_worker_result(self) -> Result<Message, Error> {
         self.worker_result()?.response()
@@ -87,13 +95,16 @@ impl Promise<Message> {
 }
 
 impl Promise<()> {
-    /// Blocks for local write/flush completion under the reply's original deadline.
+    /// Blocks until the reply is written and flushed locally, under its original
+    /// deadline.
+    ///
     /// The peer does not send another acknowledgment for this reply.
     pub fn wait(self) -> Result<(), Error> {
         self.wait_result()?.written()
     }
 
-    /// Observes writer/deadline worker completion without servicing deadlines itself.
+    /// Waits for the writer or the deadline worker to settle the promise,
+    /// without servicing deadlines itself.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn wait_worker_result(self) -> Result<(), Error> {
         self.worker_result()?.written()
@@ -101,8 +112,12 @@ impl Promise<()> {
 }
 
 impl<T> Promise<T> {
-    /// Creates a promise and the sender that its `PendingOperation` will own.
-    /// The channel holds one result without waiting for the caller to receive it.
+    /// Creates a promise and the sender that its
+    /// [`PendingOperation`](super::operation::PendingOperation) will own.
+    ///
+    /// The channel holds one result without waiting for the caller to receive
+    /// it. The `response` flag marks a request, which expects a peer answer
+    /// rather than a local write result.
     pub(super) fn pair(
         session: Weak<SessionInner>,
         deadline: Instant,
@@ -132,14 +147,16 @@ impl<T> Promise<T> {
         )
     }
 
-    /// Runs `callback` once the result is ready. Requests notify on a response or
-    /// an error, replies on local write and flush completion or an error, so a
-    /// notification implies neither success nor peer receipt. The result is
-    /// published first, so `wait()` then takes it without waiting for
-    /// publication, though it still decodes a response.
+    /// Runs `callback` once the result is ready.
+    ///
+    /// Requests notify on a response or an error, replies on local write and
+    /// flush completion or an error, so a notification implies neither success
+    /// nor peer receipt. The result is published first, so [`Promise::wait`]
+    /// then takes it without waiting for publication, though it still decodes
+    /// a response.
     ///
     /// Registering or receiving a notification neither decodes the response nor
-    /// releases its retained bytes. They remain charged until `wait()` or drop.
+    /// releases its retained bytes. They remain charged until waiting or drop.
     /// Deadlines are unchanged, and registration does not service expiry.
     ///
     /// On a settled promise, the callback runs at once on the registering thread,
@@ -149,13 +166,13 @@ impl<T> Promise<T> {
     /// return promptly and must not panic.
     ///
     /// Dropping the promise drops a callback still waiting for settlement, without
-    /// cancelling the operation. A callback already taken by settlement still runs.
+    /// canceling the operation. A callback already taken by settlement still runs.
     ///
     /// # Panics
     /// Panics if notification was already registered on this promise.
     pub fn notify(&mut self, callback: impl FnOnce() + Send + 'static) {
         // Check before locking so caller misuse cannot poison shared state and
-        // cause another panic when the promise is dropped during unwinding.
+        // cause another panic when the promise is dropped during unwinding
         assert!(!self.registered, "promise notification already registered");
 
         // Serialize registration with publication and promise drop
@@ -170,8 +187,9 @@ impl<T> Promise<T> {
     }
 
     /// Expires pending operations, then waits for the session to publish its result.
+    ///
     /// The session decides whether an answer or timeout came first.
-    #[allow(unused_mut)] // The test-only wait hook must be taken now that we implement Drop.
+    #[allow(unused_mut)] // only test and fuzz builds mutate self, taking the wait hook
     fn wait_result(mut self) -> Result<PromiseResult, Error> {
         // Settle any operations already expired before waiting
         if let Some(session) = self.session.upgrade() {
@@ -193,7 +211,9 @@ impl<T> Promise<T> {
         }
     }
 
-    /// Notifies a test just before `wait_result()` starts waiting on the result channel.
+    /// Arms a one-shot notification sent just before [`Self::wait_result`]
+    /// starts waiting on the result channel.
+    ///
     /// A result sent before the wait stays buffered in that channel.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) fn watch_wait(&mut self) -> mpsc::Receiver<()> {
@@ -202,15 +222,17 @@ impl<T> Promise<T> {
         receiver
     }
 
-    /// Lets callback tests check the notification lock without retaining the promise.
+    /// Returns a probe reporting whether the notification lock is free, usable
+    /// after the promise is gone.
     #[cfg(test)]
     pub(super) fn notification_unlocked(&self) -> impl Fn() -> bool + Send + 'static {
         let notification = self.notification.clone();
         move || notification.try_lock().is_ok()
     }
 
-    /// Waits for a worker result without calling `SessionInner::expire()`, so tests
-    /// can prove workers process deadlines without help from `Promise::wait()`.
+    /// Waits for a worker result without calling [`SessionInner::expire`], so
+    /// tests can prove workers process deadlines without help from
+    /// [`Promise::wait`].
     #[cfg(any(test, feature = "fuzz"))]
     fn worker_result(self) -> Result<PromiseResult, Error> {
         self.result
@@ -221,6 +243,7 @@ impl<T> Promise<T> {
 
 impl<T> Drop for Promise<T> {
     /// Takes an unrun callback under the notification lock, then drops it outside.
+    ///
     /// The protocol never drops a handed-out promise under its session lock.
     fn drop(&mut self) {
         // Clear registration before releasing the lock
@@ -238,8 +261,9 @@ impl<T> Drop for Promise<T> {
 
 impl<T> fmt::Debug for Promise<T> {
     /// Shows the deadline, whether a notification is registered and whether
-    /// the result has been published. A notification lock held elsewhere
-    /// leaves the completion out.
+    /// the result has been published.
+    ///
+    /// A notification lock held elsewhere leaves the completion out.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut promise = f.debug_struct("Promise");
         promise
@@ -252,33 +276,41 @@ impl<T> fmt::Debug for Promise<T> {
     }
 }
 
-/// Shared notification state survives the session without retaining it.
+/// Notification state shared by a promise and its sender, surviving the
+/// session without retaining it.
 #[derive(Default)]
 struct NotificationState {
-    /// The result has been published, including when no hook was registered yet.
+    /// Whether the result has been published, including when no hook was
+    /// registered yet.
     done: bool,
     /// Application callback taken by settlement or promise drop.
     hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
-/// Single-use result sender for a request or reply. Its one-slot channel never
-/// needs to wait for the application to receive the result.
+/// Single-use result sender for a request or reply.
+///
+/// Its one-slot channel never needs to wait for the application to receive
+/// the result.
 pub(super) struct ResultSender {
-    /// Requests expect peer answers; replies expect local write completion.
+    /// Whether the operation is a request expecting a peer answer, rather than
+    /// a reply expecting local write completion.
     pub(super) response: bool,
-    /// Receives exactly one result before this sender is released.
+    /// Channel carrying exactly one result before this sender is released.
     result: mpsc::SyncSender<Result<PromiseResult, Error>>,
-    /// Serializes publication and notification with registration and promise drop.
+    /// State serializing publication and notification with registration and
+    /// promise drop.
     notification: Arc<Mutex<NotificationState>>,
 }
 
 impl ResultSender {
     /// Publishes the result and hands back its callback, to run once the caller
-    /// holds no wire lock. Byte admission reads the delivery flag to learn
-    /// whether the promise still exists.
+    /// holds no wire lock.
+    ///
+    /// Byte admission reads the delivery flag to learn whether the promise
+    /// still exists.
     pub(super) fn send(self, result: Result<PromiseResult, Error>) -> Notification {
-        // Lock before publishing: a concurrent waiter must not drop the promise
-        // and clear its hook between receiving the result and our notification.
+        // Lock before publishing, so a concurrent waiter cannot drop the promise
+        // and clear its hook between receiving the result and our notification
         let mut notification = self.notification.lock().expect("notification not poisoned");
         let delivered = self.result.send(result).is_ok();
         if delivered {
@@ -311,8 +343,9 @@ impl Notification {
     }
 }
 
-/// Runs collected callbacks on scope exit, including early returns.
-/// Declare this before acquiring any wire locks so their guards drop first.
+/// Collector of callbacks that run on scope exit, including early returns.
+///
+/// Declare it before acquiring any wire locks, so their guards drop first.
 #[derive(Default)]
 pub(super) struct Notifications {
     /// Callbacks taken from promises settled in this scope.
@@ -346,7 +379,7 @@ impl Drop for Notifications {
 pub(super) enum PromiseResult {
     /// Original response bytes, decoded only when a request promise is observed.
     Response(IncomingEnvelope),
-    /// Local reply writing and flushing completed; no incoming message exists.
+    /// Completion of the local reply write and flush, with no incoming message.
     Written,
 }
 
@@ -368,7 +401,7 @@ impl PromiseResult {
     }
 }
 
-/// Checks that both promise owners can be transferred to application threads.
+/// Checks promise notifications and that promises move to application threads.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -379,7 +412,8 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak, mpsc};
     use std::time::Duration;
 
-    /// Duplicate registration leaves the original callback and result usable.
+    /// Checks that a duplicate registration panics and leaves the original
+    /// callback and result usable.
     #[test]
     fn test_duplicate_notification() {
         for completed in [false, true] {
@@ -416,7 +450,8 @@ mod tests {
         }
     }
 
-    /// A disconnected callback consumer leaves success and failure unchanged.
+    /// Checks that a callback whose consumer is gone leaves success and failure
+    /// results unchanged.
     #[test]
     fn test_disconnected_notification() {
         for completed in [false, true] {
@@ -456,7 +491,8 @@ mod tests {
         }
     }
 
-    /// A returning waiter cannot clear a callback already taken by publication.
+    /// Checks that a returning waiter cannot clear a callback already taken by
+    /// publication.
     #[test]
     fn test_notification_with_waiter() {
         for _ in 0..32 {
@@ -486,14 +522,16 @@ mod tests {
         }
     }
 
-    /// Dropping a pending promise releases its callback captures outside the notification lock.
+    /// Checks that dropping a pending promise releases its callback captures
+    /// outside the notification lock.
     #[test]
     fn test_dropped_promise_releases_callback_without_lock() {
-        /// Reports whether capture destruction can acquire the notification lock.
+        /// Capture reporting whether its destruction can acquire the
+        /// notification lock.
         struct Capture {
             /// Shared registration state surviving the dropped promise.
             notification: Arc<Mutex<NotificationState>>,
-            /// Reports destruction to the test without blocking.
+            /// Channel reporting destruction to the test without blocking.
             dropped: mpsc::Sender<bool>,
         }
 
@@ -535,7 +573,8 @@ mod tests {
     /// and to print it.
     #[test]
     fn test_thread_capabilities() {
-        /// Requires an owned value to be printable and transferable to a background thread.
+        /// Requires an owned value to be printable and transferable to a
+        /// background thread.
         fn movable<T: Debug + Send + 'static>() {}
         movable::<Promise<Message>>();
         movable::<Promise<()>>();

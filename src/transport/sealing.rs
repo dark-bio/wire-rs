@@ -4,19 +4,22 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Seals messages into packets and opens them using each direction's xHPKE context.
+//! Message sealing and packet opening with each direction's xHPKE context.
 
 use crate::transport::{Error, MAX_MESSAGE_SIZE};
 use darkbio_crypto::xhpke;
 
 /// Bytes the session's AEAD adds to a sealed message (the Poly1305 tag).
+///
 /// Sealing advances the HPKE sequence, so message sizes are bounded with this
 /// before sealing. Rejecting a packet after sealing would leave a sequence gap.
 pub(crate) const OVERHEAD: usize = 16;
 
-/// Seals a message for the peer with the outbound context. Messages above
-/// MAX_MESSAGE_SIZE are rejected before sealing, leaving the HPKE sequence
-/// untouched. A crypto failure leaves the context unusable.
+/// Seals a message for the peer with the outbound context.
+///
+/// Messages above [`MAX_MESSAGE_SIZE`] are rejected before sealing, leaving the
+/// HPKE sequence untouched. Other failures come from the crypto layer, such as
+/// an exhausted sequence, which leaves the context unusable.
 pub(crate) fn seal(sender: &mut xhpke::Sender, message: &[u8]) -> Result<Vec<u8>, Error> {
     if message.len() > MAX_MESSAGE_SIZE {
         return Err(Error::PacketTooLarge(message.len()));
@@ -26,14 +29,18 @@ pub(crate) fn seal(sender: &mut xhpke::Sender, message: &[u8]) -> Result<Vec<u8>
         .map_err(|err| Error::EncryptionFailed(err.to_string()))
 }
 
-/// Opens a sealed packet from the peer with the inbound context. A failure to
-/// decrypt means the HPKE sequence can no longer be followed.
+/// Opens a sealed packet from the peer with the inbound context.
+///
+/// A failed open leaves the inbound sequence unchanged. A damaged packet the
+/// peer sealed has still advanced the peer's sequence, so after a failure the
+/// two may be out of step.
 pub(crate) fn open(receiver: &mut xhpke::Receiver, packet: &[u8]) -> Result<Vec<u8>, Error> {
     receiver
         .open(packet, &[])
         .map_err(|err| Error::EncryptionFailed(err.to_string()))
 }
 
+/// Checks the sealing overhead and the message size bound it sets.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -41,8 +48,8 @@ mod tests {
     use crate::transport::MAX_FRAME_SIZE;
     use darkbio_cobs as cobs;
 
-    // Tests that the sealing overhead constant matches what the session AEAD
-    // actually adds, so a crypto upgrade cannot silently break size bounds.
+    /// Checks that the sealing overhead constant matches what the session AEAD
+    /// adds, so a crypto upgrade cannot silently break size bounds.
     #[test]
     fn test_seal_overhead() {
         let secret = xhpke::SecretKey::generate();
@@ -54,9 +61,10 @@ mod tests {
         }
     }
 
-    // Tests that the conservative message limit fits the worst-case sealing
-    // and COBS overhead. The next byte exceeds that worst-case frame budget;
-    // particular messages may still produce smaller frames.
+    /// Checks that the message limit is the largest size whose worst-case
+    /// sealing and COBS overhead still fits a frame.
+    ///
+    /// Particular messages over the limit may still produce smaller frames.
     #[test]
     fn test_message_limit() {
         let framed = |size: usize| cobs::encode_buffer(size + OVERHEAD);
@@ -65,11 +73,11 @@ mod tests {
         assert!(framed(MAX_MESSAGE_SIZE + 1) > MAX_FRAME_SIZE);
     }
 
-    // Tests that a message at the limit seals into a packet that fits a frame and
-    // that one over the limit is rejected before sealing. The rejection leaves
-    // the HPKE sequence untouched, so the session stays in sync.
+    /// Checks that a message at the limit seals into a packet that fits a
+    /// frame, while one over it is rejected without advancing the sequence.
     #[test]
     fn test_seal_bounds() {
+        // Set up both ends of one encrypted direction
         let secret = xhpke::SecretKey::generate();
         let (mut sender, encap) = secret.public_key().new_sender(b"test").unwrap();
         let mut receiver = secret.new_receiver(&encap, b"test").unwrap();

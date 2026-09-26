@@ -5,8 +5,10 @@
 // license that can be found in the LICENSE file.
 
 //! Concurrent scenarios between a real client and server on bounded byte pipes.
-//! Gates let tests wait for I/O to block before injecting faults or reconnecting.
-//! Scripted clock advances exercise deadline recovery without closing the stream.
+//!
+//! Gates let tests wait for I/O to block before injecting faults or
+//! reconnecting. Scripted clock advances exercise deadline recovery without
+//! closing the stream.
 
 use super::self_attestation;
 use crate::transport::{Client, Closer, Error, Event, Read, Sender, Server, Stream, Write};
@@ -19,70 +21,112 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Clock budget for deliberately stalled output.
+/// Write budget in scenarios that stall output on purpose.
 const FAULT_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Budget for ordinary output during the concurrent scenarios.
+/// Write budget for ordinary output in the concurrent scenarios.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Non-default handshake budget advanced by the scenario driver.
+/// Handshake budget of both peers, which scenarios expire by advancing the
+/// clock.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Enough space for reset and HostHello before the client starts reading.
+/// Pipe capacity with room for a reset and HostHello before the client starts
+/// reading.
 const HANDSHAKE_CAPACITY: usize = 64 * 1024;
 
 /// One bounded concurrency or timeout scenario, independently repeatable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Scenario {
-    // Handshake failures and recovery.
-    /// Fail reset output or the following reply read, then retry on the same
-    /// stream. Each phase runs sequentially without a companion operation.
-    FailedPrelude { read: bool },
-    /// Fail ArkHello or HostAck output, then retry. Lost replies must expire
-    /// the client's handshake without another fault to rescue its read.
+    /// A failed reset write or reply read, then a retry on the same stream.
+    ///
+    /// Each phase runs on its own, without a concurrent send.
+    FailedPrelude {
+        /// Whether the reply read fails rather than the reset write.
+        read: bool,
+    },
+    /// A failed ArkHello or HostAck output, then a retry.
+    ///
+    /// A lost reply must expire the client's handshake, with no other fault to
+    /// release its read.
     HandshakeFailure {
+        /// Whether the client's HostAck fails rather than the server's ArkHello.
         ack: bool,
+        /// Whether the flush fails rather than the write.
         flush: bool,
+        /// Whether the output times out rather than failing with an error.
         timeout: bool,
     },
-    /// Alternate read and write failures across reconnect attempts.
+    /// Read and write failures alternating across reconnect attempts.
+    ///
+    /// The byte picks two to four attempts.
     RepeatedAttempts(u8),
-    /// Retry an abandoned handshake while its old ArkHello is still blocked,
-    /// draining that reply so the server can consume the replacement hello.
+    /// A retry while the abandoned handshake's ArkHello is still blocked.
+    ///
+    /// The client drains that reply so the server can read the replacement
+    /// hello.
     AbandonedHello,
-    /// Reset without Hello, or Hello without ACK, must expire and allow retry.
-    SilentHandshake { ack: bool },
-    /// Continuous resets on the server or junk on the client must not refresh
-    /// the handshake deadline. Stop the noise and recover on the same stream.
-    HandshakeNoise { server: bool },
+    /// A reset without a HostHello, or a HostHello without a HostAck, which
+    /// must expire and allow a retry.
+    SilentHandshake {
+        /// Whether the HostAck goes missing rather than the HostHello.
+        ack: bool,
+    },
+    /// Repeated resets to the server, or junk to the client, during a
+    /// handshake.
+    ///
+    /// The noise must not refresh the handshake deadline, and the stream
+    /// recovers once it stops.
+    HandshakeNoise {
+        /// Whether the noise is resets to the server rather than junk to the
+        /// client.
+        server: bool,
+    },
 
-    // Established sessions and reconnects.
-    /// Reconnect while server output is blocked, optionally with client output
-    /// blocked too. Old writes may time out before the sequential handshake.
-    Reconnect { both_directions: bool },
-    /// Drain at least 33 legitimate old messages before a new handshake.
+    /// A reconnect while server output is blocked, and optionally client output
+    /// too.
+    ///
+    /// Old writes may time out before the sequential handshake.
+    Reconnect {
+        /// Whether client output is blocked as well.
+        both_directions: bool,
+    },
+    /// A backlog of at least 33 sealed messages from the old session, drained
+    /// before a new handshake.
+    ///
+    /// The byte adds that many messages to the backlog.
     Backlog(u8),
-    /// A server message times out during its write or flush, then the stream recovers.
-    ServerTimeout { flush: bool },
+    /// A server message timing out in its write or flush, followed by recovery
+    /// on the same stream.
+    ServerTimeout {
+        /// Whether the flush times out rather than the write.
+        flush: bool,
+    },
 
-    /// Either peer closes while both are reading, during a handshake or session.
-    Shutdown { handshake: bool, server: bool },
+    /// A close by either peer while both are reading, in a handshake or a
+    /// session.
+    Shutdown {
+        /// Whether the client is in a handshake rather than a receive.
+        handshake: bool,
+        /// Whether the server's stream is closed rather than the client's.
+        server: bool,
+    },
 }
 
 /// Adapter operation addressed by a test gate or a one-shot fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Operation {
-    /// Read from the pipe's queued input.
+    /// A read from the pipe's queued bytes.
     Read,
-    /// Append bytes to its bounded output queue.
+    /// A write appending bytes to the pipe's bounded queue.
     Write,
-    /// Flush after an output buffer has been queued.
+    /// A flush of written bytes.
     Flush,
 }
 
 impl Operation {
-    /// Index of the operation's gate and waiting count.
+    /// Returns the index of the operation's gate and waiting count.
     fn index(self) -> usize {
         match self {
             Self::Read => 0,
@@ -95,49 +139,71 @@ impl Operation {
 /// Failure injected once the selected operation becomes eligible.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FaultKind {
-    /// Return the specified error without consuming bytes.
+    /// An immediate error of the kind, transferring no bytes.
     Error(io::ErrorKind),
-    /// Wait until the supplied absolute deadline and return TimedOut.
+    /// A stall until the operation's deadline passes, then `TimedOut`.
+    ///
+    /// Closing the pipe ends the stall with `BrokenPipe`.
     Timeout,
 }
 
 /// A one-shot fault activated after a given number of successful flushes.
 #[derive(Clone, Copy, Debug)]
 struct Fault {
+    /// Operation the fault fails.
     operation: Operation,
+    /// Successful flushes the pipe must count before the fault applies.
     after_flushes: usize,
+    /// Failure the operation meets.
     kind: FaultKind,
 }
 
 /// Queued bytes, gates and observations of one bounded unidirectional pipe.
 #[derive(Debug, Default)]
 struct State {
+    /// Bytes written and not read yet.
     bytes: VecDeque<u8>,
+    /// Whether the pipe is closed for good.
     closed: bool,
+    /// Operations a test gate holds, by operation index.
     paused: [bool; 3],
+    /// Calls blocked in each operation, by operation index.
     waiting: [usize; 3],
+    /// Number of successful flushes.
     flushes: usize,
+    /// Number of zero bytes written, which counts frame delimiters.
     delimiters: usize,
-    read_deadline: Option<Instant>, // Last installed deadline, observed while the read is blocked
-    read_error: Option<io::ErrorKind>, // One failed deadline installation, before any bytes are read
+    /// Read deadline the reader installed last, which tests check while the
+    /// read is blocked.
+    read_deadline: Option<Instant>,
+    /// Error the next read deadline installation returns, before any bytes
+    /// are read.
+    read_error: Option<io::ErrorKind>,
+    /// One-shot faults armed and not taken yet.
     faults: VecDeque<Fault>,
+    /// Number of scenario threads waiting for the armed faults to be taken.
     #[cfg(test)]
-    fault_waiters: usize, // Scenario threads waiting for the armed faults to be taken
+    fault_waiters: usize,
 }
 
 /// Bounded byte pipe with deadline-aware I/O.
-/// Blocked calls release the state lock, so closing can acquire it and wake them.
+///
+/// Blocked calls release the state lock, so closing can acquire it and wake
+/// them.
 #[derive(Debug)]
 pub(crate) struct Pipe {
     /// Clock used by every adapter and gate on this pipe.
     clock: Clock,
+    /// Maximum bytes the pipe holds before writes block.
     capacity: usize,
+    /// Queued bytes, gates and observations under one lock.
     state: Mutex<State>,
+    /// Condition variable waking blocked calls and waiting tests on changes.
     changed: Condvar,
 }
 
 impl Pipe {
-    /// Creates a bounded queue with no pending operations or faults.
+    /// Creates an open, empty pipe with no pending operations or faults.
     pub(crate) fn new(capacity: usize, clock: &Clock) -> Arc<Self> {
         Arc::new(Self {
             clock: clock.clone(),
@@ -147,7 +213,7 @@ impl Pipe {
         })
     }
 
-    /// Permanently closes this test adapter, waking every blocked call.
+    /// Permanently closes the pipe, waking every blocked call.
     pub(crate) fn close(&self) {
         self.state.lock().unwrap().closed = true;
         self.changed.notify_all();
@@ -159,8 +225,10 @@ impl Pipe {
         self.changed.notify_all();
     }
 
-    /// Makes the next `set_read_deadline()` fail. Unlike a timeout from `read()`,
-    /// this error is returned immediately by the framer without retrying.
+    /// Makes the next [`set_read_deadline`](Read::set_read_deadline) call fail.
+    ///
+    /// Unlike a timeout from a read, the transport returns this error at once,
+    /// without retrying.
     pub(crate) fn fail_read_deadline(&self, error: io::ErrorKind) {
         self.state.lock().unwrap().read_error = Some(error);
     }
@@ -206,7 +274,9 @@ impl Pipe {
     }
 
     /// Waits until a scenario waits for the armed faults to be taken, or until
-    /// the clock reaches `deadline`. Returns whether that waiter came first.
+    /// the clock reaches `deadline`.
+    ///
+    /// Returns whether that waiter came first.
     #[cfg(test)]
     pub(crate) fn wait_fault_waiter(&self, deadline: Instant) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -220,7 +290,7 @@ impl Pipe {
         true
     }
 
-    /// Waits for the reader to consume a complete scripted batch of bytes.
+    /// Waits until the reader has taken every queued byte.
     fn wait_drained(&self) {
         let mut state = self.state.lock().unwrap();
         while !state.bytes.is_empty() {
@@ -229,6 +299,8 @@ impl Pipe {
     }
 
     /// Waits once and tracks the operation in the blocked-call count.
+    ///
+    /// Returns `TimedOut` when the deadline ends the wait on an open pipe.
     fn wait<'a>(
         &self,
         mut state: MutexGuard<'a, State>,
@@ -253,7 +325,10 @@ impl Pipe {
         }
     }
 
-    /// Consumes a matching fault, including one targeting a call already paused.
+    /// Takes the first fault armed for the operation whose flush threshold the
+    /// pipe has reached.
+    ///
+    /// A fault applies even to a paused operation.
     fn take_fault(state: &mut State, operation: Operation) -> Option<FaultKind> {
         let index = state.faults.iter().position(|fault| {
             fault.operation == operation && fault.after_flushes <= state.flushes
@@ -262,6 +337,7 @@ impl Pipe {
     }
 
     /// Returns an injected error or waits for its deadline to expire.
+    ///
     /// Closing the pipe wakes even an intentionally stalled operation.
     fn fail(
         &self,
@@ -288,16 +364,22 @@ impl Pipe {
 }
 
 /// A cloneable endpoint used as either the reader or writer of its pipe.
+///
 /// Each clone configures its own deadlines, independently of the shared bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct Adapter {
+    /// Pipe the endpoint reads from or writes into.
     pipe: Arc<Pipe>,
+    /// Deadline for this endpoint's reads, `None` to wait without one.
     read_deadline: Option<Instant>,
+    /// Deadline for this endpoint's writes and flushes.
     write_deadline: Instant,
 }
 
 impl Adapter {
-    /// Creates an endpoint whose I/O deadlines must be configured before use.
+    /// Creates an endpoint on the pipe without a read deadline.
+    ///
+    /// Its write deadline starts expired, so writes need a deadline set first.
     pub(crate) fn new(pipe: Arc<Pipe>) -> Self {
         let now = pipe.clock.now();
         Self {
@@ -418,19 +500,31 @@ impl io::Write for Adapter {
 struct Peers {
     /// Sole driver of both peers' monotonic and wall times.
     tester: TestClock,
+    /// Real client reading the incoming pipe and writing the outgoing one.
     client: Client<Adapter, Adapter>,
+    /// Server identity the client pins.
     identity: xdsa::PublicKey,
+    /// Pipe carrying server output to the client.
     incoming: Arc<Pipe>,
+    /// Pipe carrying client output to the server.
     outgoing: Arc<Pipe>,
+    /// Server receive results, forwarded by the server thread.
     events: mpsc::Receiver<Result<Event<Adapter>, Error>>,
+    /// Closer of the client's stream.
     closer: Closer,
+    /// Closer of the server's stream.
     server_closer: Closer,
+    /// Server thread, joined on drop.
     server: Option<JoinHandle<()>>,
+    /// Background send threads, joined on drop.
     senders: Vec<JoinHandle<()>>,
 }
 
 impl Peers {
-    /// Starts a server that keeps consuming its stream after recoverable errors.
+    /// Creates both peers on one paused clock and starts the server thread.
+    ///
+    /// The server keeps receiving after recoverable errors and stops once its
+    /// stream ends.
     fn new(outgoing_capacity: usize, incoming_capacity: usize, write_timeout: Duration) -> Self {
         // Connect both gated pipes on one paused clock
         let tester = crate::transport::testing::test_clock();
@@ -456,7 +550,7 @@ impl Peers {
         let closer = client_stream.closer();
         let server_closer = server_stream.closer();
 
-        // Run the server reader until physical shutdown ends the stream
+        // Run the server until its stream ends, forwarding every other result
         let signer = xdsa::SecretKey::generate();
         let identity = signer.public_key();
         let attestation = self_attestation(&signer);
@@ -490,7 +584,9 @@ impl Peers {
         }
     }
 
-    /// Connects and waits for the server's new connection event.
+    /// Connects and waits for the server's new connection event, returning the
+    /// client and server senders.
+    ///
     /// Discards preceding disconnection and message events from the old session.
     fn connect(&mut self) -> (Sender<Adapter>, Sender<Adapter>) {
         let (client, _) = self.client.connect(&self.identity).unwrap();
@@ -503,8 +599,11 @@ impl Peers {
     }
 
     /// Retries after a failed attempt and verifies fresh traffic and old-sender
-    /// rejection. An already delivered ACK may leave an older Connected queued.
+    /// rejection.
+    ///
+    /// An already delivered HostAck may leave an older connection event queued.
     fn recover(&mut self, old: &[Sender<Adapter>]) {
+        // Reconnect and require every old sender to be refused
         let (client, _) = self.client.connect(&self.identity).unwrap();
         for sender in old {
             assert!(matches!(
@@ -512,6 +611,8 @@ impl Peers {
                 Err(Error::EncryptionFailed(_))
             ));
         }
+
+        // Send fresh traffic, keeping the latest connection before it arrives
         client.send(b"fresh ping").unwrap();
         let mut server = None;
         loop {
@@ -526,6 +627,8 @@ impl Peers {
             }
         }
         let server = server.expect("fresh connection event before fresh message");
+
+        // Both new senders carry traffic
         self.round_trip(&client, &server);
     }
 
@@ -534,8 +637,11 @@ impl Peers {
         self.events.recv().unwrap().unwrap()
     }
 
-    /// Sends in the background and optionally releases server input afterwards.
-    /// This can make a blocked client send wait for a server send to finish.
+    /// Sends in the background and optionally releases server input afterwards,
+    /// returning a channel for the send's result.
+    ///
+    /// Releasing input afterwards can make a blocked client send wait for a
+    /// server send to finish.
     fn send(
         &mut self,
         sender: Sender<Adapter>,
@@ -554,7 +660,7 @@ impl Peers {
         result
     }
 
-    /// Proves that both directions work after recovery and neither stream was closed.
+    /// Checks that both directions carry a message and neither pipe is closed.
     fn round_trip(&mut self, client: &Sender<Adapter>, server: &Sender<Adapter>) {
         client.send(b"ping").unwrap();
         assert!(matches!(self.event(), Event::Message(bytes) if bytes == b"ping"));
@@ -564,10 +670,13 @@ impl Peers {
         assert!(!self.outgoing.state.lock().unwrap().closed);
     }
 
-    /// Fails one handshake phase after it reaches adapter I/O. Read failures
-    /// happen after reset/Hello complete; write failures must return without
-    /// starting a read. Releasing the phase leaves the stream reusable.
+    /// Fails one handshake phase after it reaches adapter I/O.
+    ///
+    /// Read failures happen after the reset and HostHello complete; write
+    /// failures must return without starting a read. Releasing the phase leaves
+    /// the stream reusable.
     fn fail_prelude(&mut self, read: bool) {
+        // Park the handshake at the phase's operation, then fail and release it
         let pipe = if read {
             self.incoming.clone()
         } else {
@@ -588,6 +697,8 @@ impl Peers {
             pipe.pause(operation, false);
             connecting.join().unwrap()
         });
+
+        // Require the phase's own error, with both pipes still open
         match result {
             Err(Error::RecvFailed(err)) if read => assert_eq!(err.kind(), io::ErrorKind::Other),
             Err(Error::SendFailed(err)) if !read => assert_eq!(err.kind(), io::ErrorKind::Other),
@@ -599,11 +710,16 @@ impl Peers {
 }
 
 impl Drop for Peers {
-    /// Closes the adapters before joining workers, even after an assertion fails.
+    /// Closes both streams before joining the threads, even after an assertion
+    /// fails.
+    ///
     /// This keeps blocked peers and helper threads from being left behind.
     fn drop(&mut self) {
+        // Close both streams first, releasing every blocked call
         self.closer.close();
         self.server_closer.close();
+
+        // Join the threads, raising their panics unless already unwinding
         for sender in self.senders.drain(..) {
             let result = sender.join();
             if !thread::panicking() {
@@ -617,9 +733,16 @@ impl Drop for Peers {
     }
 }
 
-/// Runs one concurrency scenario and checks progress, errors and session isolation.
-/// Recovery must leave the same stream usable. Any mismatch panics.
+/// Runs one concurrency scenario, checking progress, errors and session
+/// isolation.
+///
+/// Recovery must leave the same stream usable.
+///
+/// # Panics
+///
+/// Panics if any check fails.
 pub fn run(scenario: Scenario) {
+    // Save the scenario as a fuzz seed when seeds are being collected
     #[cfg(feature = "fuzz")]
     super::seed::seed(super::seed::TRANSPORT_DUPLEX, &[scenario]);
 
@@ -635,9 +758,13 @@ pub fn run(scenario: Scenario) {
             flush,
             timeout,
         } => {
+            // Establish a session whose senders the retry must refuse
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
             let (client, server) = peers.connect();
             let mut old = vec![client, server];
+
+            // Arm the fault on the server's ArkHello, or the client's HostAck
+            // after its reset and HostHello flushes
             let operation = if flush {
                 Operation::Flush
             } else {
@@ -657,10 +784,11 @@ pub fn run(scenario: Scenario) {
             pipe.fault(operation, after_flushes, kind);
             let lost_reply = !ack && (timeout || !flush);
             if lost_reply {
-                // Model a reply the client cannot read, even if all bytes were
-                // accepted before flush failed. Only its own deadline releases it.
+                // Model a reply the client cannot read, even when all bytes were
+                // accepted before flush failed. Only its deadline releases it.
                 peers.incoming.pause(Operation::Read, true);
             }
+
             // Let the selected fault park before advancing its output deadline
             let started = peers.tester.clock().now();
             let first = thread::scope(|scope| {
@@ -671,7 +799,8 @@ pub fn run(scenario: Scenario) {
                     peers.tester.advance(FAULT_TIMEOUT);
                 }
                 if !ack {
-                    // Settle failed server output before expiring the client's own read
+                    // Settle failed server output before expiring the client's
+                    // own read
                     assert!(matches!(
                         peers.events.recv().unwrap().unwrap(),
                         Event::Disconnected
@@ -692,6 +821,8 @@ pub fn run(scenario: Scenario) {
                 }
                 connecting.join().unwrap()
             });
+
+            // Require the error the failed output implies for the attempt
             if ack {
                 let expected = if timeout {
                     io::ErrorKind::TimedOut
@@ -705,12 +836,14 @@ pub fn run(scenario: Scenario) {
                 );
             } else {
                 // ArkHello can arrive before its flush fails; local connect
-                // success does not imply that the server accepted the ACK.
+                // success does not imply that the server accepted the HostAck
                 assert!(
                     first.is_ok()
                         || matches!(first, Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
                 );
             }
+
+            // Keep any sender the attempt returned, then recover
             if let Ok((sender, _)) = first {
                 old.push(sender);
             }
@@ -729,6 +862,7 @@ pub fn run(scenario: Scenario) {
             }
         }
         Scenario::AbandonedHello => {
+            // Abandon a handshake while its ArkHello is stuck in the small pipe
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, WRITE_TIMEOUT);
             peers.incoming.pause(Operation::Read, true);
             let client = &mut peers.client;
@@ -752,6 +886,7 @@ pub fn run(scenario: Scenario) {
             peers.round_trip(&client, &server);
         }
         Scenario::SilentHandshake { ack } => {
+            // Start a server handshake that never gets its HostHello or HostAck
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
             let (client, server) = peers.connect();
             let started = peers.tester.clock().now();
@@ -770,13 +905,17 @@ pub fn run(scenario: Scenario) {
                 peers.client.send_frame_blob(&[]).unwrap();
             }
             assert!(matches!(peers.event(), Event::Disconnected));
-            // Check the deadline the server installs on its pipe. Taking the ACK's
-            // fault notifies the pipe, and the clock unlists a wait while it wakes.
+
+            // Check the deadline the server installs on its pipe. Taking
+            // the HostAck's fault notifies the pipe, and the clock unlists
+            // a wait while it wakes.
             peers.outgoing.wait_blocked(Operation::Read);
             assert_eq!(
                 peers.outgoing.state.lock().unwrap().read_deadline,
                 Some(started + HANDSHAKE_TIMEOUT)
             );
+
+            // Expire that deadline exactly, then recover on the same stream
             peers.tester.advance_to(started + HANDSHAKE_TIMEOUT);
             assert!(
                 matches!(peers.events.recv().unwrap(), Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
@@ -785,13 +924,14 @@ pub fn run(scenario: Scenario) {
             peers.recover(&[client, server]);
         }
         Scenario::HandshakeNoise { server } => {
+            // Establish a session, then fill one side's next handshake with noise
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
             let (old_client, old_server) = peers.connect();
             let started = peers.tester.clock().now();
             if server {
                 peers.client.send_frame_blob(&[]).unwrap();
                 assert!(matches!(peers.event(), Event::Disconnected));
-                // Feed resets between clock advances while retaining the first deadline
+                // Feed resets between clock advances, keeping the first deadline
                 for _ in 0..4 {
                     peers.client.send_frame_blob(&[]).unwrap();
                     peers.outgoing.wait_drained();
@@ -807,13 +947,15 @@ pub fn run(scenario: Scenario) {
                     matches!(peers.events.recv().unwrap(), Err(Error::RecvFailed(ref err)) if err.kind() == io::ErrorKind::TimedOut)
                 );
             } else {
-                // Hold the real server before it can read reset/Hello, while a
-                // raw peer supplies notifications and malformed stale packets.
+                // Hold the real server before it can read the reset and
+                // HostHello, while a raw peer supplies notifications and
+                // malformed stale packets
                 peers.outgoing.pause(Operation::Read, true);
                 let mut junk = Adapter::new(peers.incoming.clone());
                 thread::scope(|scope| {
                     let connecting = scope.spawn(|| peers.client.connect(&peers.identity));
-                    // Drain each noise batch before moving closer to the original deadline
+                    // Drain each noise batch before moving closer to the original
+                    // deadline
                     for _ in 0..4 {
                         junk.set_write_deadline(peers.tester.clock().now() + FAULT_TIMEOUT)
                             .unwrap();
@@ -834,10 +976,13 @@ pub fn run(scenario: Scenario) {
                 });
                 peers.outgoing.pause(Operation::Read, false);
             }
+
+            // Expiry came after exactly one budget, and the stream recovers
             assert_eq!(peers.tester.clock().elapsed(started), HANDSHAKE_TIMEOUT);
             peers.recover(&[old_client, old_server]);
         }
         Scenario::Reconnect { both_directions } => {
+            // Block old output from the server, and from the client if asked
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, FAULT_TIMEOUT);
             let (old_client, old_server) = peers.connect();
             let client_send = if both_directions {
@@ -854,8 +999,11 @@ pub fn run(scenario: Scenario) {
                 both_directions,
             );
             peers.incoming.wait_blocked(Operation::Write);
+
+            // Reconnect past the blocked output
             let (client, server) = if both_directions {
-                // Park reconnect behind the old send before expiring both blocked writes
+                // Park reconnect behind the old send before expiring both
+                // blocked writes
                 let waiting = peers.client.watch_writer();
                 let client = thread::scope(|scope| {
                     let connecting = scope.spawn(|| peers.client.connect(&peers.identity));
@@ -875,6 +1023,8 @@ pub fn run(scenario: Scenario) {
             } else {
                 peers.connect()
             };
+
+            // Old writes time out only when both directions were blocked
             let sent = server_send.recv().unwrap();
             if both_directions {
                 assert!(
@@ -888,6 +1038,8 @@ pub fn run(scenario: Scenario) {
                     matches!(sent.recv().unwrap(), Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut)
                 );
             }
+
+            // The old senders are refused and the new session works both ways
             assert!(matches!(
                 old_client.send(b"old"),
                 Err(Error::EncryptionFailed(_))
@@ -899,12 +1051,15 @@ pub fn run(scenario: Scenario) {
             peers.round_trip(&client, &server);
         }
         Scenario::Backlog(extra) => {
+            // Queue a backlog from the old session, then reconnect past it
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, WRITE_TIMEOUT);
             let (old_client, old_server) = peers.connect();
             for id in 0..33 + usize::from(extra) {
                 old_server.send(&[id as u8]).unwrap();
             }
             let (client, server) = peers.connect();
+
+            // The old senders are refused and the new session works both ways
             assert!(matches!(
                 old_client.send(b"old"),
                 Err(Error::EncryptionFailed(_))
@@ -916,6 +1071,7 @@ pub fn run(scenario: Scenario) {
             peers.round_trip(&client, &server);
         }
         Scenario::ServerTimeout { flush } => {
+            // Stall a server message in its write or flush, then expire it
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, 64, FAULT_TIMEOUT);
             let (_, old_server) = peers.connect();
             let before = peers.incoming.state.lock().unwrap().delimiters;
@@ -936,6 +1092,8 @@ pub fn run(scenario: Scenario) {
             });
             peers.tester.wait_blocked(2);
             peers.tester.advance(FAULT_TIMEOUT);
+
+            // The send times out, writing no failure notification after it
             assert!(matches!(
                 sent.recv().unwrap(),
                 Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut
@@ -944,6 +1102,8 @@ pub fn run(scenario: Scenario) {
                 peers.incoming.state.lock().unwrap().delimiters,
                 before + usize::from(flush)
             );
+
+            // The old sender is refused, and a new session works on the stream
             assert!(matches!(
                 old_server.send(b"old"),
                 Err(Error::EncryptionFailed(_))
@@ -952,11 +1112,14 @@ pub fn run(scenario: Scenario) {
             peers.round_trip(&client, &server);
         }
         Scenario::Shutdown { handshake, server } => {
+            // Establish a session, and keep the server from answering a handshake
             let mut peers = Peers::new(HANDSHAKE_CAPACITY, HANDSHAKE_CAPACITY, WRITE_TIMEOUT);
             let (old_client, old_server) = peers.connect();
             if handshake {
                 peers.outgoing.pause(Operation::Read, true);
             }
+
+            // Park both peers in reads, then close the selected side
             let closer = if server {
                 peers.server_closer.clone()
             } else {
@@ -978,7 +1141,7 @@ pub fn run(scenario: Scenario) {
                 });
                 incoming.wait_blocked(Operation::Read);
                 outgoing.wait_blocked(Operation::Read);
-                // Ordinary receives must clear the preceding handshake deadline.
+                // Ordinary receives must clear the preceding handshake deadline
                 assert_eq!(
                     incoming.state.lock().unwrap().read_deadline.is_some(),
                     handshake
@@ -993,7 +1156,9 @@ pub fn run(scenario: Scenario) {
                 closure.recv().unwrap();
                 assert!(matches!(received.recv().unwrap(), Err(Error::Terminated)));
             });
-            // The server driver exits on EOF and drops its event sender.
+
+            // The server driver exits on EOF and drops its event sender, and
+            // neither old sender works
             assert!(matches!(peers.events.recv(), Err(mpsc::RecvError)));
             assert!(old_client.send(b"old").is_err());
             assert!(old_server.send(b"old").is_err());
@@ -1001,11 +1166,13 @@ pub fn run(scenario: Scenario) {
     }
 }
 
+/// Tests running every duplex scenario.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Output errors and timeouts, including flush after complete peer delivery.
+    /// Tests that failed handshake output, by error or timeout in a write or
+    /// flush, leaves the stream ready for a retry.
     #[test]
     fn test_handshake_output_failure_retry() {
         // Fail every output phase and recover on the same paused stream
@@ -1022,35 +1189,38 @@ mod tests {
         }
     }
 
-    // A reset without a hello expires on the server's original deadline.
+    /// Tests that a reset without a HostHello expires on the server's original
+    /// deadline.
     #[test]
     fn test_server_deadline_before_hello() {
         // Advance the parked handshake without supplying a hello
         run(Scenario::SilentHandshake { ack: false });
     }
 
-    // A hello without an acknowledgment expires on the server's original deadline.
+    /// Tests that a HostHello without a HostAck expires on the server's original
+    /// deadline.
     #[test]
     fn test_server_deadline_before_ack() {
         // Advance the parked handshake after withholding its acknowledgment
         run(Scenario::SilentHandshake { ack: true });
     }
 
-    // Repeated resets preserve the server's first handshake deadline.
+    /// Tests that repeated resets keep the server's first handshake deadline.
     #[test]
     fn test_reset_stream_keeps_one_deadline() {
         // Feed resets between explicit advances to the original deadline
         run(Scenario::HandshakeNoise { server: true });
     }
 
-    // Junk frames preserve the client's first handshake deadline.
+    /// Tests that junk frames keep the client's first handshake deadline.
     #[test]
     fn test_client_junk_keeps_one_deadline() {
         // Feed junk between explicit advances to the original deadline
         run(Scenario::HandshakeNoise { server: false });
     }
 
-    // Closing either peer releases both reads during handshakes and sessions.
+    /// Tests that closing either peer releases both reads, in a handshake or a
+    /// session.
     #[test]
     fn test_shutdown_releases_peer_reads() {
         // Close each side while both adapter reads are parked
@@ -1061,8 +1231,8 @@ mod tests {
         }
     }
 
-    // Tests reconnect with old output in one or both directions. Old writes
-    // can time out; the fresh session must work and refuse the old senders.
+    /// Tests that a reconnect past old output blocked in one or both directions
+    /// yields a working session that refuses the old senders.
     #[test]
     fn test_reconnect_drains_bounded_output() {
         // Reconnect with old output blocked in each direction
@@ -1071,8 +1241,8 @@ mod tests {
         }
     }
 
-    // Tests reconnect with more than 32 queued messages from the old session.
-    // All must drain, and old senders must fail after the new session starts.
+    /// Tests that a reconnect drains more than 32 queued old-session messages
+    /// and refuses the old senders.
     #[test]
     fn test_reconnect_drains_stale_backlog() {
         // Recover after draining both small and large old-session backlogs
@@ -1081,8 +1251,8 @@ mod tests {
         }
     }
 
-    // Tests that a blocked server write or flush times out without another
-    // notification attempt. The same open stream must accept a new session.
+    /// Tests that a blocked server write or flush times out without a
+    /// notification attempt, leaving the stream open for a new session.
     #[test]
     fn test_server_timeout_preserves_stream() {
         // Advance blocked writes and flushes before reconnecting
@@ -1091,8 +1261,8 @@ mod tests {
         }
     }
 
-    // Tests read and write failures in sequential handshake phases. Each
-    // failure must return and leave the stream open for the next attempt.
+    /// Tests that a failed reset write or reply read returns and leaves the
+    /// stream open for the next handshake.
     #[test]
     fn test_prelude_failure_preserves_stream() {
         // Inject each prelude failure before reconnecting on the same stream
@@ -1101,18 +1271,19 @@ mod tests {
         }
     }
 
-    // Tests alternating read and write failures followed by successful retries.
-    // A failed earlier attempt must not affect a later handshake.
+    /// Tests that alternating read and write failures across handshakes leave
+    /// each retry unaffected.
     #[test]
     fn test_repeated_attempts_preserve_stream() {
         // Alternate faults across consecutive handshakes
         run(Scenario::RepeatedAttempts(2));
     }
 
-    // Tests immediate retry while an abandoned ArkHello is still blocked in a
-    // 64-byte inbound pipe, with room for HostHello in the opposite direction.
-    // Both old and new replies must flush successfully, so recovery
-    // cannot rely on the old response reaching its output deadline first.
+    /// Tests that an immediate retry drains an abandoned ArkHello still blocked
+    /// in a 64-byte inbound pipe.
+    ///
+    /// Both the old and the new reply must flush, so recovery cannot rely on
+    /// the old one reaching its output deadline first.
     #[test]
     fn test_reconnect_drains_abandoned_hello() {
         // Drain the abandoned reply before starting the replacement handshake

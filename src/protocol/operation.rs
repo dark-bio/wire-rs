@@ -15,12 +15,16 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-/// Key for one entry in the session's `operations` map. Equality compares the
-/// `Arc` pointers.
-/// A new operation gets a new key even if the peer reuses a wire ID, so a late
-/// write result cannot complete another operation.
+/// Key for one entry in the session's `operations` map.
+///
+/// Equality compares the `Arc` pointers. A new operation gets a new key even
+/// if the peer reuses a wire ID, so a late write result cannot complete
+/// another operation.
 #[derive(Clone)]
-pub(super) struct OperationKey(Arc<()>);
+pub(super) struct OperationKey(
+    /// Allocation whose address distinguishes this operation.
+    Arc<()>,
+);
 
 impl OperationKey {
     /// Creates a key distinct from every other key still in use.
@@ -45,22 +49,28 @@ impl Hash for OperationKey {
     }
 }
 
-/// A request waiting for an answer, or a reply waiting for its write to finish.
-/// Stored in the session's `operations` map until its promise gets a result.
+/// Request waiting for an answer, or reply waiting for its write to finish.
+///
+/// It stays in the session's `operations` map until its promise gets a result.
 pub(super) struct PendingOperation {
     /// Deadline for the result, including time in the outgoing queue.
     pub(super) deadline: Instant,
     /// Channel that sends the result to this operation's promise.
     pub(super) sender: ResultSender,
-    /// Wire ID as a log label, distinct from the operation key. A reply has it
-    /// from queueing, a request from the moment the writer takes it.
+    /// Wire ID as a log label, distinct from the operation key.
+    ///
+    /// A reply has it from queueing, a request from the moment the writer
+    /// takes it.
     pub(super) log_id: Option<LogId>,
 }
 
 impl PendingOperation {
-    /// Sends the answer to the promise, or `Timeout` if the deadline was reached.
+    /// Sends the answer to the promise, or [`Error::Timeout`] if the deadline
+    /// was reached.
+    ///
     /// Only an on-time answer reserves bytes. If it exceeds the byte limit and
-    /// its promise still exists, returns that error to the reader to close the session.
+    /// its promise still exists, returns that error so the caller closes the
+    /// session.
     pub(super) fn complete_response(
         self,
         now: Instant,
@@ -74,7 +84,7 @@ impl PendingOperation {
             assert!(self.sender.response, "only requests accept peer answers");
             match retain() {
                 Ok(message) => {
-                    // If the promise was dropped, the failed send releases the bytes.
+                    // If the promise was dropped, the failed send releases the bytes
                     notifications.push(self.sender.send(Ok(PromiseResult::Response(message))));
                 }
                 Err(error) => {
@@ -93,9 +103,11 @@ impl PendingOperation {
         Ok(())
     }
 
-    /// Fails either a request or a reply promise, using `Timeout` if its deadline
-    /// has passed. If the promise was dropped, the result is discarded. Timeouts
-    /// are logged here, whichever path detected them.
+    /// Fails either a request or a reply promise, using [`Error::Timeout`] if its
+    /// deadline has passed.
+    ///
+    /// If the promise was dropped, the result is discarded. Timeouts are logged
+    /// here, whichever path detected them.
     pub(super) fn fail(self, error: Error, now: Instant) -> Notification {
         // Give expiry precedence over another failure
         let error = if now >= self.deadline {
@@ -122,33 +134,40 @@ impl PendingOperation {
     }
 }
 
-/// A request or reply in the session's `outgoing` queue. The writer takes it,
-/// sends it, then uses `operation` to report the write result.
+/// Request or reply in the session's `outgoing` queue.
+///
+/// The writer takes it, sends it, then uses `operation` to report the write
+/// result.
 pub(super) struct OutgoingMessage {
     /// Request or reply to encode and send.
     pub(super) body: OutgoingBody,
-    /// Reports the write result to this message's operation.
+    /// Handle reporting the write result to this message's operation.
     pub(super) operation: OperationHandle,
-    /// Deadline checked by scenarios. The live deadline worker reads the
-    /// corresponding entry in the session's `operations` map instead.
+    /// Deadline checked by scenarios.
+    ///
+    /// The live deadline worker reads the corresponding entry in the session's
+    /// `operations` map instead.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) deadline: Instant,
 }
 
-/// Outgoing message before `Side::encode()` puts it in a wire envelope.
+/// Outgoing message before [`Side::encode`](super::envelope::Side::encode)
+/// puts it in a wire envelope.
 pub(super) enum OutgoingBody {
-    /// Our request. `SessionInner::next_outgoing()` assigns its wire ID.
+    /// Request of our own, whose wire ID [`SessionInner::next_outgoing`] assigns.
     Request(Message),
-    /// A response to the given peer request ID within this exact session.
+    /// Response to the given peer request ID within this exact session.
     Reply {
         /// Original peer request ID.
         id: u64,
-        /// Application response or the standard unanswered error.
+        /// Application response or error, or an automatic `UNANSWERED` or
+        /// `UNKNOWN` error.
         result: Result<Message, schema::Error>,
     },
 }
 
-/// Identifies the session and operation that should receive a write result.
+/// Handle naming the session and operation that should receive a write result.
+///
 /// The session removes completed operations, so reporting a result again does
 /// nothing. The weak reference never changes to point to a replacement session.
 pub(super) struct OperationHandle {
@@ -159,8 +178,10 @@ pub(super) struct OperationHandle {
 }
 
 impl OperationHandle {
-    /// Reports a write result. Successful requests keep waiting for a peer answer;
-    /// successful replies and failed writes send their result to the promise.
+    /// Reports a write result to the operation, if it is still pending.
+    ///
+    /// Successful requests keep waiting for a peer answer, while successful
+    /// replies and failed writes send their result to the promise.
     pub(super) fn record_write(&self, result: Result<(), Error>) {
         if let Some(session) = self.session.upgrade() {
             session.record_write(&self.key, result);

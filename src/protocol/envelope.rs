@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Encoding, retaining and decoding `HostToArk` and `ArkToHost` envelopes.
+//! Encoding, retaining and decoding [`HostToArk`] and [`ArkToHost`] envelopes.
 //!
 //! A request carries an ID chosen by its sender; the response echoes that ID.
 //! Clients choose odd request IDs and servers choose even ones. An incoming ID
@@ -25,15 +25,20 @@ use std::sync::{Arc, Weak};
 /// Role deciding envelope direction and request parity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Side {
-    /// Host requests have odd IDs and its connection serves one session.
+    /// Host role, whose requests have odd IDs and whose connection serves one
+    /// session.
     Client,
-    /// Ark requests have even IDs; the server accepts successive sessions.
+    /// Ark role, whose requests have even IDs and whose server accepts
+    /// successive sessions.
     Server,
 }
 
 impl Side {
     /// Reads the envelope's routing fields without decoding its nested payload.
-    /// The caller keeps the original bytes for full decoding later.
+    ///
+    /// The caller keeps the original bytes for full decoding later. An envelope
+    /// that does not parse, or lacks exactly one body, fails with
+    /// [`Error::Malformed`].
     pub(super) fn decode_header(&self, bytes: Bytes) -> Result<Header, Error> {
         // Parse out the message shape for request or response routing
         let length = bytes.len();
@@ -56,6 +61,7 @@ impl Side {
                 )
             }
         };
+
         // Content the schema does not have is content still, just unknown. With
         // no known content decoded, any top level tag left in the content range
         // is probably a future message not yet known by this build.
@@ -69,7 +75,7 @@ impl Side {
                     break false;
                 };
                 if tag >= 0x100 {
-                    // first field tag of the content oneofs
+                    // The content oneofs number their fields from this tag up
                     break true;
                 }
                 if skip_field(wire_type, tag, &mut rest, DecodeContext::default()).is_err() {
@@ -77,6 +83,8 @@ impl Side {
                 }
             }
         };
+
+        // Name the body for log lines, whether known, unknown or an error
         let header = Header {
             id,
             failed,
@@ -85,7 +93,8 @@ impl Side {
                 .or(failed.then_some("err")),
             unknown,
         };
-        // Require exactly one body; presence is preserved even for empty bytes.
+
+        // Require exactly one body; presence is preserved even for empty bytes
         if (payload.is_some() || unknown) == failed {
             return Err(self.malformed(
                 Some(header),
@@ -115,8 +124,9 @@ impl Side {
     }
 
     /// Decodes the peer's envelope, requiring exactly one of content or error.
-    /// `SessionInner::handle_message()` classifies the ID and rejects requests
-    /// containing errors. Keeps decoder errors for the warning at the call site.
+    ///
+    /// [`SessionInner::handle_message`] classifies the ID and rejects requests
+    /// containing errors. Decoder errors are kept for the warning at the call site.
     pub(super) fn decode(
         &self,
         bytes: &[u8],
@@ -127,8 +137,10 @@ impl Side {
         }
     }
 
-    /// Logs one rejection with the metadata available at that point. Leaves ID
-    /// and kind absent if the outer envelope could not be parsed.
+    /// Logs one rejection with the metadata available at that point, returning
+    /// [`Error::Malformed`].
+    ///
+    /// The ID and kind are left out if the outer envelope could not be parsed.
     pub(super) fn malformed(
         &self,
         header: Option<Header>,
@@ -169,7 +181,7 @@ pub(super) struct Header {
     pub(super) id: u64,
     /// Whether the envelope carries an error instead of content.
     pub(super) failed: bool,
-    /// Payload field name for log lines. Absent if the envelope has no body.
+    /// Payload field name for log lines, absent if the envelope has no body.
     pub(super) payload: Option<&'static str>,
     /// Whether the content is a field this build does not know.
     pub(super) unknown: bool,
@@ -177,22 +189,25 @@ pub(super) struct Header {
 
 /// One encoded envelope held by the request queue or a completed response promise.
 pub(super) struct IncomingEnvelope {
-    /// Original protobuf bytes, including repeated and unknown fields. Keeping
-    /// these intact preserves nested message merging when decoded later.
+    /// Original protobuf bytes, including repeated and unknown fields.
+    ///
+    /// Keeping these intact preserves nested message merging when decoded later.
     bytes: Bytes,
     /// Parsed metadata for warnings if deferred decoding fails.
     header: Header,
-    /// Returns byte capacity to the original session when dropped.
+    /// Byte charge returned to the original session when dropped.
     charge: ByteCharge,
     /// Wire direction used only when the application retrieves this message.
     side: Side,
-    /// A malformed body closes its original session, never a replacement.
+    /// Original session, which a malformed body closes, never a replacement.
     session: Weak<SessionInner>,
 }
 
 impl IncomingEnvelope {
-    /// Reserves bytes for an envelope that passed the outer checks. Counts its
-    /// full encoded length against the session's shared byte limit.
+    /// Reserves bytes for an envelope that passed the outer checks.
+    ///
+    /// Its full encoded length counts against the session's shared byte limit.
+    /// An envelope that does not fit fails with [`Error::InboundByteLimitExceeded`].
     pub(super) fn new(
         bytes: Bytes,
         header: Header,
@@ -212,7 +227,10 @@ impl IncomingEnvelope {
     }
 
     /// Releases the byte charge, then decodes the payload for the caller.
-    /// Decoding work and decoded data are outside the inbound byte limit.
+    ///
+    /// Decoding work and decoded data are outside the inbound byte limit. A peer
+    /// error returns [`Error::Remote`], and a malformed payload closes the
+    /// original session.
     pub(super) fn decode(self) -> Result<Message, Error> {
         let Self {
             bytes,
@@ -235,8 +253,9 @@ impl IncomingEnvelope {
     }
 }
 
-/// Returns an envelope's byte charge to its original session counter on drop.
-/// Keeps the counter alive while an unread response still holds bytes.
+/// Byte charge of one envelope, returned to its original session's counter on drop.
+///
+/// It keeps the counter alive while an unread response still holds bytes.
 struct ByteCharge {
     /// Counter independent of the session lifetime and any replacement session.
     used: Arc<AtomicUsize>,
@@ -245,8 +264,9 @@ struct ByteCharge {
 }
 
 impl ByteCharge {
-    /// Adds to the byte count unless it would exceed the limit. Never waits for
-    /// a consumer to release bytes.
+    /// Adds to the byte count unless it would exceed the limit.
+    ///
+    /// It never waits for a consumer to release bytes.
     fn reserve(used: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self, Error> {
         // This atomic only tracks usage. The session lock and result channels
         // synchronize access to the messages themselves.
@@ -308,7 +328,7 @@ where
     Ok((id, body))
 }
 
-/// Keeps the decoder's reason until the caller logs it and returns `Malformed`.
+/// Decoder failure kept until the caller logs it and returns [`Error::Malformed`].
 #[derive(Debug, thiserror::Error)]
 pub(super) enum DecodeError {
     /// Invalid protobuf, including a malformed nested payload.
@@ -359,8 +379,10 @@ trait Envelope: ProtobufMessage + Default {
     type Content;
 
     /// Assembles the ID, error and content in the order returned by
-    /// [`Self::into_parts`]. This does not validate the field combination or
-    /// classify the envelope as a request or response.
+    /// [`Self::into_parts`].
+    ///
+    /// This does not validate the field combination or classify the envelope
+    /// as a request or response.
     fn from_parts(id: u64, err: Option<schema::Error>, content: Option<Self::Content>) -> Self;
 
     /// Takes the envelope apart into its ID, error and content.
@@ -397,7 +419,7 @@ impl Envelope for ArkToHost {
     }
 }
 
-/// Whether an incoming envelope is a peer request or a response to our request.
+/// Kind of an incoming envelope, a peer request or a response to our request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MessageKind {
     /// Peer request whose response must echo the received ID.
@@ -407,8 +429,9 @@ pub(super) enum MessageKind {
 }
 
 impl MessageKind {
-    /// Uses our request parity to classify an incoming ID: matching parity
-    /// means a response, opposite parity means a request.
+    /// Classifies an incoming ID by our request parity.
+    ///
+    /// Matching parity means a response, and the opposite parity means a request.
     pub(super) fn from_id(id: u64, parity: Parity) -> Self {
         if Parity::of(id) == parity {
             Self::Response
@@ -424,8 +447,8 @@ impl MessageKind {
 mod tests {
     use super::*;
 
-    /// Tests incoming ID classification: own parity means a response, the other
-    /// parity means a peer request.
+    /// Checks that an incoming ID of our own parity is a response, and one of the
+    /// other parity a peer request.
     #[test]
     fn test_kinds() {
         /// One received ID and its expected interpretation for the receiving side.
@@ -458,7 +481,7 @@ mod tests {
                 parity: Parity::Even,
                 kind: MessageKind::Response,
             },
-            // Zero is an ordinary even ID, with the same classification rules.
+            // Zero is an ordinary even ID, with the same classification rules
             TestCase {
                 id: 0,
                 parity: Parity::Odd,
@@ -481,13 +504,14 @@ mod tests {
     }
 }
 
-/// Generated envelope views with nested messages left as bytes. These use the
-/// same field numbers and oneofs as the full message bindings.
+/// Generated envelope views with nested messages left as bytes.
+///
+/// These use the same field numbers and oneofs as the full message bindings.
 #[allow(clippy::all)]
 #[allow(rustdoc::broken_intra_doc_links)]
 pub(super) mod opaque {
     include!("generated/darkbio.wire.opaque.rs");
 }
 
-// Payload names follow the schema alongside the generated envelope views.
+// Name the payloads of the envelope views after their schema fields
 include!("generated/darkbio.wire.names.rs");

@@ -4,6 +4,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Benchmarks of reading and writing frames and packets through a client's framer.
+
 #![expect(
     clippy::disallowed_methods,
     reason = "benchmarks measure real elapsed time"
@@ -17,13 +19,19 @@ use darkbio_wire::transport::testing::Memory;
 use rand::RngExt;
 use std::io::{Cursor, empty, sink};
 
+/// Size of the in-memory stream each benchmark reads or writes, 512 MiB.
+///
+/// Iterations beyond what the stream holds are not run, and the measured time
+/// is scaled up to cover them.
 const MAX_MEMORY_USAGE: usize = 512 * 1024 * 1024;
 
-// Benchmarks reading frames via the wire framer.
+/// Measures reading delimited frames through a client's framer, without COBS
+/// decoding them.
 fn bench_frame_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("frame_read");
 
     for size in [16, 256, 4096, 65536, 262144, 1048576] {
+        // Generate one random frame without zero bytes, then its delimiter
         let mut data: Vec<u8> = rand::rng()
             .random_iter::<u8>()
             .filter(|&b| b != 0)
@@ -31,6 +39,7 @@ fn bench_frame_read(c: &mut Criterion) {
             .collect();
         data.push(0);
 
+        // Fill the input stream with copies of that frame
         let mut reader: Cursor<Vec<u8>> = Cursor::new(
             data.iter()
                 .cloned()
@@ -39,6 +48,7 @@ fn bench_frame_read(c: &mut Criterion) {
                 .collect(),
         );
 
+        // Time as many reads as the stream holds, scaled to the requested count
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::from_parameter(size), |b| {
             b.iter_custom(|iters| {
@@ -62,12 +72,14 @@ fn bench_frame_read(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmarks writing frames via the wire framer.
+/// Measures writing already encoded frames through a client's framer, which
+/// adds only the delimiter.
 fn bench_frame_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("frame_write");
     let mut drain = Cursor::new(Vec::with_capacity(MAX_MEMORY_USAGE));
 
     for size in [16, 256, 4096, 65536, 262144, 1048576] {
+        // Generate one random frame without zero bytes
         let data: Vec<u8> = rand::rng()
             .random_iter::<u8>()
             .filter(|&b| b != 0)
@@ -75,6 +87,7 @@ fn bench_frame_write(c: &mut Criterion) {
             .collect();
         let frame_size = data.len() + 1;
 
+        // Time as many writes as the drain holds, scaled to the requested count
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::from_parameter(size), |b| {
             b.iter_custom(|iters| {
@@ -98,17 +111,20 @@ fn bench_frame_write(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmarks reading packets via the wire framer.
+/// Measures reading frames through a client's framer and COBS decoding them
+/// into packets, without decryption.
 fn bench_packet_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("packet_read");
 
     for size in [16, 256, 4096, 65536, 262144, 1048576] {
+        // Encode one random packet into a delimited frame
         let data: Vec<u8> = rand::rng().random_iter().take(size).collect();
         let mut encoded = vec![0u8; cobs::encode_buffer(size)];
         let len = cobs::encode(&data, &mut encoded).unwrap();
         encoded.truncate(len);
         encoded.push(0);
 
+        // Fill the input stream with copies of that frame
         let mut reader: Cursor<Vec<u8>> = Cursor::new(
             encoded
                 .iter()
@@ -118,6 +134,7 @@ fn bench_packet_read(c: &mut Criterion) {
                 .collect(),
         );
 
+        // Time as many reads as the stream holds, scaled to the requested count
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::from_parameter(size), |b| {
             b.iter_custom(|iters| {
@@ -143,15 +160,18 @@ fn bench_packet_read(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmarks writing packets via the wire framer.
+/// Measures COBS encoding packets and writing them through a client's framer,
+/// without encryption.
 fn bench_packet_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("packet_write");
     let mut drain = Cursor::new(Vec::with_capacity(MAX_MEMORY_USAGE));
 
     for size in [16, 256, 4096, 65536, 262144, 1048576] {
+        // Generate one random packet and bound its worst case frame size
         let data: Vec<u8> = rand::rng().random_iter().take(size).collect();
         let packet_size = cobs::encode_buffer(size) + 1;
 
+        // Time as many writes as the drain holds, scaled to the requested count
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::from_parameter(size), |b| {
             b.iter_custom(|iters| {

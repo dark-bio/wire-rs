@@ -10,13 +10,17 @@ use super::Error;
 use super::schema::*;
 
 /// Defines the shared body enum and conversions from the schema-derived payload list.
-/// The generator invokes this once with the union of both envelope directions.
+///
+/// The generated `message.rs` invokes it once, with the union of both envelope
+/// directions.
 macro_rules! messages {
     ($($variant:ident($payload:ty),)*) => {
-        /// A request or successful response body from either direction. Variants
-        /// are named by their body type, so a request and its response stay apart.
-        /// Request IDs and wire envelopes remain internal to the session API. The
-        /// session checks whether it can send this message in its direction.
+        /// Request or successful response body from either direction.
+        ///
+        /// Variants are named by their body type, so a request and its response
+        /// stay apart. Request IDs and wire envelopes remain internal to the
+        /// session API. The session checks whether it can send this message in
+        /// its direction.
         ///
         /// Use `From`/`.into()` to submit a body and `TryFrom` to extract an expected
         /// body type. Extraction checks the variant and returns
@@ -34,7 +38,8 @@ macro_rules! messages {
         }
 
         impl Message {
-            /// Returns the payload's Rust type name for response mismatch errors.
+            /// Returns the payload's Rust type name for type mismatch and
+            /// direction errors.
             fn type_name(&self) -> &'static str {
                 match self {
                     $(Self::$variant(_) => stringify!($payload),)*
@@ -70,6 +75,7 @@ macro_rules! messages {
 }
 
 /// Generates direction conversion from each envelope's actual schema fields.
+///
 /// Shared bodies remain usable in either direction without a hand-maintained list.
 macro_rules! contents {
     ($module:ident, $($field:ident => $variant:ident,)*) => {
@@ -106,8 +112,8 @@ mod tests {
     use crate::protocol::schema::{self, DeviceInfoRequest, DeviceInfoResponse};
     use crate::protocol::{Error, Message};
 
-    /// Rejects a different `Message` variant even when its protobuf fields could
-    /// be decoded as the requested type.
+    /// Checks that extraction rejects a different `Message` variant, even when
+    /// its protobuf fields could decode as the requested type.
     #[test]
     fn test_response_extraction_checks_the_variant() {
         use prost::Message as _;
@@ -124,8 +130,8 @@ mod tests {
             })
         ));
 
-        // These bodies have the same field name and tag in opposite wire envelopes,
-        // but must remain distinct variants in the common public message enum.
+        // Keep bodies apart that share a field name and tag in opposite wire
+        // envelopes, since they are distinct variants of the public message enum
         let message: Message = DeviceInfoRequest {}.into();
         assert!(matches!(
             DeviceInfoResponse::try_from(message),

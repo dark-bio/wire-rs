@@ -5,9 +5,10 @@
 // license that can be found in the LICENSE file.
 
 //! COBS framing over a raw byte stream, with independent reading and writing
-//! halves. Frames end with a zero. COBS encoding removes zeros from the payload.
+//! halves.
 //!
-//! The byte stream need not report peer connections or disconnections. For
+//! Frames end with a zero. COBS encoding removes zeros from the payload. The
+//! byte stream need not report peer connections or disconnections. For
 //! example, a WebUSB client may crash and reconnect without the server noticing.
 //! Session boundaries therefore use signals in the byte stream itself.
 //!
@@ -29,18 +30,28 @@ use std::ops::Range;
 use std::time::Instant;
 use tracing::debug;
 
-/// Reads and decodes frames using its own input buffers. The writing half can
-/// run on another thread without sharing these buffers.
+/// Reader that decodes frames from its own input buffers.
+///
+/// The writing half can run on another thread without sharing these buffers.
 pub(crate) struct FrameReader<R: Read> {
-    reader: ReadHalf<R>, // Input adapter with shutdown accounting
+    /// Input adapter with shutdown accounting.
+    reader: ReadHalf<R>,
 
-    buffer: Vec<u8>, // Received bytes not yet consumed, partial or multiple frames
-    filled: usize,   // Number of received bytes in buffer
-    offset: usize,   // Start of the next frame in the buffer
-    search: usize,   // Bytes before this index have already been checked for a delimiter
-    discard: bool,   // An oversized frame was reported; discard its remainder through the delimiter
+    /// Received bytes not yet consumed, holding partial or multiple frames.
+    buffer: Vec<u8>,
+    /// Number of received bytes in `buffer`.
+    filled: usize,
+    /// Start of the next frame in `buffer`.
+    offset: usize,
+    /// End of the region already checked for a delimiter, where the next
+    /// search resumes.
+    search: usize,
+    /// Whether an oversized frame was reported and its remainder is still being
+    /// discarded through the delimiter.
+    discard: bool,
 
-    packet: Vec<u8>, // Last decoded packet, handed out as a view until the next read
+    /// Last decoded packet, handed out as a view until the next read.
+    packet: Vec<u8>,
 }
 
 impl<R: Read> FrameReader<R> {
@@ -51,7 +62,8 @@ impl<R: Read> FrameReader<R> {
                 inner: reader,
                 closer: close,
             },
-            buffer: vec![0u8; MAX_FRAME_SIZE + 1], // Extra byte holds the delimiter or proves overflow
+            // The extra byte holds the delimiter or proves overflow
+            buffer: vec![0u8; MAX_FRAME_SIZE + 1],
             filled: 0,
             offset: 0,
             search: 0,
@@ -61,22 +73,24 @@ impl<R: Read> FrameReader<R> {
     }
 
     /// Reads and decodes one packet, returning a view valid until the next read.
+    ///
     /// An empty frame signals a session boundary and returns `None`. An encoded
     /// empty packet returns an empty slice instead.
     ///
-    /// A handshake deadline applies to buffered frames and all read/discard
-    /// progress. Expiry retains unread bytes for the next attempt. Without a
-    /// deadline, buffered frames remain readable after closure; needing more
-    /// input then returns `Terminated`.
+    /// A handshake deadline applies to buffered frames and all read and discard
+    /// progress. Expiry retains unread bytes for the next attempt. Buffered
+    /// frames remain readable after closure, and needing more input then returns
+    /// [`Error::Terminated`].
     #[inline]
     pub fn next_packet(&mut self, deadline: Option<Instant>) -> Result<Option<&[u8]>, Error> {
-        // Find the next frame between zero delimiters.
+        // Find the next frame between zero delimiters
         let frame = self.next_frame(deadline)?;
 
-        // An empty frame is a session signal, not a COBS packet.
+        // An empty frame is a session signal, not a COBS packet
         if frame.start == frame.end {
             return Ok(None);
         }
+
         // Decode it with COBS. The framer split the stream at the first zero,
         // so the frame is guaranteed zero free and the cheaper decoder applies.
         let size = cobs::decode_nonzero(&self.buffer[frame.start..frame.end], &mut self.packet)
@@ -84,20 +98,25 @@ impl<R: Read> FrameReader<R> {
         Ok(Some(&self.packet[..size]))
     }
 
-    /// Finds the next frame and returns its range within `buffer` without copying.
-    /// More than MAX_FRAME_SIZE nonzero bytes report an error immediately, before
-    /// the frame's full length is known. Later calls discard the remainder through
-    /// its delimiter. They neither report the frame again nor treat its delimiter
-    /// as a reset. Read failures preserve this discard state.
+    /// Finds the next frame and returns its range within `buffer` without
+    /// copying.
+    ///
+    /// More than [`MAX_FRAME_SIZE`] nonzero bytes report an error immediately,
+    /// before the frame's full length is known. Later calls discard the
+    /// remainder through its delimiter. They neither report the frame again nor
+    /// treat its delimiter as a reset. Read failures preserve this discard
+    /// state.
     #[inline]
     fn next_frame(&mut self, deadline: Option<Instant>) -> Result<Range<usize>, Error> {
         'outer: loop {
+            // Refuse to continue once the handshake deadline has passed
             if let Some(deadline) = deadline {
                 check_deadline(&self.reader.inner.clock(), deadline).map_err(Error::RecvFailed)?;
             }
+
             // Search for the frame delimiter, starting from where we left off
             if let Some(found) = memchr::memchr(0, &self.buffer[self.search..self.filled]) {
-                // Consume the frame and its delimiter from the buffer.
+                // Consume the frame and its delimiter from the buffer
                 let start = self.offset;
                 let end = self.search + found;
 
@@ -110,16 +129,18 @@ impl<R: Read> FrameReader<R> {
                     self.discard = false;
                     continue 'outer;
                 }
-                // The frame fits within the size limit.
+
+                // The frame fits within the size limit
                 return Ok(Range { start, end });
             }
+
             // The searched region is delimiter free, don't rescan it later
             self.search = self.filled;
 
             // Frame delimiter not found, we only have fragments
             if !self.discard {
                 if self.offset > 0 {
-                    // Move the partial frame to the start to make room for more input.
+                    // Move the partial frame to the start to make room for more input
                     let used = self.filled - self.offset;
                     self.buffer.copy_within(self.offset..self.filled, 0);
                     self.filled = used;
@@ -127,13 +148,14 @@ impl<R: Read> FrameReader<R> {
                     self.search = used;
                 }
             } else {
-                // Discard this portion of the oversized frame.
+                // Discard this portion of the oversized frame
                 self.filled = 0;
                 self.offset = 0;
                 self.search = 0
             }
+
             // A full delimiter-free buffer proves overflow. Report it before
-            // reading any more, retaining only the need to drain its remainder.
+            // reading further, retaining only the need to drain its remainder.
             if self.filled == MAX_FRAME_SIZE + 1 {
                 self.discard = true;
                 self.filled = 0;
@@ -141,6 +163,7 @@ impl<R: Read> FrameReader<R> {
                 self.search = 0;
                 return Err(Error::FrameTooLarge(MAX_FRAME_SIZE + 1));
             }
+
             // Read more data to try and find the next frame marker
             match self.reader.read(&mut self.buffer[self.filled..], deadline) {
                 // Adapter or deadline setter failure
@@ -169,16 +192,20 @@ impl<R: Read> FrameReader<R> {
     }
 }
 
-/// Encodes and writes frames using its own output buffer. The reading half can
-/// run on another thread without sharing this buffer.
+/// Writer that encodes frames into its own output buffer.
 ///
+/// The reading half can run on another thread without sharing this buffer.
 /// Every send takes one absolute deadline for writing and flushing. A flush
 /// that returns after the deadline fails the complete frame.
 pub(crate) struct FrameWriter<W: Write> {
-    writer: WriteHalf<W>, // Output adapter with shutdown accounting
+    /// Output adapter with shutdown accounting.
+    writer: WriteHalf<W>,
 
-    resync: bool, // Whether the last send failed, possibly leaving a frame unterminated
-    frame: Vec<u8>, // Leading recovery zero, encoded frame, trailing delimiter
+    /// Whether the last send failed or never finished, possibly leaving a frame
+    /// unterminated.
+    resync: bool,
+    /// Leading recovery zero, encoded frame and trailing delimiter.
+    frame: Vec<u8>,
 }
 
 impl<W: Write> FrameWriter<W> {
@@ -194,33 +221,38 @@ impl<W: Write> FrameWriter<W> {
         }
     }
 
-    /// Signals a session reset with two zeros. The first terminates any partial
-    /// frame, including one left by a previous client. The second forms the empty
-    /// reset frame. No extra recovery delimiter is needed. Both bytes and flush
-    /// share the supplied absolute deadline.
+    /// Signals a session reset with two zeros.
+    ///
+    /// The first terminates any partial frame, including one left by a previous
+    /// client. The second forms the empty reset frame. No extra recovery
+    /// delimiter is needed. Both bytes and flush share the supplied absolute
+    /// deadline.
     pub fn send_reset(&mut self, deadline: Instant) -> Result<(), Error> {
         self.resync = false;
 
-        // Send two zeros: one to finish an old frame, one to signal the reset
+        // Send two zeros, one to finish an old frame and one to signal the reset
         self.frame[1] = 0;
         self.send_frame(1, deadline)
     }
 
-    /// Signals a dropped session with an empty frame. After a failed send, an
-    /// extra delimiter first terminates its partial frame. Both delimiters and
-    /// flush share the supplied absolute deadline.
+    /// Signals a dropped session with an empty frame.
+    ///
+    /// After a failed send, an extra delimiter first terminates its partial
+    /// frame. Both delimiters and flush share the supplied absolute deadline.
     pub fn send_dropped(&mut self, deadline: Instant) -> Result<(), Error> {
         // Send an empty frame, preceded by a recovery delimiter if needed
         self.send_frame(0, deadline)
     }
 
-    /// COBS encodes a packet and sends it as a delimited frame. Packets whose
-    /// maximum encoding size would exceed MAX_FRAME_SIZE are rejected. Encoding,
-    /// any recovery delimiter, partial writes and flush all share the supplied
+    /// Encodes a packet with COBS and sends it as a delimited frame.
+    ///
+    /// Packets whose maximum encoding size would exceed [`MAX_FRAME_SIZE`] are
+    /// rejected with [`Error::FrameTooLarge`] before any output. Encoding, any
+    /// recovery delimiter, partial writes and flush all share the supplied
     /// absolute deadline.
     #[inline]
     pub fn send_packet(&mut self, packet: &[u8], deadline: Instant) -> Result<(), Error> {
-        // Encode the packet with COBS and send it as a frame
+        // Encode the packet with COBS, refusing one whose worst case cannot fit
         let len = cobs::encode_buffer(packet.len());
         if len > MAX_FRAME_SIZE {
             return Err(Error::FrameTooLarge(len));
@@ -228,18 +260,20 @@ impl<W: Write> FrameWriter<W> {
         let size = cobs::encode(packet, &mut self.frame[1..=MAX_FRAME_SIZE])
             .expect("frame buffer holds any packet passing the size check");
 
-        // Send the encoded frame with its trailing delimiter.
+        // Send the encoded frame with its trailing delimiter
         self.send_frame(size, deadline)
     }
 
     /// Writes and flushes `size` bytes starting at buffer index one, followed
-    /// by a delimiter. After a failed send, the slice also includes the reserved
-    /// leading zero to terminate the previous partial frame.
-    /// The resync flag stays raised until writing and flushing succeed within
-    /// the deadline. Transport reuse after a panic remains unsupported.
+    /// by a delimiter.
+    ///
+    /// After a failed send, the slice also includes the reserved leading zero
+    /// to terminate the previous partial frame. The resync flag stays raised
+    /// until writing and flushing succeed within the deadline. Transport reuse
+    /// after a panic is unsupported.
     #[inline]
     fn send_frame(&mut self, size: usize, deadline: Instant) -> Result<(), Error> {
-        // Index zero stays reserved for recovery; the frame begins at one.
+        // Index zero stays reserved for recovery; the frame begins at one
         self.frame[size + 1] = 0;
         let start = if std::mem::replace(&mut self.resync, true) {
             0
@@ -252,13 +286,16 @@ impl<W: Write> FrameWriter<W> {
         // report accepted bytes even when they return after the deadline.
         let result = check_deadline(&self.writer.inner.clock(), deadline).and(result);
 
-        // The next send needs a recovery delimiter if this one failed.
+        // The next send needs a recovery delimiter if this one failed
         self.resync = result.is_err();
         result.map_err(Error::SendFailed)
     }
 
     /// Writes an encoded frame from a slice for tests, benchmarks and fuzzing.
-    /// Panics on frames larger than MAX_FRAME_SIZE.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes` is longer than [`MAX_FRAME_SIZE`].
     #[inline]
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -269,6 +306,8 @@ impl<W: Write> FrameWriter<W> {
     }
 }
 
+/// Checks frame encoding and decoding, oversized frames, recovery delimiters
+/// and deadlines.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -282,8 +321,8 @@ mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::time::{Duration, Instant};
 
-    // An expired attempt cannot consume a frame already buffered by an earlier
-    // read. A new attempt must still find that exact frame.
+    /// Checks that an expired attempt leaves a frame buffered by an earlier
+    /// read for the next attempt to find.
     #[test]
     fn test_deadline_preserves_buffered_frames() {
         // Buffer two frames on a paused clock and consume the first
@@ -294,6 +333,7 @@ mod tests {
             Closer::new(&clock, || {}),
         );
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[1][..]));
+
         // Reject the expired attempt without consuming the second frame
         assert!(matches!(
             reader.next_packet(Some(clock.now())),
@@ -302,16 +342,20 @@ mod tests {
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[2][..]));
     }
 
-    // Bytes accepted by a late read remain in the framer even when its attempt
-    // expires. Exercise both a partial frame and a complete buffered frame.
+    /// Checks that bytes from a late read stay in the framer when their attempt
+    /// expires, for both a partial and a complete frame.
     #[test]
     fn test_deadline_preserves_late_read_bytes() {
-        /// Delivers the first frame prefix after sleeping to its clock deadline.
+        /// Reader whose first read returns a prefix of its input only at the
+        /// installed deadline.
         struct LateReader {
             /// Clock governing the delayed read.
             clock: Clock,
+            /// Encoded frame the reader hands out.
             input: Cursor<Vec<u8>>,
+            /// Length of the late first read, taken when it happens.
             first: Option<usize>,
+            /// Latest installed read deadline.
             deadline: Option<Instant>,
         }
         impl Read for LateReader {
@@ -364,8 +408,8 @@ mod tests {
         }
     }
 
-    // Expiry while discarding an oversized frame must retain the discard state;
-    // its eventual delimiter must not turn into a reset in the next attempt.
+    /// Checks that expiry while discarding an oversized frame keeps the discard
+    /// state, so the frame's tail is never served as a frame or a reset.
     #[test]
     fn test_deadline_preserves_oversized_discard() {
         // Reject an oversized prefix on a paused clock
@@ -381,6 +425,7 @@ mod tests {
             reader.next_packet(None),
             Err(Error::FrameTooLarge(_))
         ));
+
         // Keep discarding across expiry until the original delimiter arrives
         assert!(matches!(
             reader.next_packet(Some(clock.now())),
@@ -389,7 +434,8 @@ mod tests {
         assert_eq!(reader.next_packet(None).unwrap(), Some(&[42][..]));
     }
 
-    // Closing leaves complete buffered frames readable, then reports EOF.
+    /// Checks that closing leaves complete buffered frames readable before
+    /// reporting EOF.
     #[test]
     fn test_close_drains_buffered_frames() {
         // Read one frame while leaving another buffered
@@ -408,7 +454,8 @@ mod tests {
         assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
     }
 
-    // Tests decoding empty packets, embedded zeros and COBS length boundaries.
+    /// Checks decoding of empty packets, embedded zeros and COBS length
+    /// boundaries.
     #[test]
     fn test_next_packet() {
         // Define framing boundaries on a paused clock
@@ -418,8 +465,10 @@ mod tests {
 
         /// Input and expected result for one framing boundary case.
         struct TestCase {
+            /// Encoded frame with its delimiter.
             input: Vec<u8>,
-            expected: Option<Vec<u8>>, // Decoded packet, none if the frame fails to decode
+            /// Decoded packet, or `None` if the frame fails to decode.
+            expected: Option<Vec<u8>>,
         }
         let tests = [
             // Empty packet, no zeroes encoded
@@ -453,7 +502,7 @@ mod tests {
                     .collect(),
                 expected: Some((1..=0xff).collect()),
             },
-            // A COBS code promising more bytes than the frame carries fails.
+            // A COBS code promising more bytes than the frame carries fails
             TestCase {
                 input: [0xff, 0x01, 0x00].to_vec(),
                 expected: None,
@@ -486,8 +535,8 @@ mod tests {
         }
     }
 
-    // Tests encoding empty packets, embedded zeros and COBS length boundaries.
-    // Packets that cannot fit the frame buffer must be refused before output.
+    /// Checks encoding at COBS length boundaries, and that a packet too large
+    /// for the frame buffer is refused before output.
     #[test]
     fn test_send_packet() {
         // Define encoding boundaries on a paused clock
@@ -497,8 +546,10 @@ mod tests {
 
         /// Input and expected result for one framing boundary case.
         struct TestCase {
+            /// Packet to encode.
             input: Vec<u8>,
-            expected: Option<Vec<u8>>, // Bytes on the wire, none if the packet is refused
+            /// Bytes on the wire, or `None` if the packet is refused.
+            expected: Option<Vec<u8>>,
         }
         let tests = [
             // Empty packet, no zeroes encoded
@@ -526,7 +577,7 @@ mod tests {
                         .collect(),
                 ),
             },
-            // A 255-byte payload must be split across two COBS runs.
+            // A 255-byte payload must be split across two COBS runs
             TestCase {
                 input: (1..=0xff).collect(),
                 expected: Some(
@@ -536,7 +587,7 @@ mod tests {
                         .collect(),
                 ),
             },
-            // A packet whose encoding would not fit a frame is refused up front.
+            // A packet whose encoding would not fit a frame is refused up front
             TestCase {
                 input: vec![0x01; MAX_FRAME_SIZE],
                 expected: None,
@@ -572,7 +623,8 @@ mod tests {
         }
     }
 
-    // Tests reading empty, small and maximum-sized frames from the byte stream.
+    /// Checks reading empty, small and maximum-sized frames from the byte
+    /// stream.
     #[test]
     fn test_next_frame() {
         // Define raw frame boundaries on a paused clock
@@ -580,9 +632,11 @@ mod tests {
         let tester = test_clock();
         let clock = tester.clock();
 
-        /// Raw input and the frame it must deliver, including the size boundary.
+        /// Raw input and the frame it must deliver.
         struct TestCase {
+            /// Bytes on the wire, delimiter included.
             input: Vec<u8>,
+            /// Frame the reader must deliver, without its delimiter.
             expected: Vec<u8>,
         }
         let tests = [
@@ -596,7 +650,7 @@ mod tests {
                 input: b"foo\0".to_vec(),
                 expected: b"foo".to_vec(),
             },
-            // A frame at the exact size limit is accepted.
+            // A frame at the exact size limit is accepted
             TestCase {
                 input: std::iter::repeat_n(b'a', MAX_FRAME_SIZE)
                     .chain(std::iter::once(0))
@@ -617,9 +671,11 @@ mod tests {
         }
     }
 
-    // Tests that each oversized frame reports one error, including when it spans
-    // several buffers. Its terminator is consumed, while following frames and a
-    // separate reset survive. A preceding frame also exercises buffer compaction.
+    /// Checks that each oversized frame reports one error, even across several
+    /// buffers, while its terminator is consumed and later frames and resets
+    /// survive.
+    ///
+    /// A preceding frame also exercises buffer compaction.
     #[test]
     fn test_next_frame_oversized() {
         // Surround oversized frames with valid frames and resets
@@ -634,6 +690,7 @@ mod tests {
             Memory::new(Cursor::new(input), &clock),
             Closer::new(&clock, || {}),
         );
+
         // Report each oversized frame once and preserve its successors
         assert_eq!(framing.next_frame_blob().unwrap(), b"before");
         for _ in 0..2 {
@@ -647,9 +704,10 @@ mod tests {
         assert!(matches!(framing.next_frame_blob(), Err(Error::Terminated)));
     }
 
-    // Tests that read failures preserve the discard state of an oversized frame.
-    // The next call resumes discarding instead of serving its tail as a frame.
-    // Overflow must be reported before another read, even without a delimiter.
+    /// Checks that read failures and EOF keep the discard state of an oversized
+    /// frame, so the next call resumes discarding instead of serving its tail.
+    ///
+    /// Overflow must be reported before another read, even without a delimiter.
     #[test]
     fn test_next_frame_discard_resumes() {
         // Define interrupted discard cases on a paused clock
@@ -658,7 +716,10 @@ mod tests {
         let clock = tester.clock();
 
         /// Reader handing out one mock result per read.
-        struct Mock(VecDeque<io::Result<Vec<u8>>>);
+        struct Mock(
+            /// Results still to hand out, in order.
+            VecDeque<io::Result<Vec<u8>>>,
+        );
 
         impl io::Read for Mock {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -676,11 +737,14 @@ mod tests {
         let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
         let timeout = || io::Error::from(io::ErrorKind::WouldBlock);
 
-        /// Adapter results after the oversized prefix and the frames or read
+        /// Adapter results from the oversized prefix on, and the frames or read
         /// failures expected after the initial size error.
         struct TestCase {
+            /// Adapter results, starting with the oversized prefix.
             reads: Vec<io::Result<Vec<u8>>>,
-            expected: Vec<Option<Vec<u8>>>, // Frame served per call, none for a failure
+            /// Frame served per call after the size error, or `None` for a
+            /// read failure.
+            expected: Vec<Option<Vec<u8>>>,
         }
         let tests = [
             // An interrupted read resumes the discard of an oversized frame
@@ -704,6 +768,7 @@ mod tests {
         ];
 
         for (i, tt) in tests.into_iter().enumerate() {
+            // Report the oversized prefix, then serve each expected result
             let mut framing = FrameReader::new(
                 Memory::new(Mock(tt.reads.into()), &clock),
                 Closer::new(&clock, || {}),
@@ -724,7 +789,7 @@ mod tests {
             }
         }
 
-        // EOF while discarding does not make a later tail into a fresh frame.
+        // EOF while discarding does not make a later tail into a fresh frame
         let reads = vec![
             Ok(vec![b'a'; MAX_FRAME_SIZE + 1]),
             Ok(Vec::new()),
@@ -742,8 +807,8 @@ mod tests {
         assert_eq!(framing.next_frame_blob().unwrap(), b"foo");
     }
 
-    // Tests raw frame boundaries with and without the reserved recovery prefix,
-    // including a maximum-sized frame that fills the entire combined buffer.
+    /// Checks raw frame output with and without the recovery prefix, up to a
+    /// maximum-sized frame that fills the entire combined buffer.
     #[test]
     fn test_send_frame() {
         // Define raw output boundaries on a paused clock
@@ -753,7 +818,9 @@ mod tests {
 
         /// Input and expected result for one framing boundary case.
         struct TestCase {
+            /// Encoded frame to write, without its delimiter.
             input: &'static [u8],
+            /// Bytes on the wire without the recovery prefix.
             expected: Vec<u8>,
         }
         let tests = [
@@ -767,7 +834,7 @@ mod tests {
                 input: b"foo",
                 expected: b"foo\0".to_vec(),
             },
-            // A frame at the exact size limit is accepted.
+            // A frame at the exact size limit is accepted
             TestCase {
                 input: &[b'a'; MAX_FRAME_SIZE],
                 expected: std::iter::repeat_n(b'a', MAX_FRAME_SIZE)
@@ -778,6 +845,7 @@ mod tests {
 
         for (i, tt) in tests.into_iter().enumerate() {
             for resync in [false, true] {
+                // Write each frame with and without a pending recovery prefix
                 let mut wire_to_host = Vec::new();
                 let mut framing = FrameWriter::new(
                     Memory::new(&mut wire_to_host, &clock),
@@ -788,6 +856,7 @@ mod tests {
                     .send_frame_blob(tt.input, clock.now() + DEFAULT_WRITE_TIMEOUT)
                     .unwrap();
 
+                // Expect the recovery zero ahead of the frame only when resyncing
                 let mut expected = Vec::new();
                 if resync {
                     expected.push(0);
@@ -798,17 +867,21 @@ mod tests {
         }
     }
 
-    // A successful flush that returns after the deadline still fails the frame.
-    // The next send must use a fresh budget and resynchronize the same adapter.
+    /// Checks that a successful flush returning after the deadline fails its
+    /// frame, and the next send resynchronizes the adapter with a fresh budget.
     #[test]
     fn test_late_flush_resynchronizes() {
-        /// Collects bytes and delays one flush until its deadline has elapsed,
-        /// modeling a successful adapter call whose return was scheduled late.
+        /// Writer delaying one flush until its deadline has elapsed.
+        ///
+        /// It models a successful adapter call whose return was scheduled late.
         struct LateFlush {
             /// Clock governing the delayed flush.
             clock: Clock,
+            /// Bytes accepted so far.
             bytes: Vec<u8>,
+            /// Latest installed write deadline.
             deadline: Option<Instant>,
+            /// Whether the next flush sleeps until the deadline.
             delay: bool,
         }
 
@@ -868,9 +941,11 @@ mod tests {
         assert_eq!(framing.writer.inner.bytes, b"old\0\0new\0");
     }
 
-    // Tests the isolated framer's buffer and recovery flag after a writer panic.
-    // Catching the panic here lets the test inspect the next send's delimiter.
-    // Reusing a complete transport after a panic is not supported.
+    /// Checks that a writer panic leaves the recovery flag raised, so the
+    /// framer's next send starts with a recovery delimiter.
+    ///
+    /// Catching the panic here lets the test inspect the next send's delimiter.
+    /// Reusing a complete transport after a panic is not supported.
     #[test]
     fn test_send_panic() {
         // Prepare a writer that panics once on a paused clock
@@ -880,7 +955,9 @@ mod tests {
 
         /// Writer panicking on its first write and collecting the ones after.
         struct Panicky {
+            /// Whether the next write panics.
             armed: bool,
+            /// Bytes accepted after the panic.
             written: Vec<u8>,
         }
 

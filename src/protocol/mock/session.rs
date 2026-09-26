@@ -5,8 +5,10 @@
 // license that can be found in the LICENSE file.
 
 //! Session scenarios with controlled input, write results and time.
-//! Scripts call the public request, reply, wait and close methods. Test hooks
-//! report when a call starts waiting so later steps can run while it is blocked.
+//!
+//! Scripts call the public request, reply, wait and close methods, while the
+//! driver stands in for the transport reader and writer. Test hooks report when
+//! a call starts waiting, so later steps can run while it is blocked.
 
 use crate::protocol::operation::{OutgoingBody, OutgoingMessage};
 use crate::protocol::server::{ServerInner, SessionSource};
@@ -20,21 +22,26 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Errors that a script can expect from a protocol call or promise.
+///
+/// Write results scripted through [`write_error`] can also end an operation
+/// with `Closed`, `Reset`, `Terminated` or `Timeout`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
-    /// The owner closed locally or no longer exists.
+    /// The session or server was closed locally, or its owner was dropped.
     Closed,
-    /// A new session replaced the original one.
+    /// A replacement session reset the original one.
     Reset,
-    /// The fixture dropped `SessionSource`, as if the server reader had stopped.
+    /// The driver dropped the [`SessionSource`], as if the server reader had
+    /// stopped.
     Terminated,
     /// The deadline passed before the operation got a result.
     Timeout,
-    /// The peer returned this application-defined error code.
+    /// The peer answered with an error carrying this code.
     Remote(u64),
-    /// The answer variant did not match the requested Rust response type.
+    /// The answer's variant did not match the response type the wait asked for.
     WrongType,
-    /// The peer sent an invalid outer envelope or nested payload.
+    /// The peer sent an invalid envelope or payload, or reused a request ID
+    /// that is still reserved.
     Malformed,
     /// The inbound request limit closed the session.
     Requests,
@@ -42,7 +49,11 @@ enum Failure {
     Bytes,
 }
 
-/// Converts an error to the script's `Failure`, panicking on unsupported errors.
+/// Maps a protocol error to the script's [`Failure`].
+///
+/// # Panics
+///
+/// Panics on an error no scenario expects, such as [`Error::TooLarge`].
 fn failure(error: Error) -> Failure {
     match error {
         Error::Closed => Failure::Closed,
@@ -61,7 +72,11 @@ fn failure(error: Error) -> Failure {
     }
 }
 
-/// Creates the write failures supported by scripted writer results.
+/// Maps a scripted write failure to the error the writer would report.
+///
+/// # Panics
+///
+/// Panics on a failure no write can report, such as `Remote`.
 fn write_error(error: Failure) -> Error {
     match error {
         Failure::Closed => Error::Closed,
@@ -72,7 +87,8 @@ fn write_error(error: Failure) -> Error {
     }
 }
 
-/// Builds an application response from a body tag or an application error code.
+/// Builds a one-byte development body from a tag, or an error with the code and
+/// the message `refused`.
 fn response(result: Result<u8, u64>) -> Result<Message, schema::Error> {
     result
         .map(|tag| vec![tag].into())
@@ -88,7 +104,8 @@ enum ExpectedMessage {
     Reply(u64, Result<u8, u64>),
 }
 
-/// Requires failure with the script's exact ending reason, regardless of result type.
+/// Asserts that a result failed with the expected reason, whatever its success
+/// type.
 fn refused<T>(result: Result<T, Error>, expected: Failure) {
     match result {
         Err(error) => assert_eq!(failure(error), expected),
@@ -96,16 +113,19 @@ fn refused<T>(result: Result<T, Error>, expected: Failure) {
     }
 }
 
-/// Runs a blocking call on another thread and lets the script check its result.
+/// Blocking call running on its own thread, whose result the script collects
+/// later.
 pub(super) struct Job<T> {
-    /// Completed value; disconnection also exposes a worker panic to the driver.
+    /// Receiver of the call's value, disconnected without one if the call panics.
     result: mpsc::Receiver<T>,
-    /// Worker joined after its result arrives so successful jobs leave no thread.
+    /// Thread running the call, joined once its result arrives so a finished
+    /// job leaves no thread behind.
     thread: JoinHandle<()>,
 }
 
 impl<T: Send + 'static> Job<T> {
-    /// Starts an operation without blocking the scenario's remaining steps.
+    /// Starts the call on a new thread without blocking the script's remaining
+    /// steps.
     pub(super) fn start(run: impl FnOnce() -> T + Send + 'static) -> Self {
         let (result, receiver) = mpsc::channel();
         Self {
@@ -116,11 +136,11 @@ impl<T: Send + 'static> Job<T> {
         }
     }
 
-    /// Receives the result and joins the worker.
+    /// Waits for the call's result and joins its thread.
     ///
     /// # Panics
     ///
-    /// Panics if the operation panics or ends without sending its result.
+    /// Panics if the call panicked.
     pub(super) fn finish(self) -> T {
         let result = self.result.recv().expect("scenario operation must finish");
         self.thread
@@ -130,209 +150,271 @@ impl<T: Send + 'static> Job<T> {
     }
 }
 
-/// Scripted actions with explicit session labels, responder slots and expectations.
-/// Start/finish pairs let other steps run while a call is blocked.
+/// One script action, naming sessions by label and saved handles by slot.
+///
+/// A step also carries the outcome it expects. A body tag stands for a one-byte
+/// development body. Start and finish pairs let other steps run while a call is
+/// blocked.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step {
-    // Session setup and acceptance.
-    /// Attaches a session under the given label, closing the previous session.
+    /// Session attached through the source under this label, resetting the
+    /// previous one.
     Open(u8),
-    /// Requires attaching a new session to fail with the given reason.
+    /// Attachment of a new session that must fail with this reason.
     RefuseOpen(Failure),
-    /// Calls `accept()` and checks that it returns the labeled session.
+    /// Acceptance that must return the labeled session, whose owner and
+    /// handles the driver saves.
     Accept(u8),
-    /// Starts `accept()` and waits for the hook reporting that no session is ready.
+    /// Acceptance started on its own thread, returning once `accept()` waits
+    /// for a session.
     StartAccept,
-    /// Finishes an overlapping acceptance with the given session label.
+    /// End of a started acceptance, which must return the labeled session.
     FinishAccept(u8),
-    /// Requires an overlapping acceptance to fail with this ending reason.
+    /// End of a started acceptance, which must fail with this reason.
     FinishAcceptError(Failure),
-    /// Allows either closed acceptance or an accepted session that is now closed.
+    /// End of a started acceptance, which either fails with `Closed` or returns
+    /// a session already closed.
     FinishAcceptClosed,
 
-    // Session policy and usage.
-    /// Changes both inbound limits through the public session setter.
+    /// Request and byte limits set through the labeled session's public setter.
     InboundLimits(u8, usize, usize),
-    /// Changes both server limits for the current and future sessions.
+    /// Request and byte limits set on the server for the current and future
+    /// sessions.
     ServerInboundLimits(usize, usize),
-    /// Sets the timeout for subsequent automatic replies.
+    /// Timeout set on the labeled session for its later automatic replies.
     AutoreplyTimeout(u8, Duration),
-    /// Sets the automatic reply timeout for the current and future server sessions.
+    /// Automatic reply timeout set on the server for the current and future
+    /// sessions.
     ServerAutoreplyTimeout(Duration),
-    /// Checks accepted requests and retained bytes from the original envelopes.
+    /// Expected count of accepted requests and retained envelope bytes in the
+    /// labeled session.
     Usage(u8, usize, usize),
 
-    // Incoming messages.
-    /// Delivers a request: session label, request ID and one-byte body tag.
+    /// Request with this ID and body tag, which the labeled session must admit.
     Deliver(u8, u64, u8),
-    /// Attempts fixture admission with an exact ID and expects a capacity failure.
+    /// Request with this ID and body tag, which the labeled session must refuse
+    /// with the given reason.
     RejectDelivery(u8, u64, u8, Failure),
-    /// Requires delivery to the labeled session to fail with the given reason.
+    /// Request that the labeled session must refuse with this reason.
     RefuseDelivery(u8, Failure),
-    /// Passes original envelope bytes through the reader path and checks admission.
+    /// Envelope bytes passed through the labeled session's reader handling, with
+    /// the expected result.
+    ///
+    /// A failure closes the session, as the reader does.
     Raw(u8, Vec<u8>, Result<(), Failure>),
-    /// Receives a request: session label, expected body tag and saved responder slot.
+    /// Receive on the labeled session, expecting this body tag and saving the
+    /// responder in a slot.
     Receive(u8, u8, u8),
-    /// Receives a full typed message and retains its responder for later steps.
+    /// Receive on the labeled session, expecting this whole message and saving
+    /// the responder in a slot.
     ReceiveMessage(u8, Message, u8),
-    /// Starts and finishes a receive that must fail with the given ending reason.
+    /// Receive on the labeled session that must fail with this reason.
     ReceiveError(u8, Failure),
-    /// Starts receiving on the labeled session and waits until its queue wait.
+    /// Receive started on its own thread, returning once it waits on the labeled
+    /// session's empty queue.
     StartReceive(u8),
-    /// Finishes a receive: session label, expected body tag and saved responder slot.
+    /// End of a started receive, expecting this body tag and saving the
+    /// responder in a slot.
     FinishReceive(u8, u8, u8),
-    /// Requires an overlapping receive on this session to fail with the given reason.
+    /// End of a started receive, which must fail with this reason.
     FinishReceiveError(u8, Failure),
 
-    // Request and reply submission.
-    /// Submits a request: session, promise slot, body tag, absolute time in milliseconds.
+    /// Request from the labeled session with this body tag and a deadline in
+    /// script milliseconds, saving its promise in a slot.
     Request(u8, u8, u8, u64),
-    /// Requires request submission through this session's handle to fail.
+    /// Request through the labeled session's requester that must fail with this
+    /// reason.
     RefuseRequest(u8, Failure),
-    /// Submits a reply: responder slot, promise slot, body/error, absolute deadline.
+    /// Reply through a saved responder, with a body tag or error code and a
+    /// deadline in script milliseconds, saving its promise in a slot.
     Reply(u8, u8, Result<u8, u64>, u64),
-    /// Consumes the saved responder slot and requires reply submission to fail.
+    /// Reply through a saved responder that must fail with this reason.
     RefuseReply(u8, Failure),
-    /// Drops the saved responder slot without supplying a reply.
+    /// Saved responder dropped without a reply.
     DropReply(u8),
-    /// Takes queued automatic replies and checks their request IDs.
+    /// `UNANSWERED` replies taken from the labeled session's queue and written,
+    /// answering these request IDs in order.
+    ///
+    /// Nothing else may be queued behind them.
     Abandoned(u8, Vec<u64>),
 
-    // Outgoing messages and peer answers.
-    /// Takes a queued message: session, outgoing slot, content and original deadline.
+    /// Message taken from the labeled session's queue into an outgoing slot,
+    /// carrying this content and deadline in script milliseconds.
     Outgoing(u8, u8, ExpectedMessage, u64),
-    /// Takes output using real wire-ID assignment and saves its completion handle.
+    /// Message taken the way the writer takes it into an outgoing slot,
+    /// expecting this wire ID.
     SendNext(u8, u8, u64),
-    /// Checks that no unexpired messages remain in this session's outgoing queue.
+    /// Check that the labeled session has no unexpired message queued.
     NoOutgoing(u8),
-    /// Reports local write/flush completion for a retained outgoing slot.
+    /// Local write result reported for the message in a saved outgoing slot,
+    /// which stays saved for further results.
     Written(u8, Result<(), Failure>),
-    /// Supplies the peer answer for a retained outgoing request slot.
+    /// Peer answer to the request in a saved outgoing slot, with a body tag or
+    /// error code.
     Answer(u8, Result<u8, u64>),
-    /// Supplies an answer whose content is not the byte-vector type used by the waiter.
+    /// Peer answer to the request in a saved outgoing slot, carrying a body
+    /// other than development bytes.
     AnswerOther(u8),
 
-    // Promise completion.
-    /// Registers a request promise to send the supplied token on completion.
+    /// Notification registered on a saved request promise, sending this token
+    /// once the promise settles.
     Notify(u8, u8),
-    /// Registers a reply promise to send the supplied token on completion.
+    /// Notification registered on a saved reply promise, sending this token
+    /// once the promise settles.
     NotifyWrite(u8, u8),
-    /// Drains notifications and checks the exact tokens without consuming promises.
+    /// Tokens expected from the notifications sent since the last check, in any
+    /// order.
     Notifications(Vec<u8>),
-    /// Waits for a request's byte-vector answer or its exact failure.
+    /// Wait on a saved request promise, expecting a development answer with this
+    /// tag or this failure.
     Wait(u8, Result<u8, Failure>),
-    /// Waits for a `Message` and checks its variant and body tag.
+    /// Wait on a saved request promise for the whole message, which must be a
+    /// development body with this tag.
     WaitMessage(u8, u8),
-    /// Starts a request wait and waits for its blocking-call notification.
+    /// Wait started on a saved request promise in its own thread, returning once
+    /// the wait is about to block.
     StartWait(u8),
-    /// Finishes an overlapping request wait with the expected outcome.
+    /// End of a started request wait, expecting this answer tag or failure.
     FinishWait(u8, Result<u8, Failure>),
-    /// Drops a request promise, leaving the request in progress.
+    /// Saved request promise dropped, leaving the request running.
     DropPromise(u8),
-    /// Waits for a reply's local write completion.
+    /// Wait on a saved reply promise, expecting this write result.
     WaitWrite(u8, Result<(), Failure>),
-    /// Starts waiting on a reply promise before reporting its write result.
+    /// Wait started on a saved reply promise in its own thread, returning once
+    /// the wait is about to block.
     StartWaitWrite(u8),
-    /// Finishes an overlapping reply wait with the expected outcome.
+    /// End of a started reply wait, expecting this write result.
     FinishWaitWrite(u8, Result<(), Failure>),
-    /// Drops a reply promise, leaving the reply queued or being written.
+    /// Saved reply promise dropped, leaving the reply queued or being written.
     DropWritePromise(u8),
 
-    // Deadlines.
-    /// Changes the test clock without calling `expire()`.
+    /// Test clock moved to this script time in milliseconds, without calling
+    /// `expire()`.
+    ///
+    /// Script time never moves backward.
     Time(u64),
-    /// Calls `expire()` to fail timed-out operations and discard expired messages.
+    /// Call to `expire()` on the labeled session, failing overdue operations and
+    /// discarding their queued messages.
     Expire(u8),
-    /// Checks the earliest pending deadline, or that no operations remain.
+    /// Expected earliest pending deadline of the labeled session in script
+    /// milliseconds, or none.
     Deadline(u8, Option<u64>),
-    /// Starts the deadline worker for a fixture whose timeouts settle asynchronously.
+    /// Deadline worker started for the labeled session, so its timeouts settle
+    /// without a waiting caller.
+    ///
+    /// The step returns once a thread waits on the test clock.
     Deadlines(u8),
 
-    // Closure and release.
-    /// Closes the labeled session through its saved `Closer`.
+    /// Closure of the labeled session through its saved [`Closer`].
     CloseSession(u8),
-    /// Drops the labeled session owner while retaining its other handles.
+    /// Drop of the labeled session's owner, keeping its other saved handles.
     DropSession(u8),
-    /// Checks that the saved weak reference to this session cannot be upgraded.
+    /// Check that the labeled session's state is freed, so its saved reference
+    /// cannot upgrade.
     Released(u8),
-    /// Closes the server through its saved `Closer`.
+    /// Closure of the server through its saved [`Closer`].
     CloseServer,
-    /// Drops the server owner and checks weak handles do not retain its state.
+    /// Drop of the server owner, which must free its state despite the saved
+    /// closer and session source.
     DropServer,
-    /// Drops the source of sessions, modeling a terminated reader.
+    /// Drop of the session source, which ends the server as a stopped reader
+    /// would.
     DropSource,
 
-    // Concurrent closure.
-    /// Releases two threads together to close the same labeled session.
+    /// Two closures of the labeled session, released together from separate
+    /// threads.
     RaceCloses(u8),
-    /// Releases two threads together to close the persistent server.
+    /// Two closures of the server, released together from separate threads.
     RaceServerCloses,
-    /// Races server closure with attaching a session; that session must end too.
+    /// Server closure raced against attaching a session, which must end closed
+    /// either way.
     RaceServerCloseOpen,
-    /// Starts `request()` and `close()` together. The request must fail either
-    /// immediately or through its promise once both calls return.
+    /// Request from the labeled session raced against its closure.
+    ///
+    /// The request must fail with `Closed`, at once or through its promise.
     RaceRequestClose(u8),
-    /// Releases answer delivery and closure together, accepting either first result.
+    /// Peer answer to the request in a saved outgoing slot, raced against
+    /// closing the labeled session.
+    ///
+    /// The saved request promise must end with the answer or with `Closed`.
     RaceAnswerClose(u8, u8, u8),
-    /// Starts `reply()` and `close()` together for this responder's session.
+    /// Reply through a saved responder, raced against closing the labeled
+    /// session.
+    ///
+    /// The reply must fail with `Closed`, at once or through its promise.
     RaceReplyClose(u8, u8),
-    /// Races a reply's write result with `close()`; either result may reach the promise.
+    /// Write result for the reply in a saved outgoing slot, raced against
+    /// closing the labeled session.
+    ///
+    /// The saved reply promise must end with success or with `Closed`.
     RaceWriteClose(u8, u8, u8),
 }
 
-/// A receive result returned with its owner so the driver can use the session again.
+/// Receive result handed back with the session owner, so the driver can use the
+/// session again.
 type ReceiveResult = (Session, Result<(Message, Responder), Error>);
-/// An acceptance result returned with its persistent server owner.
+/// Acceptance result handed back with the server owner, which the driver keeps.
 type AcceptResult = (Server, Result<Session, Error>);
 
-/// Sessions, saved handles and background calls used by one script. Labels keep
-/// referring to the same session after replacement so steps can exercise old handles.
+/// Fixture state for one script, holding its sessions, saved handles and
+/// background calls.
+///
+/// Labels keep referring to the same session after replacement, so steps can
+/// exercise old handles.
 struct Driver {
-    /// Sole driver of time for the server and all fixture sessions.
+    /// Test clock driving time for the server and every fixture session.
     tester: darkbio_clock::TestClock,
-    /// Deadline workers joined after their sessions close.
+    /// Deadline workers started by [`Step::Deadlines`], joined once their
+    /// sessions close.
     workers: Vec<JoinHandle<()>>,
-    /// Server owner, temporarily moved out while acceptance runs.
+    /// Server owner, moved out while an acceptance runs and gone after
+    /// [`Step::DropServer`].
     server: Option<Server>,
     /// Weak reference used to check that dropping the server frees its state.
     server_ref: Weak<ServerInner>,
-    /// Server closer usable while acceptance owns the server or after owner drop.
+    /// Server closer, usable while an acceptance owns the server or after the
+    /// owner drops.
     closer: Closer,
-    /// Sole source of replacement sessions in place of a real transport reader.
+    /// Session source standing in for the server's transport reader, gone after
+    /// [`Step::DropSource`].
     source: Option<SessionSource>,
-    /// In-progress acceptance job, holding the unique server owner.
+    /// Acceptance in progress, holding the only server owner.
     accepting: Option<Job<AcceptResult>>,
 
-    /// Accepted owners currently available to the script, indexed by session label.
+    /// Accepted owners currently available to the script, by session label.
     sessions: HashMap<u8, Session>,
-    /// Session references saved by `Open`, including sessions later replaced.
+    /// Session references saved by [`Step::Open`], including sessions later
+    /// replaced.
     session_refs: HashMap<u8, Weak<SessionInner>>,
-    /// Requester handles kept after dropping their sessions.
+    /// Requesters saved at acceptance, kept after their sessions drop.
     requesters: HashMap<u8, Requester>,
-    /// Session closers retained to exercise closure after replacement or owner drop.
+    /// Session closers kept to exercise closure after replacement or owner drop.
     closers: HashMap<u8, Closer>,
-    /// In-progress receive jobs, each holding its labeled session owner.
+    /// Receive calls in progress, each holding its labeled session owner.
     receiving: HashMap<u8, Job<ReceiveResult>>,
 
-    /// Responders indexed by script slot, not by wire request ID.
+    /// Responders by script slot, not by wire request ID.
     responders: HashMap<u8, Responder>,
     /// Request promises saved for later wait or drop steps.
     promises: HashMap<u8, Promise<Message>>,
     /// Reply promises saved for later wait or drop steps.
     writes: HashMap<u8, Promise<()>>,
-    /// Shared event channel; tokens do not own promises or release response bytes.
+    /// Channel carrying notification tokens, which neither own promises nor
+    /// release response bytes.
     notifications: (mpsc::Sender<u8>, mpsc::Receiver<u8>),
-    /// Messages taken from the queue whose write results and answers are supplied later.
+    /// Messages taken from session queues, by outgoing slot, awaiting their
+    /// scripted write results and answers.
     outgoing: HashMap<u8, OutgoingMessage>,
-    /// Background calls waiting for request answers.
+    /// Background waits on request promises, by promise slot.
     waiting: HashMap<u8, Job<Result<Vec<u8>, Error>>>,
-    /// Background calls waiting for reply write results.
+    /// Background waits on reply promises, by promise slot.
     writing: HashMap<u8, Job<Result<(), Error>>>,
 
-    /// Base for deterministic absolute deadlines, kept ahead of the wall clock.
+    /// Test clock instant of script time zero, which scripted times and
+    /// deadlines count from.
     epoch: Instant,
-    /// Current scripted time in milliseconds, independent of expiry servicing.
+    /// Current script time in milliseconds, independent of expiry.
     time: u64,
 }
 
@@ -374,7 +456,8 @@ impl Driver {
         }
     }
 
-    /// Checks an accepted session's identity and saves its owner and cloned handles.
+    /// Restores the server owner, checks that acceptance returned the labeled
+    /// session and saves its owner and handles.
     fn accepted(&mut self, id: u8, (server, result): AcceptResult) {
         self.server = Some(server);
         let session = result.unwrap();
@@ -387,7 +470,8 @@ impl Driver {
         assert!(self.sessions.insert(id, session).is_none());
     }
 
-    /// Checks the received body tag, saves its responder and restores the owner.
+    /// Checks the received body tag, saves its responder in the slot and restores
+    /// the session owner.
     fn received(&mut self, id: u8, tag: u8, slot: u8, (session, result): ReceiveResult) {
         let (message, responder) = result.unwrap();
         assert_eq!(message, Message::Develop(vec![tag]));
@@ -395,12 +479,13 @@ impl Driver {
         self.sessions.insert(id, session);
     }
 
-    /// Converts script milliseconds into an absolute deadline.
+    /// Converts script milliseconds into an instant on the test clock.
     fn at(&self, millis: u64) -> Instant {
         self.epoch + Duration::from_millis(millis)
     }
 
-    /// Checks a typed answer while preserving the exact error category.
+    /// Asserts that a development answer carries the expected tag, or that the
+    /// wait failed with the expected reason.
     fn answer_result(result: Result<Vec<u8>, Error>, expected: Result<u8, Failure>) {
         match expected {
             Ok(tag) => assert_eq!(result.unwrap(), vec![tag]),
@@ -408,7 +493,7 @@ impl Driver {
         }
     }
 
-    /// Checks the result of waiting for a reply to be written.
+    /// Asserts that a reply wait ended with the expected write result.
     fn write_result(result: Result<(), Error>, expected: Result<(), Failure>) {
         match expected {
             Ok(()) => result.unwrap(),
@@ -416,8 +501,15 @@ impl Driver {
         }
     }
 
-    /// Executes one script action, awaiting acknowledgments for blocking operations.
-    /// Assertions also reject invalid scripts, such as overwriting an owned slot.
+    /// Executes one script step and checks its expected outcome.
+    ///
+    /// A step starting a blocking call returns once the call's hook reports its
+    /// wait, so later steps run while it is blocked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outcome differs from the step's expectation, or if the
+    /// script is invalid, such as saving into an occupied slot.
     fn step(&mut self, step: Step) {
         match step {
             Step::Open(id) => {
@@ -615,6 +707,7 @@ impl Driver {
                 Job::start(move || drop(responder)).finish();
             }
             Step::Abandoned(id, expected) => {
+                // Take one `UNANSWERED` reply per expected ID and report its write
                 let session = self.session_refs[&id].upgrade().unwrap();
                 for id in expected {
                     let outgoing = session.take_outgoing().expect("abandonment queued");
@@ -630,6 +723,8 @@ impl Driver {
                     assert_eq!(error.msg, "request left unanswered");
                     outgoing.operation.record_write(Ok(()));
                 }
+
+                // Require nothing else in the queue
                 assert!(
                     session.take_outgoing().is_none(),
                     "unexpected additional outgoing message"
@@ -807,6 +902,7 @@ impl Driver {
             }
             Step::DropSource => drop(self.source.take().unwrap()),
             step @ (Step::RaceCloses(_) | Step::RaceServerCloses) => {
+                // Hold two closures of the same target at one barrier
                 let closer = match step {
                     Step::RaceCloses(id) => self.closers[&id].clone(),
                     Step::RaceServerCloses => self.closer.clone(),
@@ -823,12 +919,15 @@ impl Driver {
                         })
                     })
                     .collect();
+
+                // Release both and wait for them to return
                 gate.wait();
                 for job in jobs {
                     job.finish();
                 }
             }
             Step::RaceServerCloseOpen => {
+                // Hold an attach and a server closure at one barrier
                 let gate = Arc::new(Barrier::new(3));
                 let mut source = self.source.take().unwrap();
                 let opened = {
@@ -847,11 +946,14 @@ impl Driver {
                         closer.close();
                     })
                 };
+
+                // Release both and wait for them to return
                 gate.wait();
                 closed.finish();
                 let (source, result) = opened.finish();
-                // If accept() took the session, it may still exist but must be
-                // closed now. Otherwise server closure also drops that session.
+
+                // If `accept()` took the session, it may still exist but must be
+                // closed already. Otherwise server closure drops that session too.
                 match result {
                     Ok(session) => {
                         if let Some(session) = session.upgrade() {
@@ -863,6 +965,7 @@ impl Driver {
                 self.source = Some(source);
             }
             Step::RaceRequestClose(id) => {
+                // Hold a request and a closure of its session at one barrier
                 let requester = self.requesters[&id].clone();
                 let closer = self.closers[&id].clone();
                 let deadline = self.at(self.time + 100);
@@ -881,6 +984,8 @@ impl Driver {
                         closer.close();
                     })
                 };
+
+                // Release both, then require the request to fail with `Closed`
                 gate.wait();
                 closed.finish();
                 match requested.finish() {
@@ -892,6 +997,7 @@ impl Driver {
                 }
             }
             Step::RaceAnswerClose(id, outgoing, promise) => {
+                // Hold an answer and a closure of its session at one barrier
                 let outgoing = self.outgoing.remove(&outgoing).unwrap();
                 let promise = self.promises.remove(&promise).unwrap();
                 let closer = self.closers[&id].clone();
@@ -910,6 +1016,8 @@ impl Driver {
                         closer.close();
                     })
                 };
+
+                // Release both, then require the answer or `Closed` in the promise
                 gate.wait();
                 closed.finish();
                 answered.finish();
@@ -919,6 +1027,7 @@ impl Driver {
                 }
             }
             Step::RaceReplyClose(id, responder) => {
+                // Hold a reply and a closure of its session at one barrier
                 let responder = self.responders.remove(&responder).unwrap();
                 let closer = self.closers[&id].clone();
                 let deadline = self.at(self.time + 100);
@@ -937,6 +1046,8 @@ impl Driver {
                         closer.close();
                     })
                 };
+
+                // Release both, then require the reply to fail with `Closed`
                 gate.wait();
                 closed.finish();
                 match replied.finish() {
@@ -947,6 +1058,7 @@ impl Driver {
                 }
             }
             Step::RaceWriteClose(id, outgoing, promise) => {
+                // Hold a write result and a closure of its session at one barrier
                 let outgoing = self.outgoing.remove(&outgoing).unwrap();
                 let promise = self.writes.remove(&promise).unwrap();
                 let closer = self.closers[&id].clone();
@@ -965,6 +1077,8 @@ impl Driver {
                         closer.close();
                     })
                 };
+
+                // Release both, then require success or `Closed` in the promise
                 gate.wait();
                 closed.finish();
                 record_write.finish();
@@ -977,7 +1091,8 @@ impl Driver {
 }
 
 impl Drop for Driver {
-    /// Closes the server so blocked calls wake up even if an assertion panics.
+    /// Closes the server and every saved session so blocked calls wake, even
+    /// after a failed step, then joins the deadline workers.
     fn drop(&mut self) {
         // Wake every application call and deadline worker before joining
         self.closer.close();
@@ -992,8 +1107,14 @@ impl Drop for Driver {
     }
 }
 
-/// Runs a scenario, reporting the exact failed step and rejecting unfinished jobs.
+/// Runs a scenario script against a fresh fixture.
+///
+/// # Panics
+///
+/// Panics at the first failed step, after printing its index and value, or if
+/// the script leaves a started acceptance, receive or wait unfinished.
 fn run(steps: Vec<Step>) {
+    // Run each step, naming the one that fails before passing its panic on
     let mut driver = Driver::new();
     for (index, step) in steps.into_iter().enumerate() {
         let result =
@@ -1003,6 +1124,8 @@ fn run(steps: Vec<Step>) {
             std::panic::resume_unwind(error);
         }
     }
+
+    // Require every started call to have been finished by the script
     assert!(
         driver.receiving.is_empty(),
         "unfinished receive in scenario"

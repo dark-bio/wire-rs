@@ -4,14 +4,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Benchmark runner, printing the host environment before the benchmarks.
+
 mod wire;
 
-/// Prints a collection of system hardware, software and runtime infos so that
-/// benchmarks originating from different people can be meaningfully compared.
+/// Prints the host's hardware, software and runtime details, so benchmarks run
+/// on different machines can be compared.
 fn print_system_infos() {
     use sysinfo::System;
 
-    // Print operating system infos
+    // Print the operating system details
     println!("Benchmark Environment:");
     println!(
         "  OS:        {} {}",
@@ -24,7 +26,7 @@ fn print_system_infos() {
     );
     println!("  Arch:      {}", std::env::consts::ARCH);
 
-    // Print hardware infos
+    // Print the hardware details
     let sys = System::new_all();
     let cpus = sys.cpus();
     if let Some(cpu) = cpus.first() {
@@ -37,7 +39,7 @@ fn print_system_infos() {
         sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0
     );
 
-    // Print Rust runtime infos
+    // Print the Rust build details
     #[cfg(debug_assertions)]
     println!("  Build:     debug");
     #[cfg(not(debug_assertions))]
@@ -47,9 +49,12 @@ fn print_system_infos() {
     println!();
 }
 
-/// Clone of criterion_main!, but prints system infos first.
+/// Defines the benchmark `main` like `criterion_main!`, printing the host
+/// environment first.
 macro_rules! criterion_main_with_info {
     ( $( $group:path ),+ $(,)* ) => {
+        /// Prints the host environment, then runs every benchmark group and
+        /// the final summary.
         fn main() {
             print_system_infos();
 

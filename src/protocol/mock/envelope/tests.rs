@@ -11,13 +11,17 @@ use crate::protocol::schema::{
     self, ArkToHost, DeviceInfoRequest, HostToArk, ark_to_host, host_to_ark,
 };
 
-/// The direction prefix selects one decoder, which consumes all remaining bytes.
-/// A relay failure is only defined in the Ark-to-host envelope.
+/// The direction byte's low bit selects one decoder, which consumes every
+/// remaining byte.
 #[test]
 fn test_input_format() {
+    // Refuse input without a direction byte, and an empty envelope on either side
     for input in [&[][..], &[0], &[1]] {
         assert!(!run(input));
     }
+
+    // Accept a relay failure only on the host, the one side whose envelope
+    // defines it, and refuse it with a truncated field appended
     let bytes = ArkToHost {
         id: 2,
         err: None,
@@ -33,8 +37,8 @@ fn test_input_format() {
     }
 }
 
-/// Runs every shape through the fuzz entry point and checks which ones the
-/// decoder accepts. Only one of content and error may be present.
+/// The decoder accepts exactly one of content and error, refusing both, neither
+/// and invalid protobuf.
 #[test]
 fn test_envelope_shapes() {
     /// One envelope, the side receiving it, and whether it is accepted.
@@ -51,7 +55,7 @@ fn test_envelope_shapes() {
         msg: "refused".into(),
     };
     let tests = [
-        // A schema request and an opaque development body, both host to Ark.
+        // A schema request and an opaque development body, both host to Ark
         TestCase {
             client: false,
             bytes: HostToArk {
@@ -72,7 +76,7 @@ fn test_envelope_shapes() {
             .encode_to_vec(),
             accepted: true,
         },
-        // The largest ID carrying a schema response and an error, Ark to host.
+        // The largest IDs carrying a schema response and an error, Ark to host
         TestCase {
             client: true,
             bytes: ArkToHost {
@@ -95,7 +99,7 @@ fn test_envelope_shapes() {
             .encode_to_vec(),
             accepted: true,
         },
-        // Both fields, neither field, invalid protobuf and empty input.
+        // Both fields, neither field, invalid protobuf and empty input
         TestCase {
             client: false,
             bytes: HostToArk {
@@ -127,6 +131,8 @@ fn test_envelope_shapes() {
             accepted: false,
         },
     ];
+
+    // Run each case through the fuzz entry point, prefixed by its direction byte
     for (i, tt) in tests.iter().enumerate() {
         let mut input = vec![u8::from(tt.client)];
         input.extend_from_slice(&tt.bytes);
@@ -134,9 +140,8 @@ fn test_envelope_shapes() {
     }
 }
 
-/// Content of a tag the schema does not have is unknown content to the header
-/// decoder and refused by the full one. A future envelope field below the
-/// content tags is not content, and unknown content next to an error is both.
+/// The header decoder counts an unknown tag in the content range as content,
+/// which the full decoder refuses.
 #[test]
 fn test_unknown_content() {
     use prost::encoding::{WireType, encode_key};
@@ -153,8 +158,10 @@ fn test_unknown_content() {
         bytes.extend_from_slice(&[1, 0x2a]);
         bytes
     }
-    // These fields have identical encodings in both envelope directions.
+
+    // These fields have identical encodings in both envelope directions
     for (direction, side) in [(0, Side::Server), (1, Side::Client)] {
+        // Pass unknown content through the header decoder, but not the full one
         let unknown = envelope(5, None, 0x7ff);
         let header = side.decode_header(Bytes::from(unknown.clone())).unwrap();
         assert_eq!(header.id, 5);
@@ -163,14 +170,17 @@ fn test_unknown_content() {
         assert_eq!(header.payload, Some("unknown"));
         assert!(side.decode(&unknown).is_err());
 
+        // Refuse an unknown field below the content tags as no body at all
         let future = envelope(5, None, 0x7f);
         assert!(side.decode_header(Bytes::from(future.clone())).is_err());
 
+        // Refuse unknown content beside an error as carrying both
         let both = envelope(5, Some(schema::Error::new(7, "refused")), 0x7ff);
         assert!(side.decode_header(Bytes::from(both.clone())).is_err());
-        // Full protobuf decoding ignores the unknown content beside the error.
+        // Full protobuf decoding ignores the unknown content beside the error
         assert!(side.decode(&both).is_ok());
 
+        // Refuse all three through the fuzz entry point
         for bytes in [unknown, future, both] {
             let mut input = vec![direction];
             input.extend_from_slice(&bytes);
@@ -179,8 +189,8 @@ fn test_unknown_content() {
     }
 }
 
-/// Unknown fields and noncanonical ID encodings preserve the decoded message.
-/// Re-encoding normalizes them, so its size need not match the received bytes.
+/// Unknown fields and noncanonical ID encodings decode to the same message,
+/// which re-encodes shorter.
 #[test]
 fn test_envelope_normalization() {
     for client in [false, true] {
@@ -207,10 +217,12 @@ fn test_envelope_normalization() {
                 .encode_to_vec(),
             )
         };
+
+        // Prepend ID fields to an envelope that leaves its zero ID unencoded
         for prefix in [
-            &[0x08, 0x81, 0x00][..],   // ID 1 as an overlong varint.
-            &[0x08, 0x02, 0x08, 0x01], // The last scalar ID wins.
-            &[0x08, 0x01, 0x78, 0x2a], // Unknown field 15 is ignored.
+            &[0x08, 0x81, 0x00][..],   // ID 1 as an overlong varint
+            &[0x08, 0x02, 0x08, 0x01], // the last scalar ID wins
+            &[0x08, 0x01, 0x78, 0x2a], // unknown field 15 is ignored
         ] {
             let mut bytes = prefix.to_vec();
             bytes.extend_from_slice(&content);
@@ -225,8 +237,11 @@ fn test_envelope_normalization() {
     }
 }
 
-/// The send limit applies to the whole encoded envelope, including ID, body
-/// length and nested error fields. A body above the send limit can still decode.
+/// The send limit applies to the whole encoded envelope, including its ID, body
+/// length and nested error fields.
+///
+/// Decoding accepts an envelope above the send limit, and only re-encoding
+/// refuses it.
 #[test]
 fn test_encoded_size_boundaries() {
     /// Builds a peer envelope through the schema, without the protocol encoder.
@@ -256,14 +271,14 @@ fn test_encoded_size_boundaries() {
         for id in [0, 127, 128, u64::MAX] {
             for error in [false, true] {
                 // Measure overhead near the limit so the length varints have
-                // the same widths as the three boundary cases below.
+                // the same widths as the three boundary cases below
                 let len = MAX_MESSAGE_SIZE - 64;
                 let overhead = envelope(client, id, len, error).len() - len;
                 for size in [MAX_MESSAGE_SIZE - 1, MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE + 1] {
                     let bytes = envelope(client, id, size - overhead, error);
                     assert_eq!(bytes.len(), size);
-                    // Direct checks keep these multi-megabyte boundaries out of
-                    // the seed corpus used for ordinary envelope mutation.
+                    // Direct checks keep these envelopes of about 2 MiB out of
+                    // the seed corpus used for ordinary envelope mutation
                     assert!(check(client, &bytes));
                 }
             }
@@ -271,7 +286,8 @@ fn test_encoded_size_boundaries() {
     }
 }
 
-/// Opaque parsing accepts bounded nested bytes that native decoding rejects.
+/// The header decoder accepts a truncated nested body or error that full
+/// decoding refuses.
 #[test]
 fn test_opaque_header_defers_nested_validation() {
     for client in [false, true] {

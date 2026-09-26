@@ -4,15 +4,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Fuzz target running the shared connection scenarios through real protocol
+//! workers and encrypted streams.
+//!
+//! Randomness is repeatable, while native worker scheduling still varies the
+//! interleavings.
+
 #![no_main]
 
 use darkbio_wire::protocol::mock::connection::{Action, Kind, fuzz};
 use libfuzzer_sys::fuzz_target;
 
-// Shared connection scenarios drive real protocol workers and encrypted streams.
-// Randomness is repeatable; native worker scheduling still varies interleavings.
 fuzz_target!(
-    // Initialize crypto and worker state before libFuzzer measures input coverage.
+    // Initialize crypto and worker state before libFuzzer measures input coverage
     init: {
         fuzz(&[
             Action { kind: Kind::Pipeline, slot: 0, value: 1, budget: 1 },
@@ -21,6 +25,7 @@ fuzz_target!(
         ]);
     },
     |actions: Vec<Action>| {
+        // Restart the randomness from the same seed for every input
         #[cfg(getrandom_backend = "custom")]
         darkbio_wire::transport::mock::random::reseed("protocol-fuzz");
 

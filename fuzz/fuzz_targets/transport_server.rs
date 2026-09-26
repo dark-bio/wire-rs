@@ -4,13 +4,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//! Fuzz target driving a real transport server through an arbitrary sequence
+//! of client frames.
+//!
+//! The mock client checks every reaction against a model of the protocol's
+//! state machine.
+
 #![no_main]
 
 use darkbio_wire::transport::mock::client::{Step, run};
 use libfuzzer_sys::fuzz_target;
 
-// Drives a real server side through an arbitrary sequence of client frames, the
-// mock client checking every reaction against the protocol's state machine.
 fuzz_target!(
     // Warm up the process on a script touching every layer, so one-time
     // initialization is not attributed to whichever input runs first

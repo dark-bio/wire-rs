@@ -12,7 +12,7 @@ use std::io;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-/// Installs the test logger once per process.
+/// Guard installing the test logger once per process.
 static INIT: Once = Once::new();
 
 /// A one-shot gate whose wait is visible to the scenario's paused clock.
@@ -36,7 +36,10 @@ impl Gate {
         }
     }
 
-    /// Parks until released or until the supplied clock deadline expires.
+    /// Parks until released or until the optional deadline expires on the
+    /// gate's clock.
+    ///
+    /// An expired deadline returns a `TimedOut` error.
     pub fn wait(&self, deadline: Option<Instant>) -> io::Result<()> {
         let mut open = self.inner.0.lock().unwrap();
         while !*open {
@@ -83,9 +86,10 @@ pub struct PipeWriter {
     deadline: Option<Instant>,
 }
 
-/// Creates an in-memory pipe whose configured deadlines bound reads and whose
-/// output never waits for the reader. Dropping the writer delivers EOF after
-/// its bytes. Direct standard I/O is unlimited until a deadline is configured.
+/// Creates an in-memory pipe whose output never waits for the reader.
+///
+/// Reads and writes observe the configured deadlines, and have none until one
+/// is set. Dropping the writer delivers EOF after its bytes.
 pub fn pipe(clock: &Clock) -> (PipeReader, PipeWriter) {
     let (outgoing, incoming) = mpsc::unbounded();
     (
@@ -105,12 +109,15 @@ pub fn pipe(clock: &Clock) -> (PipeReader, PipeWriter) {
 
 impl io::Read for PipeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Fail at once if the read deadline has already passed
         if let Some(deadline) = self.deadline {
             remaining(&self.clock, deadline)?;
         }
         if buf.is_empty() {
             return Ok(0);
         }
+
+        // Take the next chunk once the current one is consumed, then read from it
         if self.buffered.position() == self.buffered.get_ref().len() as u64 {
             let incoming = match self.deadline {
                 Some(deadline) => self.clock.recv_deadline(&self.incoming, deadline),
@@ -174,7 +181,9 @@ impl Write for PipeWriter {
     }
 }
 
-/// Returns the nonzero part of a deadline still available for an adapter call.
+/// Returns the time an adapter call has left before a deadline.
+///
+/// A deadline already reached returns a `TimedOut` error.
 pub fn remaining(clock: &Clock, deadline: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(clock.now())
@@ -182,7 +191,10 @@ pub fn remaining(clock: &Clock, deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::ErrorKind::TimedOut.into())
 }
 
-// init_tracing sets up a test logger to push log messages to stderr.
+/// Installs a trace-level logger writing to the test harness's captured output,
+/// once per process.
+///
+/// `RUST_LOG` can still set the levels of specific targets.
 pub fn init_tracing() {
     INIT.call_once(|| {
         tracing_subscriber::fmt()
@@ -197,8 +209,11 @@ pub fn init_tracing() {
     });
 }
 
-// served reads the next message and retains the sender delivered by the
-// latest Connected event, for tests exchanging messages across sessions.
+/// Reads the next message from a transport server, keeping `sender` on the
+/// server's current session.
+///
+/// An [`Event::Connected`] stores its sender and an [`Event::Disconnected`]
+/// clears it, for tests exchanging messages across sessions.
 pub fn served<R: Read, W: Write, A: Attester>(
     server: &mut Server<R, W, A>,
     sender: &mut Option<Sender<W>>,
