@@ -254,7 +254,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     // frame's budget; a fresh attempt here could block again.
                     Err(Error::SendFailed(err)) => return Err(Error::SendFailed(err)),
 
-                    // Tell the client that the handshake did not establish a session
+                    // Notify the client that the handshake did not establish a session
                     Err(err) => {
                         warn!("dropping wire handshake: {}", err);
                         if let Err(err) = self.outbound.send_dropped(Some(deadline)) {
@@ -389,14 +389,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
         self.receiver.take().is_some()
     }
 
-    /// Sends an empty frame to tell the client it has no session. Logs failures.
+    /// Sends an empty frame to notify the client it has no session. Logs failures.
     fn send_dropped(&self) {
         if let Err(err) = self.outbound.send_dropped(None) {
             warn!("failed to signal dropped session: {}", err);
         }
     }
 
-    /// Ends the encrypted session and tells the client with an empty frame.
+    /// Ends the encrypted session and notifies the client with an empty frame.
     /// The stream remains available for the client to connect again. Notification
     /// failures are logged. This does not produce a Disconnected event because
     /// the caller already knows the session ended.

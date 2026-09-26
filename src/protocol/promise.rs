@@ -274,8 +274,8 @@ pub(super) struct ResultSender {
 
 impl ResultSender {
     /// Publishes the result and hands back its callback, to run once the caller
-    /// holds no wire lock. The delivery flag tells byte admission whether the
-    /// promise still exists.
+    /// holds no wire lock. Byte admission reads the delivery flag to learn
+    /// whether the promise still exists.
     pub(super) fn send(self, result: Result<PromiseResult, Error>) -> Notification {
         // Lock before publishing: a concurrent waiter must not drop the promise
         // and clear its hook between receiving the result and our notification.

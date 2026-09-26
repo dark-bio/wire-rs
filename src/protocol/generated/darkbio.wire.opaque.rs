@@ -4,8 +4,8 @@
 ///
 /// Every message carries an id and is either a request, its id chosen by the
 /// host, or the host's response to a request of the Ark, echoing the Ark's id.
-/// To avoid id collisions, hosts allocate odd ids and Arks even ones, so a
-/// receiver can tell a response from a request by the parity of the id alone.
+/// To avoid id collisions, hosts allocate odd ids and Arks even ones, so the
+/// parity of the id alone distinguishes a response from a request.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HostToArk {
     /// Enveloping fields, reserved range 0x001-0x0ff
@@ -144,8 +144,8 @@ pub mod host_to_ark {
 ///
 /// Every message carries an id and is either a request, its id chosen by the
 /// Ark, or the Ark's response to a request of the host, echoing the host's id.
-/// To avoid id collisions, hosts allocate odd ids and Arks even ones, so a
-/// receiver can tell a response from a request by the parity of the id alone.
+/// To avoid id collisions, hosts allocate odd ids and Arks even ones, so the
+/// parity of the id alone distinguishes a response from a request.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ArkToHost {
     /// Enveloping fields, reserved range 0x001-0x0ff

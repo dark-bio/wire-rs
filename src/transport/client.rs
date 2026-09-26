@@ -342,7 +342,7 @@ impl<R: Read, W: Write> Client<R, W> {
 
         // Retrieve the next COBS encoded packet. A skipped frame may have
         // carried a sealed message, so the session cannot continue past it.
-        // An empty frame is the server telling us it has no session with us.
+        // An empty frame signals that the server has no session with us.
         let packet = match self.reader.next_packet(None) {
             Err(err) => {
                 if matches!(err, Error::FrameDecodingFailed(_) | Error::FrameTooLarge(_)) {
