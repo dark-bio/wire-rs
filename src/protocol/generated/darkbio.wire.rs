@@ -81,12 +81,12 @@ pub mod host_to_ark {
         /// Asks the Ark to authorize joining the app relay
         #[prost(message, tag = "1025")]
         RelayJoin(super::RelayJoinRequest),
-        /// Opaque request from the companion app to the Ark
+        /// Forwards one frame from the relay socket to the Ark
         #[prost(message, tag = "1026")]
-        RelayReq(super::RelayAppToArkRequest),
-        /// Opaque response from the companion app to an Ark request
+        RelayInbound(super::RelayInboundRequest),
+        /// Confirms the relay socket accepted the frame
         #[prost(message, tag = "1027")]
-        RelayRes(super::RelayAppToArkResponse),
+        RelayOutbound(super::RelayOutboundResponse),
         /// Starts the unlock, confirmed through the app
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockRequest),
@@ -160,7 +160,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -221,15 +221,12 @@ pub mod ark_to_host {
         /// Signed authorization for the cloud to join the relay
         #[prost(message, tag = "1025")]
         RelayJoin(super::RelayJoinResponse),
-        /// Opaque request from the Ark to the companion app
+        /// Confirms the Ark received the frame
         #[prost(message, tag = "1026")]
-        RelayReq(super::RelayArkToAppRequest),
-        /// Opaque response from the Ark to an app request
+        RelayInbound(super::RelayInboundResponse),
+        /// Asks the host to write one frame to its relay socket
         #[prost(message, tag = "1027")]
-        RelayRes(super::RelayArkToAppResponse),
-        /// Protocol violation found in an app response, for debugging
-        #[prost(message, tag = "1028")]
-        RelayFail(super::RelayAppToArkFailure),
+        RelayOutbound(super::RelayOutboundRequest),
         /// Acknowledges the completed unlock
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockResponse),
@@ -563,91 +560,47 @@ pub struct RelayJoinRequest {}
 /// to join the rendezvous point.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelayJoinResponse {
-    /// Seal[Ark->Cloud]["relaying-v1"][null](null)
+    /// Seal[Ark->Cloud]["relaying-v2:join"][null](null)
     #[prost(bytes = "vec", tag = "1")]
     pub auth: ::prost::alloc::vec::Vec<u8>,
 }
-/// RelayAppToArkRequest is an opaque request from the companion app that the Ark may
-/// respond to, or may flat out reject.
+/// RelayInboundRequest forwards one frame from the host's relay socket to the Ark.
+///
+/// The relay connects the Ark with its companion app through the host and the
+/// cloud. Its frames are opaque to the host, which forwards them unchanged in
+/// both directions and never interprets them. Each frame is sealed to its
+/// recipient by the other endpoint, or by the cloud itself.
+///
+/// The host sends one request for each message its relay socket delivers, in
+/// arrival order.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RelayAppToArkRequest {
-    /// Application layer request ID from the app
-    #[prost(uint64, tag = "1")]
-    pub id: u64,
-    /// Seal[App->Ark]["relaying-v1:request"][id](\[method, [params...]\]))
-    #[prost(bytes = "vec", tag = "2")]
-    pub req: ::prost::alloc::vec::Vec<u8>,
+pub struct RelayInboundRequest {
+    /// Seal[App|Cloud->Ark]["relaying-v2:frame"][null](...)
+    #[prost(bytes = "vec", tag = "1")]
+    pub frame: ::prost::alloc::vec::Vec<u8>,
 }
-/// RelayArkToAppResponse is an opaque response from the Ark to the companion app to an
-/// opaque request.
+/// RelayInboundResponse confirms receipt of the frame. The Ark answers as soon
+/// as it has the frame, before processing it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RelayInboundResponse {}
+/// RelayOutboundRequest asks the host to write one frame to its relay socket.
+///
+/// A host without a relay socket attaches one first through relay_join. If it
+/// cannot, it answers with the reserved UNAVAILABLE error.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RelayArkToAppResponse {
-    /// Application layer request ID from the app being responding to
-    #[prost(uint64, tag = "1")]
-    pub id: u64,
-    /// Seal[Ark->App]["relaying-v1:response"][id](\[result, [err_code, err_str]\])
-    #[prost(bytes = "vec", tag = "2")]
-    pub res: ::prost::alloc::vec::Vec<u8>,
+pub struct RelayOutboundRequest {
+    /// Seal[Ark->App]["relaying-v2:frame"][null](...)
+    #[prost(bytes = "vec", tag = "1")]
+    pub frame: ::prost::alloc::vec::Vec<u8>,
 }
-/// RelayAppToArkFailure is returned if a low level protocol violation is detected
-/// when an app-to-ark response was processed.
+/// RelayOutboundResponse confirms that the relay socket accepted the frame, which
+/// does not mean the frame reached the app.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RelayOutboundResponse {}
+/// UnlockRequest asks the Ark to open its user data storage.
 ///
-/// This is not an actionable message, rather it's just a way to expose a protocol
-/// failure / violation to the calling app for debugging purposes.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RelayAppToArkFailure {
-    /// Reason for rejecting the response at the protocol level
-    #[prost(string, tag = "1")]
-    pub error: ::prost::alloc::string::String,
-}
-/// RelayArkToAppRequest is an opaque request from the Ark to the companion app, which
-/// will generally be sent as an interim response to some other request, requiring
-/// authorization from the app side.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RelayArkToAppRequest {
-    /// Application layer request ID from the ark
-    #[prost(uint64, tag = "1")]
-    pub id: u64,
-    /// Seal[Ark->App]["relaying-v1:request"][id](\[method, [params...]\])
-    #[prost(bytes = "vec", tag = "2")]
-    pub req: ::prost::alloc::vec::Vec<u8>,
-}
-/// RelayAppToArkResponse is an opaque response from the companion app to an opaque
-/// Ark request. The ark will respond with the deferred response to the original
-/// request.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RelayAppToArkResponse {
-    /// Application layer request ID from the ark being responding to
-    #[prost(uint64, tag = "1")]
-    pub id: u64,
-    /// Seal[App->Ark]["relaying-v1:response"][id](\[result, [err_code, err_str]\])
-    #[prost(bytes = "vec", tag = "2")]
-    pub res: ::prost::alloc::vec::Vec<u8>,
-}
-/// UnlockRequest requests the device to start the unlock procedure. This request
-/// is async, potentially returning a response only after confirming with the app.
-///
-/// It will trigger sending a RelayArkToAppRequest with the request content:
-///    - method: "unlock"
-///    - params: \[\]
-///
-/// The request expects a RelayAppToArkResponse with the response content:
-///
-///    If approved:
-///      - result = key: \[u8; 32\] // Shared secret from the pairing protocol
-///      - err_code: 0
-///      - err_str:  ""
-///
-///    If denied:
-///      - result = key = \[0u8; 32\] // All zeroes (signals a denial)
-///      - err_code: 0              // No error, deny is valid user choice
-///      - err_str:  ""             // No error, deny is valid user choice
-///
-/// where:
-///    - key: Symmetric key for accessing the storage partition
-///
-/// Note, relayed messages are encrypted and authenticated on the timestamp and
-/// request/response id, so there's no need for further complications.
+/// The Ark answers once the owner approves or declines on their phone, or the
+/// approval window runs out.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnlockRequest {}
 /// UnlockResponse contains whether the unlock was successfully executed.
@@ -689,30 +642,8 @@ pub struct ExecutionUploadChunkResponse {}
 /// execute the uploaded 3rd party app. The upload must have been completed
 /// (i.e. the sum of chunk sizes matches the declared size).
 ///
-/// This request is async, potentially returning a response only after confirming
-/// with the app.
-///
-/// It will trigger sending a RelayArkToAppRequest with the request content:
-///    - method: "execute"
-///    - params: \[task: string\]
-///
-/// The request expects a RelayAppToArkResponse with the response content:
-///
-///    If approved:
-///      - result = approval = true  // CBOR boolean
-///      - err_code: 0
-///      - err_str:  ""
-///
-///    If denied:
-///      - result = approval = false // CBOR boolean
-///      - err_code: 0              // No error, deny is valid user choice
-///      - err_str:  ""             // No error, deny is valid user choice
-///
-/// where:
-///    - approval: Whether the user approved or denied the execution request
-///
-/// Note, relayed messages are encrypted and authenticated on the timestamp and
-/// request/response id, so there's no need for further complications.
+/// The Ark answers once the owner approves or declines on their phone, or the
+/// approval window runs out.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionScheduleRequest {
     /// Task id returned by ExecutionUploadStartResponse

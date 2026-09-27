@@ -81,12 +81,12 @@ pub mod host_to_ark {
         /// Asks the Ark to authorize joining the app relay
         #[prost(bytes, tag = "1025")]
         RelayJoin(::prost::bytes::Bytes),
-        /// Opaque request from the companion app to the Ark
+        /// Forwards one frame from the relay socket to the Ark
         #[prost(bytes, tag = "1026")]
-        RelayReq(::prost::bytes::Bytes),
-        /// Opaque response from the companion app to an Ark request
+        RelayInbound(::prost::bytes::Bytes),
+        /// Confirms the relay socket accepted the frame
         #[prost(bytes, tag = "1027")]
-        RelayRes(::prost::bytes::Bytes),
+        RelayOutbound(::prost::bytes::Bytes),
         /// Starts the unlock, confirmed through the app
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
@@ -160,7 +160,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1028, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -221,15 +221,12 @@ pub mod ark_to_host {
         /// Signed authorization for the cloud to join the relay
         #[prost(bytes, tag = "1025")]
         RelayJoin(::prost::bytes::Bytes),
-        /// Opaque request from the Ark to the companion app
+        /// Confirms the Ark received the frame
         #[prost(bytes, tag = "1026")]
-        RelayReq(::prost::bytes::Bytes),
-        /// Opaque response from the Ark to an app request
+        RelayInbound(::prost::bytes::Bytes),
+        /// Asks the host to write one frame to its relay socket
         #[prost(bytes, tag = "1027")]
-        RelayRes(::prost::bytes::Bytes),
-        /// Protocol violation found in an app response, for debugging
-        #[prost(bytes, tag = "1028")]
-        RelayFail(::prost::bytes::Bytes),
+        RelayOutbound(::prost::bytes::Bytes),
         /// Acknowledges the completed unlock
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
