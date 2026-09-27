@@ -20,18 +20,28 @@ fn test_input_format() {
         assert!(!run(input));
     }
 
-    // Accept a relay failure only on the host, the one side whose envelope
-    // defines it, and refuse it with a truncated field appended
+    // Build an envelope only the host can decode. The Ark would parse its content
+    // as a SlotIdentifyRequest, whose field 1 is a string, not a varint.
     let bytes = ArkToHost {
         id: 2,
         err: None,
-        content: Some(ark_to_host::Content::RelayFail(Default::default())),
+        content: Some(ark_to_host::Content::SlotIdentify(
+            schema::SlotIdentifyResponse {
+                kind: schema::SlotKind::SlotReferenceGenome.into(),
+                ..Default::default()
+            },
+        )),
     }
     .encode_to_vec();
+
+    // Accept the envelope only when the direction byte selects the host decoder
     for direction in [0, 1, 254, 255] {
+        // Decode every byte after the direction
         let mut input = vec![direction];
         input.extend_from_slice(&bytes);
         assert_eq!(run(&input), direction & 1 != 0);
+
+        // Refuse a truncated field after the envelope
         input.push(0x80);
         assert!(!run(&input));
     }

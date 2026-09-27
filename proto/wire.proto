@@ -54,9 +54,9 @@ message HostToArk {
 
     // Relay messages, reserved range 0x401-0x500
 
-    RelayJoinRequest      relay_join = 0x401; // Asks the Ark to authorize joining the app relay
-    RelayAppToArkRequest  relay_req = 0x402;  // Opaque request from the companion app to the Ark
-    RelayAppToArkResponse relay_res = 0x403;  // Opaque response from the companion app to an Ark request
+    RelayJoinRequest      relay_join = 0x401;     // Asks the Ark to authorize joining the app relay
+    RelayInboundRequest   relay_inbound = 0x402;  // Forwards one frame from the relay socket to the Ark
+    RelayOutboundResponse relay_outbound = 0x403; // Confirms the relay socket accepted the frame
 
     // Operational messages, reserved range 0x501-0x600
 
@@ -135,10 +135,9 @@ message ArkToHost {
 
     // Relay messages, reserved range 0x401-0x500
 
-    RelayJoinResponse     relay_join = 0x401; // Signed authorization for the cloud to join the relay
-    RelayArkToAppRequest  relay_req = 0x402;  // Opaque request from the Ark to the companion app
-    RelayArkToAppResponse relay_res = 0x403;  // Opaque response from the Ark to an app request
-    RelayAppToArkFailure  relay_fail = 0x404; // Protocol violation found in an app response, for debugging
+    RelayJoinResponse    relay_join = 0x401;     // Signed authorization for the cloud to join the relay
+    RelayInboundResponse relay_inbound = 0x402;  // Confirms the Ark received the frame
+    RelayOutboundRequest relay_outbound = 0x403; // Asks the host to write one frame to its relay socket
 
     // Operational messages, reserved range 0x501-0x600
 
@@ -424,70 +423,43 @@ message RelayJoinRequest {
 // relaying (i.e. paired) and if so, it signs an authorization for the server
 // to join the rendezvous point.
 message RelayJoinResponse {
-  bytes auth = 1; // Seal[Ark->Cloud]["relaying-v1"][null](null)
+  bytes auth = 1; // Seal[Ark->Cloud]["relaying-v2:join"][null](null)
 }
 
-// RelayAppToArkRequest is an opaque request from the companion app that the Ark may
-// respond to, or may flat out reject.
-message RelayAppToArkRequest {
-  uint64 id = 1;  // Application layer request ID from the app
-  bytes  req = 2; // Seal[App->Ark]["relaying-v1:request"][id]([method, [params...]]))
-}
-// RelayArkToAppResponse is an opaque response from the Ark to the companion app to an
-// opaque request.
-message RelayArkToAppResponse {
-  uint64 id = 1;  // Application layer request ID from the app being responding to
-  bytes  res = 2; // Seal[Ark->App]["relaying-v1:response"][id]([result, [err_code, err_str]])
-}
-// RelayAppToArkFailure is returned if a low level protocol violation is detected
-// when an app-to-ark response was processed.
+// RelayInboundRequest forwards one frame from the host's relay socket to the Ark.
 //
-// This is not an actionable message, rather it's just a way to expose a protocol
-// failure / violation to the calling app for debugging purposes.
-message RelayAppToArkFailure {
-  string error = 1; // Reason for rejecting the response at the protocol level
+// The relay connects the Ark with its companion app through the host and the
+// cloud. Its frames are opaque to the host, which forwards them unchanged in
+// both directions and never interprets them. Each frame is sealed to its
+// recipient by the other endpoint, or by the cloud itself.
+//
+// The host sends one request for each message its relay socket delivers, in
+// arrival order.
+message RelayInboundRequest {
+  bytes frame = 1; // Seal[App|Cloud->Ark]["relaying-v2:frame"][null](...)
+}
+// RelayInboundResponse confirms receipt of the frame. The Ark answers as soon
+// as it has the frame, before processing it.
+message RelayInboundResponse {
 }
 
-// RelayArkToAppRequest is an opaque request from the Ark to the companion app, which
-// will generally be sent as an interim response to some other request, requiring
-// authorization from the app side.
-message RelayArkToAppRequest {
-  uint64 id = 1;  // Application layer request ID from the ark
-  bytes  req = 2; // Seal[Ark->App]["relaying-v1:request"][id]([method, [params...]])
+// RelayOutboundRequest asks the host to write one frame to its relay socket.
+//
+// A host without a relay socket attaches one first through relay_join. If it
+// cannot, it answers with the reserved UNAVAILABLE error.
+message RelayOutboundRequest {
+  bytes frame = 1; // Seal[Ark->App]["relaying-v2:frame"][null](...)
 }
-// RelayAppToArkResponse is an opaque response from the companion app to an opaque
-// Ark request. The ark will respond with the deferred response to the original
-// request.
-message RelayAppToArkResponse {
-  uint64 id = 1;  // Application layer request ID from the ark being responding to
-  bytes  res = 2; // Seal[App->Ark]["relaying-v1:response"][id]([result, [err_code, err_str]])
+// RelayOutboundResponse confirms that the relay socket accepted the frame, which
+// does not mean the frame reached the app.
+message RelayOutboundResponse {
 }
 
 
-// UnlockRequest requests the device to start the unlock procedure. This request
-// is async, potentially returning a response only after confirming with the app.
+// UnlockRequest asks the Ark to open its user data storage.
 //
-// It will trigger sending a RelayArkToAppRequest with the request content:
-//   - method: "unlock"
-//   - params: []
-//
-// The request expects a RelayAppToArkResponse with the response content:
-//
-//   If approved:
-//     - result = key: [u8; 32] // Shared secret from the pairing protocol
-//     - err_code: 0
-//     - err_str:  ""
-//
-//   If denied:
-//     - result = key = [0u8; 32] // All zeroes (signals a denial)
-//     - err_code: 0              // No error, deny is valid user choice
-//     - err_str:  ""             // No error, deny is valid user choice
-//
-// where:
-//   - key: Symmetric key for accessing the storage partition
-//
-// Note, relayed messages are encrypted and authenticated on the timestamp and
-// request/response id, so there's no need for further complications.
+// The Ark answers once the owner approves or declines on their phone, or the
+// approval window runs out.
 message UnlockRequest{
 }
 // UnlockResponse contains whether the unlock was successfully executed.
@@ -521,30 +493,8 @@ message ExecutionUploadChunkResponse{
 // execute the uploaded 3rd party app. The upload must have been completed
 // (i.e. the sum of chunk sizes matches the declared size).
 //
-// This request is async, potentially returning a response only after confirming
-// with the app.
-//
-// It will trigger sending a RelayArkToAppRequest with the request content:
-//   - method: "execute"
-//   - params: [task: string]
-//
-// The request expects a RelayAppToArkResponse with the response content:
-//
-//   If approved:
-//     - result = approval = true  // CBOR boolean
-//     - err_code: 0
-//     - err_str:  ""
-//
-//   If denied:
-//     - result = approval = false // CBOR boolean
-//     - err_code: 0              // No error, deny is valid user choice
-//     - err_str:  ""             // No error, deny is valid user choice
-//
-// where:
-//   - approval: Whether the user approved or denied the execution request
-//
-// Note, relayed messages are encrypted and authenticated on the timestamp and
-// request/response id, so there's no need for further complications.
+// The Ark answers once the owner approves or declines on their phone, or the
+// approval window runs out.
 message ExecutionScheduleRequest{
   uint64 taskid = 1; // Task id returned by ExecutionUploadStartResponse
 }
