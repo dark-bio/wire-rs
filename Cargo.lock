@@ -450,9 +450,9 @@ dependencies = [
 
 [[package]]
 name = "darkbio-trust"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d3d06e8971c65286e956a3b8eadcde851e7f60ec4a854d04ce84b9db14725e"
+checksum = "2b2e39ff598220ffd978244d6d1a93dd0103c4819e25c491253670cb974e738f"
 dependencies = [
  "darkbio-crypto",
  "hex",
