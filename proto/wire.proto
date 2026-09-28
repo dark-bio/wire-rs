@@ -423,7 +423,7 @@ message RelayJoinRequest {
 // relaying (i.e. paired) and if so, it signs an authorization for the server
 // to join the rendezvous point.
 message RelayJoinResponse {
-  bytes auth = 1; // Seal[Ark->Cloud]["relaying-v2:join"][null](null)
+  bytes auth = 1; // Seal[Ark->Cloud]["relaying-v2:join"][cloud_crypto_id](null)
 }
 
 // RelayInboundRequest forwards one frame from the host's relay socket to the Ark.
@@ -431,12 +431,13 @@ message RelayJoinResponse {
 // The relay connects the Ark with its companion app through the host and the
 // cloud. Its frames are opaque to the host, which forwards them unchanged in
 // both directions and never interprets them. Each frame is sealed to its
-// recipient by the other endpoint, or by the cloud itself.
+// recipient by the other endpoint, or by the cloud itself, and its
+// authenticated data names the recipient's encryption key.
 //
 // The host sends one request for each message its relay socket delivers, in
 // arrival order.
 message RelayInboundRequest {
-  bytes frame = 1; // Seal[App|Cloud->Ark]["relaying-v2:frame"][null](...)
+  bytes frame = 1; // Seal[App|Cloud->Ark]["relaying-v2:frame"][ark_crypto_id](...)
 }
 // RelayInboundResponse confirms receipt of the frame. The Ark answers as soon
 // as it has the frame, before processing it.
@@ -448,7 +449,7 @@ message RelayInboundResponse {
 // A host without a relay socket attaches one first through relay_join. If it
 // cannot, it answers with the reserved UNAVAILABLE error.
 message RelayOutboundRequest {
-  bytes frame = 1; // Seal[Ark->App]["relaying-v2:frame"][null](...)
+  bytes frame = 1; // Seal[Ark->App]["relaying-v2:frame"][app_crypto_id](...)
 }
 // RelayOutboundResponse confirms that the relay socket accepted the frame, which
 // does not mean the frame reached the app.

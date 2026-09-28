@@ -560,7 +560,7 @@ pub struct RelayJoinRequest {}
 /// to join the rendezvous point.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelayJoinResponse {
-    /// Seal[Ark->Cloud]["relaying-v2:join"][null](null)
+    /// Seal[Ark->Cloud]["relaying-v2:join"][cloud_crypto_id](null)
     #[prost(bytes = "vec", tag = "1")]
     pub auth: ::prost::alloc::vec::Vec<u8>,
 }
@@ -569,13 +569,14 @@ pub struct RelayJoinResponse {
 /// The relay connects the Ark with its companion app through the host and the
 /// cloud. Its frames are opaque to the host, which forwards them unchanged in
 /// both directions and never interprets them. Each frame is sealed to its
-/// recipient by the other endpoint, or by the cloud itself.
+/// recipient by the other endpoint, or by the cloud itself, and its
+/// authenticated data names the recipient's encryption key.
 ///
 /// The host sends one request for each message its relay socket delivers, in
 /// arrival order.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelayInboundRequest {
-    /// Seal[App|Cloud->Ark]["relaying-v2:frame"][null](...)
+    /// Seal[App|Cloud->Ark]["relaying-v2:frame"][ark_crypto_id](...)
     #[prost(bytes = "vec", tag = "1")]
     pub frame: ::prost::alloc::vec::Vec<u8>,
 }
@@ -589,7 +590,7 @@ pub struct RelayInboundResponse {}
 /// cannot, it answers with the reserved UNAVAILABLE error.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelayOutboundRequest {
-    /// Seal[Ark->App]["relaying-v2:frame"][null](...)
+    /// Seal[Ark->App]["relaying-v2:frame"][app_crypto_id](...)
     #[prost(bytes = "vec", tag = "1")]
     pub frame: ::prost::alloc::vec::Vec<u8>,
 }
