@@ -31,8 +31,8 @@ base64 = { version = "0.23", optional = true }
 criterion = { version = "0.8", optional = true }
 darkbio-clock = "0.3"
 darkbio-cobs = "1"
-darkbio-crypto = { version = "0.19.1", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
-darkbio-trust = "0.6.0"
+darkbio-crypto = { version = "0.19.3", features = ["cbor", "cose", "cwt", "xdsa", "xhpke"] }
+darkbio-trust = "0.6.1"
 getrandom = { version = "0.4", optional = true }
 memchr = "2"
 prost = "0.14"
