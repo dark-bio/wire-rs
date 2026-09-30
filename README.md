@@ -25,7 +25,7 @@ The protocol is built for USB bulk endpoints, which browsers can drive through W
 - There is one long-lived stream, created by the device and shared by every application in turn. Bytes one application leaves in the buffers may reach the next.
 - An application can close its own handle and rely on the usual I/O events. The Ark cannot recreate its endpoints without a slow and noisy USB reconnect.
 
-So the protocol runs its own sessions and tolerates junk already on the line when a client arrives. Packets travel as [COBS](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing) frames delimited by zero bytes, and an empty frame is a reset. Frames are at most 2 MiB, and a larger one ends the session. A client opens every session with a reset and a handshake, skipping stale data until the Ark answers. When the Ark ends a session or receives data outside one, it sends a reset too, so the client knows to connect again.
+So the protocol runs its own sessions and tolerates junk already on the line when a client arrives. Packets travel as [COBS](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing) frames delimited by zero bytes, and an empty frame is a reset. Frames are at most 2 MiB, and a larger one ends the session. A client opens every session with a reset and a handshake, skipping stale data until the Ark answers. When the Ark ends a session or receives data outside one, it tries to send a reset too, so the client knows to connect again.
 
 ## Handshake and trust
 
@@ -53,11 +53,11 @@ Both sides send requests and answer the peer's, with any number in flight at onc
 
 A request returns a `Promise` at once, and `wait` blocks until the reply arrives or the deadline passes. The deadline includes the time spent in the outgoing queue. An expired request can still reach the peer. A responder dropped without an answer sends an `UNANSWERED` error. A request whose content this build does not know gets `UNKNOWN`, so a newer peer learns what an older one serves.
 
-The application must keep receiving and answering the peer's requests while its own wait for replies. By default, a session holds at most 1024 pending peer requests and 16 MiB of buffered incoming messages. Exceeding either closes the session, since the protocol has no flow control.
+The application must keep receiving and answering the peer's requests while its own requests wait for replies. By default, a session holds at most 1024 pending peer requests and 16 MiB of buffered incoming messages. Exceeding either closes the session, since the protocol has no flow control.
 
 ## Timeouts and clocks
 
-A handshake has 5 s to complete, and each outgoing frame 5 s to be written, both configurable. A timeout fails that handshake or send without closing the byte stream, so a new session can start on it. Reads in an established session have no timeout. They wait until data arrives or the stream shuts down.
+A handshake has 5 s to complete, and each outgoing frame 5 s to be written. `Stream::set_write_timeout` changes the frame budget. Reads in an established session have no timeout. They wait until data arrives or the stream shuts down.
 
 The crate reads all time from the stream's clock, the one its reader and writer report. That clock is real by default, and it drives every deadline and the check of the attestation's validity. Tests build in-memory streams on a [darkbio-clock](https://github.com/dark-bio/clock-rs) `TestClock` and advance it by hand, so a 5 s timeout passes without waiting 5 s.
 

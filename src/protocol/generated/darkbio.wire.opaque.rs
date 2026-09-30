@@ -242,7 +242,7 @@ pub mod ark_to_host {
         /// Whether the app still runs, with its result once done
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
-        /// Acknowledges the cancelled run or upload
+        /// Acknowledges the canceled run or upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
         /// Current state of every data slot
