@@ -25,9 +25,7 @@ The protocol is built for USB bulk endpoints, which browsers can drive through W
 - There is one long-lived stream, created by the device and shared by every application in turn. Bytes one application leaves in the buffers may reach the next.
 - An application can close its own handle and rely on the usual I/O events. The Ark cannot recreate its endpoints without a slow and noisy USB reconnect.
 
-So the protocol runs its own sessions and tolerates junk already on the line when a client arrives. Packets travel as [COBS](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing) frames delimited by zero bytes, and an empty frame is a reset. Frames are at most 2 MiB, and a larger one ends the session.
-
-A client opens every session with a reset and a handshake, skipping stale data until the Ark answers. The Ark resets too when it ends a session or receives data outside one, so the client knows to connect again. The Ark's resets are best effort, so a host that stopped reading can miss one and stay unaware of the lost session. Data the host sends afterwards prompts another.
+So the protocol runs its own sessions and tolerates junk already on the line when a client arrives. Packets travel as [COBS](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing) frames delimited by zero bytes, and an empty frame is a reset. Frames are at most 2 MiB, and a larger one ends the session. A client opens every session with a reset and a handshake, skipping stale data until the Ark answers. When the Ark ends a session or receives data outside one, it tries to send a reset too, so the client knows to connect again.
 
 ## Handshake and trust
 
@@ -59,17 +57,13 @@ The application must keep receiving and answering the peer's requests while its 
 
 ## Timeouts and clocks
 
-A handshake's reads and writes share a 5 s budget, and each outgoing frame gets 5 s to be encoded, written and flushed. `Stream::set_write_timeout` changes the frame budget. The protocol layer keeps the handshake budget at 5 s, while the transport's `Client` and `Server` can change it. Waiting for locks or callbacks can stretch a call beyond these budgets.
-
-A timeout fails its handshake or send. The transport and the protocol server leave the byte stream open for a new session. A protocol client closes its stream, so reconnecting needs a new one. Reads in an established session have no timeout. They wait until data arrives or the stream shuts down.
+A handshake has 5 s to complete, and each outgoing frame 5 s to be written. `Stream::set_write_timeout` changes the frame budget. Reads in an established session have no timeout. They wait until data arrives or the stream shuts down.
 
 The crate reads all time from the stream's clock, the one its reader and writer report. That clock is real by default, and it drives every deadline and the check of the attestation's validity. Tests build in-memory streams on a [darkbio-clock](https://github.com/dark-bio/clock-rs) `TestClock` and advance it by hand, so a 5 s timeout passes without waiting 5 s.
 
 ## Test vectors
 
-The `vectors` directory holds golden transcripts for validating third-party clients. There are no server vectors, since the Ark, genuine or emulated, is the only server. Each JSON file holds one client scenario, such as stale data before a handshake, an oversized frame or a timeout. It records the server's keys, the client's calls with their results, and every byte read and written.
-
-A client under test replays the reads and must produce the recorded writes. Encrypted frames differ between runs, so the replay opens them with the server's keys and compares their contents. The writes must also keep the recorded boundaries, since the scripted failures happen there. A client that merges the reset and its hello into one write fails the replay, even though the Ark accepts the same bytes. Only a recovery delimiter recorded on its own may lead a larger write.
+The `vectors` directory holds golden transcripts for validating third-party clients. Each JSON file holds one client scenario, such as stale data before a handshake, an oversized frame or a timeout. It records the server's keys, the client's calls with their results, and every byte read and written. A client under test replays the reads and must produce the recorded writes. Encrypted frames differ between runs, so the replay opens them with the server's keys and compares their contents. There are no server vectors, since the Ark, genuine or emulated, is the only server.
 
 ## Stability
 
