@@ -6,9 +6,14 @@
 
 //! Replays recorded scenarios against a fresh client.
 //!
-//! Reads follow the transcript. Deterministic writes must match the recorded
-//! bytes. Complete encrypted frames can differ, so the replay opens them with
-//! the server's keys to check their contents.
+//! Reads follow the transcript, and writes follow its recorded write events
+//! with the faults scripted at them. A recorded lone recovery delimiter may
+//! lead a larger write, which then counts as a partial write of that one byte.
+//!
+//! Signals and complete HostHello frames must match the recorded bytes, while
+//! the unfinished output of a failed write is accepted as is. Complete
+//! encrypted frames can differ, so the replay opens them with the server's
+//! keys to check their contents.
 
 use super::{Event, ReadError, Vector};
 use crate::transport::mock::server::check_session;
