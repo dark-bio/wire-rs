@@ -986,8 +986,9 @@ pub enum ReservedErrors {
     /// The peer serves this request but not in its current state, before cloud
     /// sync or pairing. It may once the state changes.
     Unavailable = 4,
-    /// The peer serves this request but the owner refused the approval it asked
-    /// for on the phone. The owner's choice, not a failure.
+    /// The peer serves this request but the approval it asked for on the phone
+    /// did not authorize it. The owner declined, or the phone's answer broke the
+    /// approval's rules and counts as a decline.
     Unauthorized = 5,
     /// The peer serves this request but the approval it asked for did not arrive
     /// before its window ran out, on the phone or at the button.
