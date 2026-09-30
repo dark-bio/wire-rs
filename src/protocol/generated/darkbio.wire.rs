@@ -966,6 +966,7 @@ pub struct DatasetPath {
 /// ReservedErrors names the assigned protocol-wide errors in the reserved range
 /// 0x00 to 0xff (inclusive). No code in this range may be assigned a request
 /// specific meaning. Assigned codes must not be repurposed.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ReservedErrors {

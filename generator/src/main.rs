@@ -31,6 +31,9 @@ fn main() {
     // Load the schema's descriptors, which the bindings are generated from last
     let mut config = prost_build::Config::new();
     config.protoc_executable(&protoc).out_dir(&out_dir);
+
+    // Keep the reserved errors open, since new codes join them over time
+    config.enum_attribute(".darkbio.wire.ReservedErrors", "#[non_exhaustive]");
     let descriptors = config
         .load_fds(&[proto.join("wire.proto")], &[&proto])
         .expect("failed to load wire.proto");
