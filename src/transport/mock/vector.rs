@@ -100,8 +100,10 @@ pub enum Event {
     ///
     /// A partial failure combines two standard I/O calls in one event, the
     /// write that accepts the bytes and the next write or flush that fails.
-    /// Replay keeps these boundaries and the faults scripted at them, except
-    /// that a recorded lone recovery delimiter may lead a larger write.
+    ///
+    /// Replay keeps each event's boundaries and the faults scripted at them. A
+    /// recorded lone recovery delimiter is the exception, as a larger write may
+    /// start with it.
     Write {
         /// Bytes the adapter accepted.
         bytes: Vec<u8>,
