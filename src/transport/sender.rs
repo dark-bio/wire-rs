@@ -92,8 +92,7 @@ impl<W: Write> Sender<W> {
     ///
     /// # Panics
     ///
-    /// Panics on an unexpected encryption failure, a poisoned lock, or a write
-    /// timeout too large to add to an [`Instant`](std::time::Instant). Transport
+    /// Panics on an unexpected encryption failure or a poisoned lock. Transport
     /// reuse after a panic is unsupported.
     pub fn send(&self, message: &[u8]) -> Result<(), Error> {
         // Retain the transport and the session's context, refusing once either
@@ -611,6 +610,8 @@ mod tests {
 
     /// Tests that an I/O panic releases its active-operation count, so shutdown
     /// completes and the last active send releases the transport writer.
+    ///
+    /// The session still ends through the writer lock that the panic poisoned.
     #[test]
     fn test_close_with_panicking_send() {
         // Arrange a panic after shutdown releases the gated write
@@ -629,15 +630,22 @@ mod tests {
             closer,
             DEFAULT_WRITE_TIMEOUT,
         ));
-        let (_sealer, sender) = connect(&outbound, sender);
+        let (sealer, sender) = connect(&outbound, sender);
 
-        // Catch the send panic and require shutdown and writer drop to complete
+        // Catch the send panic and require shutdown to complete
         let sending = thread::spawn(move || {
             panic::catch_unwind(AssertUnwindSafe(|| sender.send(&payload(1))))
         });
         entered.recv().unwrap();
         outbound.close();
         assert!(sending.join().unwrap().is_err());
+
+        // End the session through the poisoned writer lock, as an owner's drop does
+        let ending = panic::catch_unwind(AssertUnwindSafe(|| outbound.end(&sealer)));
+        assert!(ending.is_ok());
+        assert!(outbound.finish_receive(&sealer, Ok(Vec::new())).is_err());
+
+        // Require the transport writer to go once the last reference drops
         drop(outbound);
         dropped.recv().unwrap();
     }

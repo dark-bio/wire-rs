@@ -11,12 +11,13 @@
 //! waiting for output.
 
 use super::framing::FrameWriter;
+use super::io::deadline_after;
 use super::{Closer, Error, Sender, Write};
 use crate::LogId;
 use darkbio_clock::Clock;
 use darkbio_crypto::xhpke;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 use tracing::{trace, warn};
 
@@ -120,8 +121,17 @@ impl<W: Write> Outbound<W> {
     /// Sends that obtain the writer first may finish before ending takes effect.
     /// The lock wait has no overall timeout. This leaves the stream open and
     /// sends no signal.
+    ///
+    /// A writer lock poisoned by a panicking adapter is still taken, only to
+    /// retire the binding. Dropping an owner after such a panic therefore does
+    /// not panic again.
     pub(crate) fn end(&self, sealer: &Arc<Mutex<xhpke::Sender>>) {
-        self.lock().end(sealer);
+        let framer = self.wait_writer().unwrap_or_else(PoisonError::into_inner);
+        Writer {
+            outbound: self,
+            framer,
+        }
+        .end(sealer);
     }
 
     /// Ends the session that `sealer` identifies and, on the server, sends an
@@ -135,7 +145,7 @@ impl<W: Write> Outbound<W> {
         if writer.end(sealer) && self.side == Side::Server {
             writer
                 .framer
-                .send_dropped(self.clock.now() + self.timeout)?;
+                .send_dropped(deadline_after(&self.clock, self.timeout))?;
         }
         Ok(())
     }
@@ -210,7 +220,7 @@ impl<W: Write> Outbound<W> {
         writer.unbind();
         writer
             .framer
-            .send_reset(deadline.min(self.clock.now() + self.timeout))
+            .send_reset(deadline.min(deadline_after(&self.clock, self.timeout)))
     }
 
     /// Removes the binding and sends an empty frame notification.
@@ -220,7 +230,7 @@ impl<W: Write> Outbound<W> {
     pub(crate) fn send_dropped(&self, limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
         writer.unbind();
-        let budget = self.clock.now() + self.timeout;
+        let budget = deadline_after(&self.clock, self.timeout);
         let deadline = limit.map_or(budget, |limit| limit.min(budget));
         writer.framer.send_dropped(deadline)
     }
@@ -231,7 +241,7 @@ impl<W: Write> Outbound<W> {
     /// best-effort failure notification.
     pub(super) fn send_packet(&self, packet: &[u8], limit: Option<Instant>) -> Result<(), Error> {
         let mut writer = self.lock();
-        let budget = self.clock.now() + self.timeout;
+        let budget = deadline_after(&self.clock, self.timeout);
         let deadline = limit.map_or(budget, |limit| limit.min(budget));
         let result = writer.framer.send_packet(packet, deadline);
         if let Err(err @ Error::SendFailed(_)) = &result {
@@ -247,7 +257,7 @@ impl<W: Write> Outbound<W> {
         let mut writer = self.lock();
         writer
             .framer
-            .send_frame_blob(frame, self.clock.now() + self.timeout)
+            .send_frame_blob(frame, deadline_after(&self.clock, self.timeout))
     }
 
     /// Acquires exclusive output ownership.
@@ -256,23 +266,28 @@ impl<W: Write> Outbound<W> {
     /// sealing order through the handoff. A poisoned writer is an
     /// implementation failure and is not recovered.
     pub(super) fn lock(&self) -> Writer<'_, W> {
+        // Keep the frame guard through any binding changes
+        let framer = self.wait_writer().expect("writer lock not poisoned");
+        Writer {
+            outbound: self,
+            framer,
+        }
+    }
+
+    /// Waits for the frame writer's lock, reporting whether a panic poisoned it.
+    fn wait_writer(&self) -> LockResult<MutexGuard<'_, FrameWriter<W>>> {
         // Let tests fence writer acquisition while another call owns the lock
         #[cfg(any(test, feature = "fuzz"))]
         {
             *self.writer_waits.0.lock().unwrap() += 1;
             self.writer_waits.1.notify_all();
         }
-        let framer = self.writer.lock().expect("writer lock not poisoned");
+        let framer = self.writer.lock();
         #[cfg(any(test, feature = "fuzz"))]
         {
             *self.writer_waits.0.lock().unwrap() -= 1;
         }
-
-        // Keep the frame guard through any binding changes
-        Writer {
-            outbound: self,
-            framer,
-        }
+        framer
     }
 
     /// Waits for calls to reach writer acquisition while a test holds that writer.
@@ -361,7 +376,7 @@ impl<W: Write> Writer<'_, W> {
         }
 
         // Write within a fresh frame budget, ending the session on failure
-        let deadline = self.outbound.clock.now() + self.outbound.timeout;
+        let deadline = deadline_after(&self.outbound.clock, self.outbound.timeout);
         if let Err(err) = self.framer.send_packet(packet, deadline) {
             if self.end(sealer) {
                 warn!("ending session {}: {}", log_id, err);
@@ -407,7 +422,7 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// Writer exposing its bytes for assertions about frame and notification order.
     #[derive(Clone)]
@@ -805,5 +820,56 @@ mod tests {
         let packet = reader.next_packet(None).unwrap().unwrap();
         assert_eq!(sealing::open(&mut peer, packet).unwrap(), payload(1));
         assert!(matches!(reader.next_packet(None), Err(Error::Terminated)));
+    }
+
+    /// Tests that a write budget too large to add to an instant expires every
+    /// frame at once, ending the session without touching the adapter.
+    #[test]
+    fn test_unrepresentable_budget_expires_output() {
+        // Bind a session on a server transport with an unrepresentable budget
+        let tester = test_clock();
+        let clock = tester.clock();
+        let collector = Collector(Arc::default(), clock.clone());
+        let outbound = Arc::new(Outbound::new(
+            collector.clone(),
+            Side::Server,
+            Closer::new(&clock, || {}),
+            Duration::MAX,
+        ));
+        let sealer = Arc::new(Mutex::new(contexts().0));
+        let sender = outbound.bind(&sealer);
+
+        // Time out the message, which ends its session
+        assert!(matches!(
+            sender.send(b"message"),
+            Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(matches!(
+            sender.send(b"late"),
+            Err(Error::EncryptionFailed(_))
+        ));
+
+        // Time out every standalone frame the same way
+        let deadline = clock.now() + DEFAULT_WRITE_TIMEOUT;
+        for (frame, result) in [
+            ("packet", outbound.send_packet(b"hello", None)),
+            ("dropped", outbound.send_dropped(None)),
+            ("reset", outbound.send_reset(deadline)),
+            ("blob", outbound.send_frame_blob(b"blob")),
+        ] {
+            assert!(
+                matches!(result, Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut),
+                "{frame}"
+            );
+        }
+
+        // Time out a local disconnect's notification too, with nothing written
+        let fresh = Arc::new(Mutex::new(contexts().0));
+        let _sender = outbound.bind(&fresh);
+        assert!(matches!(
+            outbound.disconnect(&fresh),
+            Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(collector.0.lock().unwrap().is_empty());
     }
 }

@@ -10,8 +10,8 @@
 use super::framing::{FrameReader, FrameWriter};
 use super::{
     Attestation, CRYPTO_DOMAIN_WIRE, CRYPTO_DOMAIN_WIRE_ARK_TO_HOST,
-    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Client, Error, Event, Read, Roots, Server, Stream, Verifier,
-    Write, handshake,
+    CRYPTO_DOMAIN_WIRE_HOST_TO_ARK, Client, DEFAULT_HANDSHAKE_TIMEOUT, Error, Event, Read, Roots,
+    Server, Stream, Verifier, Write, handshake,
 };
 use crate::{memory, protocol};
 use darkbio_clock::TestClock;
@@ -356,6 +356,178 @@ fn test_server_handshake_uses_clock_wall_time() {
     tester.set_system_time(UNIX_EPOCH - Duration::from_secs(1));
     writer.send_packet(&ack, deadline).unwrap();
     peer.join().unwrap();
+}
+
+/// Checks that a client keeps a session whose ack went out in time, even when
+/// its deadline passes before connecting returns.
+#[test]
+fn test_client_keeps_session_after_timely_ack() {
+    // Serve one handshake, reporting once the server holds the session
+    let mut tester = crate::transport::testing::test_clock();
+    let clock = tester.clock();
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let (connected, established) = mpsc::channel();
+    let serving = thread::spawn(move || {
+        let mut server = Server::new(ark, signer, attest);
+        assert!(matches!(server.recv().unwrap(), Event::Connected(_)));
+        connected.send(()).unwrap();
+        server.recv()
+    });
+
+    // Pass the client's deadline once its ack is out and the server holds the
+    // session
+    let mut client = Client::new(host);
+    client.ack_hook = Some(Box::new(move || {
+        established.recv().unwrap();
+        tester.advance(DEFAULT_HANDSHAKE_TIMEOUT * 2);
+    }));
+    let (sender, _) = client.connect(&identity).unwrap();
+
+    // Deliver a message over the session both sides established
+    sender.send(b"hello").unwrap();
+    assert!(matches!(
+        serving.join().unwrap(),
+        Ok(Event::Message(message)) if message == b"hello"
+    ));
+}
+
+/// Checks that a server keeps a handshake whose ack it read in time, even when
+/// its deadline passes while it opens that ack.
+#[test]
+fn test_server_keeps_session_after_timely_ack() {
+    // Connect a client, reporting once its connect call has returned
+    let mut tester = crate::transport::testing::test_clock();
+    let clock = tester.clock();
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let (connected, established) = mpsc::channel();
+    let connecting = thread::spawn(move || {
+        let mut client = Client::new(host);
+        client.connect(&identity).unwrap();
+        connected.send(()).unwrap();
+        client.recv()
+    });
+
+    // Pass the server's deadline once it opened the ack and the client holds
+    // the session
+    let mut server = Server::new(ark, signer, attest);
+    server.ack_hook = Some(Box::new(move || {
+        established.recv().unwrap();
+        tester.advance(DEFAULT_HANDSHAKE_TIMEOUT * 2);
+    }));
+    let Event::Connected(sender) = server.recv().unwrap() else {
+        panic!("expected a connection");
+    };
+
+    // Deliver a message over the session both sides established
+    sender.send(b"hello").unwrap();
+    assert_eq!(connecting.join().unwrap().unwrap(), b"hello");
+}
+
+/// Checks that a handshake budget too large for an instant expires at once,
+/// and that a finite budget then connects on the same stream.
+#[test]
+fn test_unrepresentable_handshake_budget_expires_at_once() {
+    // Refuse the client's reset before any output
+    let tester = crate::transport::testing::test_clock();
+    let clock = tester.clock();
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let serving = thread::spawn(move || {
+        let mut server = Server::new(ark, signer, attest);
+        matches!(server.recv(), Ok(Event::Connected(_)))
+    });
+    let mut client = Client::new(host).set_handshake_timeout(Duration::MAX);
+    assert!(matches!(
+        client.connect(&identity),
+        Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut
+    ));
+
+    // Connect on the same stream once the client's budget is finite again
+    let mut client = client.set_handshake_timeout(DEFAULT_HANDSHAKE_TIMEOUT);
+    client.connect(&identity).unwrap();
+    assert!(serving.join().unwrap());
+
+    // Expire the server's attempt as soon as a client's reset requests one
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let connecting = thread::spawn(move || Client::new(host).connect(&identity).map(|_| ()));
+    let mut server = Server::new(ark, signer, attest).set_handshake_timeout(Duration::MAX);
+    assert!(matches!(
+        server.recv(),
+        Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::TimedOut
+    ));
+
+    // Complete the same client's handshake once the server's budget is finite,
+    // the second zero of its reset pair starting the new attempt
+    let mut server = server.set_handshake_timeout(DEFAULT_HANDSHAKE_TIMEOUT);
+    assert!(matches!(server.recv(), Ok(Event::Connected(_))));
+    connecting.join().unwrap().unwrap();
+}
+
+/// Checks that a client whose verification runs past the handshake deadline
+/// fails without sending its ack, so the server never connects.
+#[test]
+fn test_client_expires_before_ack() {
+    /// Verifier that waits for the server to park on the ack, then passes the
+    /// handshake deadline before accepting the pinned key.
+    struct Slow {
+        /// Clock the verification moves past the deadline.
+        tester: std::sync::Mutex<TestClock>,
+        /// Identity key the verification accepts.
+        identity: xdsa::PublicKey,
+    }
+
+    impl Verifier for Slow {
+        type Info = Attestation;
+
+        fn verify(
+            &self,
+            attestation: &Attestation,
+            now: SystemTime,
+        ) -> Result<(xdsa::PublicKey, Self::Info), String> {
+            // Wait for the server to park on the ack, then pass both deadlines
+            let mut tester = self.tester.lock().unwrap();
+            tester.wait_blocked(1);
+            tester.advance(DEFAULT_HANDSHAKE_TIMEOUT * 2);
+            Verifier::verify(&self.identity, attestation, now)
+        }
+    }
+
+    // Serve one handshake attempt on the Ark side
+    let tester = crate::transport::testing::test_clock();
+    let clock = tester.clock();
+    let signer = xdsa::SecretKey::generate();
+    let identity = signer.public_key();
+    let attest = attestation(&signer, clock.system_time());
+    let (host, ark) = memory::duplex(64 * 1024, &clock);
+    let serving = thread::spawn(move || Server::new(ark, signer, attest).recv().map(|_| ()));
+
+    // Let verification pass the deadline, which must refuse the ack send
+    let verifier = Slow {
+        tester: std::sync::Mutex::new(tester),
+        identity,
+    };
+    let mut client = Client::new(host);
+    assert!(matches!(
+        client.connect(&verifier),
+        Err(Error::SendFailed(err)) if err.kind() == io::ErrorKind::TimedOut
+    ));
+
+    // Require the server to time out waiting for the ack it never got
+    assert!(matches!(
+        serving.join().unwrap(),
+        Err(Error::RecvFailed(err)) if err.kind() == io::ErrorKind::TimedOut
+    ));
 }
 
 /// Checks that sessions and their handles report the stream's clock, also after

@@ -11,7 +11,7 @@ use crate::LogId;
 use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
-use crate::transport::io::check_deadline;
+use crate::transport::io::deadline_after;
 use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
 use crate::transport::sender::Sender;
@@ -130,6 +130,10 @@ pub struct Client<R: Read, W: Write> {
     outbound: Arc<Outbound<W>>,
     /// Label of the latest session in log lines, zero before the first one.
     log_id: LogId,
+
+    /// Hook a test runs once the next handshake has written its HostAck.
+    #[cfg(test)]
+    pub(super) ack_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<R: Read, W: Write> Client<R, W> {
@@ -151,6 +155,8 @@ impl<R: Read, W: Write> Client<R, W> {
             sealer: None,
             outbound,
             log_id: LogId::default(),
+            #[cfg(test)]
+            ack_hook: None,
         }
     }
 
@@ -162,8 +168,8 @@ impl<R: Read, W: Write> Client<R, W> {
     /// frame is also limited by the stream's write timeout. Waiting for locks
     /// and verifier callbacks can extend the call beyond the deadline.
     ///
-    /// Zero expires attempts immediately. A duration too large to add to an
-    /// [`Instant`] panics when the next handshake's deadline is constructed.
+    /// Zero, or a duration too large to add to an [`Instant`], expires attempts
+    /// immediately.
     pub fn set_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -202,18 +208,18 @@ impl<R: Read, W: Write> Client<R, W> {
     /// to progress. Backpressure can instead fail an outgoing frame on timeout.
     ///
     /// The handshake uses one configured deadline, shared by output and peer
-    /// waits. Waiting for writes already in flight may extend the call. If
-    /// connecting fails, the client has no session and every sender it issued
-    /// before is invalid.
+    /// waits. A successful ack send within that deadline establishes the session.
+    /// Waiting for writes already in flight may extend the call. If connecting
+    /// fails, the client has no session and every sender it issued before is
+    /// invalid.
     ///
     /// # Panics
     ///
-    /// Panics if the handshake or write timeout is too large to add to an
-    /// [`Instant`], or if signing reads a wall time before the Unix epoch from
-    /// the stream's clock.
+    /// Panics if signing reads a wall time before the Unix epoch from the
+    /// stream's clock.
     pub fn connect<V: Verifier>(&mut self, verifier: &V) -> Result<(Sender<W>, V::Info), Error> {
         // Compute the deadline by which the handshake must finish
-        let deadline = self.outbound.clock.now() + self.handshake_timeout;
+        let deadline = deadline_after(&self.outbound.clock, self.handshake_timeout);
 
         // Generate ephemeral client keys for this session
         let host_xdsa_sk = xdsa::SecretKey::generate();
@@ -345,9 +351,15 @@ impl<R: Read, W: Write> Client<R, W> {
         )
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
 
-        // Send the ack, failing an attempt that finished past its deadline
+        // Send the ack, whose successful send within the deadline completes the
+        // handshake
         self.outbound.send_packet(&ack, Some(deadline))?;
-        check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
+
+        // Let a test move time on once the ack is out
+        #[cfg(test)]
+        if let Some(hook) = self.ack_hook.take() {
+            hook();
+        }
 
         // Session established, the ack ahead of anything sealed into it
         let sender = self.new_session(sender, receiver);
@@ -494,7 +506,7 @@ impl<R: Read, W: Write> Client<R, W> {
             host_xdsa_sk,
             host_xhpke_sk,
             Some(timestamp),
-            self.outbound.clock.now() + self.handshake_timeout,
+            deadline_after(&self.outbound.clock, self.handshake_timeout),
         )
     }
 

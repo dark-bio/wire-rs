@@ -85,8 +85,8 @@ impl<R: Read, W: Write> Stream<R, W> {
     /// peer replies is outside this budget. Handshake frames also share the
     /// overall handshake deadline, which can shorten this write budget.
     ///
-    /// Zero refuses output immediately. A duration too large to add to an
-    /// [`Instant`] panics when an outgoing frame's deadline is constructed.
+    /// Zero, or a duration too large to add to an [`Instant`], refuses output
+    /// immediately.
     pub fn set_write_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
