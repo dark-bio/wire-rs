@@ -989,6 +989,9 @@ pub enum ReservedErrors {
     /// The peer serves this request but the approval it asked for did not arrive
     /// before its window ran out, on the phone or at the button.
     Unconfirmed = 6,
+    /// The peer serves this request but the approval it asked for could not be
+    /// sent to the phone, since the relay failed on the way.
+    Undelivered = 7,
 }
 impl ReservedErrors {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1004,6 +1007,7 @@ impl ReservedErrors {
             Self::Unavailable => "RESERVED_ERRORS_UNAVAILABLE",
             Self::Unauthorized => "RESERVED_ERRORS_UNAUTHORIZED",
             Self::Unconfirmed => "RESERVED_ERRORS_UNCONFIRMED",
+            Self::Undelivered => "RESERVED_ERRORS_UNDELIVERED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1016,6 +1020,7 @@ impl ReservedErrors {
             "RESERVED_ERRORS_UNAVAILABLE" => Some(Self::Unavailable),
             "RESERVED_ERRORS_UNAUTHORIZED" => Some(Self::Unauthorized),
             "RESERVED_ERRORS_UNCONFIRMED" => Some(Self::Unconfirmed),
+            "RESERVED_ERRORS_UNDELIVERED" => Some(Self::Undelivered),
             _ => None,
         }
     }

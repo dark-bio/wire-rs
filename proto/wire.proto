@@ -211,6 +211,10 @@ enum ReservedErrors {
   // The peer serves this request but the approval it asked for did not arrive
   // before its window ran out, on the phone or at the button.
   RESERVED_ERRORS_UNCONFIRMED = 6;
+
+  // The peer serves this request but the approval it asked for could not be
+  // sent to the phone, since the relay failed on the way.
+  RESERVED_ERRORS_UNDELIVERED = 7;
 }
 
 
