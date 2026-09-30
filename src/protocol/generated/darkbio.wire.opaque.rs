@@ -221,7 +221,7 @@ pub mod ark_to_host {
         /// Signed authorization for the cloud to join the relay
         #[prost(bytes, tag = "1025")]
         RelayJoin(::prost::bytes::Bytes),
-        /// Confirms the Ark received the frame
+        /// Confirms the Ark opened the frame
         #[prost(bytes, tag = "1026")]
         RelayInbound(::prost::bytes::Bytes),
         /// Asks the host to write one frame to its relay socket

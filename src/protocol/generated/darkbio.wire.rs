@@ -221,7 +221,7 @@ pub mod ark_to_host {
         /// Signed authorization for the cloud to join the relay
         #[prost(message, tag = "1025")]
         RelayJoin(super::RelayJoinResponse),
-        /// Confirms the Ark received the frame
+        /// Confirms the Ark opened the frame
         #[prost(message, tag = "1026")]
         RelayInbound(super::RelayInboundResponse),
         /// Asks the host to write one frame to its relay socket
@@ -581,8 +581,9 @@ pub struct RelayInboundRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub frame: ::prost::alloc::vec::Vec<u8>,
 }
-/// RelayInboundResponse confirms receipt of the frame. The Ark answers as soon
-/// as it has the frame, before processing it.
+/// RelayInboundResponse confirms the Ark opened the frame, which decrypted and
+/// verified. The Ark answers before acting on the frame's content, and refuses
+/// a frame it cannot open with an error whose message names the cause.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelayInboundResponse {}
 /// RelayOutboundRequest asks the host to write one frame to its relay socket.
