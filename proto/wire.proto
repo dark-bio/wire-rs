@@ -136,7 +136,7 @@ message ArkToHost {
     // Relay messages, reserved range 0x401-0x500
 
     RelayJoinResponse    relay_join = 0x401;     // Signed authorization for the cloud to join the relay
-    RelayInboundResponse relay_inbound = 0x402;  // Confirms the Ark received the frame
+    RelayInboundResponse relay_inbound = 0x402;  // Confirms the Ark opened the frame
     RelayOutboundRequest relay_outbound = 0x403; // Asks the host to write one frame to its relay socket
 
     // Operational messages, reserved range 0x501-0x600
@@ -445,8 +445,9 @@ message RelayJoinResponse {
 message RelayInboundRequest {
   bytes frame = 1; // Seal[App|Cloud->Ark]["relaying-v2:frame"][ark_crypto_id](...)
 }
-// RelayInboundResponse confirms receipt of the frame. The Ark answers as soon
-// as it has the frame, before processing it.
+// RelayInboundResponse confirms the Ark opened the frame, which decrypted and
+// verified. The Ark answers before acting on the frame's content, and refuses
+// a frame it cannot open with an error whose message names the cause.
 message RelayInboundResponse {
 }
 
