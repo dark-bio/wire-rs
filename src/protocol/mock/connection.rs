@@ -557,7 +557,9 @@ impl Driver {
                 });
             }
             Step::HandshakeReadTimeout => {
-                // Fail the server's next read deadline once its hello flush blocks
+                // Fail the server's next read deadline once its hello flush
+                // blocks, watching for the pause its reader takes afterwards
+                let retries = self.server.as_ref().unwrap().inner.watch_read_retries();
                 let incoming = self.pipes[0].clone();
                 let outgoing = self.pipes[1].clone();
                 outgoing.pause(Operation::Flush, true);
@@ -574,6 +576,10 @@ impl Driver {
                 };
                 let _ = client.connect(&self.identity);
                 gate.finish();
+
+                // Let the server's reader retry, so it reads the next reset
+                let deadline = retries.recv().unwrap();
+                self.tester.advance_to(deadline);
             }
             Step::InboundLimits(id, requests, bytes) => {
                 let session = self

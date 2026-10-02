@@ -511,14 +511,18 @@ fn test_send_failure_wakes_receivers() {
 
 /// A fatal read wakes blocked receives and accepts, and fails every pending or
 /// later call with the read's cause.
+///
+/// The end of the stream is fatal on both sides. An adapter error is fatal
+/// only to a client, since a server retries the failed read.
 #[test]
 fn test_read_failure_wakes_callers() {
     use Step::*;
     crate::testing::init_tracing();
-    for (mode, local, first, peer, incoming) in
-        [(Mode::Client, 0, 1, 2, 1), (Mode::Server, 1, 2, 1, 0)]
-    {
-        for eof in [false, true] {
+    for (mode, local, first, peer, incoming, eofs) in [
+        (Mode::Client, 0, 1, 2, 1, [false, true].as_slice()),
+        (Mode::Server, 1, 2, 1, 0, [true].as_slice()),
+    ] {
+        for &eof in eofs {
             // Leave two requests, a responder and a receive pending while the
             // reader blocks
             let mut driver = Driver::new(mode);
