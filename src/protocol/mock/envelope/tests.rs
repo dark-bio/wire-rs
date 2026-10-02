@@ -178,7 +178,7 @@ fn test_unknown_content() {
         assert!(!header.failed);
         assert!(header.unknown);
         assert_eq!(header.payload, Some("unknown"));
-        assert!(side.decode(&unknown).is_err());
+        assert!(side.decode(Bytes::from(unknown.clone())).is_err());
 
         // Refuse an unknown field below the content tags as no body at all
         let future = envelope(5, None, 0x7f);
@@ -188,7 +188,7 @@ fn test_unknown_content() {
         let both = envelope(5, Some(schema::Error::new(7, "refused")), 0x7ff);
         assert!(side.decode_header(Bytes::from(both.clone())).is_err());
         // Full protobuf decoding ignores the unknown content beside the error
-        assert!(side.decode(&both).is_ok());
+        assert!(side.decode(Bytes::from(both.clone())).is_ok());
 
         // Refuse all three through the fuzz entry point
         for bytes in [unknown, future, both] {
@@ -236,7 +236,7 @@ fn test_envelope_normalization() {
         ] {
             let mut bytes = prefix.to_vec();
             bytes.extend_from_slice(&content);
-            let (id, body) = side.decode(&bytes).unwrap();
+            let (id, body) = side.decode(Bytes::from(bytes.clone())).unwrap();
             assert_eq!(id, 1);
             assert_eq!(body, Ok(crate::protocol::Message::Develop(vec![1, 2])));
             assert!(peer.encode(id, body).unwrap().len() < bytes.len());

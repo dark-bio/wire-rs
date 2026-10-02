@@ -129,8 +129,10 @@ impl Side {
     /// containing errors. Decoder errors are kept for the warning at the call site.
     pub(super) fn decode(
         &self,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> Result<(u64, Result<Message, schema::Error>), DecodeError> {
+        // Decode from the owned buffer, so prost splits byte fields off it
+        // instead of first copying each into a temporary buffer
         match self {
             Self::Client => decode::<ArkToHost>(bytes),
             Self::Server => decode::<HostToArk>(bytes),
@@ -240,10 +242,11 @@ impl IncomingEnvelope {
             session,
         } = self;
         drop(charge);
-        match side.decode(&bytes) {
+        let length = bytes.len();
+        match side.decode(bytes) {
             Ok((_, body)) => body.map_err(Error::Remote),
             Err(error) => {
-                let error = side.malformed(Some(header), bytes.len(), "payload", error);
+                let error = side.malformed(Some(header), length, "payload", error);
                 if let Some(session) = session.upgrade() {
                     session.close(error.clone());
                 }
@@ -315,7 +318,7 @@ where
 
 /// Decodes an envelope, rejecting invalid protobuf or anything other than
 /// exactly one of content or error.
-fn decode<E: Envelope>(bytes: &[u8]) -> Result<(u64, Result<Message, schema::Error>), DecodeError>
+fn decode<E: Envelope>(bytes: Bytes) -> Result<(u64, Result<Message, schema::Error>), DecodeError>
 where
     Message: From<E::Content>,
 {
