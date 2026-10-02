@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "darkbio-wire"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "arbitrary",
  "base64",
