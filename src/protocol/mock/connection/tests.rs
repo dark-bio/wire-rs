@@ -511,14 +511,18 @@ fn test_send_failure_wakes_receivers() {
 
 /// A fatal read wakes blocked receives and accepts, and fails every pending or
 /// later call with the read's cause.
+///
+/// The end of the stream is fatal on both sides. An adapter error is fatal
+/// only to a client, since a server retries the failed read.
 #[test]
 fn test_read_failure_wakes_callers() {
     use Step::*;
     crate::testing::init_tracing();
-    for (mode, local, first, peer, incoming) in
-        [(Mode::Client, 0, 1, 2, 1), (Mode::Server, 1, 2, 1, 0)]
-    {
-        for eof in [false, true] {
+    for (mode, local, first, peer, incoming, eofs) in [
+        (Mode::Client, 0, 1, 2, 1, [false, true].as_slice()),
+        (Mode::Server, 1, 2, 1, 0, [true].as_slice()),
+    ] {
+        for &eof in eofs {
             // Leave two requests, a responder and a receive pending while the
             // reader blocks
             let mut driver = Driver::new(mode);
@@ -608,6 +612,181 @@ fn test_read_failure_wakes_callers() {
             driver.step(Released(local));
         }
     }
+}
+
+/// A server read failing inside a frame keeps the frame and the session, whose
+/// deadlines and replies progress across the pause.
+#[test]
+fn test_server_read_recovery() {
+    use EnvelopeShape::*;
+    use Step::*;
+    for after in [0, 1, 15] {
+        run(
+            Mode::Server,
+            &[
+                // Leave one expiring request and one live request on the session
+                Request(1, 0, 10, 50),
+                Read(2, Content(10)),
+                Request(1, 1, 11, 3000),
+                Read(4, Content(11)),
+                // Split the peer's next request, and let the short request
+                // expire while the reader pauses
+                FailRead(after, io::ErrorKind::BrokenPipe, false),
+                Send(1, Content(20)),
+                ReadPaused,
+                Advance(50),
+                Answer(0, Err(Failure::Timeout)),
+                // Queue both answers while the reader still pauses
+                Send(2, Content(30)),
+                Send(4, Content(31)),
+                RetryRead,
+                // Deliver the split request and the live answer on the session
+                Receive(1, 20, 0),
+                Reply(0, 0, Ok(40), 3000),
+                Read(1, Content(40)),
+                Written(0, Ok(())),
+                Answer(1, Ok(31)),
+                Outstanding(1, vec![]),
+                // Exchange another request on the same session
+                Request(1, 2, 12, 3000),
+                Read(6, Content(12)),
+                Send(6, Content(32)),
+                Answer(2, Ok(32)),
+                Shutdown,
+                Stopped,
+            ],
+        );
+    }
+}
+
+/// A server read failure losing the rest of a frame ends the session without
+/// delivering what follows the gap, and the server accepts a new session.
+#[test]
+fn test_server_read_loss_reconnects() {
+    use EnvelopeShape::*;
+    use Step::*;
+    for after in [1, 8, 16] {
+        run(
+            Mode::Server,
+            &[
+                // Leave a request waiting, then lose the rest of the next frame
+                Request(1, 0, 10, 3000),
+                Read(2, Content(10)),
+                FailRead(after, io::ErrorKind::Other, true),
+                Send(1, Content(20)),
+                ReadPaused,
+                // Queue an answer and another request behind the gap
+                Send(2, Content(30)),
+                Send(3, Content(21)),
+                RetryRead,
+                // Neither the broken request nor the traffic behind it arrives
+                ReceiveError(1, Failure::Transport),
+                Answer(0, Err(Failure::Transport)),
+                Blocked(0, Operation::Read),
+                ReceiveError(1, Failure::Transport),
+                Usage(1, 0, 0),
+                Refused(1),
+                // Accept and use a new session on the same server
+                Reconnect(2),
+                Send(1, Content(22)),
+                Receive(2, 22, 0),
+                Reply(0, 0, Ok(32), 3000),
+                Read(1, Content(32)),
+                Written(0, Ok(())),
+                Shutdown,
+                Stopped,
+            ],
+        );
+    }
+}
+
+/// Every repeated server read or setter failure waits the full pause before
+/// its retry.
+#[test]
+fn test_server_read_failures_are_paced() {
+    use EnvelopeShape::*;
+    use Step::*;
+    run(
+        Mode::Server,
+        &[
+            // Split the peer's request after its first byte
+            FailRead(1, io::ErrorKind::Other, false),
+            Send(1, Content(10)),
+            ReadPaused,
+            // Fail three retries in a row, by a read and then two setters
+            FailRead(0, io::ErrorKind::WouldBlock, false),
+            RetryRead,
+            ReadPaused,
+            FailReadDeadline(io::ErrorKind::TimedOut),
+            RetryRead,
+            ReadPaused,
+            FailReadDeadline(io::ErrorKind::BrokenPipe),
+            RetryRead,
+            ReadPaused,
+            // Complete and answer the request once the failures stop
+            RetryRead,
+            Receive(1, 10, 0),
+            Reply(0, 0, Ok(20), 3000),
+            Read(1, Content(20)),
+            Written(0, Ok(())),
+            Shutdown,
+            Stopped,
+        ],
+    );
+}
+
+/// A reconnect after a server read failure retires the old session's handles
+/// and serves the new session.
+#[test]
+fn test_server_reconnect_after_read_failure() {
+    use EnvelopeShape::*;
+    use Step::*;
+    run(
+        Mode::Server,
+        &[
+            // Hold a responder and a request across a failed read and its pause
+            Send(1, Content(10)),
+            Receive(1, 10, 0),
+            Request(1, 0, 20, 3000),
+            Read(2, Content(20)),
+            FailRead(0, io::ErrorKind::BrokenPipe, false),
+            ReadPaused,
+            RetryRead,
+            // Reconnect, which must retire the old session and its handles
+            Reconnect(2),
+            ReceiveError(1, Failure::Transport),
+            Answer(0, Err(Failure::Transport)),
+            Abandon(0),
+            Close(1),
+            Refused(1),
+            Drop(1),
+            Released(1),
+            // Serve a request on the new session
+            Send(1, Content(11)),
+            Receive(2, 11, 0),
+            Reply(0, 0, Ok(21), 3000),
+            Read(1, Content(21)),
+            Written(0, Ok(())),
+            Shutdown,
+            Stopped,
+        ],
+    );
+}
+
+/// Closing the server during a read pause stops every worker without moving
+/// the clock.
+#[test]
+fn test_server_close_during_read_pause() {
+    use Step::*;
+    run(
+        Mode::Server,
+        &[
+            FailRead(0, io::ErrorKind::Other, false),
+            ReadPaused,
+            Shutdown,
+            Stopped,
+        ],
+    );
 }
 
 /// A transport write timeout closes the session even if its promise already timed out.

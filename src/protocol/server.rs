@@ -22,11 +22,19 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+/// Pause before the reader retries a failed read, so an adapter that keeps
+/// failing cannot spin it.
+const READ_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 /// Owner of a persistent server stream, accepting successive sessions.
 ///
 /// Closing or dropping the server ends its active session and shuts down the
 /// physical stream. Closing an individual [`Session`] keeps this owner and
 /// its stream available for another handshake.
+///
+/// A failed read keeps the server and its current session, and reading resumes
+/// after a 100 ms pause on the stream's clock. The end of the stream ends the
+/// server.
 pub struct Server {
     /// Server state retained independently of any accepted session owner.
     pub(super) inner: Arc<ServerInner>,
@@ -58,6 +66,8 @@ impl Server {
                     ready: None,
                     #[cfg(any(test, feature = "fuzz"))]
                     wait_hook: None,
+                    #[cfg(any(test, feature = "fuzz"))]
+                    retry_hook: None,
                 }),
                 changed: Condvar::new(&stream.clock()),
                 stream_closer: Some(stream_closer),
@@ -210,17 +220,20 @@ fn run_reader<R: Read, W: Write + Send + 'static, A: Attester>(
                     session.close(error);
                 }
             }
-            // A handshake that timed out or failed to write leaves the reader
-            // available for the next reset
-            Err(transport::Error::RecvFailed(error))
-                if error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                tracing::debug!("wire handshake timed out");
+            // Keep the session, whose binding and partial frame survive the
+            // failed read, and pause so a failing adapter cannot spin the reader
+            Err(transport::Error::RecvFailed(error)) => {
+                tracing::warn!("wire receive failed, retrying: {}", error);
+                if !server.pause_reader() {
+                    break;
+                }
             }
+            // A handshake that failed to write leaves the reader available for
+            // the next reset
             Err(transport::Error::SendFailed(error)) => {
                 tracing::debug!("wire handshake output failed: {}", error);
             }
-            // Any other failure ends the server and its stream
+            // The end of the stream, or any other failure, ends the server
             Err(error) => {
                 server.close(error.into());
                 break;
@@ -288,6 +301,10 @@ enum State {
         /// One-shot test notification sent under the server lock before waiting.
         #[cfg(any(test, feature = "fuzz"))]
         wait_hook: Option<std::sync::mpsc::Sender<()>>,
+        /// Test notification of each pause the reader takes after a failed
+        /// read, carrying the deadline it waits for, sent under the server lock.
+        #[cfg(any(test, feature = "fuzz"))]
+        retry_hook: Option<std::sync::mpsc::Sender<std::time::Instant>>,
     },
     /// Closed server, with its closing error and the session attached at the time.
     ///
@@ -389,6 +406,39 @@ impl ServerInner {
         }
     }
 
+    /// Waits [`READ_RETRY_DELAY`] on the stream clock before the reader retries
+    /// a failed read, returning false if the server closes first.
+    fn pause_reader(&self) -> bool {
+        // Fix the deadline first, so a wait that starts late still ends on time
+        let deadline = self.clock.now() + READ_RETRY_DELAY;
+        let mut state = self.state.lock().expect("server state not poisoned");
+
+        // Let a test move time on once the pause has its deadline
+        #[cfg(any(test, feature = "fuzz"))]
+        if let State::Open {
+            retry_hook: Some(hook),
+            ..
+        } = &*state
+        {
+            let _ = hook.send(deadline);
+        }
+
+        // Wait out the delay, ending early once a close switches the state
+        loop {
+            if matches!(*state, State::Closed { .. }) {
+                return false;
+            }
+            let (guard, result) = self
+                .changed
+                .wait_deadline(state, deadline)
+                .expect("server state not poisoned");
+            state = guard;
+            if result.timed_out() {
+                return matches!(*state, State::Open { .. });
+            }
+        }
+    }
+
     /// Closes the previous session and makes this one available to
     /// [`Server::accept`].
     ///
@@ -469,6 +519,7 @@ impl Server {
                 session: Weak::new(),
                 ready: None,
                 wait_hook: None,
+                retry_hook: None,
             }),
             changed: Condvar::new(&clock),
             stream_closer: None,
@@ -533,6 +584,25 @@ impl ServerInner {
         *wait_hook = Some(sender);
         receiver
     }
+
+    /// Arms a notification for every pause the reader takes after a failed
+    /// read, carrying the deadline the pause waits for.
+    ///
+    /// It is sent while holding `state`, once the pause has fixed its
+    /// deadline, so advancing the clock to it cannot race the wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the server is closed.
+    pub(super) fn watch_read_retries(&self) -> std::sync::mpsc::Receiver<std::time::Instant> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut state = self.state.lock().expect("server state not poisoned");
+        let State::Open { retry_hook, .. } = &mut *state else {
+            panic!("only watch an open server read");
+        };
+        *retry_hook = Some(sender);
+        receiver
+    }
 }
 
 /// Checks server policy callbacks and ownership bounds, and compiles server
@@ -541,10 +611,266 @@ impl ServerInner {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::Side;
-    use crate::protocol::{Error, Server, Session};
+    use crate::memory;
+    use crate::protocol::{self, Error, Message, Server, Session};
+    use crate::transport::mock::self_attestation;
+    use crate::transport::testing::test_clock;
     use crate::transport::{Attester, Read, Stream, Write};
+    use darkbio_clock::Clock;
     use darkbio_crypto::xdsa;
+    use std::collections::VecDeque;
     use std::fmt::Debug;
+    use std::io::{self, Write as _};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// Pause the server's docs promise between a failed read and its retry.
+    const PAUSE: Duration = Duration::from_millis(100);
+
+    /// Failure a [`Faults`] reader injects.
+    enum Fault {
+        /// The read itself fails.
+        Read,
+        /// Installing the read's deadline fails with a timeout, as a broken
+        /// adapter's setter can.
+        Setter,
+        /// The read fails and loses the rest of the frame it was inside.
+        Loss,
+    }
+
+    /// Ark-side reader that hands out one byte per read and injects the
+    /// failures its test queues, recording when each happened.
+    struct Faults {
+        /// Duplex half carrying the host's bytes.
+        inner: memory::Reader,
+        /// Failures the test queued, shared with it.
+        plan: Arc<Mutex<Plan>>,
+    }
+
+    /// Failures a [`Faults`] reader still owes, and those it injected.
+    #[derive(Default)]
+    struct Plan {
+        /// Bytes to hand out before the first queued failure.
+        after: usize,
+        /// Failures to inject in order, one per read attempt.
+        queued: VecDeque<Fault>,
+        /// Clock times of the injected failures.
+        failed: Vec<Instant>,
+        /// Whether bytes are being dropped up to the next frame delimiter.
+        losing: bool,
+    }
+
+    impl io::Read for Faults {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // Fail this read if a read or loss failure is due, recording when
+            {
+                let mut plan = self.plan.lock().unwrap();
+                if plan.after == 0 && matches!(plan.queued.front(), Some(Fault::Read | Fault::Loss))
+                {
+                    let fault = plan.queued.pop_front().unwrap();
+                    plan.losing = matches!(fault, Fault::Loss);
+                    plan.failed.push(self.inner.clock().now());
+                    return Err(io::Error::other("injected read failure"));
+                }
+            }
+
+            // Hand out one byte, so a failure can land inside a frame, dropping
+            // the bytes a loss took up to the frame's delimiter
+            loop {
+                let len = buf.len().min(1);
+                let read = self.inner.read(&mut buf[..len])?;
+                let mut plan = self.plan.lock().unwrap();
+                if plan.losing && read == 1 && buf[0] != 0 {
+                    continue;
+                }
+                plan.losing = false;
+                plan.after = plan.after.saturating_sub(read);
+                return Ok(read);
+            }
+        }
+    }
+
+    impl Read for Faults {
+        fn clock(&self) -> Clock {
+            self.inner.clock()
+        }
+
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            // Fail installing the deadline if a setter failure is due,
+            // recording when
+            {
+                let mut plan = self.plan.lock().unwrap();
+                if plan.after == 0 && matches!(plan.queued.front(), Some(Fault::Setter)) {
+                    plan.queued.pop_front();
+                    plan.failed.push(self.inner.clock().now());
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+            }
+            self.inner.set_read_deadline(deadline)
+        }
+    }
+
+    /// Starts a server whose reader fails on request.
+    ///
+    /// Returns the server, the host's end of the link, the failure plan, the
+    /// deadlines of the reader's pauses and the server's identity.
+    fn faulty_server(
+        clock: &Clock,
+    ) -> (
+        Server,
+        memory::Duplex,
+        Arc<Mutex<Plan>>,
+        mpsc::Receiver<Instant>,
+        xdsa::PublicKey,
+    ) {
+        // Wrap the Ark's reader, so the test decides which reads fail
+        let signer = xdsa::SecretKey::generate();
+        let identity = signer.public_key();
+        let attestation = self_attestation(&signer);
+        let (host, ark) = memory::duplex(64 * 1024, clock);
+        let (reader, writer, closer, _) = ark.into_parts();
+        let plan = Arc::new(Mutex::new(Plan::default()));
+        let faults = Faults {
+            inner: reader,
+            plan: plan.clone(),
+        };
+        let stream = Stream::new(faults, writer, move || closer.close());
+
+        // Start the server and watch its reader pause after each failure
+        let server = Server::new(stream, signer, attestation);
+        let retries = server.inner.watch_read_retries();
+        (server, host, plan, retries, identity)
+    }
+
+    /// Checks that a failed read and a failing deadline setter keep the server,
+    /// each retry waiting out the documented pause, and that the handshake
+    /// then completes.
+    #[test]
+    fn test_server_retries_failed_reads() {
+        // Fail a read and then a deadline setter behind a client's first byte
+        let mut tester = test_clock();
+        let (mut server, host, plan, retries, identity) = faulty_server(&tester.clock());
+        {
+            let mut plan = plan.lock().unwrap();
+            plan.after = 1;
+            plan.queued.extend([Fault::Read, Fault::Setter]);
+        }
+        let connecting =
+            thread::spawn(move || protocol::connect(host, &identity).map(|(client, _)| client));
+
+        // Require each pause to last the documented time and the retry to wait
+        // it out
+        for failure in 0..2 {
+            let deadline = retries.recv().unwrap();
+            let failed = plan.lock().unwrap().failed[failure];
+            assert_eq!(deadline - failed, PAUSE, "{failure}");
+            tester.advance_to(deadline);
+        }
+        let failed = plan.lock().unwrap().failed.clone();
+        assert_eq!(failed[1] - failed[0], PAUSE);
+
+        // Require the handshake to complete once reads succeed again, keeping
+        // the client open until the server accepts
+        let _client = connecting.join().unwrap().unwrap();
+        server.accept().unwrap();
+    }
+
+    /// Checks that a read failing inside a frame keeps the session, whose
+    /// deadlines run during the pause, and which gets the frame once the
+    /// retry reads the rest.
+    #[test]
+    fn test_server_keeps_session_across_failed_read() {
+        // Connect, and leave an Ark request that expires during the pause
+        let mut tester = test_clock();
+        let (mut server, host, plan, retries, identity) = faulty_server(&tester.clock());
+        let (client, _) = protocol::connect(host, &identity).unwrap();
+        let mut session = server.accept().unwrap();
+        let expiry = tester.clock().now() + PAUSE / 2;
+        let expiring = session
+            .requester()
+            .request(b"pong".to_vec(), expiry)
+            .unwrap();
+
+        // Send a request whose frame a failed read splits after its first byte
+        {
+            let mut plan = plan.lock().unwrap();
+            plan.after = 1;
+            plan.queued.push_back(Fault::Read);
+        }
+        let deadline = tester.clock().now() + Duration::from_secs(5);
+        let answer = client
+            .requester()
+            .request(b"ping".to_vec(), deadline)
+            .unwrap();
+
+        // Require the deadline worker to expire the Ark request while the
+        // reader pauses, then let the reader retry
+        let resume = retries.recv().unwrap();
+        tester.advance_to(expiry);
+        assert!(matches!(expiring.wait_worker_result(), Err(Error::Timeout)));
+        tester.advance_to(resume);
+
+        // Require the same session to receive the split request and answer it
+        let (message, responder) = session.recv().unwrap();
+        assert_eq!(message, Message::Develop(b"ping".to_vec()));
+        let written = responder.reply(message, deadline).unwrap();
+        assert_eq!(answer.wait::<Vec<u8>>().unwrap(), b"ping");
+        written.wait().unwrap();
+    }
+
+    /// Checks that a read failure losing the rest of a frame ends the session
+    /// instead of letting it read past the gap.
+    #[test]
+    fn test_server_ends_session_after_lost_frame() {
+        // Connect, then lose all but the first byte of the next frame
+        let mut tester = test_clock();
+        let (mut server, host, plan, retries, identity) = faulty_server(&tester.clock());
+        let (client, _) = protocol::connect(host, &identity).unwrap();
+        let mut session = server.accept().unwrap();
+        {
+            let mut plan = plan.lock().unwrap();
+            plan.after = 1;
+            plan.queued.push_back(Fault::Loss);
+        }
+
+        // Send a request into the loss and another behind it
+        let deadline = tester.clock().now() + Duration::from_secs(5);
+        let _lost = client
+            .requester()
+            .request(b"lost".to_vec(), deadline)
+            .unwrap();
+        let _after = client
+            .requester()
+            .request(b"after".to_vec(), deadline)
+            .unwrap();
+        tester.advance_to(retries.recv().unwrap());
+
+        // Require the session to end on the broken frame without either request
+        assert!(session.recv().is_err());
+    }
+
+    /// Checks that closing the server ends the reader's pause with the clock
+    /// stopped.
+    #[test]
+    fn test_server_close_interrupts_read_retry() {
+        // Fail the read after a junk byte, parking the reader in its pause
+        let tester = test_clock();
+        let (server, host, plan, retries, _) = faulty_server(&tester.clock());
+        {
+            let mut plan = plan.lock().unwrap();
+            plan.after = 1;
+            plan.queued.push_back(Fault::Read);
+        }
+        let (_reader, mut writer, _closer, _) = host.into_parts();
+        writer.write_all(&[1]).unwrap();
+        retries.recv().unwrap();
+
+        // Close the server and require its reader to exit without the clock
+        let workers = server.inner.workers.clone();
+        server.close();
+        workers.wait_stopped();
+    }
 
     /// Checks that a server policy change closing its session runs promise
     /// callbacks outside the server lock.

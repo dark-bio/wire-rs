@@ -47,7 +47,7 @@ impl Seedable for session::Action {
 impl Seedable for connection::Action {
     fn seed(&self, seed: &mut Seed) {
         /// Number of connection action kinds, which scales the encoded kind index.
-        const COUNT: u32 = 19;
+        const COUNT: u32 = 23;
         seed.variant(self.kind as u32, COUNT);
         seed.byte(self.slot);
         seed.byte(self.value);
