@@ -55,13 +55,14 @@ fn check(client: bool, bytes: &[u8]) -> bool {
 
     // Match the reader's admission gate, which rejects unknown content beside
     // an error even though schema-only decoding ignores the unknown field
-    let Ok(header) = side.decode_header(Bytes::copy_from_slice(bytes)) else {
+    let received = Bytes::copy_from_slice(bytes);
+    let Ok(header) = side.decode_header(received.clone()) else {
         return false;
     };
 
     // Decode the whole envelope, as a later receive or wait would, and require
     // it to match the header
-    let Ok((id, body)) = side.decode(bytes) else {
+    let Ok((id, body)) = side.decode(received) else {
         return false;
     };
     assert_eq!(header.id, id);
@@ -91,7 +92,9 @@ fn check(client: bool, bytes: &[u8]) -> bool {
     // Require any other body to re-encode at that size and decode unchanged
     let bytes = encoded.expect("accepted envelope within the send limit encodes");
     assert_eq!(bytes.len(), size);
-    let (echoed, echo) = side.decode(&bytes).expect("re-encoded envelope decodes");
+    let (echoed, echo) = side
+        .decode(bytes.into())
+        .expect("re-encoded envelope decodes");
     assert_eq!(echoed, id);
     assert_eq!(echo, body);
     true
