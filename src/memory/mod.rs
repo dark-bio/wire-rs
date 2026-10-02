@@ -133,10 +133,13 @@ impl io::Read for Reader {
 
             // Deliver ready bytes even after the installed read deadline
             if !state.bytes.is_empty() {
+                // Copy both ring buffer halves, then remove the copied bytes
                 let count = buf.len().min(state.bytes.len());
-                for (out, byte) in buf.iter_mut().zip(state.bytes.drain(..count)) {
-                    *out = byte;
-                }
+                let (front, back) = state.bytes.as_slices();
+                let split = count.min(front.len());
+                buf[..split].copy_from_slice(&front[..split]);
+                buf[split..count].copy_from_slice(&back[..count - split]);
+                state.bytes.drain(..count);
                 drop(state);
                 self.pipe.changed.notify_all();
                 return Ok(count);
@@ -569,6 +572,46 @@ mod tests {
         let mut accepted = [0; 3];
         ark_read.read_exact(&mut accepted).unwrap();
         assert_eq!(&accepted, b"qrs");
+    }
+
+    /// Checks that one read copies across the queue's wraparound, filling as
+    /// much of the buffer as the queue holds and leaving the rest queued.
+    #[test]
+    fn test_read_across_wraparound() {
+        let tests: [(usize, usize, &[u8; 6], &[u8]); 5] = [
+            (1, 1, b"c-----", b"def"), // stops inside the front half
+            (2, 2, b"cd----", b"ef"),  // stops at the wrap
+            (3, 3, b"cde---", b"f"),   // crosses into the back half
+            (4, 4, b"cdef--", b""),    // takes everything queued
+            (6, 4, b"cdef--", b""),    // leaves the rest of the buffer untouched
+        ];
+        for (i, (size, count, filled, rest)) in tests.into_iter().enumerate() {
+            // Wrap the queued bytes around the end of a 4 byte pipe
+            let tester = test_clock();
+            let (host, ark) = duplex(4, &tester.clock());
+            let (_host_read, mut writer) = host.into_halves();
+            let (mut reader, _ark_write) = ark.into_halves();
+            writer.write_all(b"abcd").unwrap();
+            reader.read_exact(&mut [0; 2]).unwrap();
+            writer.write_all(b"ef").unwrap();
+            assert_eq!(
+                reader.pipe.lock().bytes.as_slices(),
+                (b"cd".as_slice(), b"ef".as_slice()),
+                "test {i}"
+            );
+
+            // Read once, leaving the buffer past the copied bytes untouched
+            let mut buf = [b'-'; 6];
+            let copied = reader.read(&mut buf[..size]).unwrap();
+            assert_eq!(copied, count, "test {i}");
+            assert_eq!(&buf, filled, "test {i}");
+
+            // Drain the bytes left queued once the writer closes
+            drop(writer);
+            let mut left = Vec::new();
+            reader.read_to_end(&mut left).unwrap();
+            assert_eq!(left, rest, "test {i}");
+        }
     }
 
     /// Checks that an idle timed read expires without EOF or buffer changes,
