@@ -25,7 +25,7 @@ use prost::Message as _;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Weak, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default protocol timeout for scenarios that do not specify one.
 const BUDGET: Duration = Duration::from_secs(3);
@@ -121,6 +121,18 @@ enum Step {
     /// Read timeout injected into the server after its ArkHello, while it awaits
     /// the HostAck.
     HandshakeReadTimeout,
+    /// Server read failure with the error after this many more bytes, dropping
+    /// the rest of the frame up to its delimiter when the flag is set.
+    FailRead(usize, io::ErrorKind, bool),
+    /// Failure of the server's next read deadline setter, armed while its
+    /// reader pauses.
+    FailReadDeadline(io::ErrorKind),
+    /// Next pause of the server's reader, which must follow one new failure by
+    /// the documented 100 ms.
+    ReadPaused,
+    /// End of the current pause at its deadline, after checking that the reader
+    /// does not retry earlier.
+    RetryRead,
     /// Inbound request and byte limits for the labeled session, through its
     /// public setter.
     InboundLimits(u8, usize, usize),
@@ -370,6 +382,12 @@ struct Driver {
     identity: xdsa::PublicKey,
     /// Host-to-Ark and Ark-to-host pipes.
     pipes: [Arc<Pipe>; 2],
+    /// Deadlines of the server reader's pauses, each sent once it is fixed.
+    read_retries: Option<mpsc::Receiver<Instant>>,
+    /// Deadline of the pause the driver last took, until a retry ends it.
+    read_retry: Option<Instant>,
+    /// Number of read failures whose pauses the driver has checked.
+    read_failures: usize,
 
     /// Owners keyed by script labels, including retained predecessors.
     sessions: HashMap<u8, Session>,
@@ -444,6 +462,9 @@ impl Driver {
             raw: None,
             identity: identity.clone(),
             pipes,
+            read_retries: None,
+            read_retry: None,
+            read_failures: 0,
 
             sessions: HashMap::new(),
             states: HashMap::new(),
@@ -465,6 +486,7 @@ impl Driver {
         match mode {
             Mode::Both | Mode::Server => {
                 let mut server = Server::new(ark, signer, attestation);
+                driver.read_retries = Some(server.inner.watch_read_retries());
                 driver.workers.push(server.inner.workers.clone());
                 match mode {
                     Mode::Both => {
@@ -557,9 +579,7 @@ impl Driver {
                 });
             }
             Step::HandshakeReadTimeout => {
-                // Fail the server's next read deadline once its hello flush
-                // blocks, watching for the pause its reader takes afterwards
-                let retries = self.server.as_ref().unwrap().inner.watch_read_retries();
+                // Fail the server's next read deadline once its hello flush blocks
                 let incoming = self.pipes[0].clone();
                 let outgoing = self.pipes[1].clone();
                 outgoing.pause(Operation::Flush, true);
@@ -578,7 +598,46 @@ impl Driver {
                 gate.finish();
 
                 // Let the server's reader retry, so it reads the next reset
-                let deadline = retries.recv().unwrap();
+                self.step(Step::ReadPaused);
+                self.tester.advance_to(self.read_retry.take().unwrap());
+            }
+            Step::FailRead(after, error, loss) => {
+                self.pipes[0].fail_read_after(after, error, loss);
+            }
+            Step::FailReadDeadline(error) => {
+                assert!(self.read_retry.is_some());
+                self.pipes[0].fail_read_deadline(error);
+            }
+            Step::ReadPaused => {
+                // Take the next pause, which must not overlap an earlier one
+                assert!(self.read_retry.is_none());
+                let deadline = self.read_retries.as_ref().unwrap().recv().unwrap();
+
+                // Require one new failure, now and 100 ms before the deadline
+                let failures = self.pipes[0].read_failures();
+                self.read_failures += 1;
+                assert_eq!(failures.len(), self.read_failures);
+                let failed = *failures.last().unwrap();
+                assert_eq!(failed, self.tester.clock().now());
+                assert_eq!(deadline - failed, Duration::from_millis(100));
+                self.read_retry = Some(deadline);
+            }
+            Step::RetryRead => {
+                // Require the parked reader to wait for the full retry deadline
+                let deadline = self.read_retry.take().unwrap();
+                self.tester.wait_blocked(self.parked);
+                assert_eq!(self.tester.next_deadline(), Some(deadline));
+
+                // Stop just before expiry and require the fault count to stay put
+                self.tester.advance_to(deadline - Duration::from_nanos(1));
+                self.tester.wait_blocked(self.parked);
+                assert_eq!(self.pipes[0].read_failures().len(), self.read_failures);
+                assert!(matches!(
+                    self.read_retries.as_ref().unwrap().try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+
+                // Release the pause at its fixed deadline
                 self.tester.advance_to(deadline);
             }
             Step::InboundLimits(id, requests, bytes) => {

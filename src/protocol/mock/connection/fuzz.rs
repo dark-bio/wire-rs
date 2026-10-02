@@ -94,6 +94,25 @@ pub enum Kind {
     Close,
     /// Failed output write or flush while a receive waits, closing the session.
     Fault,
+    /// Server read failure inside a frame, which keeps the frame and the
+    /// session while a short request expires during the pause.
+    ///
+    /// A client closes its session instead.
+    ReadRecovery,
+    /// Server read failure that drops the rest of a frame, which ends only that
+    /// session.
+    ///
+    /// A client closes its session instead.
+    ReadLoss,
+    /// Server read and deadline setter failures in a row, each retried after
+    /// the full pause.
+    ///
+    /// A client closes its session instead.
+    ReadFailures,
+    /// Reconnect after a server read failure, with the old handles retained.
+    ///
+    /// A client closes its session instead.
+    ReadReconnect,
 }
 
 /// Maximum actions run from one input, each driving several live exchanges.
@@ -113,7 +132,13 @@ fn ends_client(action: &Action) -> bool {
         | Kind::ResponseBeforeFailure
         | Kind::InboundFailure => true,
         Kind::ReuseDuringFlush => action.budget & 1 == 1,
-        Kind::Replace | Kind::Disconnect | Kind::HandshakeFailure => true,
+        Kind::Replace
+        | Kind::Disconnect
+        | Kind::HandshakeFailure
+        | Kind::ReadRecovery
+        | Kind::ReadLoss
+        | Kind::ReadFailures
+        | Kind::ReadReconnect => true,
         _ => false,
     }
 }
@@ -691,7 +716,129 @@ pub fn run(actions: &[Action]) {
                 local += 1;
                 next = 2;
             }
-            Kind::Close | Kind::Replace | Kind::Disconnect | Kind::HandshakeFailure => {
+            Kind::ReadRecovery if server => {
+                // Fail 0 to 15 bytes into the peer's next frame, taking the
+                // offset from the slot's bits above its role bit
+                let offset = usize::from((slot >> 1) % 16);
+
+                // Expire one request within the 100 ms pause, keeping a second
+                let timeout = 50 + u64::from(budget % 40);
+                steps.extend([
+                    Step::Request(local, 0, value, timeout),
+                    Step::Read(next, content.clone()),
+                    Step::Request(local, 1, value, 3000),
+                    Step::Read(next + 2, content.clone()),
+                    // Split the peer's request and let the short request expire
+                    // while the reader pauses
+                    Step::FailRead(offset, io::ErrorKind::BrokenPipe, false),
+                    Step::Send(peer, content.clone()),
+                    Step::ReadPaused,
+                    Step::Advance(timeout),
+                    Step::Answer(0, Err(Failure::Timeout)),
+                    // Queue both answers behind the split frame, then retry
+                    Step::Send(next, answer.clone()),
+                    Step::Send(next + 2, answer.clone()),
+                    Step::RetryRead,
+                    // Deliver the split frame and both answers on this session
+                    Step::Receive(local, value, 0),
+                    Step::Reply(0, 0, Ok(value.wrapping_add(1)), 3000),
+                    Step::Read(peer, answer.clone()),
+                    Step::Written(0, Ok(())),
+                    Step::Answer(1, Ok(value.wrapping_add(1))),
+                    Step::Outstanding(local, vec![]),
+                ]);
+                next += 4;
+            }
+            Kind::ReadLoss if server => {
+                // Fail 1 to 16 bytes into the peer's next frame, so the bytes
+                // before the gap make a broken frame rather than an empty one
+                let offset = usize::from((slot >> 1) % 16 + 1);
+                steps.extend([
+                    // Leave a request waiting while a frame loses its rest
+                    Step::Request(local, 0, value, 3000),
+                    Step::Read(next, content.clone()),
+                    Step::FailRead(offset, io::ErrorKind::Other, true),
+                    Step::Send(peer, content.clone()),
+                    Step::ReadPaused,
+                    // Queue an answer and another request beyond the gap
+                    Step::Send(next, answer.clone()),
+                    Step::Send(peer.wrapping_add(2), answer.clone()),
+                    Step::RetryRead,
+                    // Require the broken frame to end the session
+                    Step::ReceiveError(local, Failure::Transport),
+                    Step::Answer(0, Err(Failure::Transport)),
+                    // Drain the old input and require that neither request arrived
+                    Step::Blocked(0, Operation::Read),
+                    Step::ReceiveError(local, Failure::Transport),
+                    Step::Usage(local, 0, 0),
+                ]);
+                ended = true;
+            }
+            Kind::ReadFailures if server => {
+                // Split the peer's next frame 0 to 15 bytes in
+                let offset = usize::from((slot >> 1) % 16);
+                steps.extend([
+                    Step::FailRead(offset, io::ErrorKind::Other, false),
+                    Step::Send(peer, content.clone()),
+                    Step::ReadPaused,
+                ]);
+
+                // Fail one to four retries in a row, by reads, deadline setters
+                // or both in turn as the value picks
+                for failure in 0..budget % 4 + 1 {
+                    let read = match value % 3 {
+                        0 => true,
+                        1 => false,
+                        _ => failure % 2 == 0,
+                    };
+                    let fault = if read {
+                        Step::FailRead(0, io::ErrorKind::WouldBlock, false)
+                    } else {
+                        Step::FailReadDeadline(io::ErrorKind::TimedOut)
+                    };
+                    steps.extend([fault, Step::RetryRead, Step::ReadPaused]);
+                }
+
+                // Complete the split frame once the failures stop, and answer it
+                steps.extend([
+                    Step::RetryRead,
+                    Step::Receive(local, value, 0),
+                    Step::Reply(0, 0, Ok(value.wrapping_add(1)), 3000),
+                    Step::Read(peer, answer.clone()),
+                    Step::Written(0, Ok(())),
+                ]);
+            }
+            Kind::ReadReconnect if server => {
+                steps.extend([
+                    // Retain a responder and an unanswered request through recovery
+                    Step::Send(peer, content.clone()),
+                    Step::Receive(local, value, 0),
+                    Step::Request(local, 0, value, 3000),
+                    Step::Read(next, content.clone()),
+                    Step::FailRead(0, io::ErrorKind::BrokenPipe, false),
+                    Step::ReadPaused,
+                    Step::RetryRead,
+                    // Reconnect, which must retire the old session and its handles
+                    Step::Reconnect(local + 1),
+                    Step::ReceiveError(local, Failure::Transport),
+                    Step::Answer(0, Err(Failure::Transport)),
+                    Step::Abandon(0),
+                    Step::Close(local),
+                    Step::Refused(local),
+                    Step::Drop(local),
+                    Step::Released(local),
+                ]);
+                local += 1;
+                next = 2;
+            }
+            Kind::Close
+            | Kind::Replace
+            | Kind::Disconnect
+            | Kind::HandshakeFailure
+            | Kind::ReadRecovery
+            | Kind::ReadLoss
+            | Kind::ReadFailures
+            | Kind::ReadReconnect => {
                 steps.extend([
                     Step::StartReceive(local),
                     Step::Close(local),

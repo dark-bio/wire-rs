@@ -158,6 +158,17 @@ struct Fault {
     kind: FaultKind,
 }
 
+/// Read failure after a byte prefix, optionally losing the frame's remainder.
+#[derive(Clone, Copy, Debug)]
+struct ReadFault {
+    /// Bytes to deliver before returning the error.
+    after: usize,
+    /// Error returned by the read.
+    error: io::ErrorKind,
+    /// Whether to discard bytes up to the next delimiter, keeping the delimiter.
+    loss: bool,
+}
+
 /// Queued bytes, gates and observations of one bounded unidirectional pipe.
 #[derive(Debug, Default)]
 struct State {
@@ -181,6 +192,13 @@ struct State {
     read_error: Option<io::ErrorKind>,
     /// One-shot faults armed and not taken yet.
     faults: VecDeque<Fault>,
+    /// Read failures in order, each after its count of bytes delivered since
+    /// the one before.
+    read_faults: VecDeque<ReadFault>,
+    /// Whether a failed read is dropping bytes up to the next frame delimiter.
+    read_loss: bool,
+    /// Times of byte-positioned read failures and failed deadline setters.
+    read_failures: Vec<Instant>,
     /// Number of scenario threads waiting for the armed faults to be taken.
     #[cfg(test)]
     fault_waiters: usize,
@@ -231,6 +249,22 @@ impl Pipe {
     /// without retrying.
     pub(crate) fn fail_read_deadline(&self, error: io::ErrorKind) {
         self.state.lock().unwrap().read_error = Some(error);
+    }
+
+    /// Queues a read failure after `after` bytes, optionally losing the rest of
+    /// its frame while retaining the delimiter.
+    pub(crate) fn fail_read_after(&self, after: usize, error: io::ErrorKind, loss: bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .read_faults
+            .push_back(ReadFault { after, error, loss });
+        self.changed.notify_all();
+    }
+
+    /// Returns the times of byte-positioned read failures and setter failures.
+    pub(crate) fn read_failures(&self) -> Vec<Instant> {
+        self.state.lock().unwrap().read_failures.clone()
     }
 
     /// Arms a one-shot fault and wakes a matching call already waiting in I/O.
@@ -400,6 +434,7 @@ impl Read for Adapter {
         let mut state = self.pipe.state.lock().unwrap();
         state.read_deadline = deadline;
         if let Some(error) = state.read_error.take() {
+            state.read_failures.push(self.pipe.clock.now());
             return Err(error.into());
         }
         Ok(())
@@ -420,8 +455,31 @@ impl io::Read for Adapter {
             if let Some(fault) = Pipe::take_fault(&mut state, Operation::Read) {
                 return self.pipe.fail(state, Operation::Read, fault, deadline);
             }
+            // Fail once the next failure's bytes are delivered, recording when
+            if let Some(fault) = state.read_faults.pop_front_if(|fault| fault.after == 0) {
+                state.read_loss |= fault.loss;
+                state.read_failures.push(self.pipe.clock.now());
+                return Err(fault.error.into());
+            }
             if !state.paused[Operation::Read.index()] && !state.bytes.is_empty() {
-                let len = buf.len().min(state.bytes.len());
+                // Drop the lost suffix, preserving its delimiter for the framer
+                if state.read_loss {
+                    while state.bytes.front().is_some_and(|byte| *byte != 0) {
+                        state.bytes.pop_front();
+                    }
+                    self.pipe.changed.notify_all();
+                    if state.bytes.is_empty() {
+                        continue;
+                    }
+                    state.read_loss = false;
+                }
+
+                // Stop at the next failure's byte position, even within a frame
+                let mut len = buf.len().min(state.bytes.len());
+                if let Some(fault) = state.read_faults.front_mut() {
+                    len = len.min(fault.after);
+                    fault.after -= len;
+                }
                 for byte in &mut buf[..len] {
                     *byte = state.bytes.pop_front().unwrap();
                 }

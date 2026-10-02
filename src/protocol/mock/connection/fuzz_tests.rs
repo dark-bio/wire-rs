@@ -79,6 +79,16 @@ fn test_connection_fuzz_sequences() {
                 QueuedTimeout,
                 Pipeline,
             ],
+            [
+                ReadRecovery,
+                ReadFailures,
+                ReadLoss,
+                ReadReconnect,
+                HandshakeFailure,
+                ReadRecovery,
+                ReadFailures,
+                Incoming,
+            ],
         ] {
             run(&kinds.map(|kind| Action {
                 kind,
@@ -116,6 +126,10 @@ fn test_connection_fuzz_actions() {
             QueuedTimeout,
             ResponseBeforeFailure,
             InboundFailure,
+            ReadRecovery,
+            ReadLoss,
+            ReadFailures,
+            ReadReconnect,
         ] {
             for budget in 0..3 {
                 run(&[
@@ -133,6 +147,50 @@ fn test_connection_fuzz_actions() {
                     },
                 ]);
             }
+        }
+    }
+}
+
+/// Read failures recover at frame boundaries and inside frames, through every
+/// mix of repeated read and setter failures.
+#[test]
+fn test_connection_fuzz_read_recovery() {
+    // Fail 0, 1, 7 and 15 bytes into a frame, then one to four times in a row
+    // by reads, setters or both
+    for slot in [0, 2, 14, 30, 254] {
+        for (budget, value) in [(0, 0), (3, 1), (255, 2)] {
+            run(&[
+                Action {
+                    kind: Kind::ReadRecovery,
+                    slot,
+                    value: 255,
+                    budget,
+                },
+                Action {
+                    kind: Kind::ReadFailures,
+                    slot,
+                    value,
+                    budget,
+                },
+                Action {
+                    kind: Kind::ReadLoss,
+                    slot,
+                    value: 0,
+                    budget,
+                },
+                Action {
+                    kind: Kind::ReadReconnect,
+                    slot,
+                    value: 42,
+                    budget,
+                },
+                Action {
+                    kind: Kind::Incoming,
+                    slot,
+                    value: 127,
+                    budget,
+                },
+            ]);
         }
     }
 }
