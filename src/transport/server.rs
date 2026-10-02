@@ -11,7 +11,7 @@ use crate::LogId;
 use crate::transport::DEFAULT_HANDSHAKE_TIMEOUT;
 use crate::transport::framing::FrameReader;
 use crate::transport::handshake;
-use crate::transport::io::check_deadline;
+use crate::transport::io::{check_deadline, deadline_after};
 use crate::transport::outbound::{Outbound, Side};
 use crate::transport::sealing;
 use crate::transport::sender::Sender;
@@ -172,6 +172,9 @@ pub struct Server<R: Read, W: Write, A: Attester> {
     /// Fixed ArkHello signing time for test vectors, unset to read the clock.
     #[cfg(any(test, feature = "bench", feature = "fuzz"))]
     timestamp: Option<i64>,
+    /// Hook a test runs once the next handshake has opened its HostAck.
+    #[cfg(test)]
+    pub(super) ack_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
@@ -196,6 +199,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             log_id: LogId::default(),
             #[cfg(any(test, feature = "bench", feature = "fuzz"))]
             timestamp: None,
+            #[cfg(test)]
+            ack_hook: None,
         }
     }
 
@@ -209,8 +214,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// locks and attester callbacks can extend the call beyond the deadline.
     /// Time between [`Server::recv`] calls also consumes the budget.
     ///
-    /// Zero expires attempts immediately. A duration too large to add to an
-    /// [`Instant`] panics when the next handshake's deadline is constructed.
+    /// Zero, or a duration too large to add to an [`Instant`], expires attempts
+    /// immediately.
     pub fn set_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -263,7 +268,9 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     /// The handshake after a reset runs under one configured deadline, starting
     /// at that reset. It runs in the same call, or in the next one when the
     /// reset ended a session. Repeated resets within the attempt do not refresh
-    /// the deadline. Expiry returns a `TimedOut` I/O error, as
+    /// the deadline. A complete HostAck taken from the stream before the
+    /// deadline completes the handshake once it verifies, even if verifying
+    /// finishes later. Expiry returns a `TimedOut` I/O error, as
     /// [`Error::SendFailed`] while writing and as [`Error::RecvFailed`]
     /// otherwise. A fresh reset can start another attempt.
     ///
@@ -288,9 +295,8 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
     ///
     /// # Panics
     ///
-    /// Panics if a handshake or write timeout is too large to add to an
-    /// [`Instant`], or if a handshake reads a wall time before the Unix epoch
-    /// from the stream's clock.
+    /// Panics if a handshake reads a wall time before the Unix epoch from the
+    /// stream's clock.
     pub fn recv(&mut self) -> Result<Event<W>, Error> {
         // Continue until a message, session transition or I/O error is ready.
         // Empty frames request a handshake on the next pass.
@@ -354,7 +360,7 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                 // receive call if this one returns an event, or on the next pass.
                 Ok(None) => {
                     self.handshake_deadline =
-                        Some(self.outbound.clock.now() + self.handshake_timeout);
+                        Some(deadline_after(&self.outbound.clock, self.handshake_timeout));
                     if self.end_session() {
                         info!("wire session {} reset by host", self.log_id);
                         return Ok(Event::Disconnected);
@@ -571,8 +577,13 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
                     Error::HandshakeFailed(format!("server receiver setup failed: {}", err))
                 })?;
 
-            // Hand back the contexts unless the exchange finished past its deadline
-            check_deadline(&self.outbound.clock, deadline).map_err(Error::RecvFailed)?;
+            // Let a test move time on once the ack is opened
+            #[cfg(test)]
+            if let Some(hook) = self.ack_hook.take() {
+                hook();
+            }
+
+            // Hand back the contexts, since the ack was read within the deadline
             return Ok((sender, receiver));
         }
     }

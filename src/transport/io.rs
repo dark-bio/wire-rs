@@ -11,7 +11,7 @@
 
 use darkbio_clock::Clock;
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A standard byte reader whose blocking operations honor an absolute deadline.
 ///
@@ -118,6 +118,15 @@ impl<T: Write + ?Sized> Write for Box<T> {
     fn set_write_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         (**self).set_write_deadline(deadline)
     }
+}
+
+/// Returns the deadline `timeout` after the clock's current time.
+///
+/// A timeout too large to add to an [`Instant`] yields the current time, so
+/// its work expires at once instead of panicking.
+pub(super) fn deadline_after(clock: &Clock, timeout: Duration) -> Instant {
+    let now = clock.now();
+    now.checked_add(timeout).unwrap_or(now)
 }
 
 /// Refuses work whose absolute I/O deadline has already elapsed.
