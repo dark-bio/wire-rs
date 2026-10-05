@@ -333,7 +333,7 @@ fn test_deadline_during_write() {
         run(
             mode,
             &[
-                // Expire the request while its write is parked
+                // Expire the request while its write is waiting
                 Pause(outgoing, Operation::Write, true),
                 Request(local, 0, 10, 50),
                 Notify(0, 7),
@@ -1233,7 +1233,7 @@ fn test_new_earlier_deadline() {
         run(
             mode,
             &[
-                // Wake a parked worker with an earlier request's deadline
+                // Wake a waiting worker with an earlier request's deadline
                 Request(local, 0, 10, 3000),
                 Read(first, EnvelopeShape::Content(10)),
                 Request(local, 1, 11, 50),

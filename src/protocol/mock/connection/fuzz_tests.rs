@@ -8,6 +8,28 @@
 
 use super::*;
 
+/// A read recovery's retry deadline stays the next one on the clock while a
+/// woken deadline worker has not run yet.
+#[test]
+fn test_connection_fuzz_read_recovery_worker_deadlines() {
+    // The actions come from the CI fuzz crash `crash-3c75e0d2fdf713716f12ab98544f87df583bd24d`
+    run(&[
+        (Kind::ReadRecovery, 0, 255, 6),
+        (Kind::Incoming, 0, 255, 6),
+        (Kind::HandshakeFailure, 134, 0, 6),
+        (Kind::Pipeline, 0, 255, 6),
+        (Kind::Disconnect, 215, 39, 6),
+        (Kind::Pipeline, 0, 254, 6),
+        (Kind::Disconnect, 0, 1, 6),
+    ]
+    .map(|(kind, slot, value, budget)| Action {
+        kind,
+        slot,
+        value,
+        budget,
+    }));
+}
+
 /// Repeated failed handshakes keep each flush gate bound to its own attempt.
 #[test]
 fn test_connection_fuzz_repeated_handshake_timeouts() {

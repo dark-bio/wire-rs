@@ -156,7 +156,7 @@ fn test_blocked_framed_read_expires_on_stream_clock() {
     let mut reader = FrameReader::new(reader, closer);
     let deadline = clock.now() + Duration::from_secs(5);
     let reading = thread::spawn(move || reader.next_packet(Some(deadline)).map(|_| ()));
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
     assert_eq!(tester.next_deadline(), Some(deadline));
 
     // Pass expiry and require the reader to return instead of retrying adapter
@@ -478,7 +478,7 @@ fn test_unrepresentable_handshake_budget_expires_at_once() {
 /// fails without sending its ack, so the server never connects.
 #[test]
 fn test_client_expires_before_ack() {
-    /// Verifier that waits for the server to park on the ack, then passes the
+    /// Verifier that waits for the server's ack wait to register, then passes the
     /// handshake deadline before accepting the pinned key.
     struct Slow {
         /// Clock the verification moves past the deadline.
@@ -495,9 +495,9 @@ fn test_client_expires_before_ack() {
             attestation: &Attestation,
             now: SystemTime,
         ) -> Result<(xdsa::PublicKey, Self::Info), String> {
-            // Wait for the server to park on the ack, then pass both deadlines
+            // Wait for the server's ack wait to register, then pass both deadlines
             let mut tester = self.tester.lock().unwrap();
-            tester.wait_blocked(1);
+            tester.wait_registered(1);
             tester.advance(DEFAULT_HANDSHAKE_TIMEOUT * 2);
             Verifier::verify(&self.identity, attestation, now)
         }
@@ -584,7 +584,7 @@ fn test_protocol_handles_keep_the_stream_clock() {
     assert_eq!(responder.clock(), clock);
 }
 
-/// Checks that server acceptance parks on the stream clock until a client
+/// Checks that server acceptance waits on the stream clock until a client
 /// establishes a session.
 #[test]
 fn test_server_accept_waits_on_stream_clock() {
@@ -601,8 +601,8 @@ fn test_server_accept_waits_on_stream_clock() {
         (server, session)
     });
 
-    // Observe both the server reader and acceptance parked on this clock
-    tester.wait_blocked(2);
+    // Observe both the server reader and acceptance registered on this clock
+    tester.wait_registered(2);
     let (client, _) = protocol::connect(host, &identity).unwrap();
     let (server, session) = accepting.join().unwrap();
 
@@ -628,12 +628,11 @@ fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
     let (client, _) = protocol::connect(host, &identity).unwrap();
     let mut session = server.accept().unwrap();
 
-    // Leave one request pending, with all six protocol threads parked: a reader, a
-    // writer and a deadline worker per side
+    // Leave a request pending until both peers' readers, writers and deadline workers are parked
     let later = clock.now() + Duration::from_secs(30);
     let first = client.requester().request(vec![1], later).unwrap();
     let (_, first_responder) = session.recv().unwrap();
-    tester.wait_blocked(6);
+    tester.wait_parked(6);
 
     // Submit an earlier deadline, which the parked worker must recompute its
     // wait for
@@ -644,7 +643,7 @@ fn test_protocol_deadline_worker_notifies_without_promise_waiter() {
         let _ = events.send(());
     });
     let (_, responder) = session.recv().unwrap();
-    tester.wait_blocked(6);
+    tester.wait_parked(6);
     assert!(observed.try_recv().is_err());
 
     // Observe worker notification before any call that could synchronously

@@ -216,8 +216,10 @@ pub(crate) struct Pipe {
     capacity: usize,
     /// Queued bytes, gates and observations under one lock.
     state: Mutex<State>,
-    /// Condition variable waking blocked calls and waiting tests on changes.
+    /// Condition variable waking I/O calls when pipe data or gates change.
     changed: Condvar,
+    /// Condition variable waking scenarios when waits or injected faults change.
+    observed: Condvar,
 }
 
 impl Pipe {
@@ -228,6 +230,7 @@ impl Pipe {
             capacity,
             state: Mutex::new(State::default()),
             changed: Condvar::new(clock),
+            observed: Condvar::new(clock),
         })
     }
 
@@ -277,12 +280,13 @@ impl Pipe {
         self.changed.notify_all();
     }
 
-    /// Waits for an adapter call to block, so scenarios depend on an observed
-    /// operation rather than a scheduling delay.
-    pub(crate) fn wait_blocked(&self, operation: Operation) {
+    /// Waits for an adapter call to register a wait on the selected operation.
+    ///
+    /// A woken call remains registered until its wait returns.
+    pub(crate) fn wait_registered(&self, operation: Operation) {
         let mut state = self.state.lock().unwrap();
         while state.waiting[operation.index()] == 0 {
-            state = self.changed.wait(state).unwrap();
+            state = self.observed.wait(state).unwrap();
         }
     }
 
@@ -294,12 +298,12 @@ impl Pipe {
         #[cfg(test)]
         {
             state.fault_waiters += 1;
-            self.changed.notify_all();
+            self.observed.notify_all();
         }
 
         // Wait for adapter calls to take every armed fault
         while !state.faults.is_empty() {
-            state = self.changed.wait(state).unwrap();
+            state = self.observed.wait(state).unwrap();
         }
         #[cfg(test)]
         {
@@ -315,7 +319,7 @@ impl Pipe {
     pub(crate) fn wait_fault_waiter(&self, deadline: Instant) -> bool {
         let mut state = self.state.lock().unwrap();
         while state.fault_waiters == 0 {
-            let (next, timeout) = self.changed.wait_deadline(state, deadline).unwrap();
+            let (next, timeout) = self.observed.wait_deadline(state, deadline).unwrap();
             state = next;
             if timeout.timed_out() {
                 return state.fault_waiters != 0;
@@ -342,7 +346,7 @@ impl Pipe {
         deadline: Option<Instant>,
     ) -> io::Result<MutexGuard<'a, State>> {
         state.waiting[operation.index()] += 1;
-        self.changed.notify_all();
+        self.observed.notify_all();
         let (mut state, timed_out) = match deadline {
             Some(deadline) => {
                 let (state, timeout) = self.changed.wait_deadline(state, deadline).unwrap();
@@ -351,7 +355,7 @@ impl Pipe {
             None => (self.changed.wait(state).unwrap(), false),
         };
         state.waiting[operation.index()] -= 1;
-        self.changed.notify_all();
+        self.observed.notify_all();
         if timed_out && !state.closed {
             Err(io::ErrorKind::TimedOut.into())
         } else {
@@ -381,7 +385,7 @@ impl Pipe {
         deadline: Option<Instant>,
     ) -> io::Result<usize> {
         // Wake scenarios waiting for the fault to be taken
-        self.changed.notify_all();
+        self.observed.notify_all();
         match kind {
             FaultKind::Error(kind) => Err(kind.into()),
             FaultKind::Timeout => loop {
@@ -750,7 +754,7 @@ impl Peers {
         let identity = &self.identity;
         let result = thread::scope(|scope| {
             let connecting = scope.spawn(|| client.connect(identity));
-            pipe.wait_blocked(operation);
+            pipe.wait_registered(operation);
             pipe.fault(operation, 0, FaultKind::Error(io::ErrorKind::Other));
             pipe.pause(operation, false);
             connecting.join().unwrap()
@@ -847,13 +851,13 @@ pub fn run(scenario: Scenario) {
                 peers.incoming.pause(Operation::Read, true);
             }
 
-            // Let the selected fault park before advancing its output deadline
+            // Let the selected fault register its wait before advancing the output deadline
             let started = peers.tester.clock().now();
             let first = thread::scope(|scope| {
                 let connecting = scope.spawn(|| peers.client.connect(&peers.identity));
                 if timeout {
-                    pipe.wait_blocked(operation);
-                    peers.tester.wait_blocked(2);
+                    pipe.wait_registered(operation);
+                    peers.tester.wait_parked(2);
                     peers.tester.advance(FAULT_TIMEOUT);
                 }
                 if !ack {
@@ -872,8 +876,8 @@ pub fn run(scenario: Scenario) {
                         matches!(peers.events.recv().unwrap(), Err(Error::SendFailed(err)) if err.kind() == expected)
                     );
                     if lost_reply {
-                        peers.incoming.wait_blocked(Operation::Read);
-                        peers.tester.wait_blocked(2);
+                        peers.incoming.wait_registered(Operation::Read);
+                        peers.tester.wait_parked(2);
                         peers.tester.advance_to(started + HANDSHAKE_TIMEOUT);
                     }
                 }
@@ -928,7 +932,7 @@ pub fn run(scenario: Scenario) {
             let incoming = &peers.incoming;
             thread::scope(|scope| {
                 let connecting = scope.spawn(|| client.connect(identity));
-                incoming.wait_blocked(Operation::Write);
+                incoming.wait_registered(Operation::Write);
                 incoming.fault(Operation::Read, 0, FaultKind::Error(io::ErrorKind::Other));
                 incoming.pause(Operation::Read, false);
                 assert!(matches!(
@@ -964,10 +968,8 @@ pub fn run(scenario: Scenario) {
             }
             assert!(matches!(peers.event(), Event::Disconnected));
 
-            // Check the deadline the server installs on its pipe. Taking
-            // the HostAck's fault notifies the pipe, and the clock unlists
-            // a wait while it wakes.
-            peers.outgoing.wait_blocked(Operation::Read);
+            // Read the server's installed deadline once its input wait is registered
+            peers.outgoing.wait_registered(Operation::Read);
             assert_eq!(
                 peers.outgoing.state.lock().unwrap().read_deadline,
                 Some(started + HANDSHAKE_TIMEOUT)
@@ -993,8 +995,8 @@ pub fn run(scenario: Scenario) {
                 for _ in 0..4 {
                     peers.client.send_frame_blob(&[]).unwrap();
                     peers.outgoing.wait_drained();
-                    peers.outgoing.wait_blocked(Operation::Read);
-                    peers.tester.wait_blocked(1);
+                    peers.outgoing.wait_registered(Operation::Read);
+                    peers.tester.wait_parked(1);
                     assert_eq!(
                         peers.tester.next_deadline(),
                         Some(started + HANDSHAKE_TIMEOUT)
@@ -1019,8 +1021,8 @@ pub fn run(scenario: Scenario) {
                             .unwrap();
                         io::Write::write_all(&mut junk, &[0, 1, 0, 2, 42, 0]).unwrap();
                         peers.incoming.wait_drained();
-                        peers.incoming.wait_blocked(Operation::Read);
-                        peers.tester.wait_blocked(2);
+                        peers.incoming.wait_registered(Operation::Read);
+                        peers.tester.wait_parked(2);
                         assert_eq!(
                             peers.tester.next_deadline(),
                             Some(started + HANDSHAKE_TIMEOUT)
@@ -1046,7 +1048,7 @@ pub fn run(scenario: Scenario) {
             let client_send = if both_directions {
                 peers.outgoing.pause(Operation::Read, true);
                 let sent = peers.send(old_client.clone(), vec![1; 3 * HANDSHAKE_CAPACITY], false);
-                peers.outgoing.wait_blocked(Operation::Write);
+                peers.outgoing.wait_registered(Operation::Write);
                 Some(sent)
             } else {
                 None
@@ -1056,7 +1058,7 @@ pub fn run(scenario: Scenario) {
                 vec![2; 3 * HANDSHAKE_CAPACITY],
                 both_directions,
             );
-            peers.incoming.wait_blocked(Operation::Write);
+            peers.incoming.wait_registered(Operation::Write);
 
             // Reconnect past the blocked output
             let (client, server) = if both_directions {
@@ -1066,7 +1068,7 @@ pub fn run(scenario: Scenario) {
                 let client = thread::scope(|scope| {
                     let connecting = scope.spawn(|| peers.client.connect(&peers.identity));
                     waiting();
-                    peers.tester.wait_blocked(3);
+                    peers.tester.wait_parked(3);
                     peers.tester.advance(FAULT_TIMEOUT);
                     connecting.join().unwrap().unwrap().0
                 });
@@ -1143,12 +1145,12 @@ pub fn run(scenario: Scenario) {
                 vec![3; if flush { 8 } else { 4096 }],
                 false,
             );
-            peers.incoming.wait_blocked(if flush {
+            peers.incoming.wait_registered(if flush {
                 Operation::Flush
             } else {
                 Operation::Write
             });
-            peers.tester.wait_blocked(2);
+            peers.tester.wait_parked(2);
             peers.tester.advance(FAULT_TIMEOUT);
 
             // The send times out, writing no failure notification after it
@@ -1197,8 +1199,8 @@ pub fn run(scenario: Scenario) {
                     };
                     sent.send(result).unwrap();
                 });
-                incoming.wait_blocked(Operation::Read);
-                outgoing.wait_blocked(Operation::Read);
+                incoming.wait_registered(Operation::Read);
+                outgoing.wait_registered(Operation::Read);
                 // Ordinary receives must clear the preceding handshake deadline
                 assert_eq!(
                     incoming.state.lock().unwrap().read_deadline.is_some(),
@@ -1251,7 +1253,7 @@ mod tests {
     /// deadline.
     #[test]
     fn test_server_deadline_before_hello() {
-        // Advance the parked handshake without supplying a hello
+        // Advance the waiting handshake without supplying a hello
         run(Scenario::SilentHandshake { ack: false });
     }
 
@@ -1259,7 +1261,7 @@ mod tests {
     /// deadline.
     #[test]
     fn test_server_deadline_before_ack() {
-        // Advance the parked handshake after withholding its acknowledgment
+        // Advance the waiting handshake after withholding its acknowledgment
         run(Scenario::SilentHandshake { ack: true });
     }
 
@@ -1281,7 +1283,7 @@ mod tests {
     /// session.
     #[test]
     fn test_shutdown_releases_peer_reads() {
-        // Close each side while both adapter reads are parked
+        // Close each side while both adapter reads are waiting
         for handshake in [false, true] {
             for server in [false, true] {
                 run(Scenario::Shutdown { handshake, server });

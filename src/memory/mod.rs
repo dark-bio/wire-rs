@@ -288,7 +288,7 @@ struct State {
     writer_open: bool,
     /// Whether the reader closed with accepted output still unconsumed.
     lost: bool,
-    /// Operations parked in a wait, counted for tests to observe.
+    /// Registered operation waits, counted for tests to observe.
     #[cfg(test)]
     waiting: usize,
     /// Whether a wait fails instead of blocking, so a test cannot hang.
@@ -435,7 +435,7 @@ mod tests {
         let deadline = clock.now() + Duration::from_secs(5);
         reader.set_read_deadline(Some(deadline)).unwrap();
         let reading = thread::spawn(move || reader.read(&mut [0]));
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         assert_eq!(tester.next_deadline(), Some(deadline));
 
         // Advance exactly to expiry and observe the blocked operation returning
@@ -450,7 +450,7 @@ mod tests {
     /// reaches the installed deadline.
     #[test]
     fn test_blocked_write_expires_on_clock_deadline() {
-        // Fill the pipe and park another write on the same fixed deadline
+        // Fill the pipe and start another write with the same fixed deadline
         let mut tester = TestClock::new();
         tester.advance(Duration::from_secs(86400));
         let clock = tester.clock();
@@ -460,7 +460,7 @@ mod tests {
         let deadline = clock.now() + Duration::from_secs(5);
         writer.set_write_deadline(deadline).unwrap();
         let writing = thread::spawn(move || writer.write(b"b"));
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         assert_eq!(tester.next_deadline(), Some(deadline));
 
         // Advance exactly to expiry and observe the blocked operation returning
@@ -635,7 +635,7 @@ mod tests {
             assert_eq!(buf, [99]);
             done.send((reader, error.kind())).unwrap();
         });
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         tester.advance_to(deadline);
         let (mut reader, kind) = result.recv().unwrap();
         timed.join().unwrap();
@@ -659,7 +659,7 @@ mod tests {
     /// before timing out, without the abandoned suffix appearing afterwards.
     #[test]
     fn test_write_timeout_and_reuse() {
-        // Fill the pipe and park the remaining byte until its deadline
+        // Fill the pipe and leave the remaining byte waiting until its deadline
         let mut tester = test_clock();
         let clock = tester.clock();
         let deadline = clock.now() + TIMEOUT;
@@ -673,7 +673,7 @@ mod tests {
             assert!(clock.now() >= deadline);
             done.send((writer, error.kind())).unwrap();
         });
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         tester.advance_to(deadline);
         let (mut writer, kind) = result.recv().unwrap();
         writing.join().unwrap();
@@ -711,7 +711,7 @@ mod tests {
             done.send(writer.write_all(b"defgh")).unwrap();
         });
 
-        // Drain the pipe after the writer has parked
+        // Drain the pipe after the writer has registered its wait
         blocked(&pipe);
         reader.set_read_deadline(Some(deadline)).unwrap();
         let mut bytes = [0; 8];
@@ -742,7 +742,7 @@ mod tests {
                 write_done.send(writer.write(b"b")).unwrap();
             });
 
-            // Close only after both adapter calls have parked
+            // Close only after both adapter calls have registered their waits
             blocked(&incoming);
             blocked(&outgoing);
             if local {

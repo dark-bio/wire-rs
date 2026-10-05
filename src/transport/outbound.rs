@@ -749,7 +749,7 @@ mod tests {
 
         // Fence both writer acquisitions before checking that neither returned
         outbound.wait_writers(2);
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         assert!(done.try_recv().is_err());
 
         // Release the writer and await both end calls

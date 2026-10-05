@@ -395,7 +395,7 @@ mod tests {
             );
             let result = std::thread::scope(|scope| {
                 let reading = scope.spawn(|| reader.next_packet(Some(deadline)).map(|_| ()));
-                tester.wait_blocked(1);
+                tester.wait_registered(1);
                 tester.advance_to(deadline);
                 reading.join().unwrap()
             });
@@ -925,7 +925,7 @@ mod tests {
         let deadline = clock.now() + Duration::from_millis(100);
         let result = std::thread::scope(|scope| {
             let writing = scope.spawn(|| framing.send_frame_blob(b"old", deadline));
-            tester.wait_blocked(1);
+            tester.wait_registered(1);
             tester.advance_to(deadline);
             writing.join().unwrap()
         });

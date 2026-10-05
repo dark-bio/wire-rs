@@ -48,7 +48,7 @@ pub struct Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 pub enum Kind {
-    /// New session attached and accepted, or an acceptance parked for a later
+    /// New session attached and accepted, or an acceptance waiting for a later
     /// attach or closure to end.
     ///
     /// An ended server refuses the attach.
@@ -82,7 +82,7 @@ pub enum Kind {
     /// Peer answer to the selected request, possibly raced against closure.
     Answer,
 
-    /// Wait on the selected promise, parked until the promise settles.
+    /// Wait on the selected promise until the promise settles.
     Wait,
     /// Drop of the selected promise, leaving its operation running.
     DropPromise,
@@ -152,7 +152,7 @@ struct Operation {
     retained: bool,
     /// Whether a waiting job owns the promise until a later action collects its
     /// result.
-    parked: bool,
+    waiting: bool,
     /// Whether a notification is registered on the promise, which the model
     /// never repeats since a second registration panics.
     notified: bool,
@@ -198,7 +198,7 @@ struct Model {
     server: Option<Failure>,
     /// Whether the session source still exists.
     source: bool,
-    /// Whether a parked acceptance owns the server until an attach or closure
+    /// Whether a waiting acceptance owns the server until an attach or closure
     /// wakes it.
     accepting: bool,
     /// Whether the server owner was dropped, while the driver keeps its closer
@@ -254,14 +254,14 @@ impl Model {
             .sum()
     }
 
-    /// Finishes the parked waits whose promises have settled, releasing their
+    /// Finishes the waiting jobs whose promises have settled, releasing their
     /// bytes before the usage checks.
     ///
     /// Pending waits stay blocked and can overlap later completions or session
     /// closure.
     fn collect_waiters(&mut self) {
         for (id, operation) in self.operations.iter_mut().enumerate() {
-            if operation.parked
+            if operation.waiting
                 && let Some(result) = operation.result
             {
                 self.steps.push(if operation.request() {
@@ -269,7 +269,7 @@ impl Model {
                 } else {
                     Step::FinishWaitWrite(id as u8, result.map(|_| ()))
                 });
-                operation.parked = false;
+                operation.waiting = false;
                 operation.retained = false;
             }
         }
@@ -293,8 +293,8 @@ impl Model {
     /// failures from the encoded envelope lengths.
     ///
     /// A refused request closes the session, discarding the requests queued
-    /// before it. With `parked`, a receive starts waiting before each delivery.
-    fn incoming(&mut self, session: usize, count: u8, value: u8, parked: bool) {
+    /// before it. With `waiting`, a receive starts waiting before each delivery.
+    fn incoming(&mut self, session: usize, count: u8, value: u8, waiting: bool) {
         // Deliver each request, refusing the first one past either limit
         let base = self.responders.len();
         let mut bytes = self.byte_usage(session);
@@ -315,14 +315,14 @@ impl Model {
                 } else {
                     None
                 };
-            if parked {
+            if waiting {
                 self.steps.push(Step::StartReceive(session as u8));
             }
             if let Some(reason) = reason {
                 self.steps
                     .push(Step::RejectDelivery(session as u8, id, tag, reason));
                 self.close(session, reason);
-                if parked {
+                if waiting {
                     self.steps
                         .push(Step::FinishReceiveError(session as u8, reason));
                 }
@@ -335,7 +335,7 @@ impl Model {
         for offset in 0..usize::from(count) {
             let slot = (base + offset) as u8;
             let tag = value.wrapping_add(offset as u8);
-            self.steps.push(if parked {
+            self.steps.push(if waiting {
                 Step::FinishReceive(session as u8, tag, slot)
             } else {
                 Step::Receive(session as u8, tag, slot)
@@ -383,7 +383,7 @@ impl Model {
             result: (deadline <= self.time).then_some(Err(Failure::Timeout)),
             response_bytes: 0,
             retained,
-            parked: false,
+            waiting: false,
             notified: false,
             notification: false,
         });
@@ -399,7 +399,7 @@ impl Model {
         let session = &self.sessions[operation.session];
         operation.result.is_none()
             && operation.retained
-            && !operation.parked
+            && !operation.waiting
             && self.time < operation.deadline
             && session.reason.is_none()
             && session.owner
@@ -695,7 +695,7 @@ impl Model {
             Kind::Notify
                 if !self.operations.is_empty()
                     && self.operations[operation].retained
-                    && !self.operations[operation].parked
+                    && !self.operations[operation].waiting
                     && !self.operations[operation].notified =>
             {
                 let pending = &mut self.operations[operation];
@@ -710,14 +710,14 @@ impl Model {
             Kind::Wait
                 if !self.operations.is_empty()
                     && self.operations[operation].retained
-                    && !self.operations[operation].parked =>
+                    && !self.operations[operation].waiting =>
             {
                 let request = self.operations[operation].request();
                 // Waiting expires overdue operations in the same session before
                 // blocking. `collect_waiters()` finishes the wait once a result is
                 // available.
                 self.expire(self.operations[operation].session);
-                self.operations[operation].parked = true;
+                self.operations[operation].waiting = true;
                 self.steps.push(if request {
                     Step::StartWait(operation as u8)
                 } else {
@@ -727,7 +727,7 @@ impl Model {
             Kind::DropPromise
                 if !self.operations.is_empty()
                     && self.operations[operation].retained
-                    && !self.operations[operation].parked =>
+                    && !self.operations[operation].waiting =>
             {
                 self.operations[operation].retained = false;
                 self.steps.push(if self.operations[operation].request() {
@@ -798,7 +798,7 @@ impl Model {
                 };
 
                 // The first reason sticks, ending the current session and any
-                // parked acceptance
+                // waiting acceptance
                 if let Some(reason) = reason {
                     let reason = *self.server.get_or_insert(reason);
                     if !self.sessions.is_empty() {
@@ -923,7 +923,7 @@ pub fn run(actions: &[Action]) {
             .result
             .expect("closed session settles every operation");
         assert!(
-            !operation.parked,
+            !operation.waiting,
             "completed waiters were already collected"
         );
         model.steps.push(if operation.request() {
