@@ -246,6 +246,7 @@ fn test_client_handshake_uses_clock_wall_time() {
             &signer,
             &hello.host_crypto,
             CRYPTO_DOMAIN_WIRE,
+            &cose::Padding::None,
             1_234_567_890,
         )
         .unwrap();
@@ -347,6 +348,7 @@ fn test_server_handshake_uses_clock_wall_time() {
         &host_signer,
         &hello.ark_crypto,
         CRYPTO_DOMAIN_WIRE,
+        &cose::Padding::None,
         1_345_678_901,
     )
     .unwrap();
