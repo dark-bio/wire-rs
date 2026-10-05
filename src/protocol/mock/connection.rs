@@ -549,7 +549,7 @@ impl Driver {
     fn step(&mut self, step: Step) {
         match step {
             Step::Advance(millis) => {
-                self.tester.wait_blocked(self.parked);
+                self.tester.wait_parked(self.parked);
                 self.tester.advance(Duration::from_millis(millis));
             }
             Step::Reconnect(label) => {
@@ -565,14 +565,14 @@ impl Driver {
                     panic!("raw client required")
                 };
                 // Expire the raw client's read after failed server output leaves
-                // it parked. Time moves only once the server's hello has taken
+                // it waiting. Time moves only once the server's hello has taken
                 // the write fault. A hello that expires first skips the fault,
                 // leaving it to fail the next handshake, whose client then waits
                 // on this stopped clock.
                 let deadline = self.tester.clock().now() + WRITE_BUDGET;
                 std::thread::scope(|scope| {
                     let connecting = scope.spawn(|| client.connect(&self.identity));
-                    self.pipes[1].wait_blocked(Operation::Read);
+                    self.pipes[1].wait_registered(Operation::Read);
                     self.pipes[1].wait_faults_taken();
                     self.tester.advance_to(deadline);
                     assert!(connecting.join().unwrap().is_err());
@@ -584,7 +584,7 @@ impl Driver {
                 let outgoing = self.pipes[1].clone();
                 outgoing.pause(Operation::Flush, true);
                 let gate = Job::start(move || {
-                    outgoing.wait_blocked(Operation::Flush);
+                    outgoing.wait_registered(Operation::Flush);
                     incoming.fail_read_deadline(io::ErrorKind::TimedOut);
                     outgoing.pause(Operation::Flush, false);
                 });
@@ -625,12 +625,12 @@ impl Driver {
             Step::RetryRead => {
                 // Require the parked reader to wait for the full retry deadline
                 let deadline = self.read_retry.take().unwrap();
-                self.tester.wait_blocked(self.parked);
+                self.tester.wait_parked(self.parked);
                 assert_eq!(self.tester.next_deadline(), Some(deadline));
 
                 // Stop just before expiry and require the fault count to stay put
                 self.tester.advance_to(deadline - Duration::from_nanos(1));
-                self.tester.wait_blocked(self.parked);
+                self.tester.wait_parked(self.parked);
                 assert_eq!(self.pipes[0].read_failures().len(), self.read_failures);
                 assert!(matches!(
                     self.read_retries.as_ref().unwrap().try_recv(),
@@ -853,7 +853,7 @@ impl Driver {
                 )
             }
             Step::Pause(side, op, paused) => self.pipes[side as usize].pause(op, paused),
-            Step::Blocked(side, op) => self.pipes[side as usize].wait_blocked(op),
+            Step::Blocked(side, op) => self.pipes[side as usize].wait_registered(op),
             Step::Fault(side, op, error) => {
                 self.pipes[side as usize].fault(op, 0, FaultKind::Error(error))
             }

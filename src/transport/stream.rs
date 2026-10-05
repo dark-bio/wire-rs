@@ -424,7 +424,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// Checks that concurrent closers park on the stream clock until admitted
+    /// Checks that concurrent closers wait on the stream clock until admitted
     /// I/O is released.
     #[test]
     fn test_concurrent_closers_wait_on_stream_clock() {
@@ -438,7 +438,7 @@ mod tests {
             let second = scope.spawn(|| closer.close());
 
             // Require both shutdown waits to be registered on this clock
-            tester.wait_blocked(2);
+            tester.wait_registered(2);
             assert!(closer.enter().is_none());
 
             // Complete the admitted operation and let both closers finish
@@ -595,9 +595,9 @@ mod tests {
             }
         });
 
-        // Close only after the adapter has parked and preserve its result
+        // Close only after the adapter has registered its wait and preserve its result
         entries.recv().unwrap();
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         closer.close();
         let result = io.join().unwrap();
         if fails {
@@ -724,7 +724,7 @@ mod tests {
         });
         callback.recv().unwrap();
 
-        // Start another close and owner drop while the first callback is parked
+        // Start another close and owner drop while the first callback is waiting
         let (started, starts) = mpsc::channel();
         let second = thread::spawn({
             let closer = closer.clone();
@@ -743,7 +743,7 @@ mod tests {
         });
         starts.recv().unwrap();
         starts.recv().unwrap();
-        tester.wait_blocked(3);
+        tester.wait_registered(3);
         assert!(finishes.try_recv().is_err());
 
         // Release the callback and await all three closers
@@ -909,7 +909,7 @@ mod tests {
             });
             entries.recv().unwrap();
 
-            // Require both I/O and shutdown to park before checking completion
+            // Require both I/O and shutdown to register waits before checking completion
             let (finished, finishes) = mpsc::channel();
             let closing = thread::spawn({
                 let closer = closer.clone();
@@ -919,7 +919,7 @@ mod tests {
                 }
             });
             requests.recv().unwrap();
-            tester.wait_blocked(2);
+            tester.wait_registered(2);
             assert!(finishes.try_recv().is_err());
 
             // Release the admitted operation and refuse every new adapter call
@@ -994,7 +994,7 @@ mod tests {
     /// deadline, a timeout leaves the stream reusable and a zero budget skips I/O.
     #[test]
     fn test_output_deadline_and_reuse() {
-        // Start a partial write whose flush parks until its clock deadline
+        // Start a partial write whose flush waits until its clock deadline
         let mut tester = test_clock();
         let clock = tester.clock();
         let timeout = Duration::from_millis(40);
@@ -1017,7 +1017,7 @@ mod tests {
         let deadline = clock.now() + configured;
         let result = thread::scope(|scope| {
             let writing = scope.spawn(|| writer.write(b"abc", deadline));
-            tester.wait_blocked(1);
+            tester.wait_registered(1);
             assert_eq!(tester.next_deadline(), Some(deadline));
             tester.advance_to(deadline);
             writing.join().unwrap()
@@ -1318,7 +1318,7 @@ mod tests {
             let deadline = clock.now() + Duration::from_millis(40);
             let result = thread::scope(|scope| {
                 let writing = scope.spawn(|| writer.write(bytes, deadline));
-                tester.wait_blocked(1);
+                tester.wait_registered(1);
                 tester.advance_to(deadline);
                 writing.join().unwrap()
             });

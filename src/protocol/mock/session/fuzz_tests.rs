@@ -54,7 +54,7 @@ fn test_notifications() {
     }
 }
 
-/// Registrations notify settled and parked promises, even after the session is
+/// Registrations notify settled and waiting promises, even after the session is
 /// gone, but never dropped ones.
 #[test]
 fn test_notification_lifetimes() {
@@ -182,7 +182,7 @@ fn test_model_scripts() {
 /// Both promise kinds can wait before completion, including failed writes,
 /// wrong response types and deadlines that have already passed.
 #[test]
-fn test_parked_waits() {
+fn test_waiting_promises() {
     use Kind::*;
     for budget in [0, 4, 200] {
         for value in [0, 1, 2, 7] {
@@ -209,7 +209,7 @@ fn test_parked_waits() {
 /// Parked waits settle with `Timeout` from their deadline on, whichever expiry or
 /// ending reaches them.
 #[test]
-fn test_parked_wait_endings() {
+fn test_waiting_promise_endings() {
     use Kind::*;
 
     // Park waits on a request and a reply, then end them around the deadline
@@ -229,7 +229,7 @@ fn test_parked_wait_endings() {
         }
     }
 
-    // A replacement ends the old parked wait with a reset, and new work then
+    // A replacement ends the old waiting job with a reset, and new work then
     // settles on the successor
     run_actions(&[
         (Request, 0, 10, 20),
@@ -294,10 +294,10 @@ fn test_server_endings() {
     }
 }
 
-/// A parked acceptance ends with a later attach, server closure or dropped
+/// A waiting acceptance ends with a later attach, server closure or dropped
 /// source, after which closed sessions refuse work.
 #[test]
-fn test_parked_acceptance() {
+fn test_waiting_acceptance() {
     use Kind::*;
 
     // Park an acceptance beside open work, end it in each way, then act on the

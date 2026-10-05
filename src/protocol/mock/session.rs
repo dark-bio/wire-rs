@@ -877,7 +877,7 @@ impl Driver {
                 let session = self.session_refs[&id].upgrade().unwrap();
                 self.workers
                     .push(thread::spawn(move || session.run_deadlines()));
-                self.tester.wait_blocked(1);
+                self.tester.wait_registered(1);
             }
             Step::CloseSession(id) => {
                 let closer = self.closers[&id].clone();

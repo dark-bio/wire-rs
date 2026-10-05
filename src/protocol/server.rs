@@ -854,7 +854,7 @@ mod tests {
     /// stopped.
     #[test]
     fn test_server_close_interrupts_read_retry() {
-        // Fail the read after a junk byte, parking the reader in its pause
+        // Fail the read after a junk byte, leaving the reader waiting in its pause
         let tester = test_clock();
         let (server, host, plan, retries, _) = faulty_server(&tester.clock());
         {

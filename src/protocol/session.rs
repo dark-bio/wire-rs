@@ -981,7 +981,7 @@ impl SessionInner {
         let mut notifications = Notifications::default();
         let mut state = self.state.lock().expect("session state not poisoned");
         loop {
-            // Run expiry callbacks before selecting work or parking the writer
+            // Run expiry callbacks before selecting work or waiting again
             state.expire(self.now(), &mut notifications);
             if !notifications.is_empty() {
                 drop(state);
@@ -1474,9 +1474,9 @@ mod tests {
     use std::fmt::Debug;
 
     /// Checks that the deadline worker releases both locks before notifying and
-    /// parking again.
+    /// waiting again.
     #[test]
-    fn test_deadline_callback_releases_locks_before_worker_parks() {
+    fn test_deadline_callback_releases_locks_before_worker_waits() {
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
@@ -1495,8 +1495,8 @@ mod tests {
         let state = session.inner.clone();
         let worker = thread::spawn(move || state.run_deadlines());
 
-        // Reach the parked deadline without asking the promise to expire itself
-        tester.wait_blocked(1);
+        // Reach the registered deadline without asking the promise to expire itself
+        tester.wait_registered(1);
         tester.advance_to(deadline);
         let unlocked = receiver.recv().unwrap();
 

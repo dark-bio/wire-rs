@@ -681,7 +681,7 @@ mod tests {
         };
         entered.recv().unwrap();
 
-        // Attempt session ending while the flush remains parked
+        // Attempt session ending while the flush remains waiting
         let (started_tx, started) = mpsc::channel();
         let (ended_tx, ended) = mpsc::channel();
         let outbound = client.outbound.clone();
@@ -692,7 +692,7 @@ mod tests {
             client
         });
         started.recv().unwrap();
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         outbound.wait_writers(1);
         assert!(ended.try_recv().is_err());
 
@@ -749,8 +749,8 @@ mod tests {
         let sending = thread::spawn(move || sender.send(&payload(2)));
         entered.recv().unwrap();
 
-        // Receive the message while the outgoing flush is parked
-        tester.wait_blocked(1);
+        // Receive the message while the outgoing flush is waiting
+        tester.wait_registered(1);
         let (received_tx, received) = mpsc::channel();
         let receiving = thread::spawn(move || {
             received_tx.send(client.recv()).unwrap();
