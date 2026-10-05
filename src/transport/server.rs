@@ -533,12 +533,14 @@ impl<R: Read, W: Write, A: Attester> Server<R, W, A> {
             let timestamp = self
                 .timestamp
                 .unwrap_or_else(|| handshake::timestamp(&self.outbound.clock));
+            // The session is unpadded, since only a USB tap sees its lengths
             let sealed = cose::seal_at(
                 &ark_hello,
                 &auth,
                 &self.signer,
                 &host_hello.host_crypto,
                 CRYPTO_DOMAIN_WIRE,
+                &cose::Padding::None,
                 timestamp,
             );
             let ark_hello = sealed.map_err(|err| {

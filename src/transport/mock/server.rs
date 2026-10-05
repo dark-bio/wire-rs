@@ -707,6 +707,7 @@ impl Server {
                 signer,
                 recipient,
                 CRYPTO_DOMAIN_WIRE,
+                &cose::Padding::None,
                 TIMESTAMP,
             ),
             Flaw::Key => cose::seal_at(
@@ -719,6 +720,7 @@ impl Server {
                 signer,
                 recipient,
                 CRYPTO_DOMAIN_WIRE,
+                &cose::Padding::None,
                 TIMESTAMP,
             ),
             _ => cose::seal_at(
@@ -727,6 +729,7 @@ impl Server {
                 signer,
                 recipient,
                 CRYPTO_DOMAIN_WIRE,
+                &cose::Padding::None,
                 TIMESTAMP,
             ),
         }

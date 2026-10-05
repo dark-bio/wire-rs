@@ -711,6 +711,7 @@ fn checker_session(seed: u8) -> (Peer, Vec<u8>, xhpke::Sender) {
         &signer,
         &crypto.public_key(),
         CRYPTO_DOMAIN_WIRE,
+        &cose::Padding::None,
         TIMESTAMP,
     )
     .unwrap();

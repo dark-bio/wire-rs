@@ -422,6 +422,7 @@ impl Pending {
             &self.keys.signer,
             &self.ark_crypto,
             CRYPTO_DOMAIN_WIRE,
+            &cose::Padding::None,
             TIMESTAMP,
         )
         .unwrap();
@@ -458,6 +459,7 @@ impl Pending {
                 signer,
                 &self.ark_crypto,
                 CRYPTO_DOMAIN_WIRE,
+                &cose::Padding::None,
                 TIMESTAMP,
             ),
             _ => cose::seal_at(
@@ -471,6 +473,7 @@ impl Pending {
                 signer,
                 &self.ark_crypto,
                 CRYPTO_DOMAIN_WIRE,
+                &cose::Padding::None,
                 TIMESTAMP,
             ),
         }

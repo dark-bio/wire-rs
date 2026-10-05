@@ -341,12 +341,14 @@ impl<R: Read, W: Write> Client<R, W> {
             ark_signer: ark_identity,
             ark_crypto: ark_xhpke_pk.clone(),
         };
+        // The session is unpadded, since only a USB tap sees its lengths
         let ack = cose::seal_at(
             &ack,
             &auth,
             &host_xdsa_sk,
             &ark_xhpke_pk,
             CRYPTO_DOMAIN_WIRE,
+            &cose::Padding::None,
             timestamp.unwrap_or_else(|| handshake::timestamp(&self.outbound.clock)),
         )
         .map_err(|err| Error::HandshakeFailed(format!("failed to seal client ack: {}", err)))?;
