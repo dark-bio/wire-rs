@@ -7,9 +7,7 @@
 //! Session state, request queues, and the reader, writer, and deadline workers.
 
 use super::envelope::{Header, IncomingEnvelope, MessageKind, Parity, Side};
-use super::operation::{
-    OperationHandle, OperationKey, OutgoingBody, OutgoingMessage, PendingOperation,
-};
+use super::operation::{OperationKey, Operations, OutgoingBody, OutgoingMessage, PendingOperation};
 use super::promise::{Notifications, PromiseResult};
 use super::worker;
 use super::{
@@ -294,8 +292,9 @@ enum State {
         /// local flush returns.
         reserved_ids: HashSet<u64>,
 
-        /// Requests and replies waiting for the writer to take them.
-        outgoing: VecDeque<OutgoingMessage>,
+        /// Operations waiting to send a result to their promise, with the
+        /// requests and replies still waiting for the writer to take them.
+        operations: Operations,
         /// Next locally allocated ID, or `None` once exhausted, never wrapping
         /// or reusing an ID.
         next_id: Option<u64>,
@@ -305,11 +304,6 @@ enum State {
         /// or the session closes. A request that fails to encode is removed at
         /// once.
         outstanding: HashMap<u64, OperationKey>,
-        /// Operations waiting to send a result to their promise.
-        ///
-        /// Each is removed before sending that result, so a promise is completed
-        /// only once.
-        operations: HashMap<OperationKey, PendingOperation>,
 
         /// One-shot test notification sent under the state lock before waiting.
         #[cfg(any(test, feature = "fuzz"))]
@@ -340,10 +334,9 @@ impl SessionInner {
                 incoming: VecDeque::new(),
                 reserved_ids: HashSet::new(),
 
-                outgoing: VecDeque::new(),
+                operations: Operations::default(),
                 next_id: Some(Parity::from(side).first()),
                 outstanding: HashMap::new(),
-                operations: HashMap::new(),
 
                 #[cfg(any(test, feature = "fuzz"))]
                 wait_hook: None,
@@ -605,11 +598,7 @@ impl SessionInner {
         let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, true);
         self.enqueue(
             OutgoingBody::Request(request),
-            PendingOperation {
-                deadline,
-                sender,
-                log_id: None,
-            },
+            PendingOperation::new(deadline, sender, None),
         )?;
         Ok(promise)
     }
@@ -627,11 +616,7 @@ impl SessionInner {
         let (sender, promise) = Promise::pair(Arc::downgrade(self), deadline, false);
         self.enqueue(
             OutgoingBody::Reply { id, result },
-            PendingOperation {
-                deadline,
-                sender,
-                log_id: Some(LogId::from(id)),
-            },
+            PendingOperation::new(deadline, sender, Some(LogId::from(id))),
         )?;
         Ok(promise)
     }
@@ -649,19 +634,18 @@ impl SessionInner {
         let mut notifications = Notifications::default();
         {
             let mut state = self.state.lock().expect("session state not poisoned");
-            let (operations, outgoing, reserved_ids) = match &mut *state {
+            let (operations, reserved_ids) = match &mut *state {
                 State::Open {
                     operations,
-                    outgoing,
                     reserved_ids,
                     ..
-                } => (operations, outgoing, reserved_ids),
+                } => (operations, reserved_ids),
                 State::Closed(error) => return Err(error.clone()),
             };
 
             // Fail an expired operation at once, releasing a reply's reserved ID
             let now = self.now();
-            if now >= operation.deadline {
+            if now >= operation.deadline() {
                 if let OutgoingBody::Reply { id, .. } = body {
                     reserved_ids.remove(&id);
                 }
@@ -670,17 +654,7 @@ impl SessionInner {
             }
 
             // Queue the message and track its operation under a fresh key
-            let key = OperationKey::new();
-            outgoing.push_back(OutgoingMessage {
-                body,
-                operation: OperationHandle {
-                    session: Arc::downgrade(self),
-                    key: key.clone(),
-                },
-                #[cfg(any(test, feature = "fuzz"))]
-                deadline: operation.deadline,
-            });
-            operations.insert(key, operation);
+            operations.submit(operation, body, Arc::downgrade(self));
         }
 
         // Wake the writer and deadline worker after publishing the queued work
@@ -705,10 +679,7 @@ impl SessionInner {
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         let state = self.state.lock().expect("session state not poisoned");
         match &*state {
-            State::Open { operations, .. } => operations
-                .values()
-                .map(|operation| operation.deadline)
-                .min(),
+            State::Open { operations, .. } => operations.next_deadline(),
             State::Closed(_) => None,
         }
     }
@@ -725,11 +696,11 @@ impl SessionInner {
         // Release a reply's reservation when the writer takes it
         match &mut *state {
             State::Open {
-                outgoing,
+                operations,
                 reserved_ids,
                 ..
             } => {
-                let message = outgoing.pop_front()?;
+                let message = operations.take_queued()?;
                 if let OutgoingBody::Reply { id, .. } = &message.body {
                     reserved_ids.remove(id);
                 }
@@ -757,7 +728,7 @@ impl SessionInner {
 
         // Publish failures and reply completion while requests keep awaiting answers
         let now = self.now();
-        if now >= operation.deadline || result.is_err() {
+        if now >= operation.deadline() || result.is_err() {
             let operation = operations.remove(key).expect("operation held under lock");
             notifications.push(operation.fail(result.err().unwrap_or(Error::Timeout), now));
         } else if !operation.sender.response {
@@ -993,7 +964,6 @@ impl SessionInner {
 
             // Assign an ID and reserve the response route before releasing the lock
             let State::Open {
-                outgoing,
                 next_id,
                 outstanding,
                 operations,
@@ -1003,14 +973,14 @@ impl SessionInner {
             else {
                 return None;
             };
-            if let Some(outgoing) = outgoing.pop_front() {
+            if let Some(outgoing) = operations.take_queued() {
                 let id = match &outgoing.body {
                     OutgoingBody::Request(_) => {
                         let id = next_id.expect("wire request IDs exhausted");
                         *next_id = id.checked_add(2);
                         // Store the ID before releasing the lock, since a response
                         // can arrive before the outgoing send finishes locally
-                        outstanding.insert(id, outgoing.operation.key.clone());
+                        outstanding.insert(id, outgoing.operation.key);
                         if let Some(operation) = operations.get_mut(&outgoing.operation.key) {
                             operation.log_id = Some(LogId::from(id));
                         }
@@ -1131,12 +1101,8 @@ impl SessionInner {
             };
 
             // Submitting an earlier deadline wakes this wait. Every wakeup
-            // recomputes the minimum under the same lock used by submission.
-            state = match operations
-                .values()
-                .map(|operation| operation.deadline)
-                .min()
-            {
+            // reads the earliest one under the same lock used by submission.
+            state = match operations.next_deadline() {
                 Some(deadline) => {
                     self.changed
                         .wait_deadline(state, deadline)
@@ -1203,10 +1169,9 @@ impl State {
         match self {
             Self::Open {
                 operations,
-                outgoing,
                 incoming,
                 ..
-            } => (operations.len(), outgoing.len() + incoming.len()),
+            } => (operations.len(), operations.queued() + incoming.len()),
             Self::Closed(_) => (0, 0),
         }
     }
@@ -1229,47 +1194,38 @@ impl State {
         // Publish failures now and let the caller run callbacks after unlocking
         let mut removed = std::mem::replace(self, Self::Closed(error.clone()));
         if let Self::Open { operations, .. } = &mut removed {
-            for (_, operation) in operations.drain() {
+            for operation in operations.drain() {
                 notifications.push(operation.fail(error.clone(), now));
             }
         }
         Some(removed)
     }
 
-    /// Removes expired entries from `operations`, sends [`Error::Timeout`] to
-    /// their promises, and discards any messages they still have in `outgoing`.
+    /// Removes the operations whose deadline has passed, sends [`Error::Timeout`]
+    /// to their promises, and discards any of their messages still queued.
+    ///
+    /// It visits only the expired operations, in deadline order.
     fn expire(&mut self, now: Instant, notifications: &mut Notifications) {
         if let Self::Open {
             operations,
-            outgoing,
             reserved_ids,
             ..
         } = self
         {
-            // Remove each expired operation before publishing its terminal result
-            let expired: Vec<_> = operations
-                .iter()
-                .filter(|(_, operation)| now >= operation.deadline)
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in expired {
-                notifications.push(
-                    operations
-                        .remove(&key)
-                        .expect("expired operation held under lock")
-                        .fail(Error::Timeout, now),
-                );
-            }
-
-            // Only messages still in this queue can be discarded. Writes already
-            // started keep running with their independent transport timeout.
-            outgoing.retain(|outgoing| {
-                let retained = operations.contains_key(&outgoing.operation.key);
-                if !retained && let OutgoingBody::Reply { id, .. } = outgoing.body {
+            // Remove each expired operation before publishing its terminal
+            // result. Only messages still queued can be discarded, and writes
+            // already started keep running with their independent transport
+            // timeout.
+            while let Some((operation, queued)) = operations.pop_expired(now) {
+                if let Some(OutgoingMessage {
+                    body: OutgoingBody::Reply { id, .. },
+                    ..
+                }) = queued
+                {
                     reserved_ids.remove(&id);
                 }
-                retained
-            });
+                notifications.push(operation.fail(Error::Timeout, now));
+            }
         }
     }
 }
