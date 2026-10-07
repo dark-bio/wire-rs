@@ -64,8 +64,10 @@ message HostToArk {
     ExecutionUploadStartRequest  exec_upload_start = 0x502; // Begins a chunked upload of an app to execute
     ExecutionUploadChunkRequest  exec_upload_chunk = 0x503; // Appends a chunk to a pending app upload
     ExecutionScheduleRequest     exec_sched = 0x504;        // Runs an uploaded app, confirmed through the app
-    ExecutionStatusRequest       exec_status = 0x505;       // Checks on a running app
+    ExecutionStatusRequest       exec_status = 0x505;       // Checks where a scheduled run stands
     ExecutionCancelRequest       exec_cancel = 0x506;       // Cancels an app run or a pending upload
+    ExecutionResultRequest       exec_result = 0x507;       // Fetches the result of a resolved run
+    ExecutionOutputRequest       exec_output = 0x508;       // Reads the next piece of a released run's output
 
     // Slot messages, reserved range 0x601-0x700
 
@@ -142,11 +144,13 @@ message ArkToHost {
     // Operational messages, reserved range 0x501-0x600
 
     UnlockResponse                unlock = 0x501;            // Acknowledges the completed unlock
-    ExecutionUploadStartResponse  exec_upload_start = 0x502; // Task id for the chunk, schedule and cancel messages
+    ExecutionUploadStartResponse  exec_upload_start = 0x502; // Task id for the run's later messages
     ExecutionUploadChunkResponse  exec_upload_chunk = 0x503; // Acknowledges the appended app chunk
     ExecutionScheduleResponse     exec_sched = 0x504;        // Acknowledges the authorized and started execution
-    ExecutionStatusResponse       exec_status = 0x505;       // Whether the app still runs, with its result once done
+    ExecutionStatusResponse       exec_status = 0x505;       // Where the scheduled run stands
     ExecutionCancelResponse       exec_cancel = 0x506;       // Acknowledges the canceled run or upload
+    ExecutionResultResponse       exec_result = 0x507;       // What the owner saw when releasing the output
+    ExecutionOutputResponse       exec_output = 0x508;       // Next piece of the requested output stream
 
     // Slot messages, reserved range 0x601-0x700
 
@@ -204,16 +208,16 @@ enum ReservedErrors {
   // sync or pairing. It may once the state changes.
   RESERVED_ERRORS_UNAVAILABLE = 4;
 
-  // The peer serves this request but the approval it asked for on the phone
-  // did not authorize it. The owner declined, or the phone's answer broke the
-  // approval's rules and counts as a decline.
+  // The peer serves this request but the phone approval it depends on did not
+  // authorize it. The owner declined, or the phone's answer broke the approval's
+  // rules and counts as a decline.
   RESERVED_ERRORS_UNAUTHORIZED = 5;
 
-  // The peer serves this request but the approval it asked for did not arrive
+  // The peer serves this request but the approval it depends on did not arrive
   // before its window ran out, on the phone or at the button.
   RESERVED_ERRORS_UNCONFIRMED = 6;
 
-  // The peer serves this request but the approval it asked for could not be
+  // The peer serves this request but the approval it depends on could not be
   // sent to the phone, since the relay failed on the way.
   RESERVED_ERRORS_UNDELIVERED = 7;
 }
@@ -482,8 +486,9 @@ message UnlockResponse{
 message ExecutionUploadStartRequest{
   uint64 bytes = 1; // Total binary size in bytes
 }
-// ExecutionUploadStartResponse contains the task id to use for subsequent
-// chunk, schedule and cancel messages.
+// ExecutionUploadStartResponse contains the task id for the run's later
+// messages. The task belongs to the session that opened it. When that session
+// ends, the Ark drops the task whatever its stage, canceling a running app.
 message ExecutionUploadStartResponse{
   uint64 taskid = 1; // Task id to stream chunks into
 }
@@ -513,71 +518,114 @@ message ExecutionScheduleRequest{
 message ExecutionScheduleResponse{
 }
 
-// ExecutionCancelRequest cancels a previously started 3rd party app run or
-// an in-progress upload.
+// ExecutionCancelRequest cancels an upload, a run awaiting the owner's
+// approval or a running app. An interrupted app's run fails and goes to the
+// owner's review like any other. A run that already ended cannot be canceled.
 message ExecutionCancelRequest{
   uint64 taskid = 1; // Task id to cancel
 }
-
 // ExecutionCancelResponse acknowledges the canceled app run or upload.
 message ExecutionCancelResponse{
 }
 
-// ExecutionStatusRequest checks the execution status of a previously started
-// 3rd party app run.
+// ExecutionStatusRequest checks where a scheduled run stands. Only the session
+// that scheduled the run can check it.
 message ExecutionStatusRequest{
-  uint64 taskid = 1; // Pending execution ID to check for updates
+  uint64 taskid = 1; // Task id of the scheduled run
 }
-
-// ExecutionResultResponse contains the data gathered during an app's execution.
-message ExecutionResultResponse{
-  string app_name = 2; // Name of the executed app
-  string app_version = 3; // Version of the executed app
-  bool success = 4; // Whether the task finished successfully
-  bytes  stdout = 5;  // Raw standard output of the app
-  bytes  stderr = 6;  // Raw standard error the app (only in develop mode)
+// ExecutionState is where a scheduled run stands for its host.
+enum ExecutionState {
+  EXECUTION_STATE_UNSPECIFIED = 0; // Never sent, an unset state
+  EXECUTION_STATE_RUNNING     = 1; // The app still runs
+  EXECUTION_STATE_AWAITING    = 2; // The run ended and the owner reviews its report
+  EXECUTION_STATE_RESOLVED    = 3; // The review closed, so exec_result answers
 }
-
-// ExecutionStatusResponse contains the status of a started 3rd party app
-// execution.
+// ExecutionStatusResponse reports where a scheduled run stands.
 message ExecutionStatusResponse{
-  bool pending = 1; // Whether the app is still running
-  optional ExecutionResultResponse result = 2; // The result of the execution
+  reserved 1; // Kept free, since older hosts read it as their pending flag
+  reserved 2; // Kept free, since older hosts read it as their result
+
+  ExecutionState state = 3; // Where the run stands
 }
+
+// ExecutionResultRequest fetches the result of a resolved run.
+//
+// A released run answers with what the owner saw, the same until the run
+// closes for the host. A withheld run fails it with the reserved error its
+// report's approval closed with, and that failure closes the run.
+message ExecutionResultRequest{
+  uint64 taskid = 1; // Task id of the resolved run
+}
+// ExecutionResultResponse holds what the owner saw when releasing the run's
+// output, which the host then reads through ExecutionOutputRequest.
+message ExecutionResultResponse{
+  string          name         = 1; // App name from its manifest
+  string          version      = 2; // App version from its manifest
+  bool            develop      = 3; // Whether the app is a develop build
+  bool            success      = 4; // Whether the run succeeded
+  repeated string paths        = 5; // Paths of the owner's data as mounted, without public grants
+  string          media        = 6; // Media type of the report, such as text/markdown
+  uint64          stdout_bytes = 7; // Length in bytes of the report, the app's standard output
+  uint64          stderr_bytes = 8; // Length in bytes of a develop build's standard error, 0 otherwise
+}
+
+// ExecutionStream names one output stream of a run.
+enum ExecutionStream {
+  EXECUTION_STREAM_UNSPECIFIED = 0; // Never sent, an unset stream
+  EXECUTION_STREAM_STDOUT      = 1; // Standard output, the report
+  EXECUTION_STREAM_STDERR      = 2; // Standard error, kept for develop builds only
+}
+// ExecutionOutputRequest reads the next piece of a released run's output.
+//
+// Each stream is read once and in order, in pieces of the size the host asks
+// for. The Ark refuses a size of zero, or one whose answer would not fit a
+// wire message. The run closes for the host once exec_result has answered and
+// both streams are read to their end.
+message ExecutionOutputRequest{
+  uint64          taskid = 1; // Task id of the released run
+  ExecutionStream stream = 2; // Stream to read
+  uint64          offset = 3; // Bytes of the stream read so far, the only offset the Ark accepts
+  uint64          size   = 4; // Most bytes to return, chosen by the host
+}
+// ExecutionOutputResponse carries the next piece of the requested stream.
+message ExecutionOutputResponse{
+  bytes chunk = 1; // The requested bytes, fewer only at the stream's end
+}
+
 
 // SlotKind identifies a slot on the device. Each value corresponds to a unique
 // data type that the device can store and manage.
 enum SlotKind {
-  SLOT_UNSPECIFIED      = 0; // Never sent, an unset kind
-  SLOT_REFERENCE_GENOME = 1; // Human reference genome assembly
-  SLOT_GENE_ANNOTATIONS = 2; // Gene-to-coordinate mapping database
-  SLOT_SNP_INDEL_CALLS  = 3; // User's SNP/indel variant calls
-  SLOT_VARIANT_CATALOG  = 4; // Variant catalog (rsID-to-position), from dbSNP
+  SLOT_KIND_UNSPECIFIED      = 0; // Never sent, an unset kind
+  SLOT_KIND_REFERENCE_GENOME = 1; // Human reference genome assembly
+  SLOT_KIND_GENE_ANNOTATIONS = 2; // Gene-to-coordinate mapping database
+  SLOT_KIND_SNP_INDEL_CALLS  = 3; // User's SNP/indel variant calls
+  SLOT_KIND_VARIANT_CATALOG  = 4; // Variant catalog (rsID-to-position), from dbSNP
 }
 
 // SlotOrigin describes the nature of the data in a slot, determining what
 // actions are available to the user for filling it.
 enum SlotOrigin {
-  ORIGIN_UNSPECIFIED = 0; // Never sent, an unset origin
-  ORIGIN_PERSONAL    = 1; // Unique to the user, uploaded by them
-  ORIGIN_REFERENCE   = 2; // Standard reference data, downloaded from public sources
+  SLOT_ORIGIN_UNSPECIFIED = 0; // Never sent, an unset origin
+  SLOT_ORIGIN_PERSONAL    = 1; // Unique to the user, uploaded by them
+  SLOT_ORIGIN_REFERENCE   = 2; // Standard reference data, downloaded from public sources
 }
 
 // SlotState describes whether a slot holds data and whether that data is sound.
 enum SlotState {
-  STATE_UNSPECIFIED = 0; // Never sent, an unset state
-  STATE_EMPTY       = 1; // Nothing stored
-  STATE_FILLED      = 2; // Data present and healthy
-  STATE_DAMAGED     = 3; // Files exist but the metadata is missing, corrupt or outdated
+  SLOT_STATE_UNSPECIFIED = 0; // Never sent, an unset state
+  SLOT_STATE_EMPTY       = 1; // Nothing stored
+  SLOT_STATE_FILLED      = 2; // Data present and healthy
+  SLOT_STATE_DAMAGED     = 3; // Files exist but the metadata is missing, corrupt or outdated
 }
 
 // SlotConfidence indicates how confident the device is in its identification
 // of a file, based on content, filename and size.
 enum SlotConfidence {
-  CONFIDENCE_UNSPECIFIED = 0; // Never sent, an unset confidence
-  CONFIDENCE_LOW         = 1; // Filename/extension only, no content confirmation
-  CONFIDENCE_MID         = 2; // Format detected but slot type inferred from size/filename
-  CONFIDENCE_HIGH        = 3; // Magic bytes match and format-specific content confirmed
+  SLOT_CONFIDENCE_UNSPECIFIED = 0; // Never sent, an unset confidence
+  SLOT_CONFIDENCE_LOW         = 1; // Filename/extension only, no content confirmation
+  SLOT_CONFIDENCE_MID         = 2; // Format detected but slot type inferred from size/filename
+  SLOT_CONFIDENCE_HIGH        = 3; // Magic bytes match and format-specific content confirmed
 }
 
 // SlotDownload describes the public download the device advertises for a
@@ -727,6 +775,11 @@ message DatasetPathsResponse {
 // DatasetPath describes one path pattern under the data root. A segment in angle
 // brackets is a placeholder, described by the directory entry it names. The path
 // is the entry's stable key.
+//
+// A grantable path also carries whether it reads only public data, which is the
+// same on every Ark, and its wording. The wording is an English template that
+// describes a grant to the owner, with each placeholder named after the path's
+// own, such as "Your genotype at {rsid}".
 message DatasetPath {
   string          path      = 1; // Path as a manifest names it
   bool            directory = 2; // Directory or file
@@ -735,4 +788,6 @@ message DatasetPath {
   string          desc      = 5; // What it holds, when it is absent and when it fails
   string          format    = 6; // Exact file content, or what a directory lists
   repeated string examples  = 7; // Complete example values, most typical first
+  bool            public    = 8; // Whether a grant reads only public data, for grantable paths
+  string          wording   = 9; // Template wording a grant to the owner, for grantable paths
 }

@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -99,12 +99,18 @@ pub mod host_to_ark {
         /// Runs an uploaded app, confirmed through the app
         #[prost(bytes, tag = "1284")]
         ExecSched(::prost::bytes::Bytes),
-        /// Checks on a running app
+        /// Checks where a scheduled run stands
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
         /// Cancels an app run or a pending upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
+        /// Fetches the result of a resolved run
+        #[prost(bytes, tag = "1287")]
+        ExecResult(::prost::bytes::Bytes),
+        /// Reads the next piece of a released run's output
+        #[prost(bytes, tag = "1288")]
+        ExecOutput(::prost::bytes::Bytes),
         /// Lists the state of every data slot
         #[prost(bytes, tag = "1537")]
         SlotList(::prost::bytes::Bytes),
@@ -160,7 +166,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -230,7 +236,7 @@ pub mod ark_to_host {
         /// Acknowledges the completed unlock
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
-        /// Task id for the chunk, schedule and cancel messages
+        /// Task id for the run's later messages
         #[prost(bytes, tag = "1282")]
         ExecUploadStart(::prost::bytes::Bytes),
         /// Acknowledges the appended app chunk
@@ -239,12 +245,18 @@ pub mod ark_to_host {
         /// Acknowledges the authorized and started execution
         #[prost(bytes, tag = "1284")]
         ExecSched(::prost::bytes::Bytes),
-        /// Whether the app still runs, with its result once done
+        /// Where the scheduled run stands
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
         /// Acknowledges the canceled run or upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
+        /// What the owner saw when releasing the output
+        #[prost(bytes, tag = "1287")]
+        ExecResult(::prost::bytes::Bytes),
+        /// Next piece of the requested output stream
+        #[prost(bytes, tag = "1288")]
+        ExecOutput(::prost::bytes::Bytes),
         /// Current state of every data slot
         #[prost(bytes, tag = "1537")]
         SlotList(::prost::bytes::Bytes),
