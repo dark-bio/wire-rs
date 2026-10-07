@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -99,12 +99,18 @@ pub mod host_to_ark {
         /// Runs an uploaded app, confirmed through the app
         #[prost(message, tag = "1284")]
         ExecSched(super::ExecutionScheduleRequest),
-        /// Checks on a running app
+        /// Checks where a scheduled run stands
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusRequest),
         /// Cancels an app run or a pending upload
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelRequest),
+        /// Fetches the result of a resolved run
+        #[prost(message, tag = "1287")]
+        ExecResult(super::ExecutionResultRequest),
+        /// Reads the next piece of a released run's output
+        #[prost(message, tag = "1288")]
+        ExecOutput(super::ExecutionOutputRequest),
         /// Lists the state of every data slot
         #[prost(message, tag = "1537")]
         SlotList(super::SlotListRequest),
@@ -160,7 +166,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -230,7 +236,7 @@ pub mod ark_to_host {
         /// Acknowledges the completed unlock
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockResponse),
-        /// Task id for the chunk, schedule and cancel messages
+        /// Task id for the run's later messages
         #[prost(message, tag = "1282")]
         ExecUploadStart(super::ExecutionUploadStartResponse),
         /// Acknowledges the appended app chunk
@@ -239,12 +245,18 @@ pub mod ark_to_host {
         /// Acknowledges the authorized and started execution
         #[prost(message, tag = "1284")]
         ExecSched(super::ExecutionScheduleResponse),
-        /// Whether the app still runs, with its result once done
+        /// Where the scheduled run stands
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusResponse),
         /// Acknowledges the canceled run or upload
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelResponse),
+        /// What the owner saw when releasing the output
+        #[prost(message, tag = "1287")]
+        ExecResult(super::ExecutionResultResponse),
+        /// Next piece of the requested output stream
+        #[prost(message, tag = "1288")]
+        ExecOutput(super::ExecutionOutputResponse),
         /// Current state of every data slot
         #[prost(message, tag = "1537")]
         SlotList(super::SlotListResponse),
@@ -620,8 +632,9 @@ pub struct ExecutionUploadStartRequest {
     #[prost(uint64, tag = "1")]
     pub bytes: u64,
 }
-/// ExecutionUploadStartResponse contains the task id to use for subsequent
-/// chunk, schedule and cancel messages.
+/// ExecutionUploadStartResponse contains the task id for the run's later
+/// messages. The task belongs to the session that opened it. When that session
+/// ends, the Ark drops the task whatever its stage, canceling a running app.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionUploadStartResponse {
     /// Task id to stream chunks into
@@ -659,8 +672,9 @@ pub struct ExecutionScheduleRequest {
 /// ExecutionUploadStartResponse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionScheduleResponse {}
-/// ExecutionCancelRequest cancels a previously started 3rd party app run or
-/// an in-progress upload.
+/// ExecutionCancelRequest cancels an upload, a run awaiting the owner's
+/// approval or a running app. An interrupted app's run fails and goes to the
+/// owner's review like any other. A run that already ended cannot be canceled.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionCancelRequest {
     /// Task id to cancel
@@ -670,43 +684,88 @@ pub struct ExecutionCancelRequest {
 /// ExecutionCancelResponse acknowledges the canceled app run or upload.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionCancelResponse {}
-/// ExecutionStatusRequest checks the execution status of a previously started
-/// 3rd party app run.
+/// ExecutionStatusRequest checks where a scheduled run stands. Only the session
+/// that scheduled the run can check it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionStatusRequest {
-    /// Pending execution ID to check for updates
+    /// Task id of the scheduled run
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionResultResponse contains the data gathered during an app's execution.
+/// ExecutionStatusResponse reports where a scheduled run stands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionStatusResponse {
+    /// Where the run stands
+    #[prost(enumeration = "ExecutionState", tag = "3")]
+    pub state: i32,
+}
+/// ExecutionResultRequest fetches the result of a resolved run.
+///
+/// A released run answers with what the owner saw, the same until the run
+/// closes for the host. A withheld run fails it with the reserved error its
+/// report's approval closed with, and that failure closes the run.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionResultRequest {
+    /// Task id of the resolved run
+    #[prost(uint64, tag = "1")]
+    pub taskid: u64,
+}
+/// ExecutionResultResponse holds what the owner saw when releasing the run's
+/// output, which the host then reads through ExecutionOutputRequest.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionResultResponse {
-    /// Name of the executed app
+    /// App name from its manifest
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// App version from its manifest
     #[prost(string, tag = "2")]
-    pub app_name: ::prost::alloc::string::String,
-    /// Version of the executed app
-    #[prost(string, tag = "3")]
-    pub app_version: ::prost::alloc::string::String,
-    /// Whether the task finished successfully
+    pub version: ::prost::alloc::string::String,
+    /// Whether the app is a develop build
+    #[prost(bool, tag = "3")]
+    pub develop: bool,
+    /// Whether the run succeeded
     #[prost(bool, tag = "4")]
     pub success: bool,
-    /// Raw standard output of the app
-    #[prost(bytes = "vec", tag = "5")]
-    pub stdout: ::prost::alloc::vec::Vec<u8>,
-    /// Raw standard error the app (only in develop mode)
-    #[prost(bytes = "vec", tag = "6")]
-    pub stderr: ::prost::alloc::vec::Vec<u8>,
+    /// Paths of the owner's data as mounted, without public grants
+    #[prost(string, repeated, tag = "5")]
+    pub paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Media type of the report, such as text/markdown
+    #[prost(string, tag = "6")]
+    pub media: ::prost::alloc::string::String,
+    /// Length in bytes of the report, the app's standard output
+    #[prost(uint64, tag = "7")]
+    pub stdout_bytes: u64,
+    /// Length in bytes of a develop build's standard error, 0 otherwise
+    #[prost(uint64, tag = "8")]
+    pub stderr_bytes: u64,
 }
-/// ExecutionStatusResponse contains the status of a started 3rd party app
-/// execution.
+/// ExecutionOutputRequest reads the next piece of a released run's output.
+///
+/// Each stream is read once and in order, in pieces of the size the host asks
+/// for. The Ark refuses a size of zero, or one whose answer would not fit a
+/// wire message. The run closes for the host once exec_result has answered and
+/// both streams are read to their end.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionOutputRequest {
+    /// Task id of the released run
+    #[prost(uint64, tag = "1")]
+    pub taskid: u64,
+    /// Stream to read
+    #[prost(enumeration = "ExecutionStream", tag = "2")]
+    pub stream: i32,
+    /// Bytes of the stream read so far, the only offset the Ark accepts
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    /// Most bytes to return, chosen by the host
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+}
+/// ExecutionOutputResponse carries the next piece of the requested stream.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionStatusResponse {
-    /// Whether the app is still running
-    #[prost(bool, tag = "1")]
-    pub pending: bool,
-    /// The result of the execution
-    #[prost(message, optional, tag = "2")]
-    pub result: ::core::option::Option<ExecutionResultResponse>,
+pub struct ExecutionOutputResponse {
+    /// The requested bytes, fewer only at the stream's end
+    #[prost(bytes = "vec", tag = "1")]
+    pub chunk: ::prost::alloc::vec::Vec<u8>,
 }
 /// SlotDownload describes the public download the device advertises for a
 /// reference slot, so a host can fetch it and stream it back in.
@@ -942,6 +1001,11 @@ pub struct DatasetPathsResponse {
 /// DatasetPath describes one path pattern under the data root. A segment in angle
 /// brackets is a placeholder, described by the directory entry it names. The path
 /// is the entry's stable key.
+///
+/// A grantable path also carries whether it reads only public data, which is the
+/// same on every Ark, and its wording. The wording is an English template that
+/// describes a grant to the owner, with each placeholder named after the path's
+/// own, such as "Your genotype at {rsid}".
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DatasetPath {
     /// Path as a manifest names it
@@ -965,6 +1029,12 @@ pub struct DatasetPath {
     /// Complete example values, most typical first
     #[prost(string, repeated, tag = "7")]
     pub examples: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether a grant reads only public data, for grantable paths
+    #[prost(bool, tag = "8")]
+    pub public: bool,
+    /// Template wording a grant to the owner, for grantable paths
+    #[prost(string, tag = "9")]
+    pub wording: ::prost::alloc::string::String,
 }
 /// ReservedErrors names the assigned protocol-wide errors in the reserved range
 /// 0x00 to 0xff (inclusive). No code in this range may be assigned a request
@@ -987,14 +1057,14 @@ pub enum ReservedErrors {
     /// The peer serves this request but not in its current state, before cloud
     /// sync or pairing. It may once the state changes.
     Unavailable = 4,
-    /// The peer serves this request but the approval it asked for on the phone
-    /// did not authorize it. The owner declined, or the phone's answer broke the
-    /// approval's rules and counts as a decline.
+    /// The peer serves this request but the phone approval it depends on did not
+    /// authorize it. The owner declined, or the phone's answer broke the approval's
+    /// rules and counts as a decline.
     Unauthorized = 5,
-    /// The peer serves this request but the approval it asked for did not arrive
+    /// The peer serves this request but the approval it depends on did not arrive
     /// before its window ran out, on the phone or at the button.
     Unconfirmed = 6,
-    /// The peer serves this request but the approval it asked for could not be
+    /// The peer serves this request but the approval it depends on could not be
     /// sent to the phone, since the relay failed on the way.
     Undelivered = 7,
 }
@@ -1030,21 +1100,91 @@ impl ReservedErrors {
         }
     }
 }
+/// ExecutionState is where a scheduled run stands for its host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ExecutionState {
+    /// Never sent, an unset state
+    Unspecified = 0,
+    /// The app still runs
+    Running = 1,
+    /// The run ended and the owner reviews its report
+    Awaiting = 2,
+    /// The review closed, so exec_result answers
+    Resolved = 3,
+}
+impl ExecutionState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "EXECUTION_STATE_UNSPECIFIED",
+            Self::Running => "EXECUTION_STATE_RUNNING",
+            Self::Awaiting => "EXECUTION_STATE_AWAITING",
+            Self::Resolved => "EXECUTION_STATE_RESOLVED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EXECUTION_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "EXECUTION_STATE_RUNNING" => Some(Self::Running),
+            "EXECUTION_STATE_AWAITING" => Some(Self::Awaiting),
+            "EXECUTION_STATE_RESOLVED" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+}
+/// ExecutionStream names one output stream of a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ExecutionStream {
+    /// Never sent, an unset stream
+    Unspecified = 0,
+    /// Standard output, the report
+    Stdout = 1,
+    /// Standard error, kept for develop builds only
+    Stderr = 2,
+}
+impl ExecutionStream {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "EXECUTION_STREAM_UNSPECIFIED",
+            Self::Stdout => "EXECUTION_STREAM_STDOUT",
+            Self::Stderr => "EXECUTION_STREAM_STDERR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EXECUTION_STREAM_UNSPECIFIED" => Some(Self::Unspecified),
+            "EXECUTION_STREAM_STDOUT" => Some(Self::Stdout),
+            "EXECUTION_STREAM_STDERR" => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
 /// SlotKind identifies a slot on the device. Each value corresponds to a unique
 /// data type that the device can store and manage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SlotKind {
     /// Never sent, an unset kind
-    SlotUnspecified = 0,
+    Unspecified = 0,
     /// Human reference genome assembly
-    SlotReferenceGenome = 1,
+    ReferenceGenome = 1,
     /// Gene-to-coordinate mapping database
-    SlotGeneAnnotations = 2,
+    GeneAnnotations = 2,
     /// User's SNP/indel variant calls
-    SlotSnpIndelCalls = 3,
+    SnpIndelCalls = 3,
     /// Variant catalog (rsID-to-position), from dbSNP
-    SlotVariantCatalog = 4,
+    VariantCatalog = 4,
 }
 impl SlotKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1053,21 +1193,21 @@ impl SlotKind {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::SlotUnspecified => "SLOT_UNSPECIFIED",
-            Self::SlotReferenceGenome => "SLOT_REFERENCE_GENOME",
-            Self::SlotGeneAnnotations => "SLOT_GENE_ANNOTATIONS",
-            Self::SlotSnpIndelCalls => "SLOT_SNP_INDEL_CALLS",
-            Self::SlotVariantCatalog => "SLOT_VARIANT_CATALOG",
+            Self::Unspecified => "SLOT_KIND_UNSPECIFIED",
+            Self::ReferenceGenome => "SLOT_KIND_REFERENCE_GENOME",
+            Self::GeneAnnotations => "SLOT_KIND_GENE_ANNOTATIONS",
+            Self::SnpIndelCalls => "SLOT_KIND_SNP_INDEL_CALLS",
+            Self::VariantCatalog => "SLOT_KIND_VARIANT_CATALOG",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "SLOT_UNSPECIFIED" => Some(Self::SlotUnspecified),
-            "SLOT_REFERENCE_GENOME" => Some(Self::SlotReferenceGenome),
-            "SLOT_GENE_ANNOTATIONS" => Some(Self::SlotGeneAnnotations),
-            "SLOT_SNP_INDEL_CALLS" => Some(Self::SlotSnpIndelCalls),
-            "SLOT_VARIANT_CATALOG" => Some(Self::SlotVariantCatalog),
+            "SLOT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SLOT_KIND_REFERENCE_GENOME" => Some(Self::ReferenceGenome),
+            "SLOT_KIND_GENE_ANNOTATIONS" => Some(Self::GeneAnnotations),
+            "SLOT_KIND_SNP_INDEL_CALLS" => Some(Self::SnpIndelCalls),
+            "SLOT_KIND_VARIANT_CATALOG" => Some(Self::VariantCatalog),
             _ => None,
         }
     }
@@ -1078,11 +1218,11 @@ impl SlotKind {
 #[repr(i32)]
 pub enum SlotOrigin {
     /// Never sent, an unset origin
-    OriginUnspecified = 0,
+    Unspecified = 0,
     /// Unique to the user, uploaded by them
-    OriginPersonal = 1,
+    Personal = 1,
     /// Standard reference data, downloaded from public sources
-    OriginReference = 2,
+    Reference = 2,
 }
 impl SlotOrigin {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1091,17 +1231,17 @@ impl SlotOrigin {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::OriginUnspecified => "ORIGIN_UNSPECIFIED",
-            Self::OriginPersonal => "ORIGIN_PERSONAL",
-            Self::OriginReference => "ORIGIN_REFERENCE",
+            Self::Unspecified => "SLOT_ORIGIN_UNSPECIFIED",
+            Self::Personal => "SLOT_ORIGIN_PERSONAL",
+            Self::Reference => "SLOT_ORIGIN_REFERENCE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "ORIGIN_UNSPECIFIED" => Some(Self::OriginUnspecified),
-            "ORIGIN_PERSONAL" => Some(Self::OriginPersonal),
-            "ORIGIN_REFERENCE" => Some(Self::OriginReference),
+            "SLOT_ORIGIN_UNSPECIFIED" => Some(Self::Unspecified),
+            "SLOT_ORIGIN_PERSONAL" => Some(Self::Personal),
+            "SLOT_ORIGIN_REFERENCE" => Some(Self::Reference),
             _ => None,
         }
     }
@@ -1111,13 +1251,13 @@ impl SlotOrigin {
 #[repr(i32)]
 pub enum SlotState {
     /// Never sent, an unset state
-    StateUnspecified = 0,
+    Unspecified = 0,
     /// Nothing stored
-    StateEmpty = 1,
+    Empty = 1,
     /// Data present and healthy
-    StateFilled = 2,
+    Filled = 2,
     /// Files exist but the metadata is missing, corrupt or outdated
-    StateDamaged = 3,
+    Damaged = 3,
 }
 impl SlotState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1126,19 +1266,19 @@ impl SlotState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::StateUnspecified => "STATE_UNSPECIFIED",
-            Self::StateEmpty => "STATE_EMPTY",
-            Self::StateFilled => "STATE_FILLED",
-            Self::StateDamaged => "STATE_DAMAGED",
+            Self::Unspecified => "SLOT_STATE_UNSPECIFIED",
+            Self::Empty => "SLOT_STATE_EMPTY",
+            Self::Filled => "SLOT_STATE_FILLED",
+            Self::Damaged => "SLOT_STATE_DAMAGED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "STATE_UNSPECIFIED" => Some(Self::StateUnspecified),
-            "STATE_EMPTY" => Some(Self::StateEmpty),
-            "STATE_FILLED" => Some(Self::StateFilled),
-            "STATE_DAMAGED" => Some(Self::StateDamaged),
+            "SLOT_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SLOT_STATE_EMPTY" => Some(Self::Empty),
+            "SLOT_STATE_FILLED" => Some(Self::Filled),
+            "SLOT_STATE_DAMAGED" => Some(Self::Damaged),
             _ => None,
         }
     }
@@ -1149,13 +1289,13 @@ impl SlotState {
 #[repr(i32)]
 pub enum SlotConfidence {
     /// Never sent, an unset confidence
-    ConfidenceUnspecified = 0,
+    Unspecified = 0,
     /// Filename/extension only, no content confirmation
-    ConfidenceLow = 1,
+    Low = 1,
     /// Format detected but slot type inferred from size/filename
-    ConfidenceMid = 2,
+    Mid = 2,
     /// Magic bytes match and format-specific content confirmed
-    ConfidenceHigh = 3,
+    High = 3,
 }
 impl SlotConfidence {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1164,19 +1304,19 @@ impl SlotConfidence {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::ConfidenceUnspecified => "CONFIDENCE_UNSPECIFIED",
-            Self::ConfidenceLow => "CONFIDENCE_LOW",
-            Self::ConfidenceMid => "CONFIDENCE_MID",
-            Self::ConfidenceHigh => "CONFIDENCE_HIGH",
+            Self::Unspecified => "SLOT_CONFIDENCE_UNSPECIFIED",
+            Self::Low => "SLOT_CONFIDENCE_LOW",
+            Self::Mid => "SLOT_CONFIDENCE_MID",
+            Self::High => "SLOT_CONFIDENCE_HIGH",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "CONFIDENCE_UNSPECIFIED" => Some(Self::ConfidenceUnspecified),
-            "CONFIDENCE_LOW" => Some(Self::ConfidenceLow),
-            "CONFIDENCE_MID" => Some(Self::ConfidenceMid),
-            "CONFIDENCE_HIGH" => Some(Self::ConfidenceHigh),
+            "SLOT_CONFIDENCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SLOT_CONFIDENCE_LOW" => Some(Self::Low),
+            "SLOT_CONFIDENCE_MID" => Some(Self::Mid),
+            "SLOT_CONFIDENCE_HIGH" => Some(Self::High),
             _ => None,
         }
     }

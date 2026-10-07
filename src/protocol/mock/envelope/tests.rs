@@ -27,7 +27,7 @@ fn test_input_format() {
         err: None,
         content: Some(ark_to_host::Content::SlotIdentify(
             schema::SlotIdentifyResponse {
-                kind: schema::SlotKind::SlotReferenceGenome.into(),
+                kind: schema::SlotKind::ReferenceGenome.into(),
                 ..Default::default()
             },
         )),
