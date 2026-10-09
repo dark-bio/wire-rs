@@ -99,16 +99,16 @@ pub mod host_to_ark {
         /// Runs an uploaded app, confirmed through the app
         #[prost(bytes, tag = "1284")]
         ExecSched(::prost::bytes::Bytes),
-        /// Checks where a scheduled run stands
+        /// Checks where a scheduled task stands
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
-        /// Cancels an app run or a pending upload
+        /// Cancels a task or a pending upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
-        /// Fetches the result of a resolved run
+        /// Fetches the result of a resolved task
         #[prost(bytes, tag = "1287")]
         ExecResult(::prost::bytes::Bytes),
-        /// Reads the next piece of a released run's output
+        /// Reads the next piece of a released task's output
         #[prost(bytes, tag = "1288")]
         ExecOutput(::prost::bytes::Bytes),
         /// Lists the state of every data slot
@@ -236,19 +236,19 @@ pub mod ark_to_host {
         /// Acknowledges the completed unlock
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
-        /// Task id for the run's later messages
+        /// Task id for the later messages
         #[prost(bytes, tag = "1282")]
         ExecUploadStart(::prost::bytes::Bytes),
         /// Acknowledges the appended app chunk
         #[prost(bytes, tag = "1283")]
         ExecUploadChunk(::prost::bytes::Bytes),
-        /// Acknowledges the authorized and started execution
+        /// Acknowledges the approved task, whose app now runs
         #[prost(bytes, tag = "1284")]
         ExecSched(::prost::bytes::Bytes),
-        /// Where the scheduled run stands
+        /// Where the scheduled task stands
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
-        /// Acknowledges the canceled run or upload
+        /// Acknowledges the canceled task or upload
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
         /// What the owner saw when releasing the output

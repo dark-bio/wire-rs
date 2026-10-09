@@ -99,16 +99,16 @@ pub mod host_to_ark {
         /// Runs an uploaded app, confirmed through the app
         #[prost(message, tag = "1284")]
         ExecSched(super::ExecutionScheduleRequest),
-        /// Checks where a scheduled run stands
+        /// Checks where a scheduled task stands
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusRequest),
-        /// Cancels an app run or a pending upload
+        /// Cancels a task or a pending upload
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelRequest),
-        /// Fetches the result of a resolved run
+        /// Fetches the result of a resolved task
         #[prost(message, tag = "1287")]
         ExecResult(super::ExecutionResultRequest),
-        /// Reads the next piece of a released run's output
+        /// Reads the next piece of a released task's output
         #[prost(message, tag = "1288")]
         ExecOutput(super::ExecutionOutputRequest),
         /// Lists the state of every data slot
@@ -236,19 +236,19 @@ pub mod ark_to_host {
         /// Acknowledges the completed unlock
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockResponse),
-        /// Task id for the run's later messages
+        /// Task id for the later messages
         #[prost(message, tag = "1282")]
         ExecUploadStart(super::ExecutionUploadStartResponse),
         /// Acknowledges the appended app chunk
         #[prost(message, tag = "1283")]
         ExecUploadChunk(super::ExecutionUploadChunkResponse),
-        /// Acknowledges the authorized and started execution
+        /// Acknowledges the approved task, whose app now runs
         #[prost(message, tag = "1284")]
         ExecSched(super::ExecutionScheduleResponse),
-        /// Where the scheduled run stands
+        /// Where the scheduled task stands
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusResponse),
-        /// Acknowledges the canceled run or upload
+        /// Acknowledges the canceled task or upload
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelResponse),
         /// What the owner saw when releasing the output
@@ -632,9 +632,10 @@ pub struct ExecutionUploadStartRequest {
     #[prost(uint64, tag = "1")]
     pub bytes: u64,
 }
-/// ExecutionUploadStartResponse contains the task id for the run's later
-/// messages. The task belongs to the session that opened it. When that session
-/// ends, the Ark drops the task whatever its stage, canceling a running app.
+/// ExecutionUploadStartResponse contains the id of the new task, which every
+/// later message about it carries. The task belongs to the session that opened
+/// it. When that session ends, the Ark drops the task whatever its stage,
+/// canceling a running app.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionUploadStartResponse {
     /// Task id to stream chunks into
@@ -667,50 +668,51 @@ pub struct ExecutionScheduleRequest {
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionScheduleResponse acks that the execution was authorized and the
-/// task is now running. The host already holds the task id from the preceding
+/// ExecutionScheduleResponse acks that the owner approved the task and its app
+/// now runs. The host already holds the task id from the preceding
 /// ExecutionUploadStartResponse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionScheduleResponse {}
-/// ExecutionCancelRequest cancels an upload, a run awaiting the owner's
-/// approval or a running app. An interrupted app's run fails and goes to the
-/// owner's review like any other. A run that already ended cannot be canceled.
+/// ExecutionCancelRequest cancels an upload, a task awaiting the owner's
+/// approval or a running app. An interrupted app fails, and its report goes to
+/// the owner's review like any other. A task whose app already ended cannot be
+/// canceled.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionCancelRequest {
     /// Task id to cancel
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionCancelResponse acknowledges the canceled app run or upload.
+/// ExecutionCancelResponse acknowledges the canceled task or upload.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionCancelResponse {}
-/// ExecutionStatusRequest checks where a scheduled run stands. Only the session
-/// that scheduled the run can check it.
+/// ExecutionStatusRequest checks where a scheduled task stands. Only the
+/// session that scheduled the task can check it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionStatusRequest {
-    /// Task id of the scheduled run
+    /// Task id to check
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionStatusResponse reports where a scheduled run stands.
+/// ExecutionStatusResponse reports where a scheduled task stands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionStatusResponse {
-    /// Where the run stands
+    /// Where the task stands
     #[prost(enumeration = "ExecutionState", tag = "3")]
     pub state: i32,
 }
-/// ExecutionResultRequest fetches the result of a resolved run.
+/// ExecutionResultRequest fetches the result of a resolved task.
 ///
-/// A released run answers with what the owner saw, the same until the run
-/// closes for the host. A withheld run fails it with the reserved error its
-/// report's approval closed with, and that failure closes the run.
+/// A released task answers with what the owner saw, the same until the task
+/// closes for the host. A withheld task fails it with the reserved error its
+/// report's approval closed with, and that failure closes the task.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionResultRequest {
-    /// Task id of the resolved run
+    /// Task id to fetch the result of
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionResultResponse holds what the owner saw when releasing the run's
+/// ExecutionResultResponse holds what the owner saw when releasing the task's
 /// output, which the host then reads through ExecutionOutputRequest.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionResultResponse {
@@ -723,7 +725,7 @@ pub struct ExecutionResultResponse {
     /// Whether the app is a develop build
     #[prost(bool, tag = "3")]
     pub develop: bool,
-    /// Whether the run succeeded
+    /// Whether the app succeeded
     #[prost(bool, tag = "4")]
     pub success: bool,
     /// Paths of the owner's data as mounted, without public grants
@@ -739,15 +741,15 @@ pub struct ExecutionResultResponse {
     #[prost(uint64, tag = "8")]
     pub stderr_bytes: u64,
 }
-/// ExecutionOutputRequest reads the next piece of a released run's output.
+/// ExecutionOutputRequest reads the next piece of a released task's output.
 ///
 /// Each stream is read once and in order, in pieces of the size the host asks
 /// for. The Ark refuses a size of zero, or one whose answer would not fit a
-/// wire message. The run closes for the host once exec_result has answered and
-/// both streams are read to their end.
+/// wire message. The task closes for the host once exec_result has answered
+/// and both streams are read to their end.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionOutputRequest {
-    /// Task id of the released run
+    /// Task id to read the output of
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
     /// Stream to read
@@ -1100,7 +1102,7 @@ impl ReservedErrors {
         }
     }
 }
-/// ExecutionState is where a scheduled run stands for its host.
+/// ExecutionState is where a scheduled task stands for its host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionState {
@@ -1108,7 +1110,7 @@ pub enum ExecutionState {
     Unspecified = 0,
     /// The app still runs
     Running = 1,
-    /// The run ended and the owner reviews its report
+    /// The app ended and the owner reviews its report
     Awaiting = 2,
     /// The review closed, so exec_result answers
     Resolved = 3,
@@ -1137,7 +1139,7 @@ impl ExecutionState {
         }
     }
 }
-/// ExecutionStream names one output stream of a run.
+/// ExecutionStream names one of the app's output streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionStream {
