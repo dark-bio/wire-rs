@@ -64,10 +64,10 @@ message HostToArk {
     ExecutionUploadStartRequest  exec_upload_start = 0x502; // Begins a chunked upload of an app to execute
     ExecutionUploadChunkRequest  exec_upload_chunk = 0x503; // Appends a chunk to a pending app upload
     ExecutionScheduleRequest     exec_sched = 0x504;        // Runs an uploaded app, confirmed through the app
-    ExecutionStatusRequest       exec_status = 0x505;       // Checks where a scheduled run stands
-    ExecutionCancelRequest       exec_cancel = 0x506;       // Cancels an app run or a pending upload
-    ExecutionResultRequest       exec_result = 0x507;       // Fetches the result of a resolved run
-    ExecutionOutputRequest       exec_output = 0x508;       // Reads the next piece of a released run's output
+    ExecutionStatusRequest       exec_status = 0x505;       // Checks where a scheduled task stands
+    ExecutionCancelRequest       exec_cancel = 0x506;       // Cancels a task or a pending upload
+    ExecutionResultRequest       exec_result = 0x507;       // Fetches the result of a resolved task
+    ExecutionOutputRequest       exec_output = 0x508;       // Reads the next piece of a released task's output
 
     // Slot messages, reserved range 0x601-0x700
 
@@ -144,11 +144,11 @@ message ArkToHost {
     // Operational messages, reserved range 0x501-0x600
 
     UnlockResponse                unlock = 0x501;            // Acknowledges the completed unlock
-    ExecutionUploadStartResponse  exec_upload_start = 0x502; // Task id for the run's later messages
+    ExecutionUploadStartResponse  exec_upload_start = 0x502; // Task id for the later messages
     ExecutionUploadChunkResponse  exec_upload_chunk = 0x503; // Acknowledges the appended app chunk
-    ExecutionScheduleResponse     exec_sched = 0x504;        // Acknowledges the authorized and started execution
-    ExecutionStatusResponse       exec_status = 0x505;       // Where the scheduled run stands
-    ExecutionCancelResponse       exec_cancel = 0x506;       // Acknowledges the canceled run or upload
+    ExecutionScheduleResponse     exec_sched = 0x504;        // Acknowledges the approved task, whose app now runs
+    ExecutionStatusResponse       exec_status = 0x505;       // Where the scheduled task stands
+    ExecutionCancelResponse       exec_cancel = 0x506;       // Acknowledges the canceled task or upload
     ExecutionResultResponse       exec_result = 0x507;       // What the owner saw when releasing the output
     ExecutionOutputResponse       exec_output = 0x508;       // Next piece of the requested output stream
 
@@ -486,9 +486,10 @@ message UnlockResponse{
 message ExecutionUploadStartRequest{
   uint64 bytes = 1; // Total binary size in bytes
 }
-// ExecutionUploadStartResponse contains the task id for the run's later
-// messages. The task belongs to the session that opened it. When that session
-// ends, the Ark drops the task whatever its stage, canceling a running app.
+// ExecutionUploadStartResponse contains the id of the new task, which every
+// later message about it carries. The task belongs to the session that opened
+// it. When that session ends, the Ark drops the task whatever its stage,
+// canceling a running app.
 message ExecutionUploadStartResponse{
   uint64 taskid = 1; // Task id to stream chunks into
 }
@@ -512,77 +513,78 @@ message ExecutionUploadChunkResponse{
 message ExecutionScheduleRequest{
   uint64 taskid = 1; // Task id returned by ExecutionUploadStartResponse
 }
-// ExecutionScheduleResponse acks that the execution was authorized and the
-// task is now running. The host already holds the task id from the preceding
+// ExecutionScheduleResponse acks that the owner approved the task and its app
+// now runs. The host already holds the task id from the preceding
 // ExecutionUploadStartResponse.
 message ExecutionScheduleResponse{
 }
 
-// ExecutionCancelRequest cancels an upload, a run awaiting the owner's
-// approval or a running app. An interrupted app's run fails and goes to the
-// owner's review like any other. A run that already ended cannot be canceled.
+// ExecutionCancelRequest cancels an upload, a task awaiting the owner's
+// approval or a running app. An interrupted app fails, and its report goes to
+// the owner's review like any other. A task whose app already ended cannot be
+// canceled.
 message ExecutionCancelRequest{
   uint64 taskid = 1; // Task id to cancel
 }
-// ExecutionCancelResponse acknowledges the canceled app run or upload.
+// ExecutionCancelResponse acknowledges the canceled task or upload.
 message ExecutionCancelResponse{
 }
 
-// ExecutionStatusRequest checks where a scheduled run stands. Only the session
-// that scheduled the run can check it.
+// ExecutionStatusRequest checks where a scheduled task stands. Only the
+// session that scheduled the task can check it.
 message ExecutionStatusRequest{
-  uint64 taskid = 1; // Task id of the scheduled run
+  uint64 taskid = 1; // Task id to check
 }
-// ExecutionState is where a scheduled run stands for its host.
+// ExecutionState is where a scheduled task stands for its host.
 enum ExecutionState {
   EXECUTION_STATE_UNSPECIFIED = 0; // Never sent, an unset state
   EXECUTION_STATE_RUNNING     = 1; // The app still runs
-  EXECUTION_STATE_AWAITING    = 2; // The run ended and the owner reviews its report
+  EXECUTION_STATE_AWAITING    = 2; // The app ended and the owner reviews its report
   EXECUTION_STATE_RESOLVED    = 3; // The review closed, so exec_result answers
 }
-// ExecutionStatusResponse reports where a scheduled run stands.
+// ExecutionStatusResponse reports where a scheduled task stands.
 message ExecutionStatusResponse{
   reserved 1; // Kept free, since older hosts read it as their pending flag
   reserved 2; // Kept free, since older hosts read it as their result
 
-  ExecutionState state = 3; // Where the run stands
+  ExecutionState state = 3; // Where the task stands
 }
 
-// ExecutionResultRequest fetches the result of a resolved run.
+// ExecutionResultRequest fetches the result of a resolved task.
 //
-// A released run answers with what the owner saw, the same until the run
-// closes for the host. A withheld run fails it with the reserved error its
-// report's approval closed with, and that failure closes the run.
+// A released task answers with what the owner saw, the same until the task
+// closes for the host. A withheld task fails it with the reserved error its
+// report's approval closed with, and that failure closes the task.
 message ExecutionResultRequest{
-  uint64 taskid = 1; // Task id of the resolved run
+  uint64 taskid = 1; // Task id to fetch the result of
 }
-// ExecutionResultResponse holds what the owner saw when releasing the run's
+// ExecutionResultResponse holds what the owner saw when releasing the task's
 // output, which the host then reads through ExecutionOutputRequest.
 message ExecutionResultResponse{
   string          name         = 1; // App name from its manifest
   string          version      = 2; // App version from its manifest
   bool            develop      = 3; // Whether the app is a develop build
-  bool            success      = 4; // Whether the run succeeded
+  bool            success      = 4; // Whether the app succeeded
   repeated string paths        = 5; // Paths of the owner's data as mounted, without public grants
   string          media        = 6; // Media type of the report, such as text/markdown
   uint64          stdout_bytes = 7; // Length in bytes of the report, the app's standard output
   uint64          stderr_bytes = 8; // Length in bytes of a develop build's standard error, 0 otherwise
 }
 
-// ExecutionStream names one output stream of a run.
+// ExecutionStream names one of the app's output streams.
 enum ExecutionStream {
   EXECUTION_STREAM_UNSPECIFIED = 0; // Never sent, an unset stream
   EXECUTION_STREAM_STDOUT      = 1; // Standard output, the report
   EXECUTION_STREAM_STDERR      = 2; // Standard error, kept for develop builds only
 }
-// ExecutionOutputRequest reads the next piece of a released run's output.
+// ExecutionOutputRequest reads the next piece of a released task's output.
 //
 // Each stream is read once and in order, in pieces of the size the host asks
 // for. The Ark refuses a size of zero, or one whose answer would not fit a
-// wire message. The run closes for the host once exec_result has answered and
-// both streams are read to their end.
+// wire message. The task closes for the host once exec_result has answered
+// and both streams are read to their end.
 message ExecutionOutputRequest{
-  uint64          taskid = 1; // Task id of the released run
+  uint64          taskid = 1; // Task id to read the output of
   ExecutionStream stream = 2; // Stream to read
   uint64          offset = 3; // Bytes of the stream read so far, the only offset the Ark accepts
   uint64          size   = 4; // Most bytes to return, chosen by the host
