@@ -32,8 +32,10 @@ fn main() {
     let mut config = prost_build::Config::new();
     config.protoc_executable(&protoc).out_dir(&out_dir);
 
-    // Keep the reserved errors open, since new codes join them over time
+    // Keep the reserved errors and slot kinds open, since new codes and datasets
+    // join them over time
     config.enum_attribute(".darkbio.wire.ReservedErrors", "#[non_exhaustive]");
+    config.enum_attribute(".darkbio.wire.SlotKind", "#[non_exhaustive]");
     let descriptors = config
         .load_fds(&[proto.join("wire.proto")], &[&proto])
         .expect("failed to load wire.proto");

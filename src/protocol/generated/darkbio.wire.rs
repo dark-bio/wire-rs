@@ -1004,10 +1004,11 @@ pub struct DatasetPathsResponse {
 /// brackets is a placeholder, described by the directory entry it names. The path
 /// is the entry's stable key.
 ///
-/// A grantable path also carries whether it reads only public data, which is the
-/// same on every Ark, and its wording. The wording is an English template that
+/// A grantable path also carries its wording and whether it is public. A public
+/// path reads nothing about the owner's DNA, such as the reference genome or
+/// which datasets are uploaded. The wording is an English template that
 /// describes a grant to the owner, with each placeholder named after the path's
-/// own, such as "Your genotype at {rsid}".
+/// own, such as "Your genome around variant {rsid}".
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DatasetPath {
     /// Path as a manifest names it
@@ -1031,7 +1032,7 @@ pub struct DatasetPath {
     /// Complete example values, most typical first
     #[prost(string, repeated, tag = "7")]
     pub examples: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Whether a grant reads only public data, for grantable paths
+    /// Whether a grant reads nothing about the owner's DNA, for grantable paths
     #[prost(bool, tag = "8")]
     pub public: bool,
     /// Template wording a grant to the owner, for grantable paths
@@ -1174,6 +1175,7 @@ impl ExecutionStream {
 }
 /// SlotKind identifies a slot on the device. Each value corresponds to a unique
 /// data type that the device can store and manage.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SlotKind {
@@ -1183,10 +1185,14 @@ pub enum SlotKind {
     ReferenceGenome = 1,
     /// Gene-to-coordinate mapping database
     GeneAnnotations = 2,
-    /// User's SNP/indel variant calls
-    SnpIndelCalls = 3,
+    /// User's small variant calls, SNVs and indels
+    SmallVariants = 3,
     /// Variant catalog (rsID-to-position), from dbSNP
     VariantCatalog = 4,
+    /// User's structural variant calls
+    StructuralVariants = 5,
+    /// User's copy number calls
+    CopyNumberVariants = 6,
 }
 impl SlotKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1198,8 +1204,10 @@ impl SlotKind {
             Self::Unspecified => "SLOT_KIND_UNSPECIFIED",
             Self::ReferenceGenome => "SLOT_KIND_REFERENCE_GENOME",
             Self::GeneAnnotations => "SLOT_KIND_GENE_ANNOTATIONS",
-            Self::SnpIndelCalls => "SLOT_KIND_SNP_INDEL_CALLS",
+            Self::SmallVariants => "SLOT_KIND_SMALL_VARIANTS",
             Self::VariantCatalog => "SLOT_KIND_VARIANT_CATALOG",
+            Self::StructuralVariants => "SLOT_KIND_STRUCTURAL_VARIANTS",
+            Self::CopyNumberVariants => "SLOT_KIND_COPY_NUMBER_VARIANTS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1208,8 +1216,10 @@ impl SlotKind {
             "SLOT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
             "SLOT_KIND_REFERENCE_GENOME" => Some(Self::ReferenceGenome),
             "SLOT_KIND_GENE_ANNOTATIONS" => Some(Self::GeneAnnotations),
-            "SLOT_KIND_SNP_INDEL_CALLS" => Some(Self::SnpIndelCalls),
+            "SLOT_KIND_SMALL_VARIANTS" => Some(Self::SmallVariants),
             "SLOT_KIND_VARIANT_CATALOG" => Some(Self::VariantCatalog),
+            "SLOT_KIND_STRUCTURAL_VARIANTS" => Some(Self::StructuralVariants),
+            "SLOT_KIND_COPY_NUMBER_VARIANTS" => Some(Self::CopyNumberVariants),
             _ => None,
         }
     }

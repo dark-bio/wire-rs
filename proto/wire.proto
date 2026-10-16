@@ -598,11 +598,13 @@ message ExecutionOutputResponse{
 // SlotKind identifies a slot on the device. Each value corresponds to a unique
 // data type that the device can store and manage.
 enum SlotKind {
-  SLOT_KIND_UNSPECIFIED      = 0; // Never sent, an unset kind
-  SLOT_KIND_REFERENCE_GENOME = 1; // Human reference genome assembly
-  SLOT_KIND_GENE_ANNOTATIONS = 2; // Gene-to-coordinate mapping database
-  SLOT_KIND_SNP_INDEL_CALLS  = 3; // User's SNP/indel variant calls
-  SLOT_KIND_VARIANT_CATALOG  = 4; // Variant catalog (rsID-to-position), from dbSNP
+  SLOT_KIND_UNSPECIFIED          = 0; // Never sent, an unset kind
+  SLOT_KIND_REFERENCE_GENOME     = 1; // Human reference genome assembly
+  SLOT_KIND_GENE_ANNOTATIONS     = 2; // Gene-to-coordinate mapping database
+  SLOT_KIND_SMALL_VARIANTS       = 3; // User's small variant calls, SNVs and indels
+  SLOT_KIND_VARIANT_CATALOG      = 4; // Variant catalog (rsID-to-position), from dbSNP
+  SLOT_KIND_STRUCTURAL_VARIANTS  = 5; // User's structural variant calls
+  SLOT_KIND_COPY_NUMBER_VARIANTS = 6; // User's copy number calls
 }
 
 // SlotOrigin describes the nature of the data in a slot, determining what
@@ -778,10 +780,11 @@ message DatasetPathsResponse {
 // brackets is a placeholder, described by the directory entry it names. The path
 // is the entry's stable key.
 //
-// A grantable path also carries whether it reads only public data, which is the
-// same on every Ark, and its wording. The wording is an English template that
+// A grantable path also carries its wording and whether it is public. A public
+// path reads nothing about the owner's DNA, such as the reference genome or
+// which datasets are uploaded. The wording is an English template that
 // describes a grant to the owner, with each placeholder named after the path's
-// own, such as "Your genotype at {rsid}".
+// own, such as "Your genome around variant {rsid}".
 message DatasetPath {
   string          path      = 1; // Path as a manifest names it
   bool            directory = 2; // Directory or file
@@ -790,6 +793,6 @@ message DatasetPath {
   string          desc      = 5; // What it holds, when it is absent and when it fails
   string          format    = 6; // Exact file content, or what a directory lists
   repeated string examples  = 7; // Complete example values, most typical first
-  bool            public    = 8; // Whether a grant reads only public data, for grantable paths
+  bool            public    = 8; // Whether a grant reads nothing about the owner's DNA, for grantable paths
   string          wording   = 9; // Template wording a grant to the owner, for grantable paths
 }
