@@ -585,6 +585,55 @@ fn test_deadlines_without_writer_progress() {
     ]);
 }
 
+/// The earliest deadline follows submissions and completions in any order, and
+/// expiry keeps the submission order of the messages left queued.
+#[test]
+fn test_deadline_order() {
+    use super::ExpectedMessage;
+    use Failure::*;
+    use Step::*;
+    run(vec![
+        // Queue requests due at 200 ms and 100 ms, a reply due at 150 ms, then
+        // a request and a reply due at 200 ms
+        Open(1),
+        Accept(1),
+        Request(1, 0, 10, 200),
+        Deadline(1, Some(200)),
+        Request(1, 1, 11, 100),
+        Deadline(1, Some(100)),
+        Deliver(1, 7, 30),
+        Receive(1, 30, 0),
+        Reply(0, 0, Ok(40), 150),
+        Request(1, 2, 12, 200),
+        Deliver(1, 8, 31),
+        Receive(1, 31, 1),
+        Reply(1, 1, Ok(41), 200),
+        Deadline(1, Some(100)),
+        // Expiry at 100 ms removes only the request due then, and the rest keep
+        // their submission order in the queue
+        Time(100),
+        Expire(1),
+        Wait(1, Err(Timeout)),
+        Deadline(1, Some(150)),
+        Outgoing(1, 0, ExpectedMessage::Request(10), 200),
+        Outgoing(1, 1, ExpectedMessage::Reply(7, Ok(40)), 150),
+        // Writing the reply due next moves the earliest deadline at once
+        Written(1, Ok(())),
+        WaitWrite(0, Ok(())),
+        Deadline(1, Some(200)),
+        // Everything due at 200 ms expires together, the queued request and
+        // reply leaving the queue and the reply releasing its ID
+        Time(200),
+        Expire(1),
+        NoOutgoing(1),
+        Deadline(1, None),
+        Wait(0, Err(Timeout)),
+        Wait(2, Err(Timeout)),
+        WaitWrite(1, Err(Timeout)),
+        Deliver(1, 8, 32),
+    ]);
+}
+
 /// Every way of ending a session fails its pending promises, with `Timeout` once
 /// their deadline has passed.
 #[test]
@@ -1846,11 +1895,7 @@ fn test_observer_drop_during_response_completion() {
             let now = tester.clock().now();
             let (sender, promise) =
                 Promise::<Message>::pair(Weak::new(), now + Duration::from_secs(60), true);
-            let pending = PendingOperation {
-                deadline: now + Duration::from_secs(60),
-                sender,
-                log_id: None,
-            };
+            let pending = PendingOperation::new(now + Duration::from_secs(60), sender, None);
 
             // Hold response completion after its byte reservation
             let (entered, reserved) = mpsc::channel();
