@@ -55,6 +55,8 @@ A request returns a `Promise` at once, and `wait` blocks until the reply arrives
 
 The application must keep receiving and answering the peer's requests while its own requests wait for replies. By default, a session holds at most 1024 pending peer requests and 16 MiB of buffered incoming messages. Exceeding either closes the session, since the protocol has no flow control.
 
+A host runs an app through `exec_create`, `exec_load` and `exec_start`. Creation names the main module by its SHA-256 digest and returns a task id. While loading waits, the host answers the Ark's `exec_module_size` and `exec_module_read` requests for the main module and its dependencies. Loading has no overall deadline; each module request gets 30s. Starting opens the approval on the owner's phone in Ark Companion, and the task's apps run once the owner approves.
+
 ## Timeouts and clocks
 
 A handshake has 5 s to complete, and each outgoing frame 5 s to be written. `Stream::set_write_timeout` changes the frame budget. Reads in an established session have no timeout. They wait until data arrives or the stream shuts down.

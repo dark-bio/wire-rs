@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -87,30 +87,36 @@ pub mod host_to_ark {
         /// Confirms the relay socket accepted the frame
         #[prost(message, tag = "1027")]
         RelayOutbound(super::RelayOutboundResponse),
-        /// Starts the unlock, confirmed through the app
+        /// Requests unlock
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockRequest),
-        /// Begins a chunked upload of an app to execute
+        /// Creates a task
         #[prost(message, tag = "1282")]
-        ExecUploadStart(super::ExecutionUploadStartRequest),
-        /// Appends a chunk to a pending app upload
+        ExecCreate(super::ExecutionCreateRequest),
+        /// Loads task modules
         #[prost(message, tag = "1283")]
-        ExecUploadChunk(super::ExecutionUploadChunkRequest),
-        /// Runs an uploaded app, confirmed through the app
+        ExecLoad(super::ExecutionLoadRequest),
+        /// Requests approval
         #[prost(message, tag = "1284")]
-        ExecSched(super::ExecutionScheduleRequest),
-        /// Checks where a scheduled task stands
+        ExecStart(super::ExecutionStartRequest),
+        /// Checks task state
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusRequest),
-        /// Cancels a task or a pending upload
+        /// Cancels a task
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelRequest),
-        /// Fetches the result of a resolved task
+        /// Reads task result
         #[prost(message, tag = "1287")]
         ExecResult(super::ExecutionResultRequest),
-        /// Reads the next piece of a released task's output
+        /// Reads task output
         #[prost(message, tag = "1288")]
         ExecOutput(super::ExecutionOutputRequest),
+        /// Module size, bytes
+        #[prost(message, tag = "1289")]
+        ExecModuleSize(super::ExecutionModuleSizeResponse),
+        /// Module bytes
+        #[prost(message, tag = "1290")]
+        ExecModuleRead(super::ExecutionModuleReadResponse),
         /// Lists the state of every data slot
         #[prost(message, tag = "1537")]
         SlotList(super::SlotListRequest),
@@ -166,7 +172,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -233,30 +239,36 @@ pub mod ark_to_host {
         /// Asks the host to write one frame to its relay socket
         #[prost(message, tag = "1027")]
         RelayOutbound(super::RelayOutboundRequest),
-        /// Acknowledges the completed unlock
+        /// Confirms unlock
         #[prost(message, tag = "1281")]
         Unlock(super::UnlockResponse),
-        /// Task id for the later messages
+        /// Created task's id
         #[prost(message, tag = "1282")]
-        ExecUploadStart(super::ExecutionUploadStartResponse),
-        /// Acknowledges the appended app chunk
+        ExecCreate(super::ExecutionCreateResponse),
+        /// Confirms task loaded
         #[prost(message, tag = "1283")]
-        ExecUploadChunk(super::ExecutionUploadChunkResponse),
-        /// Acknowledges the approved task, whose app now runs
+        ExecLoad(super::ExecutionLoadResponse),
+        /// Task started
         #[prost(message, tag = "1284")]
-        ExecSched(super::ExecutionScheduleResponse),
-        /// Where the scheduled task stands
+        ExecStart(super::ExecutionStartResponse),
+        /// Task state
         #[prost(message, tag = "1285")]
         ExecStatus(super::ExecutionStatusResponse),
-        /// Acknowledges the canceled task or upload
+        /// Task canceled
         #[prost(message, tag = "1286")]
         ExecCancel(super::ExecutionCancelResponse),
-        /// What the owner saw when releasing the output
+        /// Released task result
         #[prost(message, tag = "1287")]
         ExecResult(super::ExecutionResultResponse),
-        /// Next piece of the requested output stream
+        /// Next output bytes
         #[prost(message, tag = "1288")]
         ExecOutput(super::ExecutionOutputResponse),
+        /// Requests module size
+        #[prost(message, tag = "1289")]
+        ExecModuleSize(super::ExecutionModuleSizeRequest),
+        /// Reads module bytes
+        #[prost(message, tag = "1290")]
+        ExecModuleRead(super::ExecutionModuleReadRequest),
         /// Current state of every data slot
         #[prost(message, tag = "1537")]
         SlotList(super::SlotListResponse),
@@ -622,86 +634,91 @@ pub struct UnlockRequest {}
 /// error instead.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnlockResponse {}
-/// ExecutionUploadStartRequest begins a chunked upload of a WASM binary to
-/// execute. The declared size is used to pre-allocate the receive buffer and
-/// to reject oversized uploads early; the actual bytes are sent via subsequent
-/// ExecutionUploadChunkRequest messages.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionUploadStartRequest {
-    /// Total binary size in bytes
-    #[prost(uint64, tag = "1")]
-    pub bytes: u64,
-}
-/// ExecutionUploadStartResponse contains the id of the new task, which every
-/// later message about it carries. The task belongs to the session that opened
-/// it. When that session ends, the Ark drops the task whatever its stage,
-/// canceling a running app.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionUploadStartResponse {
-    /// Task id to stream chunks into
-    #[prost(uint64, tag = "1")]
-    pub taskid: u64,
-}
-/// ExecutionUploadChunkRequest appends a chunk of data to a pending upload.
-/// Chunks must be appended in order and must not overrun the declared size.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionUploadChunkRequest {
-    /// Task id to append to
-    #[prost(uint64, tag = "1")]
-    pub taskid: u64,
-    /// Data chunk to append (reasonably capped)
-    #[prost(bytes = "vec", tag = "2")]
-    pub chunk: ::prost::alloc::vec::Vec<u8>,
-}
-/// ExecutionUploadChunkResponse is an empty ack of the chunk upload request.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionUploadChunkResponse {}
-/// ExecutionScheduleRequest finalizes an upload and requests the device to
-/// execute the uploaded 3rd party app. The upload must have been completed
-/// (i.e. the sum of chunk sizes matches the declared size).
+/// ExecutionCreateRequest creates a task, naming its main app's module by its
+/// 32-byte SHA-256 digest. The Ark answers at once with a new task id, or
+/// refuses when it has no free task slot.
 ///
-/// The Ark answers once the owner approves or declines on their phone, or the
-/// approval window runs out.
+/// The task belongs to the session that created it. Ending that session drops
+/// the task at any stage, canceling apps that still run. A task that waits 5s
+/// between steps without the host's next request expires.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionCreateRequest {
+    /// Main module's SHA-256 digest, exactly 32 bytes
+    #[prost(bytes = "vec", tag = "1")]
+    pub sha256: ::prost::alloc::vec::Vec<u8>,
+}
+/// ExecutionCreateResponse contains the new task's id, which every later
+/// message about it carries.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionScheduleRequest {
-    /// Task id returned by ExecutionUploadStartResponse
+pub struct ExecutionCreateResponse {
+    /// Task id to load and start
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionScheduleResponse acks that the owner approved the task and its app
-/// now runs. The host already holds the task id from the preceding
-/// ExecutionUploadStartResponse.
+/// ExecutionLoadRequest fetches and checks every module of the task and runs
+/// their manifest passes. It fetches the main module first, then dependencies,
+/// depth first in manifest order, each distinct module once. The Ark asks the
+/// host through exec_module_size and exec_module_read, one request per task
+/// in flight. A request left unanswered for 30s fails the task.
+///
+/// Loading has no overall deadline. The host waits for the Ark's answer or
+/// cancels the task. A task already loaded or started fails this request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutionScheduleResponse {}
-/// ExecutionCancelRequest cancels an upload, a task awaiting the owner's
-/// approval or a running app. An interrupted app fails, and its report goes to
-/// the owner's review like any other. A task whose app already ended cannot be
-/// canceled.
+pub struct ExecutionLoadRequest {
+    /// Task id returned by ExecutionCreateResponse
+    #[prost(uint64, tag = "1")]
+    pub taskid: u64,
+}
+/// ExecutionLoadResponse acknowledges that the task is loaded. A refusal gets
+/// an error instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionLoadResponse {}
+/// ExecutionStartRequest reserves room for the task's approval records and
+/// opens the approval on the owner's phone. It fails unless the task is loaded.
+///
+/// The Ark answers once the owner approves. A decline gets the reserved
+/// UNAUTHORIZED error, an expired approval UNCONFIRMED, and an approval that
+/// could not be sent to the phone UNDELIVERED.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionStartRequest {
+    /// Task id returned by ExecutionCreateResponse
+    #[prost(uint64, tag = "1")]
+    pub taskid: u64,
+}
+/// ExecutionStartResponse acknowledges the owner's approval, after which the
+/// task's apps run.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionStartResponse {}
+/// ExecutionCancelRequest cancels a task at any stage before its apps end,
+/// including loading and awaiting the owner's approval. Canceling a task whose
+/// apps run fails it, and its report then goes to the owner's review like any
+/// other. A task whose apps already ended cannot be canceled.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionCancelRequest {
     /// Task id to cancel
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionCancelResponse acknowledges the canceled task or upload.
+/// ExecutionCancelResponse acknowledges the canceled task.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionCancelResponse {}
-/// ExecutionStatusRequest checks where a scheduled task stands. Only the
-/// session that scheduled the task can check it.
+/// ExecutionStatusRequest checks where a task stands after approval. Only the
+/// session that created the task can check it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionStatusRequest {
     /// Task id to check
     #[prost(uint64, tag = "1")]
     pub taskid: u64,
 }
-/// ExecutionStatusResponse reports where a scheduled task stands.
+/// ExecutionStatusResponse reports where an approved task stands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionStatusResponse {
     /// Where the task stands
     #[prost(enumeration = "ExecutionState", tag = "3")]
     pub state: i32,
 }
-/// ExecutionResultRequest fetches the result of a resolved task.
+/// ExecutionResultRequest fetches the result of a resolved task for the session
+/// that created it.
 ///
 /// A released task answers with what the owner saw, the same until the task
 /// closes for the host. A withheld task fails it with the reserved error its
@@ -725,13 +742,13 @@ pub struct ExecutionResultResponse {
     /// Whether the app is a develop build
     #[prost(bool, tag = "3")]
     pub develop: bool,
-    /// Whether the app succeeded
+    /// Whether the task succeeded
     #[prost(bool, tag = "4")]
     pub success: bool,
     /// Paths of the owner's data as mounted, without public grants
     #[prost(string, repeated, tag = "5")]
     pub paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Media type of the report, such as text/markdown
+    /// Report media type, always text/markdown
     #[prost(string, tag = "6")]
     pub media: ::prost::alloc::string::String,
     /// Length in bytes of the report, the app's standard output
@@ -741,7 +758,8 @@ pub struct ExecutionResultResponse {
     #[prost(uint64, tag = "8")]
     pub stderr_bytes: u64,
 }
-/// ExecutionOutputRequest reads the next piece of a released task's output.
+/// ExecutionOutputRequest reads the next piece of a released task's output for
+/// the session that created it.
 ///
 /// Each stream is read once and in order, in pieces of the size the host asks
 /// for. The Ark refuses a size of zero, or one whose answer would not fit a
@@ -766,6 +784,57 @@ pub struct ExecutionOutputRequest {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionOutputResponse {
     /// The requested bytes, fewer only at the stream's end
+    #[prost(bytes = "vec", tag = "1")]
+    pub chunk: ::prost::alloc::vec::Vec<u8>,
+}
+/// ExecutionModuleSizeRequest asks the host for the size of a module of the
+/// task, named by its 32-byte SHA-256 digest. The Ark keeps one module request
+/// in flight per task. Each request gets 30s; an unanswered one fails the task.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionModuleSizeRequest {
+    /// Task id whose module the Ark needs
+    #[prost(uint64, tag = "1")]
+    pub taskid: u64,
+    /// Module's SHA-256 digest, exactly 32 bytes
+    #[prost(bytes = "vec", tag = "2")]
+    pub sha256: ::prost::alloc::vec::Vec<u8>,
+}
+/// ExecutionModuleSizeResponse returns the module's size in bytes. A host that
+/// cannot serve the module answers with an error, and the Ark refuses the task.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionModuleSizeResponse {
+    /// Size of the module in bytes
+    #[prost(uint64, tag = "1")]
+    pub size: u64,
+}
+/// ExecutionModuleReadRequest asks the host for a module's bytes from offset,
+/// at most size of them. The request never passes the module's end and asks for
+/// at most 1 MiB. The Ark keeps one module request in flight per task. Each
+/// request gets 30s; an unanswered one fails the task.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionModuleReadRequest {
+    /// Task id whose module the Ark needs
+    #[prost(uint64, tag = "1")]
+    pub taskid: u64,
+    /// Module's SHA-256 digest, exactly 32 bytes
+    #[prost(bytes = "vec", tag = "2")]
+    pub sha256: ::prost::alloc::vec::Vec<u8>,
+    /// Byte offset within the module
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    /// Most bytes to return, at most 1 MiB
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+}
+/// ExecutionModuleReadResponse carries at least one byte and at most the size
+/// requested. The Ark continues where the answer ended. An empty or longer
+/// answer fails the task.
+///
+/// Hosts answer once they hold the size asked for, or about once a second with
+/// what they hold, whichever comes first.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutionModuleReadResponse {
+    /// Bytes of the module from the requested offset
     #[prost(bytes = "vec", tag = "1")]
     pub chunk: ::prost::alloc::vec::Vec<u8>,
 }
@@ -1103,15 +1172,15 @@ impl ReservedErrors {
         }
     }
 }
-/// ExecutionState is where a scheduled task stands for its host.
+/// ExecutionState is where an approved task stands for its host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionState {
     /// Never sent, an unset state
     Unspecified = 0,
-    /// The app still runs
+    /// The task's apps still run
     Running = 1,
-    /// The app ended and the owner reviews its report
+    /// Apps ended, owner reviews the report
     Awaiting = 2,
     /// The review closed, so exec_result answers
     Resolved = 3,

@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -87,30 +87,36 @@ pub mod host_to_ark {
         /// Confirms the relay socket accepted the frame
         #[prost(bytes, tag = "1027")]
         RelayOutbound(::prost::bytes::Bytes),
-        /// Starts the unlock, confirmed through the app
+        /// Requests unlock
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
-        /// Begins a chunked upload of an app to execute
+        /// Creates a task
         #[prost(bytes, tag = "1282")]
-        ExecUploadStart(::prost::bytes::Bytes),
-        /// Appends a chunk to a pending app upload
+        ExecCreate(::prost::bytes::Bytes),
+        /// Loads task modules
         #[prost(bytes, tag = "1283")]
-        ExecUploadChunk(::prost::bytes::Bytes),
-        /// Runs an uploaded app, confirmed through the app
+        ExecLoad(::prost::bytes::Bytes),
+        /// Requests approval
         #[prost(bytes, tag = "1284")]
-        ExecSched(::prost::bytes::Bytes),
-        /// Checks where a scheduled task stands
+        ExecStart(::prost::bytes::Bytes),
+        /// Checks task state
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
-        /// Cancels a task or a pending upload
+        /// Cancels a task
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
-        /// Fetches the result of a resolved task
+        /// Reads task result
         #[prost(bytes, tag = "1287")]
         ExecResult(::prost::bytes::Bytes),
-        /// Reads the next piece of a released task's output
+        /// Reads task output
         #[prost(bytes, tag = "1288")]
         ExecOutput(::prost::bytes::Bytes),
+        /// Module size, bytes
+        #[prost(bytes, tag = "1289")]
+        ExecModuleSize(::prost::bytes::Bytes),
+        /// Module bytes
+        #[prost(bytes, tag = "1290")]
+        ExecModuleRead(::prost::bytes::Bytes),
         /// Lists the state of every data slot
         #[prost(bytes, tag = "1537")]
         SlotList(::prost::bytes::Bytes),
@@ -166,7 +172,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -233,30 +239,36 @@ pub mod ark_to_host {
         /// Asks the host to write one frame to its relay socket
         #[prost(bytes, tag = "1027")]
         RelayOutbound(::prost::bytes::Bytes),
-        /// Acknowledges the completed unlock
+        /// Confirms unlock
         #[prost(bytes, tag = "1281")]
         Unlock(::prost::bytes::Bytes),
-        /// Task id for the later messages
+        /// Created task's id
         #[prost(bytes, tag = "1282")]
-        ExecUploadStart(::prost::bytes::Bytes),
-        /// Acknowledges the appended app chunk
+        ExecCreate(::prost::bytes::Bytes),
+        /// Confirms task loaded
         #[prost(bytes, tag = "1283")]
-        ExecUploadChunk(::prost::bytes::Bytes),
-        /// Acknowledges the approved task, whose app now runs
+        ExecLoad(::prost::bytes::Bytes),
+        /// Task started
         #[prost(bytes, tag = "1284")]
-        ExecSched(::prost::bytes::Bytes),
-        /// Where the scheduled task stands
+        ExecStart(::prost::bytes::Bytes),
+        /// Task state
         #[prost(bytes, tag = "1285")]
         ExecStatus(::prost::bytes::Bytes),
-        /// Acknowledges the canceled task or upload
+        /// Task canceled
         #[prost(bytes, tag = "1286")]
         ExecCancel(::prost::bytes::Bytes),
-        /// What the owner saw when releasing the output
+        /// Released task result
         #[prost(bytes, tag = "1287")]
         ExecResult(::prost::bytes::Bytes),
-        /// Next piece of the requested output stream
+        /// Next output bytes
         #[prost(bytes, tag = "1288")]
         ExecOutput(::prost::bytes::Bytes),
+        /// Requests module size
+        #[prost(bytes, tag = "1289")]
+        ExecModuleSize(::prost::bytes::Bytes),
+        /// Reads module bytes
+        #[prost(bytes, tag = "1290")]
+        ExecModuleRead(::prost::bytes::Bytes),
         /// Current state of every data slot
         #[prost(bytes, tag = "1537")]
         SlotList(::prost::bytes::Bytes),

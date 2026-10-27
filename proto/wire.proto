@@ -60,14 +60,16 @@ message HostToArk {
 
     // Operational messages, reserved range 0x501-0x600
 
-    UnlockRequest                unlock = 0x501;            // Starts the unlock, confirmed through the app
-    ExecutionUploadStartRequest  exec_upload_start = 0x502; // Begins a chunked upload of an app to execute
-    ExecutionUploadChunkRequest  exec_upload_chunk = 0x503; // Appends a chunk to a pending app upload
-    ExecutionScheduleRequest     exec_sched = 0x504;        // Runs an uploaded app, confirmed through the app
-    ExecutionStatusRequest       exec_status = 0x505;       // Checks where a scheduled task stands
-    ExecutionCancelRequest       exec_cancel = 0x506;       // Cancels a task or a pending upload
-    ExecutionResultRequest       exec_result = 0x507;       // Fetches the result of a resolved task
-    ExecutionOutputRequest       exec_output = 0x508;       // Reads the next piece of a released task's output
+    UnlockRequest               unlock = 0x501;           // Requests unlock
+    ExecutionCreateRequest      exec_create = 0x502;      // Creates a task
+    ExecutionLoadRequest        exec_load = 0x503;        // Loads task modules
+    ExecutionStartRequest       exec_start = 0x504;       // Requests approval
+    ExecutionStatusRequest      exec_status = 0x505;      // Checks task state
+    ExecutionCancelRequest      exec_cancel = 0x506;      // Cancels a task
+    ExecutionResultRequest      exec_result = 0x507;      // Reads task result
+    ExecutionOutputRequest      exec_output = 0x508;      // Reads task output
+    ExecutionModuleSizeResponse exec_module_size = 0x509; // Module size, bytes
+    ExecutionModuleReadResponse exec_module_read = 0x50a; // Module bytes
 
     // Slot messages, reserved range 0x601-0x700
 
@@ -143,14 +145,16 @@ message ArkToHost {
 
     // Operational messages, reserved range 0x501-0x600
 
-    UnlockResponse                unlock = 0x501;            // Acknowledges the completed unlock
-    ExecutionUploadStartResponse  exec_upload_start = 0x502; // Task id for the later messages
-    ExecutionUploadChunkResponse  exec_upload_chunk = 0x503; // Acknowledges the appended app chunk
-    ExecutionScheduleResponse     exec_sched = 0x504;        // Acknowledges the approved task, whose app now runs
-    ExecutionStatusResponse       exec_status = 0x505;       // Where the scheduled task stands
-    ExecutionCancelResponse       exec_cancel = 0x506;       // Acknowledges the canceled task or upload
-    ExecutionResultResponse       exec_result = 0x507;       // What the owner saw when releasing the output
-    ExecutionOutputResponse       exec_output = 0x508;       // Next piece of the requested output stream
+    UnlockResponse             unlock = 0x501;           // Confirms unlock
+    ExecutionCreateResponse    exec_create = 0x502;      // Created task's id
+    ExecutionLoadResponse      exec_load = 0x503;        // Confirms task loaded
+    ExecutionStartResponse     exec_start = 0x504;       // Task started
+    ExecutionStatusResponse    exec_status = 0x505;      // Task state
+    ExecutionCancelResponse    exec_cancel = 0x506;      // Task canceled
+    ExecutionResultResponse    exec_result = 0x507;      // Released task result
+    ExecutionOutputResponse    exec_output = 0x508;      // Next output bytes
+    ExecutionModuleSizeRequest exec_module_size = 0x509; // Requests module size
+    ExecutionModuleReadRequest exec_module_read = 0x50a; // Reads module bytes
 
     // Slot messages, reserved range 0x601-0x700
 
@@ -479,70 +483,76 @@ message UnlockRequest{
 message UnlockResponse{
 }
 
-// ExecutionUploadStartRequest begins a chunked upload of a WASM binary to
-// execute. The declared size is used to pre-allocate the receive buffer and
-// to reject oversized uploads early; the actual bytes are sent via subsequent
-// ExecutionUploadChunkRequest messages.
-message ExecutionUploadStartRequest{
-  uint64 bytes = 1; // Total binary size in bytes
-}
-// ExecutionUploadStartResponse contains the id of the new task, which every
-// later message about it carries. The task belongs to the session that opened
-// it. When that session ends, the Ark drops the task whatever its stage,
-// canceling a running app.
-message ExecutionUploadStartResponse{
-  uint64 taskid = 1; // Task id to stream chunks into
-}
-
-// ExecutionUploadChunkRequest appends a chunk of data to a pending upload.
-// Chunks must be appended in order and must not overrun the declared size.
-message ExecutionUploadChunkRequest{
-  uint64 taskid = 1; // Task id to append to
-  bytes chunk = 2;   // Data chunk to append (reasonably capped)
-}
-// ExecutionUploadChunkResponse is an empty ack of the chunk upload request.
-message ExecutionUploadChunkResponse{
-}
-
-// ExecutionScheduleRequest finalizes an upload and requests the device to
-// execute the uploaded 3rd party app. The upload must have been completed
-// (i.e. the sum of chunk sizes matches the declared size).
+// ExecutionCreateRequest creates a task, naming its main app's module by its
+// 32-byte SHA-256 digest. The Ark answers at once with a new task id, or
+// refuses when it has no free task slot.
 //
-// The Ark answers once the owner approves or declines on their phone, or the
-// approval window runs out.
-message ExecutionScheduleRequest{
-  uint64 taskid = 1; // Task id returned by ExecutionUploadStartResponse
+// The task belongs to the session that created it. Ending that session drops
+// the task at any stage, canceling apps that still run. A task that waits 5s
+// between steps without the host's next request expires.
+message ExecutionCreateRequest{
+  bytes sha256 = 1; // Main module's SHA-256 digest, exactly 32 bytes
 }
-// ExecutionScheduleResponse acks that the owner approved the task and its app
-// now runs. The host already holds the task id from the preceding
-// ExecutionUploadStartResponse.
-message ExecutionScheduleResponse{
+// ExecutionCreateResponse contains the new task's id, which every later
+// message about it carries.
+message ExecutionCreateResponse{
+  uint64 taskid = 1; // Task id to load and start
 }
 
-// ExecutionCancelRequest cancels an upload, a task awaiting the owner's
-// approval or a running app. An interrupted app fails, and its report goes to
-// the owner's review like any other. A task whose app already ended cannot be
-// canceled.
+// ExecutionLoadRequest fetches and checks every module of the task and runs
+// their manifest passes. It fetches the main module first, then dependencies,
+// depth first in manifest order, each distinct module once. The Ark asks the
+// host through exec_module_size and exec_module_read, one request per task
+// in flight. A request left unanswered for 30s fails the task.
+//
+// Loading has no overall deadline. The host waits for the Ark's answer or
+// cancels the task. A task already loaded or started fails this request.
+message ExecutionLoadRequest{
+  uint64 taskid = 1; // Task id returned by ExecutionCreateResponse
+}
+// ExecutionLoadResponse acknowledges that the task is loaded. A refusal gets
+// an error instead.
+message ExecutionLoadResponse{
+}
+
+// ExecutionStartRequest reserves room for the task's approval records and
+// opens the approval on the owner's phone. It fails unless the task is loaded.
+//
+// The Ark answers once the owner approves. A decline gets the reserved
+// UNAUTHORIZED error, an expired approval UNCONFIRMED, and an approval that
+// could not be sent to the phone UNDELIVERED.
+message ExecutionStartRequest{
+  uint64 taskid = 1; // Task id returned by ExecutionCreateResponse
+}
+// ExecutionStartResponse acknowledges the owner's approval, after which the
+// task's apps run.
+message ExecutionStartResponse{
+}
+
+// ExecutionCancelRequest cancels a task at any stage before its apps end,
+// including loading and awaiting the owner's approval. Canceling a task whose
+// apps run fails it, and its report then goes to the owner's review like any
+// other. A task whose apps already ended cannot be canceled.
 message ExecutionCancelRequest{
   uint64 taskid = 1; // Task id to cancel
 }
-// ExecutionCancelResponse acknowledges the canceled task or upload.
+// ExecutionCancelResponse acknowledges the canceled task.
 message ExecutionCancelResponse{
 }
 
-// ExecutionStatusRequest checks where a scheduled task stands. Only the
-// session that scheduled the task can check it.
+// ExecutionStatusRequest checks where a task stands after approval. Only the
+// session that created the task can check it.
 message ExecutionStatusRequest{
   uint64 taskid = 1; // Task id to check
 }
-// ExecutionState is where a scheduled task stands for its host.
+// ExecutionState is where an approved task stands for its host.
 enum ExecutionState {
   EXECUTION_STATE_UNSPECIFIED = 0; // Never sent, an unset state
-  EXECUTION_STATE_RUNNING     = 1; // The app still runs
-  EXECUTION_STATE_AWAITING    = 2; // The app ended and the owner reviews its report
+  EXECUTION_STATE_RUNNING     = 1; // The task's apps still run
+  EXECUTION_STATE_AWAITING    = 2; // Apps ended, owner reviews the report
   EXECUTION_STATE_RESOLVED    = 3; // The review closed, so exec_result answers
 }
-// ExecutionStatusResponse reports where a scheduled task stands.
+// ExecutionStatusResponse reports where an approved task stands.
 message ExecutionStatusResponse{
   reserved 1; // Kept free, since older hosts read it as their pending flag
   reserved 2; // Kept free, since older hosts read it as their result
@@ -550,7 +560,8 @@ message ExecutionStatusResponse{
   ExecutionState state = 3; // Where the task stands
 }
 
-// ExecutionResultRequest fetches the result of a resolved task.
+// ExecutionResultRequest fetches the result of a resolved task for the session
+// that created it.
 //
 // A released task answers with what the owner saw, the same until the task
 // closes for the host. A withheld task fails it with the reserved error its
@@ -564,9 +575,9 @@ message ExecutionResultResponse{
   string          name         = 1; // App name from its manifest
   string          version      = 2; // App version from its manifest
   bool            develop      = 3; // Whether the app is a develop build
-  bool            success      = 4; // Whether the app succeeded
+  bool            success      = 4; // Whether the task succeeded
   repeated string paths        = 5; // Paths of the owner's data as mounted, without public grants
-  string          media        = 6; // Media type of the report, such as text/markdown
+  string          media        = 6; // Report media type, always text/markdown
   uint64          stdout_bytes = 7; // Length in bytes of the report, the app's standard output
   uint64          stderr_bytes = 8; // Length in bytes of a develop build's standard error, 0 otherwise
 }
@@ -577,7 +588,8 @@ enum ExecutionStream {
   EXECUTION_STREAM_STDOUT      = 1; // Standard output, the report
   EXECUTION_STREAM_STDERR      = 2; // Standard error, kept for develop builds only
 }
-// ExecutionOutputRequest reads the next piece of a released task's output.
+// ExecutionOutputRequest reads the next piece of a released task's output for
+// the session that created it.
 //
 // Each stream is read once and in order, in pieces of the size the host asks
 // for. The Ark refuses a size of zero, or one whose answer would not fit a
@@ -592,6 +604,39 @@ message ExecutionOutputRequest{
 // ExecutionOutputResponse carries the next piece of the requested stream.
 message ExecutionOutputResponse{
   bytes chunk = 1; // The requested bytes, fewer only at the stream's end
+}
+
+// ExecutionModuleSizeRequest asks the host for the size of a module of the
+// task, named by its 32-byte SHA-256 digest. The Ark keeps one module request
+// in flight per task. Each request gets 30s; an unanswered one fails the task.
+message ExecutionModuleSizeRequest{
+  uint64 taskid = 1; // Task id whose module the Ark needs
+  bytes sha256 = 2;  // Module's SHA-256 digest, exactly 32 bytes
+}
+// ExecutionModuleSizeResponse returns the module's size in bytes. A host that
+// cannot serve the module answers with an error, and the Ark refuses the task.
+message ExecutionModuleSizeResponse{
+  uint64 size = 1; // Size of the module in bytes
+}
+
+// ExecutionModuleReadRequest asks the host for a module's bytes from offset,
+// at most size of them. The request never passes the module's end and asks for
+// at most 1 MiB. The Ark keeps one module request in flight per task. Each
+// request gets 30s; an unanswered one fails the task.
+message ExecutionModuleReadRequest{
+  uint64 taskid = 1; // Task id whose module the Ark needs
+  bytes sha256 = 2;  // Module's SHA-256 digest, exactly 32 bytes
+  uint64 offset = 3; // Byte offset within the module
+  uint64 size = 4;   // Most bytes to return, at most 1 MiB
+}
+// ExecutionModuleReadResponse carries at least one byte and at most the size
+// requested. The Ark continues where the answer ended. An empty or longer
+// answer fails the task.
+//
+// Hosts answer once they hold the size asked for, or about once a second with
+// what they hold, whichever comes first.
+message ExecutionModuleReadResponse{
+  bytes chunk = 1; // Bytes of the module from the requested offset
 }
 
 
