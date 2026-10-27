@@ -179,6 +179,35 @@ fn test_model_scripts() {
     ]);
 }
 
+/// Deadlines expire in their own order while queued messages keep submission
+/// order, and completing the operation due next moves the earliest deadline.
+#[test]
+fn test_deadline_order() {
+    use Kind::*;
+    run_actions(&[
+        // Queue requests due at 200 ms and 100 ms, a reply due at 150 ms, then
+        // a request and a reply due at 200 ms
+        (Request, 0, 10, 200),
+        (Request, 0, 11, 100),
+        (Receive, 0, 30, 0),
+        (Reply, 0, 40, 150),
+        (Request, 0, 12, 200),
+        (Receive, 0, 31, 0),
+        (Reply, 1, 42, 200),
+        // Expire the request due first, then take the next two messages and
+        // write the reply among them
+        (Advance, 0, 0, 100),
+        (Expire, 0, 0, 0),
+        (Outgoing, 0, 0, 0),
+        (Outgoing, 0, 0, 0),
+        (Written, 2, 2, 0),
+        // Expire everything due at 200 ms, the queued messages included
+        (Advance, 0, 0, 100),
+        (Expire, 0, 0, 0),
+        (Outgoing, 0, 0, 0),
+    ]);
+}
+
 /// Both promise kinds can wait before completion, including failed writes,
 /// wrong response types and deadlines that have already passed.
 #[test]

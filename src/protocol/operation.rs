@@ -11,50 +11,153 @@ use super::promise::{Notification, Notifications, PromiseResult, ResultSender};
 use super::session::SessionInner;
 use super::{Error, Message, schema};
 use crate::LogId;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Weak;
 use std::time::Instant;
 
-/// Key for one entry in the session's `operations` map.
+/// Key of one operation in its session's [`Operations`], numbered in
+/// submission order.
 ///
-/// Equality compares the `Arc` pointers. A new operation gets a new key even
-/// if the peer reuses a wire ID, so a late write result cannot complete
-/// another operation.
-#[derive(Clone)]
+/// A session never reuses a key, even when the peer reuses a wire ID, so a
+/// late write result cannot complete another operation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct OperationKey(
-    /// Allocation whose address distinguishes this operation.
-    Arc<()>,
+    /// Count of operations the session submitted before this one.
+    u64,
 );
 
-impl OperationKey {
-    /// Creates a key distinct from every other key still in use.
-    pub(super) fn new() -> Self {
-        Self(Arc::new(()))
-    }
+/// Pending operations of one session, with the messages queued for its writer
+/// and the order of their deadlines.
+///
+/// Submitting, taking, completing and expiring an operation each take time
+/// logarithmic in the number pending. Draining a long queue or expiring its
+/// operations one by one therefore never rescans it.
+#[derive(Default)]
+pub(super) struct Operations {
+    /// Operations waiting to send a result to their promise.
+    ///
+    /// Each is removed before sending that result, so a promise is completed
+    /// only once.
+    pending: HashMap<OperationKey, PendingOperation>,
+    /// Messages of pending operations not yet taken by the writer, in
+    /// submission order.
+    queue: BTreeMap<OperationKey, OutgoingMessage>,
+    /// Deadline and key of every pending operation, earliest first, with ties
+    /// in submission order.
+    deadlines: BTreeSet<(Instant, OperationKey)>,
+    /// Key of the next submitted operation.
+    next_key: u64,
 }
 
-impl PartialEq for OperationKey {
-    /// Checks whether both keys point to the same `Arc` allocation.
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+impl Operations {
+    /// Tracks a new operation and queues its message for the writer.
+    ///
+    /// # Panics
+    ///
+    /// Panics once the session has used up its operation keys, before changing
+    /// anything, rather than reuse a key.
+    pub(super) fn submit(
+        &mut self,
+        operation: PendingOperation,
+        body: OutgoingBody,
+        session: Weak<SessionInner>,
+    ) {
+        // Key the operation in submission order, which is also the queue order
+        let key = OperationKey(self.next_key);
+        self.next_key = key.0.checked_add(1).expect("operation keys exhausted");
+
+        // Index its deadline and queue its message beside it
+        self.deadlines.insert((operation.deadline, key));
+        self.queue.insert(
+            key,
+            OutgoingMessage {
+                body,
+                operation: OperationHandle { session, key },
+                #[cfg(any(test, feature = "fuzz"))]
+                deadline: operation.deadline,
+            },
+        );
+        self.pending.insert(key, operation);
     }
-}
 
-impl Eq for OperationKey {}
+    /// Returns the pending operation under `key`.
+    pub(super) fn get(&self, key: &OperationKey) -> Option<&PendingOperation> {
+        self.pending.get(key)
+    }
 
-impl Hash for OperationKey {
-    /// Hashes the `Arc` pointer used by `eq()`.
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
+    /// Returns the pending operation under `key` for updating its log label.
+    pub(super) fn get_mut(&mut self, key: &OperationKey) -> Option<&mut PendingOperation> {
+        self.pending.get_mut(key)
+    }
+
+    /// Removes the operation under `key`, with its deadline and any message it
+    /// still has queued.
+    pub(super) fn remove(&mut self, key: &OperationKey) -> Option<PendingOperation> {
+        let operation = self.pending.remove(key)?;
+        self.deadlines.remove(&(operation.deadline, *key));
+        self.queue.remove(key);
+        Some(operation)
+    }
+
+    /// Takes the oldest queued message for the writer.
+    ///
+    /// Its operation stays pending until a write result or answer completes it.
+    pub(super) fn take_queued(&mut self) -> Option<OutgoingMessage> {
+        self.queue.pop_first().map(|(_, message)| message)
+    }
+
+    /// Removes the operation with the earliest deadline once `now` reaches it,
+    /// with its message if the writer has not taken it.
+    pub(super) fn pop_expired(
+        &mut self,
+        now: Instant,
+    ) -> Option<(PendingOperation, Option<OutgoingMessage>)> {
+        let &(deadline, key) = self.deadlines.first()?;
+        if now < deadline {
+            return None;
+        }
+        self.deadlines.pop_first();
+        let operation = self
+            .pending
+            .remove(&key)
+            .expect("indexed operation pending");
+        Some((operation, self.queue.remove(&key)))
+    }
+
+    /// Returns the earliest deadline of the pending operations.
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.first().map(|&(deadline, _)| deadline)
+    }
+
+    /// Counts the pending operations.
+    pub(super) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Counts the messages not yet taken by the writer.
+    pub(super) fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Removes every pending operation, for closing the session.
+    ///
+    /// The queued messages stay, so the caller can drop them after releasing
+    /// the session lock.
+    pub(super) fn drain(&mut self) -> impl Iterator<Item = PendingOperation> {
+        self.deadlines.clear();
+        self.pending.drain().map(|(_, operation)| operation)
     }
 }
 
 /// Request waiting for an answer, or reply waiting for its write to finish.
 ///
-/// It stays in the session's `operations` map until its promise gets a result.
+/// It stays in the session's [`Operations`] until its promise gets a result.
 pub(super) struct PendingOperation {
     /// Deadline for the result, including time in the outgoing queue.
-    pub(super) deadline: Instant,
+    ///
+    /// It is fixed at creation, since [`Operations`] orders pending operations
+    /// by it.
+    deadline: Instant,
     /// Channel that sends the result to this operation's promise.
     pub(super) sender: ResultSender,
     /// Wire ID as a log label, distinct from the operation key.
@@ -65,6 +168,20 @@ pub(super) struct PendingOperation {
 }
 
 impl PendingOperation {
+    /// Creates an operation whose result must reach `sender` by `deadline`.
+    pub(super) fn new(deadline: Instant, sender: ResultSender, log_id: Option<LogId>) -> Self {
+        Self {
+            deadline,
+            sender,
+            log_id,
+        }
+    }
+
+    /// Returns the deadline for this operation's result.
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     /// Sends the answer to the promise, or [`Error::Timeout`] if the deadline
     /// was reached.
     ///
@@ -134,7 +251,7 @@ impl PendingOperation {
     }
 }
 
-/// Request or reply in the session's `outgoing` queue.
+/// Request or reply queued in the session's [`Operations`].
 ///
 /// The writer takes it, sends it, then uses `operation` to report the write
 /// result.
@@ -145,8 +262,8 @@ pub(super) struct OutgoingMessage {
     pub(super) operation: OperationHandle,
     /// Deadline checked by scenarios.
     ///
-    /// The live deadline worker reads the corresponding entry in the session's
-    /// `operations` map instead.
+    /// The live deadline worker reads the deadline order in the session's
+    /// [`Operations`] instead.
     #[cfg(any(test, feature = "fuzz"))]
     pub(super) deadline: Instant,
 }
@@ -171,7 +288,7 @@ pub(super) enum OutgoingBody {
 /// The session removes completed operations, so reporting a result again does
 /// nothing. The weak reference never changes to point to a replacement session.
 pub(super) struct OperationHandle {
-    /// Session whose `operations` map is checked for this key.
+    /// Session whose [`Operations`] are checked for this key.
     pub(super) session: Weak<SessionInner>,
     /// Key used to find the operation in that session.
     pub(super) key: OperationKey,
