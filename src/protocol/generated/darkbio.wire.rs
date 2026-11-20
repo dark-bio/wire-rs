@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 261, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -45,6 +45,9 @@ pub mod host_to_ark {
         /// Requests a proof of the device's genuinity
         #[prost(message, tag = "260")]
         GenuinityProof(super::GenuinityProofRequest),
+        /// Installs the cloud-signed notary key and revocations
+        #[prost(message, tag = "261")]
+        NotarySync(super::NotarySyncRequest),
         /// Prepares an update, aborting any in progress
         #[prost(message, tag = "513")]
         FirmwareUpdatePrep(super::FirmwareUpdatePrepRequest),
@@ -172,7 +175,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 261, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -197,6 +200,9 @@ pub mod ark_to_host {
         /// Encrypted proof of the Ark's genuinity for the cloud
         #[prost(message, tag = "260")]
         GenuinityProof(super::GenuinityProofResponse),
+        /// Acknowledges the notary sync
+        #[prost(message, tag = "261")]
+        NotarySync(super::NotarySyncResponse),
         /// Ephemeral key to receive the firmware key with, sealed for the cloud
         #[prost(message, tag = "513")]
         FirmwareUpdatePrep(super::FirmwareUpdatePrepResponse),
@@ -362,6 +368,9 @@ pub struct DeviceInfoResponse {
     /// Current device clock unix timestamp, set by the cloud sync
     #[prost(uint64, tag = "10")]
     pub cloud_clock: u64,
+    /// Whether the Ark has a valid notary key and revocation list
+    #[prost(bool, tag = "13")]
+    pub notary_synced: bool,
     /// Whether the Ark is paired with a companion app (user data initialized)
     #[prost(bool, tag = "11")]
     pub paired: bool,
@@ -421,6 +430,20 @@ pub struct GenuinityProofResponse {
     #[prost(bytes = "vec", tag = "1")]
     pub proof: ::prost::alloc::vec::Vec<u8>,
 }
+/// NotarySyncRequest installs the current notary key and revocations on the Ark.
+///
+/// The notary root attests the notary key, which signs three sorted revocation
+/// lists: app digests by SHA-256, signer keys by fingerprint and publisher names.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NotarySyncRequest {
+    /// Sign[Cloud]["notarysync-v1"][null]([notary_cwt, Sign[Notary]["notarization-v1"][null](\[app_sha256s, signer_ids, publishers\])])
+    #[prost(bytes = "vec", tag = "1")]
+    pub sync: ::prost::alloc::vec::Vec<u8>,
+}
+/// NotarySyncResponse acknowledges the sync. If the Ark refuses it, the
+/// envelope carries the refusal in its err field.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NotarySyncResponse {}
 /// FirmwareUpdatePrepRequest prepares a firmware update procedure. If any previous
 /// update procedure was in progress, it is aborted.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -733,29 +756,32 @@ pub struct ExecutionResultRequest {
 /// output, which the host then reads through ExecutionOutputRequest.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionResultResponse {
-    /// App name from its manifest
+    /// App id when it's notarized, empty otherwise
     #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// App name from its manifest
+    #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     /// App version from its manifest
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "3")]
     pub version: ::prost::alloc::string::String,
     /// Whether the app is a develop build
-    #[prost(bool, tag = "3")]
+    #[prost(bool, tag = "4")]
     pub develop: bool,
     /// Whether the task succeeded
-    #[prost(bool, tag = "4")]
+    #[prost(bool, tag = "5")]
     pub success: bool,
     /// Paths of the owner's data as mounted, without public grants
-    #[prost(string, repeated, tag = "5")]
+    #[prost(string, repeated, tag = "6")]
     pub paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Report media type, always text/markdown
-    #[prost(string, tag = "6")]
+    #[prost(string, tag = "7")]
     pub media: ::prost::alloc::string::String,
     /// Length in bytes of the report, the app's standard output
-    #[prost(uint64, tag = "7")]
+    #[prost(uint64, tag = "8")]
     pub stdout_bytes: u64,
     /// Length in bytes of a develop build's standard error, 0 otherwise
-    #[prost(uint64, tag = "8")]
+    #[prost(uint64, tag = "9")]
     pub stderr_bytes: u64,
 }
 /// ExecutionOutputRequest reads the next piece of a released task's output for
@@ -1127,7 +1153,7 @@ pub enum ReservedErrors {
     /// firmware updates on an emulator or develop envelopes on production.
     Unsupported = 3,
     /// The peer serves this request but not in its current state, before cloud
-    /// sync or pairing. It may once the state changes.
+    /// sync, notary sync or pairing. It may once the state changes.
     Unavailable = 4,
     /// The peer serves this request but the phone approval it depends on did not
     /// authorize it. The owner declined, or the phone's answer broke the approval's
