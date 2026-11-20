@@ -34,6 +34,7 @@ message HostToArk {
     CloudSyncStartRequest  cloud_sync_start = 0x102;  // Starts a cloud sync with the attested cloud keys
     CloudSyncFinishRequest cloud_sync_finish = 0x103; // Finishes a cloud sync with the signed server time
     GenuinityProofRequest  genuinity_proof = 0x104;   // Requests a proof of the device's genuinity
+    NotarySyncRequest      notary_sync = 0x105;       // Installs the cloud-signed notary key and revocations
 
     // Firmware update messages, reserved range 0x201-0x300
 
@@ -119,6 +120,7 @@ message ArkToHost {
     CloudSyncStartResponse  cloud_sync_start = 0x102;  // Challenge for the cloud to sign along its time
     CloudSyncFinishResponse cloud_sync_finish = 0x103; // Timestamp the Ark accepted from the cloud
     GenuinityProofResponse  genuinity_proof = 0x104;   // Encrypted proof of the Ark's genuinity for the cloud
+    NotarySyncResponse      notary_sync = 0x105;       // Acknowledges the notary sync
 
     // Firmware update messages, reserved range 0x201-0x300
 
@@ -209,7 +211,7 @@ enum ReservedErrors {
   RESERVED_ERRORS_UNSUPPORTED = 3;
 
   // The peer serves this request but not in its current state, before cloud
-  // sync or pairing. It may once the state changes.
+  // sync, notary sync or pairing. It may once the state changes.
   RESERVED_ERRORS_UNAVAILABLE = 4;
 
   // The peer serves this request but the phone approval it depends on did not
@@ -256,8 +258,9 @@ message DeviceInfoResponse {
   string firmware_version = 7; // Current firmware version (X.Y.Z-commit)
   uint64 firmware_publish = 8; // Current firmware publish unix timestamp
 
-  bool   cloud_synced = 9;  // Whether a cloud identity was accepted since boot
-  uint64 cloud_clock = 10;  // Current device clock unix timestamp, set by the cloud sync
+  bool   cloud_synced = 9;   // Whether a cloud identity was accepted since boot
+  uint64 cloud_clock = 10;   // Current device clock unix timestamp, set by the cloud sync
+  bool   notary_synced = 13; // Whether the Ark has a valid notary key and revocation list
 
   bool paired   = 11; // Whether the Ark is paired with a companion app (user data initialized)
   bool unlocked = 12; // Whether the user data storage is open (false if unpaired)
@@ -299,6 +302,19 @@ message GenuinityProofRequest {
 // of the device.
 message GenuinityProofResponse {
   bytes proof = 1; // Seal[Ark->Cloud]["genuinity-v1"][null](null)
+}
+
+
+// NotarySyncRequest installs the current notary key and revocations on the Ark.
+//
+// The notary root attests the notary key, which signs three sorted revocation
+// lists: app digests by SHA-256, signer keys by fingerprint and publisher names.
+message NotarySyncRequest {
+  bytes sync = 1; // Sign[Cloud]["notarysync-v1"][null]([notary_cwt, Sign[Notary]["notarization-v1"][null]([app_sha256s, signer_ids, publishers])])
+}
+// NotarySyncResponse acknowledges the sync. If the Ark refuses it, the
+// envelope carries the refusal in its err field.
+message NotarySyncResponse {
 }
 
 
@@ -572,14 +588,15 @@ message ExecutionResultRequest{
 // ExecutionResultResponse holds what the owner saw when releasing the task's
 // output, which the host then reads through ExecutionOutputRequest.
 message ExecutionResultResponse{
-  string          name         = 1; // App name from its manifest
-  string          version      = 2; // App version from its manifest
-  bool            develop      = 3; // Whether the app is a develop build
-  bool            success      = 4; // Whether the task succeeded
-  repeated string paths        = 5; // Paths of the owner's data as mounted, without public grants
-  string          media        = 6; // Report media type, always text/markdown
-  uint64          stdout_bytes = 7; // Length in bytes of the report, the app's standard output
-  uint64          stderr_bytes = 8; // Length in bytes of a develop build's standard error, 0 otherwise
+  string          id           = 1; // App id when it's notarized, empty otherwise
+  string          name         = 2; // App name from its manifest
+  string          version      = 3; // App version from its manifest
+  bool            develop      = 4; // Whether the app is a develop build
+  bool            success      = 5; // Whether the task succeeded
+  repeated string paths        = 6; // Paths of the owner's data as mounted, without public grants
+  string          media        = 7; // Report media type, always text/markdown
+  uint64          stdout_bytes = 8; // Length in bytes of the report, the app's standard output
+  uint64          stderr_bytes = 9; // Length in bytes of a develop build's standard error, 0 otherwise
 }
 
 // ExecutionStream names one of the app's output streams.

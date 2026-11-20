@@ -20,7 +20,7 @@ pub struct HostToArk {
     /// the Ark. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "host_to_ark::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 261, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<host_to_ark::Content>,
 }
@@ -45,6 +45,9 @@ pub mod host_to_ark {
         /// Requests a proof of the device's genuinity
         #[prost(bytes, tag = "260")]
         GenuinityProof(::prost::bytes::Bytes),
+        /// Installs the cloud-signed notary key and revocations
+        #[prost(bytes, tag = "261")]
+        NotarySync(::prost::bytes::Bytes),
         /// Prepares an update, aborting any in progress
         #[prost(bytes, tag = "513")]
         FirmwareUpdatePrep(::prost::bytes::Bytes),
@@ -172,7 +175,7 @@ pub struct ArkToHost {
     /// request of its own. The tags are grouped by area, each area with its own range.
     #[prost(
         oneof = "ark_to_host::Content",
-        tags = "256, 257, 258, 259, 260, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
+        tags = "256, 257, 258, 259, 260, 261, 513, 514, 515, 516, 517, 769, 770, 771, 772, 773, 774, 1025, 1026, 1027, 1281, 1282, 1283, 1284, 1285, 1286, 1287, 1288, 1289, 1290, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1793, 4096"
     )]
     pub content: ::core::option::Option<ark_to_host::Content>,
 }
@@ -197,6 +200,9 @@ pub mod ark_to_host {
         /// Encrypted proof of the Ark's genuinity for the cloud
         #[prost(bytes, tag = "260")]
         GenuinityProof(::prost::bytes::Bytes),
+        /// Acknowledges the notary sync
+        #[prost(bytes, tag = "261")]
+        NotarySync(::prost::bytes::Bytes),
         /// Ephemeral key to receive the firmware key with, sealed for the cloud
         #[prost(bytes, tag = "513")]
         FirmwareUpdatePrep(::prost::bytes::Bytes),
